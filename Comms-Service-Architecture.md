@@ -1,0 +1,232 @@
+# Comms Service -- архитектура (нотификации + чат)
+
+> Универсальный, продукт-агностичный сервис нотификаций и чата.
+> **Клиент №1 -- VELO. Задача: сделать comms ДЛЯ VELO, а переиспользовать в
+> cbshome -- вторым шагом** (cbshome -- донор кода и валидатор домен-агностичности,
+> НЕ ведущий заказчик; при конфликте требований выигрывает VELO).
+> Деплоится ОТДЕЛЬНО под каждый продукт (своя БД, свой профиль, свои креды каналов);
+> DRY по коду, НЕ мультитенантный рантайм.
+>
+> Стек: Python 3.12, FastAPI, SQLAlchemy async, Postgres 16, Redis 7. ORM-only.
+> Конвенции: `->` и `--`, идентификаторы на английском.
+> Репозитории: `aivis-one/comms` (сервис), `aivis-one/ops` (деплой-тулкит),
+> `aivis-one/velo` (клиент №1), `aivis-one/cbshome` (клиент №2, позже).
+> Статус: DRAFT, код не писался.
+
+---
+
+## 0. Рамка
+
+- **НЕ рефактор модуля в монолите.** Standalone universal comms service, с первого дня.
+- **Драйвер:** заказчик недоволен монолитом VELO (хочет мультисервис); VELO встал на
+  рестарт (БД удалена, деньги возвращены, месяц паузы) -> greenfield. Comms -- сервис №1.
+- **DRY по факту кода:** у VELO и cbshome УЖЕ по копии почти одинакового движка
+  нотификаций (та же двухуровневая модель `Notification`/`NotificationDelivery`, тот же
+  пайплайн resolve/deliver/rollup, те же каналы telegram/email/push/in_app, тот же
+  `TargetType` user/role/all). Это и есть дупликация, которую убивает сервис.
+- **Чат -- greenfield для обоих** (VELO -- заглушки-вью, cbshome -- нет вообще).
+
+## 1. Залоченные решения
+
+| # | Решение |
+|---|---------|
+| 1 | **Standalone universal service**, деплой per-product, своя БД на инстанс. DRY по коду, не мультитенант. **VELO -- клиент №1.** |
+| 2 | **Слияние двух движков в канонический core.** База = движок cbshome (технически полнее: реестр резолверов, `worker`, `read_at`/бейдж, `staff_router`), доливаем `reminders` из VELO. cbshome -- донор кода, не заказчик. |
+| 3 | **Audience = синк-проекция (Model B).** Сервис держит `recipient` + `group_membership`; продукт мапит свой домен в группы и синкает членство. Сервис резолвит `USER`/`GROUP`/`ALL` над синк-данными, в чужую БД не заходит (own-your-data). |
+| 4 | **Транспорт = HTTP (sync) + Redis Streams (durable events) + транзакционный outbox** на стороне продукта. Граница двусторонняя (колбэк сервис -> продукт для того, что принадлежит продукту, напр. `DiaryEvent`). |
+| 5 | **Prefs живут в сервисе** (модель категорий). E8-канон VELO -- его словарь категорий; экран настроек VELO проксирует в сервис. |
+| 6 | **БД comms = отдельная database + роль в ПРОДУКТОВОМ Postgres** (не второй контейнер). Логическая изоляция есть (своя БД, своя роль, свой alembic, без кросс-схемных FK), ресурсной не покупаем -- co-located на одном VPS. Переезд на свой хост = смена `DATABASE_URL`. |
+| 7 | **Deploy:** comms co-located на VPS продукта; shared external Docker network; **Redis продукта -- общая шина**; **bot token общий** (продукт валидирует initData, comms шлёт); **один per-VPS инсталлер + один CLI**. |
+| 8 | **Ветки парами по окружению:** test-VPS = `velo@test` + `comms@test`; prod-VPS = `velo@main` + `comms@main`. Раскат в порядке зависимости: **сначала comms (провайдер контракта), потом продукт**. |
+| 9 | **Общий деплой-тулкит в отдельном репо `ops`** (модули bash + CLI, параметризуемые профилем окружения). `install_velo_test.sh` / `install_velo_prod.sh` / `install_cbshome.sh` уже отличаются только шапкой (ветка + домены + IP) -> сливаем в одно тело + профили. |
+| 10 | **CI на репо `comms`** (GitHub Actions): pytest на эфемерной БД + ruff + mypy. Без деплоя. Режим -- **лампочка** (информационный статус; branch protection позже). Причина: у comms НЕТ своего сервера -- он живёт на VPS продукта, и битый comms роняет общий test-контур. У продуктов CI нет и не нужен (их тесты требуют сид на test-VPS). |
+| 11 | **Границы задачи:** планируем/диспетчерим сам сервис + его деплой; рестарт VELO-v2 (его домены) -- ОТДЕЛЬНЫЙ трек-клиент. |
+
+## 2. Целевая архитектура
+
+### 2.1 Сервис и границы
+Comms -- отдельный деплой-юнит: FastAPI-приложение + своя БД + свой alembic + свой конфиг.
+Владеет ВСЕЙ comms-логикой: движок нотификаций, messaging, префы, состояние каналов.
+Продукт -- клиент: эмитит доменные события, синкает identity/группы, читает через HTTP.
+Ни сервис в БД продукта, ни продукт в БД сервиса не заходят.
+
+### 2.2 Canonical core (слияние движков) + messaging
+- **Модель:** `Notification` (channel-agnostic: type / title / body / target_type+target_value /
+  action_data JSONB / priority / scheduled_at / expiry_at / status) + `NotificationDelivery`
+  (per-recipient per-channel: channel / channel_options / status / sent_at / **read_at** /
+  attempts / error). Иммутабельность body/title после создания.
+- **Пайплайн:** resolve (`Notification` -> N `Delivery`) -> deliver (`Delivery` ->
+  `ChannelFormatter` -> внешний канал) -> rollup (статусы deliveries -> статус notification).
+- **Резолвер:** реестр `resolve_targets` + `_RESOLVERS` (из cbshome) -- generic USER/GROUP/ALL
+  над синк-проекцией (2.3).
+- **Каналы:** реестр `ChannelFormatter` (Protocol) + `get_formatter`; telegram (рабочий), email,
+  push, in_app. Новый канал = новый форматтер, core не трогаем.
+- **Шаблоны:** `template_engine` рендерит title/body по локали получателя.
+- **Надёжность:** ретраи/бэкофф; PermanentDeliveryError (403 bot blocked / chat not found / no
+  credentials -> сразу FAILED) vs transient (retry до max_attempts). `worker` + `processor`.
+- **Напоминания:** планировщик `reminders` (из VELO).
+- **In-app лента/бейдж:** `read_at` на delivery + REST (из cbshome) -- готовый «колокольчик».
+- **Диплинки:** `action_data {action, params}` (2.6).
+- Доменные enum (`NotificationType`) -- НЕ хардкод, регистрируются профилем.
+
+### 2.3 Точки расширения (3 слоя)
+1. **Per-deploy профиль** (данные, не код): словарь типов + шаблоны; конфиг каналов (какие
+   включены, токены/SMTP); дефолт локали; username бота продукта (для диплинков).
+2. **Синк-проекции** (продукт -> сервис событиями `user_upserted` / `group_changed`):
+   `recipient(id, telegram_id, email, locale, active)` + `group_membership(group_key, recipient_id)`.
+   **`recipient.id` = product user id** (НЕ внутренний суррогат, `external_id` не заводим):
+   id-пространство comms общее с продуктом -> `target_value` для `USER` -- это product user id,
+   и тестовые id должны браться из тест-бандов.
+3. **Обязанности продукта:** эмитить доменные события через транзакционный outbox; мапить свои
+   сущности в группы (`practice:42` -> группа `practice_42`).
+
+### 2.4 Messaging model
+Продукт-нейтральна: «мастер» -- просто recipient, «практика» -- opaque `subject_ref`.
+
+```
+Thread
+  id                -- СТАБИЛЬНАЯ identity (инвариант ниже)
+  client            -> recipient
+  operator_target   -> user:<recipient> | section:<section>
+  assignee? / assigned_at?
+  kind              -> dm | ticket          (определяет дедуп)
+  subject_ref?      -> (subject_type, subject_id)  -- opaque для core
+  title? / priority? / status               (open | resolved | closed)
+
+Message: id, thread_id, sender, body, created_at
+ReadState: (thread_id, participant) -> last_read_at
+Section (first-class, v1 минимальная): id, key, label
+  -- связь оператор<->секция в v1 ТРИВИАЛЬНА (любой агент -> все секции)
+```
+
+**Дедуп по `kind`:** есть `subject_ref` -> один тред на сущность; беспредметный DM -> один
+вечный на `(client, operator)`; беспредметный ticket -> много.
+
+**Мутабельность осей -- по форме `operator_target`:** `user:*` -> `assignee` неизменяем (=этот
+user), оси **frozen** (VELO: мастер); `section:*` -> `assignee` claimable (v1 без
+release/handoff), оси **mutable** (retag-capable, ТП).
+
+**Инвариант:** identity = `thread_id`; дедуп-ключ применяется ТОЛЬКО при создании -> ретеггинг
+сохраняет тред и историю. **Клейм** атомарный: ORM conditional UPDATE `assignee=me WHERE id=?
+AND assignee IS NULL` + rowcount (без SQL).
+
+**Видимость:** оператор видит тред, если `assignee==me` ИЛИ (`unassigned` И me обслуживает
+`section`); `user`-тред не в пуле -> другим невидим. **Supervisor** -- скоуп «видит всё», v1
+read-only.
+
+### 2.5 Preferences
+**Категория (регистрирует продукт) × per-recipient mute + расписание тихих часов.** Словарь
+категорий VELO (E8-канон): `new_booking, booking_cancelled, reminder, new_checkin, new_feedback,
+msg_participants, msg_support, ai_summary, monthly_report`. Гранулярность **семейная**
+(`reminder` -> `reminder_24h/1h/10min`). `msg_participants`/`msg_support` гейтят уведомления чата.
+
+### 2.6 Deep-links
+Единая таблица назначений (`action -> экран`), кодировка per-surface. Telegram: `action_data` ->
+`format_deep_link` -> `?startapp={action}__{params}`. Чат: `{open_thread, {thread_id}}`. Диплинк
+ведёт в **Mini App ПРОДУКТА** (username бота из профиля); реестр `action -> route` -- на фронте
+продукта. Ловушки: (1) startapp хрупок (charset `[A-Za-z0-9_-]`, 64 симв.) -> один параметр /
+opaque token; (2) вне Telegram нет входа/auth -> ссылки через `t.me/{bot}?startapp` сейчас,
+web-роутинг позже.
+
+## 3. Интеграция продукт <-> сервис
+
+- **Sync HTTP** (внутренняя сеть) где продукт ждёт ответ: лента колокольчика, список тредов,
+  история сообщений, пост сообщения.
+- **Durable-события через Redis Streams** для того, что продукт эмитит и забывает
+  (`booking_confirmed`, `message_posted`): consumer-group + ack + реплей.
+- **Цена сервисной границы:** инвариант «нотификация в той же транзакции, что доменное событие»
+  через границу умирает -> продукт пишет **транзакционный outbox** (строка события в ТОЙ ЖЕ
+  транзакции, что доменное изменение) -> релей отгружает outbox -> Redis Stream -> сервис
+  потребляет идемпотентно. At-least-once без распределённых транзакций.
+- **Двусторонность:** сервис -> продукт колбэком (старт треда -> VELO рисует `DiaryEvent`;
+  Дневник остаётся у VELO).
+- **Фронт:** продуктовый бэк **проксирует** чтения comms (один API-surface + одна
+  initData-авторизация) -- vs фронт напрямую (открыто, §5).
+
+## 4. Deploy / инфра
+
+### 4.1 Физическая топология (test и prod -- зеркала)
+Сервер = функция от скрипта: чистый VPS -> инсталлер -> 100/100, руками не правим; поменялся
+девопс -> переустановка с нуля. Test-VPS: `velo@test` + `comms@test` (домены `velotony.com` /
+`api.velotony.com`). Prod-VPS: `velo@main` + `comms@main` (`vel-app.com` / `api.vel-app.com`).
+Различие -- только шапка профиля (ветки, домены, IP, бот).
+
+**Что делает инсталлер на чистой машине:**
+1. система (docker, nginx, certbot, ufw), deploy-юзер, SSH deploy-ключ;
+2. клонирует ДВА репо: `velo` -> `/opt/velo/repo`, `comms` -> `/opt/velo/comms` (ветки из профиля);
+3. генерит `.env` ОДИН раз, секреты общие (Redis-пароль, bot token, `COMMS_DB_PASS`) ->
+   раскладывает по двум `.env`;
+4. создаёт shared external network;
+5. поднимает продуктовый стек (app, postgres, redis, frontend) -> healthcheck;
+6. в том же Postgres создаёт БД+роль comms;
+7. поднимает `comms-app` в shared-сеть -> healthcheck;
+8. миграции обоих (свои цепочки alembic);
+9. nginx: публичные хосты ТОЛЬКО продуктовые; **comms наружу не торчит** (внутренний);
+10. ставит CLI.
+
+**Внутри сети:** comms знает `redis:6379` и `http://app:8000`; продукт знает `http://comms-app:8000`.
+
+### 4.2 Цикл раската
+Исполнитель -> файлы -> босс пушит в `test` (репо `comms` или `velo`).
+**CI (только `comms`)**: GitHub поднимает временную машину, эфемерный Postgres, гоняет
+pytest/ruff/mypy. Красный -> на VPS ничего не везём (test-контур VELO цел, там работают люди).
+Зелёный -> босс на test-VPS делает `velo update`:
+1. `git pull` в обоих репо;
+2. **comms** (провайдер): build -> up -> healthcheck -> alembic;
+3. **продукт**: build -> up -> healthcheck -> alembic -> pytest в контейнере (против test-БД,
+   которой не дорожим -> нужны тест-банды) -> регенерация типов -> пуш типов в GitHub -> build фронта;
+4. финальный healthcheck обоих.
+Прод: мерж `test` -> `main` в обоих репо, тот же скрипт с prod-профилем, тот же порядок; БД
+бэкапится перед раскатом.
+
+### 4.3 Совместимость через границу
+Раскат двух-репный -> comms@test может уйти вперёд продукта. Контракт должен это переживать:
+**additive-изменения, старые поля не ломаем.** Пиннинг версий comms (теги вместо ветки) --
+позже, когда cbshome реально сядет на comms (два потребителя раскатываются вразнобой).
+
+### 4.4 Ops-тулкит (репо `ops`)
+Общее тело (docker/nginx/certbot, генерация `.env`, `compose up`, alembic, healthcheck, CLI) +
+профили окружений (ветки, домены, IP, состав стека). Потребляют VELO(test/prod), comms, cbshome.
+Отдельный репо -- ops правят при смене инфры, а не при доработке нотификаций (разный лайфсайкл).
+
+**Почему сливаем:** `install_velo_test.sh` / `install_velo_prod.sh` / `install_cbshome.sh` --
+это ~76КБ почти идентичного кода, различающегося ТОЛЬКО шапкой (ветка + домены + IP). Три копии
+одного скрипта; с приходом comms их станет больше (два репо на VPS, две БД, shared network,
+порядок раската). Одно тело + профили -> правка девопса в одном месте.
+
+**Модель доставки (ритуал босса не меняется):** в `/tmp` нового сервера кладётся ОДИН файл --
+**тонкий бутстрап** (шапка профиля + «склонируй `ops` и вызови его»), запускается, дальше всё как
+раньше: чистый сервер -> 100/100. Логика при этом живёт в `ops`, а не в файле.
+
+**Доступ к приватному `ops`:** ключей/токенов в бутстрапе НЕТ -- скрипт **запрашивает доступ
+интерактивно при установке** (ровно как уже спрашивает `TELEGRAM_BOT_TOKEN` через `prompt_secret`).
+Установка разовая -> одного запроса достаточно.
+
+## 5. Открытые вопросы
+1. **Фронт-интеграция:** продуктовый бэк проксирует comms (ставка) или фронт ходит напрямую?
+2. **Статусы треда:** набор (open/resolved/closed?), кто переводит, авто-закрытие.
+3. **Тред практики -- момент создания:** eager (на брони) или lazy (по первому сообщению)?
+4. **Тихие часы:** отложить (queue до окна) или подавить?
+5. **Branch protection** (шлагбаум вместо лампочки) -- позже, по опыту.
+6. **Пиннинг версии comms** для продукта -- когда подключится cbshome.
+7. **SSH deploy-key -- скоуп (к Phase 5).** На сервере уже генерится deploy-ключ для GitHub
+   (нужен WRITE: `velo update` пушит обратно регенерённые типы). Логично, чтобы ТОТ ЖЕ ключ
+   покрывал `comms` и `ops` -> «запрос доступа» = одна операция на сервер, а не три. Как именно
+   (org-wide ключ / machine user / три deploy-ключа) -- решаем в Phase 5. Сейчас не блокирует.
+8. **VELO-v2 рестарт** (его домены) -- отдельный трек-клиент.
+
+### Starred (розетки сейчас, механизм позже)
+Ретеггинг (только section-ticket): смена `subject_ref` И/ИЛИ `section` -> ре-резолв оператора ->
+ресет `assignee` -> ре-инстанс ИИ-агента секции. Оператор в пределе: человек-юзер | пул-агентов |
+ИИ-агент (привязан к БЗ секции). Розетки уже в модели (три раздельные оси + стабильный
+`thread_id` + `Section`-сущность); у VELO (user-оператор) оси frozen.
+
+## 6. TL;DR
+Standalone comms-сервис (нотификации + чат) ДЛЯ VELO, переиспользуемый в cbshome. Ядро = слияние
+двух почти одинаковых движков (база cbshome + `reminders` VELO), доменное -> в профиль + синк-
+проекцию (recipient + group_membership). Messaging свежий: Thread->Message+ReadState, оператор
+user|section, assignee/claim, инвариант thread_id, розетки под ретеггинг. Транспорт: HTTP +
+Redis Streams + транзакционный outbox на продукте, колбэк обратно. Deploy: comms co-located на VPS
+продукта (shared network, общий Redis, общий bot token, своя БД в продуктовом Postgres), ветки
+парами (test/main), раскат comms -> продукт, один инсталлер + CLI из репо `ops`, CI-лампочка на
+`comms`. Сервер = функция от скрипта; test и prod -- зеркала, различаются шапкой профиля.

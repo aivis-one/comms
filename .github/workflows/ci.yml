@@ -1,0 +1,61 @@
+# =============================================================================
+# COMMS Service -- CI (handoff item 5)
+# =============================================================================
+# Ephemeral Postgres 16 service container; schema via `alembic upgrade
+# head`; then pytest + ruff + mypy. NO deploy steps, NO SSH, NO secrets
+# (deploy wiring is Phase 5).
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: comms
+          POSTGRES_PASSWORD: comms
+          POSTGRES_DB: comms
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U comms"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      APP_ENV: ci
+      DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms
+      CHANNELS_MODE: stub
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Apply migrations (alembic upgrade head)
+        run: alembic upgrade head
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type check (mypy)
+        run: mypy app
