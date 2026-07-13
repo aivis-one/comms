@@ -31,6 +31,10 @@
 #     so a datetime can never reach render() and date-like specs are
 #     true positives. Attribute access ({user.name}) is rejected too:
 #     JSON objects arrive as dicts, use item access ({user[name]}).
+#   - type keys and categories are length-checked against the ACTUAL
+#     widths of the DB columns they land in (notifications.type,
+#     category_mutes.category) -- a too-long key would otherwise
+#     DataError at create/mute time instead of at startup;
 #   - templates for types missing from the dictionary -> loud warning
 #     (not fatal: additive contract, profile may ship templates ahead
 #     of enabling a type).
@@ -46,9 +50,13 @@ from typing import Any, Protocol
 
 import structlog
 import yaml
+from sqlalchemy import String
+from sqlalchemy.sql.elements import KeyedColumnElement
 
+from app.audience.models import CategoryMute
 from app.core.config import settings
 from app.core.exceptions import ProfileError
+from app.engine.models import Notification
 from app.engine.registry import ProfileRegistry, TemplateTree, registry
 
 logger = structlog.get_logger()
@@ -56,6 +64,32 @@ logger = structlog.get_logger()
 # File names inside the profile root.
 _TYPES_FILE = "types.yaml"
 _TEMPLATES_SUBDIR = "templates"
+
+
+def _string_column_length(column: "KeyedColumnElement[Any]") -> int:
+    """Width of a String column, introspected -- never hardcoded.
+
+    Profile keys land in DB columns; validating against the ACTUAL
+    column widths keeps this check honest if a migration ever widens
+    them. Deliberate coupling to the model layer (profile ->
+    engine/audience models); the models import nothing back, so no
+    cycle.
+    """
+    column_type = column.type
+    assert isinstance(column_type, String)
+    assert column_type.length is not None
+    return column_type.length
+
+
+# Type keys are stored in Notification.type; categories in
+# CategoryMute.category. A key longer than the column would DataError
+# at create_notification / mute time -- fail at startup instead.
+_TYPE_KEY_MAX_LENGTH = _string_column_length(
+    Notification.__table__.c["type"],
+)
+_CATEGORY_MAX_LENGTH = _string_column_length(
+    CategoryMute.__table__.c["category"],
+)
 
 
 # -----------------------------------------------------------------------------
@@ -193,6 +227,13 @@ def _parse_types(doc: Any) -> dict[str, dict[str, Any]]:
                 f"types.yaml: type key must be a non-empty string, "
                 f"got {key!r}"
             )
+        if len(key) > _TYPE_KEY_MAX_LENGTH:
+            raise ProfileError(
+                f"types.yaml: type key {key[:30]!r}... is "
+                f"{len(key)} characters; the limit is "
+                f"{_TYPE_KEY_MAX_LENGTH} (width of the "
+                f"notifications.type column)."
+            )
         if spec is None:
             spec = {}
         if not isinstance(spec, dict):
@@ -207,6 +248,13 @@ def _parse_types(doc: Any) -> dict[str, dict[str, Any]]:
             raise ProfileError(
                 f"types.yaml: `category` for type {key!r} must be a "
                 f"non-empty string, got {category!r}"
+            )
+        if category is not None and len(category) > _CATEGORY_MAX_LENGTH:
+            raise ProfileError(
+                f"types.yaml: category {category[:30]!r}... for type "
+                f"{key!r} is {len(category)} characters; the limit is "
+                f"{_CATEGORY_MAX_LENGTH} (width of the "
+                f"category_mutes.category column)."
             )
         types[key] = spec
     return types

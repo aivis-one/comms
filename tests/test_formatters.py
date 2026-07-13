@@ -16,12 +16,13 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from app.audience.models import Recipient
 from app.engine.constants import DeliveryChannel
 from app.engine.formatters import (
     PermanentDeliveryError,
+    RateLimitedError,
     StubFormatter,
     TelegramFormatter,
     close_formatters,
@@ -233,11 +234,25 @@ class TestTelegramDeliver:
         """Non-permanent Telegram errors bubble up for retry."""
         error = TelegramAPIError(
             method=SimpleNamespace(),  # type: ignore[arg-type]
-            message="Too Many Requests: retry after 5",
+            message="Bad Gateway",
         )
         fmt = TelegramFormatter(bot=_FakeBot(error=error), bot_url=BOT_URL)
         with pytest.raises(TelegramAPIError):
             await fmt.deliver(_notification(), _delivery(), _recipient())
+
+    async def test_rate_limit_maps_to_rate_limited_error(self) -> None:
+        """Phase 2.2: a real 429 arrives as TelegramRetryAfter and
+        surfaces TYPED (with the server-named wait) -- it must not
+        fall through to the permanent/transient text matching."""
+        error = TelegramRetryAfter(
+            method=SimpleNamespace(),  # type: ignore[arg-type]
+            message="Too Many Requests: retry after 42",
+            retry_after=42,
+        )
+        fmt = TelegramFormatter(bot=_FakeBot(error=error), bot_url=BOT_URL)
+        with pytest.raises(RateLimitedError) as exc_info:
+            await fmt.deliver(_notification(), _delivery(), _recipient())
+        assert exc_info.value.retry_after == 42.0
 
 
 class TestHtmlEscaping:

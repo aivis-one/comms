@@ -44,7 +44,15 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, func, inspect
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Integer,
+    SmallInteger,
+    String,
+    func,
+    inspect,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
@@ -206,9 +214,26 @@ class NotificationDelivery(UUIDMixin, Base):
         nullable=False,
     )
 
+    # Phase 2.2: how many times this delivery was deferred by a
+    # channel rate limit (HTTP 429). A SEPARATE budget from attempts:
+    # 429 is not a message failure, so it must not burn the retry
+    # budget -- but it must be bounded (a delivery cannot defer
+    # forever). Past settings.notification_max_rate_limit_deferrals a
+    # 429 degrades to a regular transient failure. A real column (not
+    # JSONB) on purpose: "how many deliveries are being throttled
+    # right now" must be a WHERE clause, not json archaeology.
+    rate_limit_deferrals: Mapped[int] = mapped_column(
+        SmallInteger,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+
     # Review 1.1: earliest moment the next transient retry may run.
     # NULL = no gate (fresh delivery or terminal state). Set by the
-    # service on transient failure: now + base * 2**(attempts-1), capped.
+    # service on transient failure: now + base * 2**(attempts-1),
+    # capped; by quiet hours (window end); by a 429 (server-named
+    # retry_after + jitter).
     next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

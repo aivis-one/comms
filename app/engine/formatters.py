@@ -66,6 +66,22 @@ class PermanentDeliveryError(Exception):
     """
 
 
+class RateLimitedError(Exception):
+    """Raised when the channel says "come back later" (HTTP 429).
+
+    Not a message failure: the channel is healthy, it just asks to
+    slow down -- and tells exactly when to retry. The service layer
+    defers via next_retry_at WITHOUT burning an attempt (same pattern
+    as quiet hours), up to a deferral budget (Phase 2.2).
+    """
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(
+            f"rate limited by channel: retry after {retry_after}s"
+        )
+        self.retry_after = retry_after
+
+
 class ChannelFormatter(Protocol):
     """Protocol for channel-specific notification delivery."""
 
@@ -211,7 +227,7 @@ class TelegramFormatter:
 
         # Lazy import: aiogram types only needed on the real send path.
         from aiogram.enums import ParseMode
-        from aiogram.exceptions import TelegramAPIError
+        from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         # Trust boundary (review 1.1): the TEMPLATE is trusted and may
@@ -280,6 +296,12 @@ class TelegramFormatter:
             return True
 
         except TelegramAPIError as exc:
+            # 429 first: TelegramRetryAfter IS-A TelegramAPIError, and
+            # the server names the exact wait -- surface it typed so
+            # the service defers via next_retry_at instead of burning
+            # an attempt (Phase 2.2).
+            if isinstance(exc, TelegramRetryAfter):
+                raise RateLimitedError(float(exc.retry_after)) from exc
             error_msg = str(exc).lower()
             for perm_error in _PERMANENT_ERRORS:
                 if perm_error in error_msg:

@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.audience.prefs import (
@@ -644,3 +645,93 @@ class TestLateMuteAtDeliver:
                 f"{status_a}+{status_b} -> expected {expected}, "
                 f"got {notification.status}"
             )
+
+    async def test_rollup_triple_mixed_is_partial_sent(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Phase 2.2 gap: the triple skipped+sent+failed -- after
+        subtracting the skip, {sent, failed} remains -> PARTIAL_SENT."""
+        for _ in range(3):
+            await _phase2_recipient(db_session)
+        notification = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.ALL,
+            target_value="*",
+            channels=["telegram"],
+        )
+        deliveries = await resolve_notification(db_session, notification)
+        assert len(deliveries) == 3
+        deliveries[0].status = DeliveryStatus.SKIPPED
+        deliveries[1].status = DeliveryStatus.SENT
+        deliveries[2].status = DeliveryStatus.FAILED
+        await db_session.flush()
+
+        await rollup_notification(db_session, notification)
+        assert notification.status == NotificationStatus.PARTIAL_SENT
+
+
+async def _force_expiry(notification_id: UUID) -> None:
+    """Backdate expiry_at -- simulates the deadline passing."""
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(Notification).where(Notification.id == notification_id)
+        )
+        notification = result.scalar_one()
+        notification.expiry_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+
+class TestQuietDeferralVsExpiry:
+    """Phase 2.2 items 3+5: a quiet deferral that pushes past
+    expiry_at is a DELIBERATE expiry, not a late send -- and the
+    quiet-defer log names the causality (beyond_expiry=true)."""
+
+    async def test_expiry_inside_quiet_window_expires(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Deferred past the deadline -> step-0 EXPIRED, nothing sent;
+        the deferral log flags beyond_expiry."""
+        recipient = await _phase2_recipient(db_session)
+        quiet_from, quiet_to, days = _window_around_now()
+        await set_quiet_hours(
+            db_session, recipient.id,
+            quiet_from=quiet_from, quiet_to=quiet_to, days=days,
+        )
+        # Expiry INSIDE the quiet window: the window opens ~now+2h,
+        # the notification dies at now+1h.
+        notification = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.USER,
+            target_value=str(recipient.id),
+            channels=["telegram"],
+            expiry_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        await db_session.commit()
+
+        with capture_logs() as logs:
+            assert await process_pending_notifications() == 1
+        deferred = [
+            log for log in logs
+            if log["event"] == "delivery_quiet_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0]["beyond_expiry"] is True
+
+        (delivery,) = await _fetch_deliveries(notification.id)
+        assert delivery.status == DeliveryStatus.PENDING
+
+        # The deadline passes while the gate is still closed.
+        await _force_expiry(notification.id)
+        await process_pending_notifications()
+
+        fresh = await _fetch_notification(notification.id)
+        assert fresh.status == NotificationStatus.EXPIRED
+        (delivery,) = await _fetch_deliveries(notification.id)
+        assert delivery.sent_at is None

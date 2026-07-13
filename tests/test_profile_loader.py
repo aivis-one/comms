@@ -449,3 +449,31 @@ class TestFormatSpecProbing:
             locale="en",
             variables={"user": {"name": "Zo"}},
         ) is None
+
+
+class TestKeyLengthValidation:
+    """Phase 2.2 item 2: profile keys are length-checked at startup
+    against the ACTUAL widths of the DB columns they land in -- a
+    too-long key would otherwise DataError at create/mute time."""
+
+    def test_type_key_too_long_is_fatal(self, tmp_path: Path) -> None:
+        """A 51-char type key exceeds notifications.type (50)."""
+        root = _write_profile(tmp_path, f"{'k' * 51}: {{}}\n")
+        with pytest.raises(ProfileError, match=r"notifications\.type"):
+            load_profile(FileProfileSource(root))
+
+    def test_category_too_long_is_fatal(self, tmp_path: Path) -> None:
+        """A 51-char category exceeds category_mutes.category (50)."""
+        root = _write_profile(
+            tmp_path, f"unit_event:\n  category: {'c' * 51}\n",
+        )
+        with pytest.raises(ProfileError, match=r"category_mutes\.category"):
+            load_profile(FileProfileSource(root))
+
+    def test_max_length_key_passes(self, tmp_path: Path) -> None:
+        """Exactly at the limit is legal (boundary, not off-by-one)."""
+        root = _write_profile(
+            tmp_path, f"{'k' * 50}:\n  category: {'c' * 50}\n",
+        )
+        profile = load_profile(FileProfileSource(root))
+        assert "k" * 50 in profile.types

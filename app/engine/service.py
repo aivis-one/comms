@@ -32,6 +32,7 @@
 # =============================================================================
 
 import asyncio
+import random
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -54,6 +55,7 @@ from app.engine.constants import (
 from app.engine.formatters import (
     ChannelFormatter,
     PermanentDeliveryError,
+    RateLimitedError,
     get_formatter,
     sanitize_error,
 )
@@ -313,6 +315,20 @@ async def deliver_notification(
       and error_message stay untouched: deferral is not a failure.
       Checked per attempt, so backoff retries landing in a quiet
       window are deferred too.
+      TIGHT EXPIRY INSIDE A QUIET WINDOW: when the window end lands
+      past the notification's expiry_at, the step-0 expire sweep will
+      mark it EXPIRED before the gate reopens -- a deliberate expiry,
+      not a late send (a "1 hour before" reminder deferred past its
+      anchor must die quietly, not arrive mid-session). The
+      delivery_quiet_deferred log carries beyond_expiry=true for
+      causality.
+    - CHANNEL RATE LIMIT (Phase 2.2): a 429 is "come back later", not
+      a message failure -- the delivery is deferred via next_retry_at
+      using the SERVER-NAMED retry_after (+1-2s jitter against
+      thundering herd), without burning an attempt; a per-delivery
+      deferral budget (rate_limit_deferrals vs
+      settings.notification_max_rate_limit_deferrals) bounds the
+      loop, past it a 429 degrades to a regular transient failure.
     - Concurrent delivery via asyncio.gather + Semaphore.
     - asyncio.wait_for with timeout per formatter call.
     - PermanentDeliveryError -> immediate FAILED, no attempts increment.
@@ -386,11 +402,21 @@ async def deliver_notification(
         quiet_until = recipient_quiet_until(recipient, now)
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
+            # Causality flag: the deferral pushes the delivery past
+            # the notification's expiry -> step-0 will EXPIRE it
+            # before it ever sends. Deliberate (a reminder deferred
+            # past its anchor must die, not arrive late), but the log
+            # must show WHY it died.
+            beyond_expiry = (
+                notification.expiry_at is not None
+                and quiet_until > notification.expiry_at
+            )
             logger.info(
                 "delivery_quiet_deferred",
                 delivery_id=str(delivery.id),
                 recipient_id=str(recipient.id),
                 until=quiet_until.isoformat(),
+                beyond_expiry=beyond_expiry,
             )
             continue
 
@@ -405,40 +431,82 @@ async def deliver_notification(
         results = await asyncio.gather(*tasks)
 
         # Apply results to delivery objects (sequential, session-safe).
-        max_attempts = settings.notification_max_delivery_attempts
         for delivery, outcome in results:
             if outcome.permanent:
                 delivery.status = DeliveryStatus.FAILED
                 delivery.error_message = outcome.error
+            elif outcome.retry_after is not None:
+                # -- Channel rate limit (429): defer, don't burn --
+                budget = settings.notification_max_rate_limit_deferrals
+                if delivery.rate_limit_deferrals < budget:
+                    delivery.rate_limit_deferrals += 1
+                    # Jitter on top of the server-named wait: every
+                    # delivery deferred by one burst must NOT wake in
+                    # the same tick and 429 again (thundering herd).
+                    delay = outcome.retry_after + random.uniform(1.0, 2.0)
+                    delivery.next_retry_at = datetime.now(UTC) + timedelta(
+                        seconds=delay,
+                    )
+                    logger.info(
+                        "delivery_rate_limit_deferred",
+                        delivery_id=str(delivery.id),
+                        retry_after=outcome.retry_after,
+                        deferrals=delivery.rate_limit_deferrals,
+                        budget=budget,
+                    )
+                else:
+                    # Budget exhausted: this 429 degrades to a regular
+                    # transient failure -- the attempts budget takes
+                    # over, which is finite (no infinite deferral).
+                    logger.warning(
+                        "delivery_rate_limit_budget_exhausted",
+                        delivery_id=str(delivery.id),
+                        deferrals=delivery.rate_limit_deferrals,
+                        budget=budget,
+                    )
+                    _apply_transient_failure(delivery, outcome.error)
             elif outcome.success:
                 delivery.attempts += 1
                 delivery.status = DeliveryStatus.SENT
                 delivery.sent_at = datetime.now(UTC)
             else:
-                delivery.attempts += 1
-                delivery.error_message = outcome.error
-                if delivery.attempts >= max_attempts:
-                    delivery.status = DeliveryStatus.FAILED
-                else:
-                    # Exponential backoff gate: base * 2**(attempts-1),
-                    # capped. Without it all attempts burned within one
-                    # poll interval (review 1.1).
-                    backoff_seconds = min(
-                        settings.notification_retry_backoff_base_seconds
-                        * 2 ** (delivery.attempts - 1),
-                        settings.notification_retry_backoff_max_seconds,
-                    )
-                    delivery.next_retry_at = datetime.now(UTC) + timedelta(
-                        seconds=backoff_seconds,
-                    )
+                _apply_transient_failure(delivery, outcome.error)
 
     await session.flush()
+
+
+def _apply_transient_failure(
+    delivery: NotificationDelivery,
+    error: str | None,
+) -> None:
+    """Apply one transient failure: burn an attempt, gate or fail.
+
+    Shared by the regular transient path and the exhausted-budget 429
+    path (a 429 past the deferral budget behaves exactly like any
+    other transient error).
+    """
+    delivery.attempts += 1
+    delivery.error_message = error
+    if delivery.attempts >= settings.notification_max_delivery_attempts:
+        delivery.status = DeliveryStatus.FAILED
+    else:
+        # Exponential backoff gate: base * 2**(attempts-1),
+        # capped. Without it all attempts burned within one
+        # poll interval (review 1.1).
+        backoff_seconds = min(
+            settings.notification_retry_backoff_base_seconds
+            * 2 ** (delivery.attempts - 1),
+            settings.notification_retry_backoff_max_seconds,
+        )
+        delivery.next_retry_at = datetime.now(UTC) + timedelta(
+            seconds=backoff_seconds,
+        )
 
 
 class _DeliveryOutcome:
     """Result of a single delivery attempt."""
 
-    __slots__ = ("error", "permanent", "success")
+    __slots__ = ("error", "permanent", "retry_after", "success")
 
     def __init__(
         self,
@@ -446,10 +514,15 @@ class _DeliveryOutcome:
         success: bool = False,
         permanent: bool = False,
         error: str | None = None,
+        retry_after: float | None = None,
     ) -> None:
         self.success = success
         self.permanent = permanent
         self.error = error
+        # Non-None marks a channel rate limit (429): the server-named
+        # wait in seconds. Handled by the apply loop against the
+        # deferral budget.
+        self.retry_after = retry_after
 
 
 async def _deliver_single(
@@ -481,6 +554,15 @@ async def _deliver_single(
             )
             return delivery, _DeliveryOutcome(
                 permanent=True, error=sanitize_error(exc),
+            )
+        except RateLimitedError as exc:
+            # Deliberately no log here: whether this becomes a deferral
+            # or degrades to a transient failure is decided in the
+            # apply loop (it owns the budget counter) -- that decision
+            # log is the valuable one, and doubling it would be noise.
+            return delivery, _DeliveryOutcome(
+                error=sanitize_error(exc),
+                retry_after=exc.retry_after,
             )
         except TimeoutError:
             logger.warning(
@@ -541,8 +623,12 @@ async def rollup_notification(
     if notification.status != NotificationStatus.PROCESSING:
         return
 
-    stmt = select(NotificationDelivery.status).where(
-        NotificationDelivery.notification_id == notification.id,
+    stmt = (
+        select(NotificationDelivery.status)
+        .where(NotificationDelivery.notification_id == notification.id)
+        # Only DISTINCT statuses: the verdict needs the set, not one
+        # row per delivery (Phase 2.2 -- constant-size result).
+        .distinct()
     )
     result = await session.execute(stmt)
     statuses = {row[0] for row in result.all()}

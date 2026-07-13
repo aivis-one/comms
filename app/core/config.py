@@ -90,6 +90,14 @@ class Settings(BaseSettings):
     notification_retry_backoff_base_seconds: int = 30
     notification_retry_backoff_max_seconds: int = 600
 
+    # Phase 2.2: how many channel rate-limit (429) deferrals a single
+    # delivery gets before a 429 degrades to a regular transient
+    # failure. Bounds the deferral loop: past the budget the attempts
+    # budget takes over, which is finite. With typical Telegram
+    # retry_after values (3-30s) the default buys minutes of honest
+    # waiting -- far beyond any realistic burst at current scale.
+    notification_max_rate_limit_deferrals: int = 10
+
     # -- Computed properties --
 
     @property
@@ -138,6 +146,13 @@ class Settings(BaseSettings):
                 f"Must be an IANA timezone name (e.g. 'UTC', "
                 f"'Europe/Berlin')."
             ) from exc
+
+        if self.notification_max_rate_limit_deferrals < 0:
+            raise ValueError(
+                "NOTIFICATION_MAX_RATE_LIMIT_DEFERRALS must be >= 0 "
+                "(0 disables 429 deferrals: every 429 is a regular "
+                "transient failure)."
+            )
 
         return self
 
