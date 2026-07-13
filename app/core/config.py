@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     # to the cbshome donor's 1-minute worker tick, where retries were
     # meaningful (review 1.1: retries burned within seconds).
     notification_retry_backoff_base_seconds: int = 30
+    # Double duty (Phase 2.3): also caps the honored 429 retry_after
+    # -- "no failure-driven gate exceeds this" is one policy knob.
     notification_retry_backoff_max_seconds: int = 600
 
     # Phase 2.2: how many channel rate-limit (429) deferrals a single

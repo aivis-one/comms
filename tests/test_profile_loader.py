@@ -477,3 +477,13 @@ class TestKeyLengthValidation:
         )
         profile = load_profile(FileProfileSource(root))
         assert "k" * 50 in profile.types
+
+    def test_column_length_guard_raises_not_asserts(self) -> None:
+        """Phase 2.3: the introspection guard is a REAL runtime check
+        (survives `python -O`) -- a non-String column raises loudly."""
+        from app.engine.profile import _string_column_length
+
+        with pytest.raises(RuntimeError, match="String column"):
+            _string_column_length(
+                Notification.__table__.c["created_at"],  # DateTime
+            )

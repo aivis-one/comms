@@ -324,11 +324,19 @@ async def deliver_notification(
       causality.
     - CHANNEL RATE LIMIT (Phase 2.2): a 429 is "come back later", not
       a message failure -- the delivery is deferred via next_retry_at
-      using the SERVER-NAMED retry_after (+1-2s jitter against
-      thundering herd), without burning an attempt; a per-delivery
-      deferral budget (rate_limit_deferrals vs
+      using the SERVER-NAMED retry_after (capped at
+      notification_retry_backoff_max_seconds -- the channel's word is
+      untrusted input; +1-2s jitter against thundering herd), without
+      burning an attempt; a per-delivery deferral budget
+      (rate_limit_deferrals vs
       settings.notification_max_rate_limit_deferrals) bounds the
       loop, past it a 429 degrades to a regular transient failure.
+      Its deferral log carries the same beyond_expiry causality flag
+      as the quiet gate. (Third path past expiry -- the plain
+      transient backoff gate, 30-600s -- is known and unflagged: the
+      shortest window of the three, not worth threading the
+      notification through _apply_transient_failure for one log
+      field.)
     - Concurrent delivery via asyncio.gather + Semaphore.
     - asyncio.wait_for with timeout per formatter call.
     - PermanentDeliveryError -> immediate FAILED, no attempts increment.
@@ -440,12 +448,38 @@ async def deliver_notification(
                 budget = settings.notification_max_rate_limit_deferrals
                 if delivery.rate_limit_deferrals < budget:
                     delivery.rate_limit_deferrals += 1
-                    # Jitter on top of the server-named wait: every
-                    # delivery deferred by one burst must NOT wake in
-                    # the same tick and 429 again (thundering herd).
-                    delay = outcome.retry_after + random.uniform(1.0, 2.0)
-                    delivery.next_retry_at = datetime.now(UTC) + timedelta(
+                    # CAP the honored server wait (Phase 2.3):
+                    # retry_after is UNTRUSTED channel output steering
+                    # our scheduler -- a buggy server or a ms-vs-s mixup
+                    # would park the delivery for hours without burning
+                    # an attempt. Reuses backoff_max on purpose: "no
+                    # failure-driven gate exceeds X" is one coherent
+                    # policy (quiet hours are a user preference, a
+                    # different category). Deliberate trade-off: a
+                    # LEGITIMATE flood-wait longer than the cap now
+                    # burns the deferral budget in cap-sized bites and
+                    # ends in an explicit FAILED with full history --
+                    # better observability than silently parking for
+                    # hours on a value we cannot verify.
+                    honored = min(
+                        outcome.retry_after,
+                        float(settings.notification_retry_backoff_max_seconds),
+                    )
+                    # Jitter on top (added AFTER the cap -- the jitter
+                    # is ours, not the server's): every delivery
+                    # deferred by one burst must NOT wake in the same
+                    # tick and 429 again (thundering herd).
+                    delay = honored + random.uniform(1.0, 2.0)
+                    next_retry_at = datetime.now(UTC) + timedelta(
                         seconds=delay,
+                    )
+                    delivery.next_retry_at = next_retry_at
+                    # Same causality flag as the quiet-hours gate: the
+                    # deferral pushes the delivery past expiry -> the
+                    # step-0 sweep will EXPIRE it, deliberately.
+                    beyond_expiry = (
+                        notification.expiry_at is not None
+                        and next_retry_at > notification.expiry_at
                     )
                     logger.info(
                         "delivery_rate_limit_deferred",
@@ -453,6 +487,7 @@ async def deliver_notification(
                         retry_after=outcome.retry_after,
                         deferrals=delivery.rate_limit_deferrals,
                         budget=budget,
+                        beyond_expiry=beyond_expiry,
                     )
                 else:
                     # Budget exhausted: this 429 degrades to a regular

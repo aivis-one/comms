@@ -216,6 +216,22 @@ async def muted_recipient_ids(
     The resolver-side gating probe: called with a concrete resolved
     audience, returns the subset to drop. Point lookups over the
     (recipient_id, category) PK.
+
+    KNOWN CEILING (acknowledged by design, do not "fix" ad hoc):
+    the expanding IN materializes one bind parameter per recipient,
+    and the Postgres wire protocol caps a statement at 32767
+    parameters (int16) -- a single-notification audience past that
+    crashes the query. Dispositioned to the "broadcast hardening"
+    backlog (trigger: audience of ONE notification approaching ~10k,
+    OR a real broadcast/digest planned in the product). The agreed
+    fix shape when reopened: set-based resolve with an anti-join
+    (this probe disappears from the hot path) or an unnest(:ids)
+    join (array travels as ONE parameter, planner nested-loops into
+    the existing PK). Do NOT invert the probe into a bare
+    `WHERE category = :cat` scan: it cannot enter the
+    (recipient_id, category) PK -- deliberately ordered for THIS
+    lookup, see migration 0003 -- and degrades with mute-table
+    growth.
     """
     if not recipient_ids:
         return set()

@@ -74,10 +74,25 @@ def _string_column_length(column: "KeyedColumnElement[Any]") -> int:
     them. Deliberate coupling to the model layer (profile ->
     engine/audience models); the models import nothing back, so no
     cycle.
+
+    Explicit raises, not asserts (Phase 2.3): these are REAL runtime
+    checks of model shape, and `python -O` strips asserts -- a
+    narrowing-only assert may vanish, a validation must not.
     """
     column_type = column.type
-    assert isinstance(column_type, String)
-    assert column_type.length is not None
+    if not isinstance(column_type, String):
+        raise RuntimeError(
+            f"Profile length validation expects a String column, "
+            f"got {type(column_type).__name__} for {column.key!r}. "
+            f"Model shape changed -- update _string_column_length "
+            f"call sites."
+        )
+    if column_type.length is None:
+        raise RuntimeError(
+            f"Profile length validation expects a BOUNDED String "
+            f"column, but {column.key!r} has no length. Model shape "
+            f"changed -- update _string_column_length call sites."
+        )
     return column_type.length
 
 

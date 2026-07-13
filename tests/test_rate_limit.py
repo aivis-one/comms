@@ -23,6 +23,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import settings
@@ -102,6 +103,7 @@ class _SlowFormatter:
 
 async def _rate_limited_setup(
     db_session: AsyncSession,
+    expiry_at: datetime | None = None,
 ) -> tuple[Recipient, Notification]:
     """One recipient + one pending telegram notification, committed."""
     recipient = await create_recipient(
@@ -115,6 +117,7 @@ async def _rate_limited_setup(
         target_type=TargetType.USER,
         target_value=str(recipient.id),
         channels=["telegram"],
+        expiry_at=expiry_at,
     )
     await db_session.commit()
     return recipient, notification
@@ -131,11 +134,22 @@ class TestRateLimitDeferral:
         _, notification = await _rate_limited_setup(db_session)
 
         before = datetime.now(UTC)
-        with patch(
-            "app.engine.service.get_formatter",
-            return_value=_RateLimitedFormatter(retry_after=42.0),
+        with (
+            patch(
+                "app.engine.service.get_formatter",
+                return_value=_RateLimitedFormatter(retry_after=42.0),
+            ),
+            capture_logs() as logs,
         ):
             assert await process_pending_notifications() == 1
+
+        deferred = [
+            log for log in logs
+            if log["event"] == "delivery_rate_limit_deferred"
+        ]
+        assert len(deferred) == 1
+        # No expiry on this notification -> the causality flag is off.
+        assert deferred[0]["beyond_expiry"] is False
 
         delivery = await _fetch_delivery(notification.id)
         assert delivery.status == DeliveryStatus.PENDING
@@ -231,3 +245,82 @@ class TestRateLimitDeferral:
         assert delivery.attempts == 1
         assert delivery.rate_limit_deferrals == 0
         assert delivery.status == DeliveryStatus.PENDING
+
+    async def test_retry_after_is_capped(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Phase 2.3: retry_after is UNTRUSTED channel output -- a
+        pathological value (ms-vs-s mixup, buggy server) must not park
+        the delivery for hours. Honored wait is capped at
+        notification_retry_backoff_max_seconds; jitter rides on top of
+        the CAPPED value."""
+        _, notification = await _rate_limited_setup(db_session)
+        cap = settings.notification_retry_backoff_max_seconds  # 600
+
+        before = datetime.now(UTC)
+        with patch(
+            "app.engine.service.get_formatter",
+            return_value=_RateLimitedFormatter(retry_after=3600.0),
+        ):
+            assert await process_pending_notifications() == 1
+
+        delivery = await _fetch_delivery(notification.id)
+        assert delivery.status == DeliveryStatus.PENDING
+        assert delivery.attempts == 0
+        assert delivery.rate_limit_deferrals == 1
+        assert delivery.next_retry_at is not None
+        # cap + jitter(1..2), NOT the server-named hour.
+        low = before + timedelta(seconds=cap)
+        high = datetime.now(UTC) + timedelta(seconds=cap + 2)
+        assert low <= delivery.next_retry_at <= high
+
+    async def test_429_deferral_flags_beyond_expiry(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Phase 2.3: same causality flag as the quiet gate -- a 429
+        deferral pushing past expiry_at is named in the log, and the
+        step-0 sweep then expires the notification, deliberately."""
+        _, notification = await _rate_limited_setup(
+            db_session,
+            expiry_at=datetime.now(UTC) + timedelta(seconds=10),
+        )
+
+        with (
+            patch(
+                "app.engine.service.get_formatter",
+                return_value=_RateLimitedFormatter(retry_after=42.0),
+            ),
+            capture_logs() as logs,
+        ):
+            assert await process_pending_notifications() == 1
+
+        deferred = [
+            log for log in logs
+            if log["event"] == "delivery_rate_limit_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0]["beyond_expiry"] is True
+
+        delivery = await _fetch_delivery(notification.id)
+        assert delivery.status == DeliveryStatus.PENDING
+        assert delivery.attempts == 0
+
+        # The deadline passes while the gate is closed -> EXPIRED.
+        await _force_expiry_now(notification.id)
+        await process_pending_notifications()
+        fresh = await _fetch_notification(notification.id)
+        assert fresh.status == NotificationStatus.EXPIRED
+        delivery = await _fetch_delivery(notification.id)
+        assert delivery.sent_at is None
+
+
+async def _force_expiry_now(notification_id: UUID) -> None:
+    """Backdate expiry_at -- simulates the deadline passing."""
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(Notification).where(Notification.id == notification_id)
+        )
+        notification = result.scalar_one()
+        notification.expiry_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
