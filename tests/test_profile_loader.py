@@ -124,7 +124,13 @@ class TestStartupEntryPoint:
     def test_empty_dir_tolerated_in_development(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Dev without TEMPLATES_DIR starts with an empty registry."""
+        """Dev without TEMPLATES_DIR starts with an empty registry.
+
+        app_env is pinned explicitly: CI exports APP_ENV=ci, and this
+        test asserts DEVELOPMENT behavior regardless of the runner env
+        (mirrors the sibling test pinning app_env="ci").
+        """
+        monkeypatch.setattr(settings, "app_env", "development")
         monkeypatch.setattr(settings, "templates_dir", "")
         registry.reset()
         with capture_logs() as logs:
