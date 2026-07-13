@@ -19,3 +19,5 @@ venv/
 # IDE
 .idea/
 .vscode/
+/docs/
+/tmp/

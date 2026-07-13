@@ -19,7 +19,12 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # Model imports -- required for Alembic autogenerate.
 # ---------------------------------------------------------------------------
 # Phase 1: audience sync projection
-from app.audience.models import GroupMembership, Recipient  # noqa: F401
+# Phase 2: category mutes (preferences)
+from app.audience.models import (  # noqa: F401
+    CategoryMute,
+    GroupMembership,
+    Recipient,
+)
 from app.core.config import settings
 from app.core.database import Base
 

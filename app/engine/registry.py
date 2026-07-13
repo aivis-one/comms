@@ -10,8 +10,9 @@
 #   - the dictionary of notification type keys it emits,
 #   - the templates for rendering them, per locale.
 #
-# In Phase 1 the profile is a stub that tests configure directly.
-# Phase 2 adds real profile loading (per-deploy data, not code).
+# In Phase 1 the profile was a stub that tests configured directly.
+# Phase 2 adds real profile loading from disk (app/engine/profile.py)
+# and per-type preference categories for mute gating.
 #
 # TEMPLATE STRUCTURE (same shape as cbshome YAML, held in memory):
 #   {locale: {type: {channel: {field: template_str}}}}
@@ -38,17 +39,33 @@ class ProfileRegistry:
     def __init__(self) -> None:
         self._types: set[str] = set()
         self._templates: dict[str, TemplateTree] = {}
+        # type_key -> preference category (Phase 2). Categories are
+        # domain vocabulary too: the profile declares them per type
+        # (family granularity -- e.g. reminder_24h/1h/10min all map
+        # to "reminder"). A type without a category is exempt from
+        # mute gating.
+        self._categories: dict[str, str] = {}
 
     # -- Types --
 
-    def register_type(self, key: str) -> None:
-        """Register a single notification type key."""
+    def register_type(self, key: str, *, category: str | None = None) -> None:
+        """Register a single notification type key.
+
+        `category` (optional) links the type to a preference category
+        for mute gating; the profile's type dictionary supplies it.
+        """
         if not key:
             raise ValueError("Notification type key must be non-empty")
         self._types.add(key)
+        if category is not None:
+            if not category:
+                raise ValueError(
+                    f"Category for type {key!r} must be non-empty"
+                )
+            self._categories[key] = category
 
     def register_types(self, keys: Iterable[str]) -> None:
-        """Register multiple notification type keys."""
+        """Register multiple notification type keys (no categories)."""
         for key in keys:
             self.register_type(key)
 
@@ -59,6 +76,20 @@ class ProfileRegistry:
     def registered_types(self) -> frozenset[str]:
         """Snapshot of all registered type keys."""
         return frozenset(self._types)
+
+    # -- Categories --
+
+    def category_of(self, type_key: str) -> str | None:
+        """Preference category for a type; None if the type has none."""
+        return self._categories.get(type_key)
+
+    def registered_categories(self) -> frozenset[str]:
+        """Snapshot of all categories declared by the profile.
+
+        The source of truth for preference validation: a mute may only
+        be set for a category the profile actually declares.
+        """
+        return frozenset(self._categories.values())
 
     # -- Templates --
 
@@ -102,6 +133,7 @@ class ProfileRegistry:
         """Clear all registrations (tests / profile reload)."""
         self._types.clear()
         self._templates.clear()
+        self._categories.clear()
         logger.info("profile_registry_reset")
 
 

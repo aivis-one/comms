@@ -41,6 +41,8 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import Recipient
+from app.audience.prefs import muted_recipient_ids
+from app.audience.quiet_hours import recipient_quiet_until
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.engine.constants import (
@@ -181,9 +183,16 @@ async def resolve_notification(
     Idempotent: if deliveries already exist (PROCESSING retry),
     skips resolve and returns existing deliveries.
 
+    MUTE GATING (Phase 2): recipients who muted the notification
+    type's category are dropped HERE, before deliveries exist -- no
+    dead rows, honest delivery metrics, and "everyone muted" is
+    decided in one place. Types without a category bypass gating.
+
     Transitions notification status: pending -> processing.
-    No targets -> FAILED (cbshome base behavior; velo marked SENT --
-    divergence flagged in the Phase 1 report).
+    Empty audience (nobody resolved, or everyone muted) -> SKIPPED:
+    the pipeline worked, there was just nobody to deliver to. FAILED
+    stays reserved for real faults (Phase 1 marked empty resolve as
+    FAILED -- cbshome base behavior; changed in Phase 2).
 
     Args:
         session: Active DB session (caller commits).
@@ -215,12 +224,38 @@ async def resolve_notification(
     )
 
     if not recipient_ids:
-        notification.status = NotificationStatus.FAILED
+        notification.status = NotificationStatus.SKIPPED
         logger.warning(
             "notification_no_targets",
             notification_id=str(notification.id),
         )
         return []
+
+    # -- Mute gate: drop recipients who muted this type's category --
+    # Evaluated at resolve time; for reminders that is the moment the
+    # notification comes due, so the mute state is current as of send.
+    # A mute set AFTER deliveries exist is intentionally not
+    # re-checked on retries (documented trade-off).
+    category = registry.category_of(notification.type)
+    if category is not None:
+        muted = await muted_recipient_ids(session, category, recipient_ids)
+        if muted:
+            recipient_ids = [r for r in recipient_ids if r not in muted]
+            logger.info(
+                "recipients_muted_category",
+                notification_id=str(notification.id),
+                category=category,
+                muted=len(muted),
+                remaining=len(recipient_ids),
+            )
+        if not recipient_ids:
+            notification.status = NotificationStatus.SKIPPED
+            logger.info(
+                "notification_all_muted",
+                notification_id=str(notification.id),
+                category=category,
+            )
+            return []
 
     # Get channels from action_data.
     channels = (notification.action_data or {}).get(
@@ -261,6 +296,13 @@ async def deliver_notification(
     """Deliver pending deliveries for a notification via formatters.
 
     - Batch-loads Recipient objects for credentials and locale.
+    - QUIET HOURS (Phase 2): a delivery whose recipient is inside
+      their quiet window is DEFERRED, not sent -- next_retry_at is set
+      to the window's end (recipient's timezone) and the existing
+      retry gate keeps it invisible to the poll until then. Attempts
+      and error_message stay untouched: deferral is not a failure.
+      Checked per attempt, so backoff retries landing in a quiet
+      window are deferred too.
     - Concurrent delivery via asyncio.gather + Semaphore.
     - asyncio.wait_for with timeout per formatter call.
     - PermanentDeliveryError -> immediate FAILED, no attempts increment.
@@ -312,6 +354,19 @@ async def deliver_notification(
             continue
 
         formatter = get_formatter(delivery.channel)
+
+        # -- Quiet-hours gate: defer, never suppress --
+        quiet_until = recipient_quiet_until(recipient, now)
+        if quiet_until is not None:
+            delivery.next_retry_at = quiet_until
+            logger.info(
+                "delivery_quiet_deferred",
+                delivery_id=str(delivery.id),
+                recipient_id=str(recipient.id),
+                until=quiet_until.isoformat(),
+            )
+            continue
+
         tasks.append(
             _deliver_single(
                 semaphore, formatter, notification, delivery, recipient,
@@ -426,6 +481,13 @@ async def rollup_notification(
 ) -> None:
     """Update Notification.status based on delivery statuses.
 
+    Only acts on PROCESSING notifications: terminal states set by
+    resolve (SKIPPED for empty/all-muted audiences) or the processor
+    (EXPIRED) must not be overwritten -- without the guard the
+    "no deliveries -> FAILED" branch below would clobber SKIPPED.
+    That branch stays as a safety net: a PROCESSING notification
+    without any deliveries is an anomaly, not a skip.
+
     Rules (cbshome base, incl. PARTIAL_SENT):
       - All sent         -> sent
       - All failed       -> failed
@@ -436,6 +498,9 @@ async def rollup_notification(
         session: Active DB session (caller commits).
         notification: The notification to roll up.
     """
+    if notification.status != NotificationStatus.PROCESSING:
+        return
+
     stmt = select(NotificationDelivery.status).where(
         NotificationDelivery.notification_id == notification.id,
     )

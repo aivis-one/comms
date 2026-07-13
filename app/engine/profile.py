@@ -1,0 +1,370 @@
+# =============================================================================
+# COMMS Service -- Product Profile Loader (Phase 2)
+# =============================================================================
+#
+# Loads the per-deploy PRODUCT PROFILE (notification type dictionary +
+# templates) from disk into the ProfileRegistry at startup.
+#
+# LAYOUT (root = TEMPLATES_DIR, bind-mounted from the product repo's
+# comms-profile/ on the VPS; the fixture directory in tests):
+#
+#   types.yaml            -- {type_key: {category: str, ...}} mapping.
+#                            A type spec may be empty ({} or bare key);
+#                            unknown spec keys are tolerated (additive
+#                            profile contract, arch doc §4.3).
+#   templates/{locale}.yaml -- {type: {channel: {field: template_str}}},
+#                            1:1 with registry.register_templates.
+#
+# DESIGN: the loader is a SOCKET. The source of raw profile data is
+# abstracted behind ProfileSource (files today; a DB or an editor UI
+# later plug in without touching parsing/validation or the registry).
+#
+# VALIDATION happens here, at startup, source-independently:
+#   - tree shape (mappings at every level, strings at the leaves);
+#   - the YAML flow-mapping trap: a bare `body: {title}` parses as a
+#     dict, not a string -- caught with an explicit hint;
+#   - a dry run of every template through format_map(SafeDict()) so a
+#     broken format spec kills the service now, not on delivery;
+#   - templates for types missing from the dictionary -> loud warning
+#     (not fatal: additive contract, profile may ship templates ahead
+#     of enabling a type).
+#
+# A broken profile raises ProfileError -> the service does not start.
+# The runtime fallback chain in template_engine stays as the second
+# line of defense.
+# =============================================================================
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
+
+import structlog
+import yaml
+
+from app.core.config import settings
+from app.core.exceptions import ProfileError
+from app.engine.registry import ProfileRegistry, TemplateTree, registry
+from app.engine.template_engine import SafeDict
+
+logger = structlog.get_logger()
+
+# File names inside the profile root.
+_TYPES_FILE = "types.yaml"
+_TEMPLATES_SUBDIR = "templates"
+
+
+# -----------------------------------------------------------------------------
+# Raw profile + sources (the socket)
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RawProfile:
+    """Unvalidated profile data as it came from a source.
+
+    `types` is whatever the types document parsed to; `templates_by_locale`
+    maps locale -> whatever that locale's template document parsed to.
+    Validation of the actual shapes happens in parse_profile().
+    """
+
+    types: Any
+    templates_by_locale: dict[str, Any] = field(default_factory=dict)
+
+
+class ProfileSource(Protocol):
+    """A source of raw profile data (files, DB, editor -- pluggable)."""
+
+    def load(self) -> RawProfile:
+        """Return the raw profile; raise ProfileError if unreadable."""
+        ...
+
+
+class FileProfileSource:
+    """Reads the profile from a directory (types.yaml + templates/)."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def load(self) -> RawProfile:
+        """Read and YAML-parse the profile files; no shape validation."""
+        root = self._root
+        if not root.is_dir():
+            raise ProfileError(
+                f"Profile directory does not exist: {root}. "
+                f"Check TEMPLATES_DIR."
+            )
+
+        types_path = root / _TYPES_FILE
+        if not types_path.is_file():
+            raise ProfileError(
+                f"Profile is missing {_TYPES_FILE}: expected at {types_path}"
+            )
+        types_doc = self._read_yaml(types_path)
+
+        templates_by_locale: dict[str, Any] = {}
+        templates_dir = root / _TEMPLATES_SUBDIR
+        if templates_dir.is_dir():
+            for path in sorted(templates_dir.glob("*.yaml")):
+                locale = path.stem
+                templates_by_locale[locale] = self._read_yaml(path)
+
+        return RawProfile(
+            types=types_doc,
+            templates_by_locale=templates_by_locale,
+        )
+
+    @staticmethod
+    def _read_yaml(path: Path) -> Any:
+        """yaml.safe_load a file, wrapping errors into ProfileError."""
+        try:
+            with path.open(encoding="utf-8") as fh:
+                return yaml.safe_load(fh)
+        except yaml.YAMLError as exc:
+            raise ProfileError(f"Invalid YAML in {path}: {exc}") from exc
+        except OSError as exc:
+            raise ProfileError(f"Cannot read {path}: {exc}") from exc
+
+
+# -----------------------------------------------------------------------------
+# Parsed profile
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Profile:
+    """Validated product profile, ready to install into the registry.
+
+    `types` maps type_key -> spec dict (category etc.); `templates`
+    maps locale -> TemplateTree.
+    """
+
+    types: dict[str, dict[str, Any]]
+    templates: dict[str, TemplateTree]
+
+
+def parse_profile(raw: RawProfile) -> Profile:
+    """Validate a raw profile and return the parsed form.
+
+    Source-independent: everything loaded by any ProfileSource goes
+    through the same checks. Raises ProfileError on the first fatal
+    problem; templates for unregistered types only log a warning.
+    """
+    types = _parse_types(raw.types)
+
+    templates: dict[str, TemplateTree] = {}
+    for locale, doc in raw.templates_by_locale.items():
+        templates[locale] = _parse_template_tree(locale, doc, types)
+
+    return Profile(types=types, templates=templates)
+
+
+def _parse_types(doc: Any) -> dict[str, dict[str, Any]]:
+    """Validate the type dictionary document.
+
+    Expected: {type_key: {category: str, ...} | None}. A None spec
+    (bare `type_key:` line) means an empty spec. Unknown spec keys are
+    tolerated silently (additive contract). The document must be a
+    MAPPING, not a list -- a list would freeze the format against
+    adding per-type fields like `category`.
+    """
+    if doc is None:
+        logger.warning("profile_types_empty")
+        return {}
+    if isinstance(doc, list):
+        raise ProfileError(
+            "types.yaml must be a mapping {type_key: {...}}, not a list. "
+            "A list cannot carry per-type fields such as `category`."
+        )
+    if not isinstance(doc, dict):
+        raise ProfileError(
+            f"types.yaml must be a mapping {{type_key: {{...}}}}, "
+            f"got {type(doc).__name__}"
+        )
+
+    types: dict[str, dict[str, Any]] = {}
+    for key, spec in doc.items():
+        if not isinstance(key, str) or not key:
+            raise ProfileError(
+                f"types.yaml: type key must be a non-empty string, "
+                f"got {key!r}"
+            )
+        if spec is None:
+            spec = {}
+        if not isinstance(spec, dict):
+            raise ProfileError(
+                f"types.yaml: spec for type {key!r} must be a mapping "
+                f"(or empty), got {type(spec).__name__}"
+            )
+        category = spec.get("category")
+        if category is not None and (
+            not isinstance(category, str) or not category
+        ):
+            raise ProfileError(
+                f"types.yaml: `category` for type {key!r} must be a "
+                f"non-empty string, got {category!r}"
+            )
+        types[key] = spec
+    return types
+
+
+def _parse_template_tree(
+    locale: str,
+    doc: Any,
+    types: dict[str, dict[str, Any]],
+) -> TemplateTree:
+    """Validate one locale's template document.
+
+    Expected: {type: {channel: {field: template_str}}}. Every leaf is
+    dry-run through format_map(SafeDict()) so a broken format spec is
+    caught at startup instead of on the delivery path.
+    """
+    if doc is None:
+        logger.warning("profile_templates_empty", locale=locale)
+        return {}
+    if not isinstance(doc, dict):
+        raise ProfileError(
+            f"templates/{locale}.yaml must be a mapping "
+            f"{{type: {{channel: {{field: str}}}}}}, "
+            f"got {type(doc).__name__}"
+        )
+
+    tree: TemplateTree = {}
+    for type_key, channels in doc.items():
+        if not isinstance(type_key, str) or not type_key:
+            raise ProfileError(
+                f"templates/{locale}.yaml: type key must be a non-empty "
+                f"string, got {type_key!r}"
+            )
+        if type_key not in types:
+            # Not fatal: the profile contract is additive -- templates
+            # may ship ahead of the type being enabled in the
+            # dictionary. But it is loud: most likely a typo.
+            logger.warning(
+                "template_for_unregistered_type",
+                locale=locale,
+                type=type_key,
+            )
+        if not isinstance(channels, dict):
+            raise ProfileError(
+                f"templates/{locale}.yaml: {type_key} must map channels "
+                f"to fields, got {type(channels).__name__}"
+            )
+        tree_channels: dict[str, dict[str, str]] = {}
+        for channel, fields in channels.items():
+            if not isinstance(channel, str) or not channel:
+                raise ProfileError(
+                    f"templates/{locale}.yaml: channel key under "
+                    f"{type_key} must be a non-empty string, "
+                    f"got {channel!r}"
+                )
+            if not isinstance(fields, dict):
+                raise ProfileError(
+                    f"templates/{locale}.yaml: {type_key}.{channel} must "
+                    f"map fields to template strings, "
+                    f"got {type(fields).__name__}"
+                )
+            tree_fields: dict[str, str] = {}
+            for fname, template in fields.items():
+                if not isinstance(fname, str) or not fname:
+                    raise ProfileError(
+                        f"templates/{locale}.yaml: field key under "
+                        f"{type_key}.{channel} must be a non-empty "
+                        f"string, got {fname!r}"
+                    )
+                _validate_leaf(locale, type_key, channel, fname, template)
+                tree_fields[fname] = template
+            tree_channels[channel] = tree_fields
+        tree[type_key] = tree_channels
+    return tree
+
+
+def _validate_leaf(
+    locale: str,
+    type_key: str,
+    channel: str,
+    fname: str,
+    template: Any,
+) -> None:
+    """Validate a single template leaf: must be a string that renders.
+
+    The dict case gets a dedicated message: in YAML a bare
+    `body: {title}` is a FLOW MAPPING (a dict {"title": None}), not
+    the string "{title}" -- the single most likely authoring mistake.
+    """
+    where = f"templates/{locale}.yaml: {type_key}.{channel}.{fname}"
+    if isinstance(template, dict):
+        raise ProfileError(
+            f"{where} is a mapping, not a string. In YAML a bare "
+            f"`{fname}: {{title}}` parses as a flow mapping; quote the "
+            f'value ("{{title}}") or use a block scalar (|-).'
+        )
+    if not isinstance(template, str):
+        raise ProfileError(
+            f"{where} must be a string, got {type(template).__name__}"
+        )
+    try:
+        # Dry run: SafeDict absorbs missing variables, so the ONLY
+        # failures left are broken format specs -- exactly what must
+        # kill startup instead of surfacing on the delivery path.
+        template.format_map(SafeDict())
+    except (ValueError, TypeError, IndexError) as exc:
+        raise ProfileError(
+            f"{where} has a broken format spec: {exc}. "
+            f"Template language is str.format_map -- check braces "
+            f"and format specs."
+        ) from exc
+
+
+# -----------------------------------------------------------------------------
+# Installation
+# -----------------------------------------------------------------------------
+
+
+def load_profile(source: ProfileSource) -> Profile:
+    """Load and validate a profile from a source."""
+    return parse_profile(source.load())
+
+
+def install_profile(
+    profile: Profile,
+    target: ProfileRegistry = registry,
+) -> None:
+    """Install a validated profile into a registry.
+
+    Types are registered with their categories; template trees are
+    merged per locale via the registry's normal merge semantics.
+    """
+    for type_key, spec in profile.types.items():
+        target.register_type(type_key, category=spec.get("category"))
+    for locale, tree in profile.templates.items():
+        target.register_templates(locale, tree)
+    logger.info(
+        "profile_installed",
+        types=len(profile.types),
+        locales=sorted(profile.templates.keys()),
+    )
+
+
+def install_profile_from_settings() -> bool:
+    """Startup entry point: load the profile from TEMPLATES_DIR.
+
+    Returns True when a profile was installed. An empty TEMPLATES_DIR
+    is tolerated ONLY in development (mirrors the DATABASE_URL
+    policy): the service starts with an empty registry and tests /
+    local experiments register what they need. Anywhere else a
+    missing profile is a deploy error -> ProfileError.
+    """
+    if not settings.templates_dir:
+        if settings.is_dev:
+            logger.warning(
+                "profile_not_configured",
+                hint="TEMPLATES_DIR is empty; registry stays empty",
+            )
+            return False
+        raise ProfileError(
+            "TEMPLATES_DIR is required outside development. "
+            "Point it at the product profile directory."
+        )
+    profile = load_profile(FileProfileSource(Path(settings.templates_dir)))
+    install_profile(profile)
+    return True

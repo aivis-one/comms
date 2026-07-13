@@ -5,13 +5,14 @@
 # TEST-BAND RULE (handoff / dispatch plan §5):
 #   recipient.id = product user id -- the id-space is SHARED with the
 #   product. Every test telegram_id therefore comes from the band
-#   assigned to comms Phase 1:
+#   assigned to the phase:
 #
-#       80000-80999   (comms engine tests -- THIS band)
+#       80000-80999   comms Phase 1 (engine tests)
+#       81000-81999   comms Phase 2 (profile / prefs / gating tests)
 #
-#   89xxx belongs to VELO's own suites -- never use it here.
-#   next_telegram_id() hands out ids from the band and refuses to
-#   overflow it.
+#   83xxx and 89xxx belong to VELO's own suites -- never use them
+#   here. The band allocators below hand out ids and refuse to
+#   overflow their band.
 # =============================================================================
 
 import itertools
@@ -28,11 +29,27 @@ _telegram_id_counter = itertools.count(TELEGRAM_ID_BAND_START)
 
 
 def next_telegram_id() -> int:
-    """Next telegram_id from the comms test band (80000-80999)."""
+    """Next telegram_id from the comms Phase 1 band (80000-80999)."""
     tid = next(_telegram_id_counter)
     if tid > TELEGRAM_ID_BAND_END:
         raise RuntimeError(
             "comms test telegram_id band 80000-80999 exhausted"
+        )
+    return tid
+
+
+PHASE2_TELEGRAM_ID_BAND_START = 81000
+PHASE2_TELEGRAM_ID_BAND_END = 81999
+
+_phase2_telegram_id_counter = itertools.count(PHASE2_TELEGRAM_ID_BAND_START)
+
+
+def next_phase2_telegram_id() -> int:
+    """Next telegram_id from the comms Phase 2 band (81000-81999)."""
+    tid = next(_phase2_telegram_id_counter)
+    if tid > PHASE2_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 81000-81999 exhausted"
         )
     return tid
 

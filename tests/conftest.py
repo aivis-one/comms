@@ -10,16 +10,22 @@
 #   - Cross-test isolation: an autouse fixture deletes all comms rows
 #     (ORM delete(), FK order) before every test.
 #
-# STUB PRODUCT PROFILE (handoff item 3):
+# STUB PRODUCT PROFILE (handoff item 3 / Phase 2 item 1):
 #   Notification types and templates come from the profile registry.
-#   In Phase 1 the profile is a stub that this conftest registers for
-#   every test: a small dictionary of unit-test type keys + en/ru
-#   templates. Real per-deploy profiles arrive in Phase 2.
+#   Since Phase 2 the test profile lives ON DISK as a real fixture
+#   directory (tests/fixtures/profile: types.yaml + templates/) and is
+#   loaded through the REAL loader (app/engine/profile.py) -- every
+#   test run exercises the same code path the service uses at startup,
+#   and the fixture YAML doubles as the reference shape for the
+#   product's comms-profile/.
 #
 # ENVIRONMENT:
 #   No env fiddling needed -- defaults align for tests:
 #     APP_ENV=development  -> local DATABASE_URL default
 #     CHANNELS_MODE=stub   -> nothing ever leaves the process
+#     TEMPLATES_DIR empty  -> startup profile load is a no-op in dev;
+#                             the stub_profile fixture installs the
+#                             fixture profile explicitly per test
 #   CI overrides DATABASE_URL via workflow env.
 # =============================================================================
 
@@ -35,43 +41,23 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.audience.models import GroupMembership, Recipient
+from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.database import dispose_engine, get_session_factory
 from app.engine.models import Notification, NotificationDelivery
+from app.engine.profile import FileProfileSource, install_profile, load_profile
 from app.engine.registry import registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # ---------------------------------------------------------------------------
-# Stub product profile (Phase 1)
+# Fixture product profile (loaded from disk through the real loader)
 # ---------------------------------------------------------------------------
 
-STUB_TYPES = (
-    "unit_event",
-    "unit_rem_24h",
-    "unit_rem_1h",
-    "unit_rem_10m",
-)
+FIXTURE_PROFILE_DIR = REPO_ROOT / "tests" / "fixtures" / "profile"
 
-STUB_TEMPLATES_EN = {
-    "unit_event": {
-        "telegram": {
-            "title": "{title}",
-            "body": "{body} [{extra}]",
-        },
-        "email": {
-            "subject": "COMMS: {title}",
-        },
-    },
-}
-
-STUB_TEMPLATES_RU = {
-    "unit_event": {
-        "telegram": {
-            "body": "RU: {body}",
-        },
-    },
-}
+# Loaded once at collection time: a broken fixture profile fails the
+# whole run loudly instead of failing every test individually.
+_FIXTURE_PROFILE = load_profile(FileProfileSource(FIXTURE_PROFILE_DIR))
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +94,7 @@ async def clean_db(apply_migrations: None) -> AsyncGenerator[None, None]:
     async with factory() as session:
         await session.execute(delete(NotificationDelivery))
         await session.execute(delete(Notification))
+        await session.execute(delete(CategoryMute))
         await session.execute(delete(GroupMembership))
         await session.execute(delete(Recipient))
         await session.commit()
@@ -116,11 +103,14 @@ async def clean_db(apply_migrations: None) -> AsyncGenerator[None, None]:
 
 @pytest.fixture(autouse=True)
 def stub_profile() -> Generator[None, None, None]:
-    """Register the stub product profile for every test."""
+    """Install the on-disk fixture profile for every test.
+
+    Goes through the REAL loader/installer path, so the registry state
+    tests see is exactly what a production startup would produce from
+    the same files.
+    """
     registry.reset()
-    registry.register_types(STUB_TYPES)
-    registry.register_templates("en", STUB_TEMPLATES_EN)
-    registry.register_templates("ru", STUB_TEMPLATES_RU)
+    install_profile(_FIXTURE_PROFILE)
     yield
     registry.reset()
 

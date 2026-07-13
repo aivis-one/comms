@@ -192,7 +192,12 @@ async def cleanup_expired_notifications() -> int:
 
     Removes notifications where:
       - expiry_at < now()
-      - status in (sent, partial_sent, expired)
+      - status in (sent, partial_sent, expired, skipped)
+
+    SKIPPED is terminal (Phase 2): an expired skipped notification is
+    as dead as an expired sent one. General retention of terminal
+    notifications (retention_days) is Phase 3 -- this cleanup only
+    covers rows that carry an explicit expiry_at.
 
     Deliveries are CASCADE-deleted automatically.
 
@@ -213,6 +218,7 @@ async def cleanup_expired_notifications() -> int:
                         NotificationStatus.SENT,
                         NotificationStatus.PARTIAL_SENT,
                         NotificationStatus.EXPIRED,
+                        NotificationStatus.SKIPPED,
                     ]),
                 )
             )

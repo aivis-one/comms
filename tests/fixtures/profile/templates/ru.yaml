@@ -1,0 +1,11 @@
+# =============================================================================
+# COMMS test profile -- templates, locale "ru"
+# =============================================================================
+# Deliberately PARTIAL: only unit_event.telegram.body. Everything else
+# falls back per the chain: recipient locale -> default locale (en) ->
+# stored title/body. Locales do not need to mirror each other.
+# =============================================================================
+
+unit_event:
+  telegram:
+    body: "RU: {body}"

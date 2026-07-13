@@ -1,0 +1,33 @@
+# =============================================================================
+# COMMS test profile -- notification type dictionary
+# =============================================================================
+# REFERENCE SHAPE for the real product profile (comms-profile/ in the
+# product repo). A MAPPING {type_key: {spec}}, not a list -- per-type
+# fields (category today, more later) extend without a format change.
+#
+# Spec fields:
+#   category -- preference category for mute gating (optional). Family
+#               granularity: several types may share one category
+#               (see the unit_rem_* family below). A type WITHOUT a
+#               category is exempt from mute gating.
+#
+# Unknown spec fields are tolerated (additive contract): a newer
+# profile keeps working against an older service.
+# =============================================================================
+
+# Single event type with its own category.
+unit_event:
+  category: unit_updates
+
+# A reminder FAMILY: three types, ONE category -- muting
+# "unit_reminder" gates all three.
+unit_rem_24h:
+  category: unit_reminder
+unit_rem_1h:
+  category: unit_reminder
+unit_rem_10m:
+  category: unit_reminder
+
+# A type with an EMPTY spec: legal (no category -> never mute-gated,
+# no templates required -- stored title/body are the fallback).
+unit_plain: {}

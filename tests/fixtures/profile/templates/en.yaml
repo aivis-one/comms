@@ -1,0 +1,18 @@
+# =============================================================================
+# COMMS test profile -- templates, locale "en"
+# =============================================================================
+# Tree shape: {type: {channel: {field: template_str}}} -- 1:1 with
+# registry.register_templates. Template language is str.format_map
+# (SafeDict): {var} placeholders, missing variables stay literal.
+#
+# YAML TRAP: a bare `body: {title}` is a FLOW MAPPING, not a string.
+# Always QUOTE values containing braces (the loader rejects the
+# unquoted form at startup with a hint).
+# =============================================================================
+
+unit_event:
+  telegram:
+    title: "{title}"
+    body: "{body} [{extra}]"
+  email:
+    subject: "COMMS: {title}"

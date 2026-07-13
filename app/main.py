@@ -31,14 +31,21 @@ from app.core.config import APP_VERSION, settings
 from app.core.database import dispose_engine, get_engine
 from app.core.logging import setup_logging
 from app.engine.formatters import close_formatters
+from app.engine.profile import install_profile_from_settings
 
 logger = structlog.get_logger()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan: logging on startup, engine cleanup on stop."""
+    """Application lifespan: logging + profile on startup, cleanup on stop.
+
+    A broken profile raises ProfileError here and the process dies
+    before serving traffic -- by design (fail at startup, not on the
+    delivery path).
+    """
     setup_logging()
+    install_profile_from_settings()
     logger.info(
         "comms_started",
         version=APP_VERSION,

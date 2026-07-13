@@ -21,6 +21,7 @@ import structlog
 from app.core.database import dispose_engine
 from app.core.logging import setup_logging
 from app.engine.formatters import close_formatters
+from app.engine.profile import install_profile_from_settings
 from app.engine.worker import run_worker_loop
 
 logger = structlog.get_logger()
@@ -49,6 +50,9 @@ async def _main() -> None:
 def main() -> None:
     """Console entrypoint: `python -m app.worker`."""
     setup_logging()
+    # The worker renders templates -> it MUST have the profile. A
+    # broken profile kills the process at startup (ProfileError).
+    install_profile_from_settings()
     asyncio.run(_main())
 
 

@@ -135,10 +135,14 @@ class TestResolveStage:
         assert len(second) == 1
         assert first[0].id == second[0].id
 
-    async def test_no_targets_marks_failed(
+    async def test_no_targets_marks_skipped(
         self, db_session: AsyncSession,
     ) -> None:
-        """Empty audience -> FAILED (cbshome base; velo said SENT)."""
+        """Empty audience -> SKIPPED (Phase 2; was FAILED in Phase 1).
+
+        Nothing broke -- there was simply nobody to deliver to. FAILED
+        is reserved for real faults so it keeps alerting value.
+        """
         notification = await create_notification(
             db_session,
             type="unit_event",
@@ -151,7 +155,7 @@ class TestResolveStage:
         deliveries = await resolve_notification(db_session, notification)
 
         assert deliveries == []
-        assert notification.status == NotificationStatus.FAILED
+        assert notification.status == NotificationStatus.SKIPPED
 
     async def test_default_channel_is_in_app(
         self, db_session: AsyncSession,

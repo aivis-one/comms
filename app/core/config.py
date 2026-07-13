@@ -22,6 +22,8 @@
 #   (recipient locale -> default_locale -> stored title/body).
 # =============================================================================
 
+from zoneinfo import ZoneInfo
+
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -60,6 +62,19 @@ class Settings(BaseSettings):
     # -- Localization --
     # Per-deploy default locale; template fallback language.
     default_locale: str = "en"
+    # Fallback IANA timezone for recipients without an explicit one --
+    # quiet-hours window math needs a timezone for everybody. Validated
+    # at startup (a bad name must not surface on the delivery path).
+    default_timezone: str = "UTC"
+
+    # -- Product profile (per-deploy data: types + templates) --
+    # Directory with the product profile: types.yaml + templates/.
+    # On the VPS it arrives as a bind-mount of the product repo's
+    # comms-profile/ (mount mechanics are Phase 5); tests point it at
+    # the fixture directory in this repo. Empty is tolerated ONLY in
+    # development (the Phase 1 stub-profile behavior for tests) --
+    # see app/engine/profile.py: install_profile_from_settings.
+    templates_dir: str = ""
 
     # -- Notification engine --
     notification_poll_interval_seconds: int = 5
@@ -114,6 +129,15 @@ class Settings(BaseSettings):
                 f"Invalid CHANNELS_MODE: {self.channels_mode}. "
                 f"Valid: {', '.join(sorted(_VALID_CHANNELS_MODES))}"
             )
+
+        try:
+            ZoneInfo(self.default_timezone)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid DEFAULT_TIMEZONE: {self.default_timezone!r}. "
+                f"Must be an IANA timezone name (e.g. 'UTC', "
+                f"'Europe/Berlin')."
+            ) from exc
 
         return self
 

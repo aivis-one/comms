@@ -4,11 +4,15 @@
 #
 # Single source of truth for dependencies and tool configuration.
 # Modeled on the cbshome/velo backend pyproject (same stack), trimmed to
-# what the Phase 1 engine core actually needs:
+# what the engine actually needs:
 #   - no redis yet (transport is Phase 3)
 #   - no email libs yet (email channel is a stub in Phase 1)
-#   - no pyyaml yet (templates come from the profile registry; file
-#     loading of per-deploy template YAML is Phase 2 profile work)
+#   - pyyaml is back (Phase 2): the per-deploy profile loader parses
+#     types.yaml + templates/{locale}.yaml with yaml.safe_load ONLY
+#   - tzdata (Phase 2): quiet-hours math resolves recipient IANA
+#     timezones via zoneinfo; the pure-python tzdata package guarantees
+#     the database exists even in slim container images without a
+#     system zoneinfo directory
 # =============================================================================
 
 [project]
@@ -26,6 +30,8 @@ dependencies = [
     "pydantic-settings>=2.5.0,<3.0",
     "structlog>=24.0.0,<25.0",
     "aiogram>=3.13.0,<4.0",
+    "pyyaml>=6.0.0,<7.0",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +41,7 @@ dev = [
     "httpx>=0.27.0,<1.0",
     "ruff>=0.7.0,<1.0",
     "mypy>=1.11.0,<2.0",
+    "types-PyYAML>=6.0.0,<7.0",
 ]
 
 [build-system]

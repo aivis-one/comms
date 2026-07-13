@@ -20,3 +20,12 @@ class ValidationError(CommsError):
 
 class NotFoundError(CommsError):
     """Requested entity does not exist (or belongs to someone else)."""
+
+
+class ProfileError(CommsError):
+    """Product profile failed to load or validate.
+
+    Raised at startup by app/engine/profile.py -- a broken profile
+    (bad YAML, malformed tree, invalid format spec) must kill the
+    service before it takes traffic, not surface on the delivery path.
+    """

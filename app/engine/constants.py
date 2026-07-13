@@ -18,8 +18,16 @@
 #     cbshome role:<r>      -> GROUP "role_<r>"
 #     velo    practice:<id> -> GROUP "practice_<id>"
 #
-# NOTIFICATION STATUS LIFECYCLE (cbshome base, incl. PARTIAL_SENT):
+# NOTIFICATION STATUS LIFECYCLE (cbshome base, incl. PARTIAL_SENT;
+# SKIPPED added in Phase 2):
 #   pending -> processing -> sent | partial_sent | failed | expired
+#                                 | skipped
+#
+#   SKIPPED (terminal) -- the pipeline ran fine but there was nobody
+#   to deliver to: the audience resolved empty, or every resolved
+#   recipient has the notification's category muted. Neither a fault
+#   (FAILED would drown real alerts) nor a delivery (SENT would hide
+#   a broken sync).
 #
 # DELIVERY STATUS LIFECYCLE:
 #   pending -> sent | failed
@@ -37,6 +45,10 @@ class NotificationStatus(enum.StrEnum):
     PARTIAL_SENT = "partial_sent"
     FAILED = "failed"
     EXPIRED = "expired"
+    # Terminal: pipeline OK, nobody to deliver to (empty audience or
+    # all recipients muted the category). Introduced in Phase 2; the
+    # status column is varchar, so no DDL is needed (append-only).
+    SKIPPED = "skipped"
 
 
 class DeliveryStatus(enum.StrEnum):
