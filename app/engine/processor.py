@@ -43,6 +43,7 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy import delete, select, update
 
+from app.core.config import settings
 from app.core.database import get_session_factory
 from app.engine.constants import NotificationStatus
 from app.engine.models import Notification
@@ -103,6 +104,9 @@ async def process_pending_notifications() -> int:
                 Notification.scheduled_at <= now,
             )
             .order_by(Notification.priority, Notification.scheduled_at)
+            # Review 1.1: cap the batch; the tail is picked up on the
+            # next tick (the worker loop is eternal anyway).
+            .limit(settings.notification_batch_size)
         )
         result = await session.execute(stmt)
         notification_ids = [row[0] for row in result.all()]

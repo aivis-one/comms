@@ -41,6 +41,7 @@
 # =============================================================================
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, func, inspect
@@ -88,7 +89,7 @@ class Notification(UUIDMixin, Base):
 
     # Deep-link intent + template variables + internal keys ("_channels").
     # {"action": "open_practice", "params": {"practice_id": "uuid"}, ...}
-    action_data: Mapped[dict | None] = mapped_column(  # type: ignore[type-arg]
+    action_data: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB,
         nullable=True,
     )
@@ -173,7 +174,7 @@ class NotificationDelivery(UUIDMixin, Base):
     # Channel-specific options, format varies by channel:
     #   telegram: {button_text, disable_preview, silent}
     #   in_app:   {action_url, dismissable}
-    channel_options: Mapped[dict | None] = mapped_column(  # type: ignore[type-arg]
+    channel_options: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB,
         nullable=True,
     )
@@ -203,6 +204,14 @@ class NotificationDelivery(UUIDMixin, Base):
         default=0,
         server_default="0",
         nullable=False,
+    )
+
+    # Review 1.1: earliest moment the next transient retry may run.
+    # NULL = no gate (fresh delivery or terminal state). Set by the
+    # service on transient failure: now + base * 2**(attempts-1), capped.
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
     error_message: Mapped[str | None] = mapped_column(

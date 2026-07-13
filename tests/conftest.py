@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
 from app.core.database import dispose_engine, get_session_factory
@@ -130,7 +131,7 @@ def stub_profile() -> Generator[None, None, None]:
 
 
 @pytest.fixture
-async def db_session() -> AsyncGenerator:  # type: ignore[type-arg]
+async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """AsyncSession from the app's session factory."""
     factory = get_session_factory()
     async with factory() as session:

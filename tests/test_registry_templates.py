@@ -112,6 +112,24 @@ class TestTemplateEngine:
         )
         assert text == "hello [{extra}]"
 
+    def test_broken_format_spec_returns_none(self) -> None:
+        """Review 1.1: a config error in the template must not raise --
+        None routes the caller to the stored-value fallback."""
+        registry.register_templates(
+            "en",
+            {"unit_event": {"telegram": {"body": "{extra:,.2f}"}}},
+        )
+        assert (
+            render(
+                notification_type="unit_event",
+                channel="telegram",
+                field="body",
+                locale="en",
+                variables={"extra": "not-a-number"},
+            )
+            is None
+        )
+
     def test_safedict_direct(self) -> None:
         """SafeDict returns '{key}' for missing keys."""
         assert "{missing}".format_map(SafeDict()) == "{missing}"

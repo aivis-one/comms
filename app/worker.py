@@ -20,6 +20,7 @@ import structlog
 
 from app.core.database import dispose_engine
 from app.core.logging import setup_logging
+from app.engine.formatters import close_formatters
 from app.engine.worker import run_worker_loop
 
 logger = structlog.get_logger()
@@ -40,6 +41,8 @@ async def _main() -> None:
     with contextlib.suppress(asyncio.CancelledError):
         await task
 
+    # Review 1.1: close the aiogram session before dropping the engine.
+    await close_formatters()
     await dispose_engine()
 
 

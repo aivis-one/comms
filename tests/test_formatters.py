@@ -7,6 +7,8 @@
 #     velo's TestTelegramFormatter)
 #   - telegram deliver: HTML message, deep-link button, permanent
 #     failure mapping to PermanentDeliveryError
+# Review 1.1: HTML escaping (trust boundary), render-error fallback,
+#   secret sanitizer, bot session close
 # =============================================================================
 
 from types import SimpleNamespace
@@ -22,10 +24,12 @@ from app.engine.formatters import (
     PermanentDeliveryError,
     StubFormatter,
     TelegramFormatter,
+    close_formatters,
     get_formatter,
     sanitize_error,
 )
 from app.engine.models import Notification, NotificationDelivery
+from app.engine.registry import registry
 from tests.helpers import next_telegram_id
 
 BOT_URL = "https://t.me/comms_testbot"
@@ -225,13 +229,152 @@ class TestTelegramDeliver:
             await fmt.deliver(_notification(), _delivery(), _recipient())
 
 
-class TestSanitizeError:
-    """Error sanitizer redacts credential-looking content."""
+class TestHtmlEscaping:
+    """Review 1.1 critical: legit < & > must not kill delivery;
+    templates stay trusted, variables and stored values do not."""
 
-    def test_redacts_after_keyword(self) -> None:
+    async def test_stored_fallback_is_escaped(self) -> None:
+        """No template -> stored title/body escaped into HTML shell."""
+        bot = _FakeBot()
+        fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
+        notification = _notification(
+            type="unit_rem_24h",  # no template registered
+            title="Баланс < 0 & просрочен",
+            body="a > b & c",
+        )
+
+        ok = await fmt.deliver(notification, _delivery(), _recipient())
+
+        assert ok is True
+        (call,) = bot.calls
+        assert call["text"] == (
+            "<b>Баланс &lt; 0 &amp; просрочен</b>\n\na &gt; b &amp; c"
+        )
+
+    async def test_variable_injection_neutralized(self) -> None:
+        """Markup smuggled through action_data renders inert."""
+        bot = _FakeBot()
+        fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
+        notification = _notification(
+            action_data={"extra": "<a href='//evil'>x</a>"},
+        )
+
+        await fmt.deliver(notification, _delivery(), _recipient())
+
+        (call,) = bot.calls
+        assert "<a href" not in call["text"]
+        assert "&lt;a href=&#x27;//evil&#x27;&gt;x&lt;/a&gt;" in call["text"]
+
+    async def test_template_html_preserved(self) -> None:
+        """Trusted template markup survives; its variables are escaped."""
+        registry.register_templates(
+            "en",
+            {"unit_event": {"telegram": {"body": "<i>{body}</i>"}}},
+        )
+        bot = _FakeBot()
+        fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
+        notification = _notification(body="5 < 7")
+
+        await fmt.deliver(notification, _delivery(), _recipient())
+
+        (call,) = bot.calls
+        assert "<i>5 &lt; 7</i>" in call["text"]
+
+    async def test_numeric_variables_keep_format_specs(self) -> None:
+        """Numbers pass escaping untouched so {x:,.2f} keeps working."""
+        registry.register_templates(
+            "en",
+            {"unit_event": {"telegram": {"body": "sum: {amount:,.2f}"}}},
+        )
+        bot = _FakeBot()
+        fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
+        notification = _notification(action_data={"amount": 1234.5})
+
+        await fmt.deliver(notification, _delivery(), _recipient())
+
+        (call,) = bot.calls
+        assert "sum: 1,234.50" in call["text"]
+
+    async def test_parse_entities_error_is_permanent(self) -> None:
+        """Broken HTML in the template itself = config error, no retry."""
+        error = TelegramAPIError(
+            method=SimpleNamespace(),  # type: ignore[arg-type]
+            message="Bad Request: can't parse entities: unsupported tag",
+        )
+        fmt = TelegramFormatter(bot=_FakeBot(error=error), bot_url=BOT_URL)
+        with pytest.raises(PermanentDeliveryError):
+            await fmt.deliver(_notification(), _delivery(), _recipient())
+
+
+class TestRenderErrorFallback:
+    """Review 1.1: broken format spec -> stored fallback, not retries."""
+
+    async def test_bad_format_spec_falls_back_to_stored(self) -> None:
+        registry.register_templates(
+            "en",
+            {"unit_event": {"telegram": {"body": "{extra:,.2f}"}}},
+        )
+        bot = _FakeBot()
+        fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
+        notification = _notification(action_data={"extra": "not-a-number"})
+
+        ok = await fmt.deliver(notification, _delivery(), _recipient())
+
+        assert ok is True
+        (call,) = bot.calls
+        # Stored body ("World") delivered instead of the broken template.
+        assert "World" in call["text"]
+
+
+class TestCloseFormatters:
+    """Review 1.1: the aiogram session is closed on shutdown."""
+
+    async def test_closes_tracked_bot_session(self) -> None:
+        from app.engine import formatters as formatters_module
+
+        class _FakeSession:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        fake_bot = SimpleNamespace(session=_FakeSession())
+        formatters_module._bot = fake_bot  # simulate real-mode init
+        try:
+            await close_formatters()
+        finally:
+            formatters_module._bot = None
+
+        assert fake_bot.session.closed is True
+        assert formatters_module._bot is None
+
+    async def test_noop_when_nothing_initialized(self) -> None:
+        """Stub mode: close is a harmless reset."""
+        await close_formatters()
+
+
+class TestSanitizeError:
+    """Review 1.1: sanitizer covers DSNs, key=value and bearer shapes."""
+
+    def test_dsn_userinfo_redacted(self) -> None:
+        msg = sanitize_error(
+            Exception("connect postgresql+asyncpg://comms:s3cret@db/comms")
+        )
+        assert "s3cret" not in msg
+        assert "://comms:[redacted]@db/comms" in msg
+
+    def test_key_value_redacted(self) -> None:
         msg = sanitize_error(Exception("failed: token=abc123 rest"))
         assert "abc123" not in msg
-        assert "[token redacted]" in msg
+        assert "token=[redacted]" in msg
+
+    def test_bearer_before_keyword_redacted(self) -> None:
+        """Secret precedes the keyword -- the Phase 1 gap (review §4)."""
+        msg = sanitize_error(
+            Exception("invalid Authorization: Bearer eyJhbGci.payload x")
+        )
+        assert "eyJhbGci" not in msg
 
     def test_plain_message_untouched(self) -> None:
         assert sanitize_error(Exception("plain failure")) == "plain failure"

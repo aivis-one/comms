@@ -30,6 +30,7 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import update
@@ -70,7 +71,7 @@ async def schedule_reminders(
     target_value: str,
     title: str = "Reminder",
     body: str = "",
-    action_data: dict | None = None,  # type: ignore[type-arg]
+    action_data: dict[str, Any] | None = None,
     correlation_key: str | None = None,
     correlation_value: str | None = None,
     channels: list[str] | None = None,
@@ -111,7 +112,7 @@ async def schedule_reminders(
     cutoff = now + min_lead
     created: list[Notification] = []
 
-    data: dict | None = action_data  # type: ignore[type-arg]
+    data: dict[str, Any] | None = action_data
     if correlation_key is not None and correlation_value is not None:
         data = {**(action_data or {}), correlation_key: correlation_value}
 
@@ -181,7 +182,7 @@ async def cancel_reminders(
     """
     conditions = [
         Notification.type.in_(types),
-        Notification.status == NotificationStatus.PENDING.value,
+        Notification.status == NotificationStatus.PENDING,
         Notification.action_data[correlation_key].astext
         == correlation_value,
     ]
@@ -193,7 +194,7 @@ async def cancel_reminders(
     stmt = (
         update(Notification)
         .where(*conditions)
-        .values(status=NotificationStatus.EXPIRED.value)
+        .values(status=NotificationStatus.EXPIRED)
     )
     result = await session.execute(stmt)
     count: int = result.rowcount  # type: ignore[attr-defined]

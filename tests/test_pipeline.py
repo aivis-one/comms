@@ -16,9 +16,11 @@ from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_session_factory
 from app.engine.constants import (
     DeliveryStatus,
@@ -57,6 +59,20 @@ async def _fetch_deliveries(
             )
         )
         return list(result.scalars().all())
+
+
+async def _force_retry_due(delivery_id: UUID) -> None:
+    """Backdate the retry gate -- simulates the backoff window passing."""
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(NotificationDelivery).where(
+                NotificationDelivery.id == delivery_id
+            )
+        )
+        delivery = result.scalar_one()
+        delivery.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
 
 
 class _FailingFormatter:
@@ -202,19 +218,23 @@ class TestDeliverAndRollup:
             "app.engine.service.get_formatter",
             return_value=_FailingFormatter(),
         ):
-            # Attempt 1: stays pending, error recorded.
+            # Attempt 1: stays pending, error recorded, retry gated.
             await process_pending_notifications()
             (delivery,) = await _fetch_deliveries(notification.id)
             assert delivery.status == DeliveryStatus.PENDING
             assert delivery.attempts == 1
             assert delivery.error_message is not None
             assert "boom transient" in delivery.error_message
+            assert delivery.next_retry_at is not None
 
             fresh = await _fetch_notification(notification.id)
             assert fresh.status == NotificationStatus.PROCESSING
 
-            # Attempts 2..3: FAILED at max (default 3).
+            # Attempts 2..3 -- each after its backoff window "passes"
+            # (backdate the gate, review 1.1): FAILED at max (3).
+            await _force_retry_due(delivery.id)
             await process_pending_notifications()
+            await _force_retry_due(delivery.id)
             await process_pending_notifications()
 
         (delivery,) = await _fetch_deliveries(notification.id)
@@ -249,6 +269,7 @@ class TestDeliverAndRollup:
         (delivery,) = await _fetch_deliveries(notification.id)
         assert delivery.status == DeliveryStatus.FAILED
         assert delivery.attempts == 0
+        assert delivery.next_retry_at is None
         assert delivery.error_message is not None
         assert "blocked" in delivery.error_message
 
@@ -298,6 +319,126 @@ class TestDeliverAndRollup:
         by_recipient = {d.recipient_id: d for d in deliveries}
         assert by_recipient[healthy.id].status == DeliveryStatus.SENT
         assert by_recipient[blocked.id].status == DeliveryStatus.FAILED
+
+
+class TestRetryBackoff:
+    """Review 1.1: transient retries are gated by next_retry_at."""
+
+    async def test_gate_blocks_early_retry_and_backs_off(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Attempts don't burn within one poll window; gate grows 2x."""
+        monkeypatch.setattr(
+            settings, "notification_retry_backoff_base_seconds", 100,
+        )
+        monkeypatch.setattr(
+            settings, "notification_retry_backoff_max_seconds", 10_000,
+        )
+        recipient = await create_recipient(db_session)
+        notification = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.USER,
+            target_value=str(recipient.id),
+            channels=["telegram"],
+        )
+        await db_session.commit()
+
+        with patch(
+            "app.engine.service.get_formatter",
+            return_value=_FailingFormatter(),
+        ):
+            # Attempt 1 -> gate ~= now + base.
+            before = datetime.now(UTC)
+            await process_pending_notifications()
+            (delivery,) = await _fetch_deliveries(notification.id)
+            assert delivery.attempts == 1
+            assert delivery.next_retry_at is not None
+            first_gate = delivery.next_retry_at
+            delta = (first_gate - before).total_seconds()
+            assert 90 <= delta <= 115
+
+            # Immediate re-poll: gated, attempts unchanged.
+            await process_pending_notifications()
+            (delivery,) = await _fetch_deliveries(notification.id)
+            assert delivery.attempts == 1
+            assert delivery.next_retry_at == first_gate
+
+            # Window passes -> attempt 2, gate doubles (base * 2).
+            await _force_retry_due(delivery.id)
+            before = datetime.now(UTC)
+            await process_pending_notifications()
+            (delivery,) = await _fetch_deliveries(notification.id)
+            assert delivery.attempts == 2
+            assert delivery.next_retry_at is not None
+            delta = (delivery.next_retry_at - before).total_seconds()
+            assert 190 <= delta <= 215
+
+    async def test_backoff_capped(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The gate never exceeds the configured cap."""
+        monkeypatch.setattr(
+            settings, "notification_retry_backoff_base_seconds", 100,
+        )
+        monkeypatch.setattr(
+            settings, "notification_retry_backoff_max_seconds", 120,
+        )
+        recipient = await create_recipient(db_session)
+        notification = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.USER,
+            target_value=str(recipient.id),
+            channels=["telegram"],
+        )
+        await db_session.commit()
+
+        with patch(
+            "app.engine.service.get_formatter",
+            return_value=_FailingFormatter(),
+        ):
+            await process_pending_notifications()
+            (delivery,) = await _fetch_deliveries(notification.id)
+            await _force_retry_due(delivery.id)
+            before = datetime.now(UTC)
+            await process_pending_notifications()
+
+        (delivery,) = await _fetch_deliveries(notification.id)
+        assert delivery.attempts == 2
+        assert delivery.next_retry_at is not None
+        # base * 2**(2-1) = 200 -> capped at 120.
+        delta = (delivery.next_retry_at - before).total_seconds()
+        assert 110 <= delta <= 135
+
+
+class TestBatchLimit:
+    """Review 1.1: the poll batch is capped; tail rides the next tick."""
+
+    async def test_limit_and_next_tick_pickup(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings, "notification_batch_size", 2)
+        recipient = await create_recipient(db_session)
+        for index in range(3):
+            await create_notification(
+                db_session,
+                type="unit_event",
+                title=f"T{index}",
+                body="B",
+                target_type=TargetType.USER,
+                target_value=str(recipient.id),
+                channels=["telegram"],
+            )
+        await db_session.commit()
+
+        assert await process_pending_notifications() == 2
+        assert await process_pending_notifications() == 1
+        assert await process_pending_notifications() == 0
 
 
 class TestSchedulingAndExpiry:

@@ -40,7 +40,9 @@
 #   returns with the profile work in later phases.
 # =============================================================================
 
-from typing import TYPE_CHECKING, Protocol
+import re
+from html import escape
+from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
 
@@ -128,6 +130,10 @@ _PERMANENT_ERRORS = frozenset({
     "bot can't initiate conversation",
     "have no rights to send a message",
     "forbidden",
+    # Review 1.1: with variables escaped, a parse failure can only come
+    # from broken HTML in the template itself -- a config error that a
+    # retry cannot fix.
+    "can't parse entities",
 })
 
 
@@ -149,7 +155,9 @@ class TelegramFormatter:
         self._bot = bot
         self._bot_url = bot_url.rstrip("/")
 
-    def format_deep_link(self, action_data: dict | None) -> str | None:  # type: ignore[type-arg]
+    def format_deep_link(
+        self, action_data: dict[str, Any] | None,
+    ) -> str | None:
         """Convert action_data to a Telegram WebApp deep link.
 
         PORTED AS-IS from velo (Phase 7.3). Deep-link work beyond this
@@ -203,23 +211,36 @@ class TelegramFormatter:
         from aiogram.exceptions import TelegramAPIError
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-        variables = build_variables(notification)
+        # Trust boundary (review 1.1): the TEMPLATE is trusted and may
+        # carry HTML; VARIABLE VALUES and the stored title/body are not
+        # and are escaped before entering ParseMode.HTML.
+        variables = _escape_html_variables(build_variables(notification))
         locale = recipient.locale or settings.default_locale
 
-        title = render(
+        rendered_title = render(
             notification_type=notification.type,
             channel=DeliveryChannel.TELEGRAM,
             field="title",
             locale=locale,
             variables=variables,
-        ) or notification.title
-        body = render(
+        )
+        title = (
+            rendered_title
+            if rendered_title is not None
+            else escape(notification.title)
+        )
+        rendered_body = render(
             notification_type=notification.type,
             channel=DeliveryChannel.TELEGRAM,
             field="body",
             locale=locale,
             variables=variables,
-        ) or notification.body
+        )
+        body = (
+            rendered_body
+            if rendered_body is not None
+            else escape(notification.body)
+        )
 
         text = f"<b>{title}</b>\n\n{body}"
 
@@ -271,25 +292,58 @@ class TelegramFormatter:
 # ---------------------------------------------------------------------------
 
 
+# Secret-redaction patterns (review 1.1). The Phase 1 version truncated
+# AFTER a keyword, leaking secrets that precede it, and missed DSNs
+# (no "password" substring in postgresql://user:pass@host).
+# Order matters: bearer first, so "Authorization: Bearer x" is not
+# half-eaten by the key=value pattern.
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
+_URL_USERINFO_RE = re.compile(r"(://[^/\s:@]+:)[^@/\s]+(@)")
+_KEYVAL_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key|apikey"
+    r"|authorization)\b\s*[=:]\s*\S+"
+)
+
+
 def sanitize_error(exc: Exception) -> str:
-    """Sanitize exception message to remove potential secrets."""
+    """Sanitize exception message to remove potential secrets.
+
+    Covers: bearer tokens, userinfo in URLs/DSNs, key=value / key: value
+    shapes for common credential keywords. Plain messages pass through.
+    """
     msg = str(exc)
-    # Truncate after sensitive keywords to avoid leaking credentials.
-    for keyword in ("password", "token", "secret", "api_key", "apikey"):
-        idx = msg.lower().find(keyword)
-        if idx != -1:
-            msg = msg[:idx] + f"[{keyword} redacted]"
-            break
+    msg = _BEARER_RE.sub("bearer [redacted]", msg)
+    msg = _URL_USERINFO_RE.sub(r"\1[redacted]\2", msg)
+    msg = _KEYVAL_RE.sub(lambda m: f"{m.group(1)}=[redacted]", msg)
     return msg[:2000]
 
 
-def build_variables(notification: Notification) -> dict:  # type: ignore[type-arg]
+def _escape_html_variables(variables: dict[str, Any]) -> dict[str, Any]:
+    """Escape variable VALUES for ParseMode.HTML (review 1.1).
+
+    Strings are HTML-escaped; numbers/bools/None pass through so
+    numeric format specs ("{amount:,.2f}") keep working; anything else
+    is stringified and escaped -- an unexpected repr must not be able
+    to break entity parsing.
+    """
+    escaped: dict[str, Any] = {}
+    for key, value in variables.items():
+        if isinstance(value, str):
+            escaped[key] = escape(value)
+        elif isinstance(value, (int, float)) or value is None:
+            escaped[key] = value
+        else:
+            escaped[key] = escape(str(value))
+    return escaped
+
+
+def build_variables(notification: Notification) -> dict[str, Any]:
     """Build template variables from notification fields and action_data.
 
     action_data keys are merged first, then title/body override on top
     to prevent action_data from overwriting core notification fields.
     """
-    variables: dict = {}  # type: ignore[type-arg]
+    variables: dict[str, Any] = {}
     if notification.action_data:
         for key, value in notification.action_data.items():
             # Skip internal keys (prefixed with underscore).
@@ -308,6 +362,10 @@ def build_variables(notification: Notification) -> dict:  # type: ignore[type-ar
 _stub = StubFormatter()
 _initialized = False
 
+# Real aiogram Bot created by _init_formatters -- kept so its aiohttp
+# session can be closed on shutdown (review 1.1: unclosed session).
+_bot: "Bot | None" = None
+
 _FORMATTERS: dict[str, ChannelFormatter] = {
     DeliveryChannel.TELEGRAM: _stub,
     DeliveryChannel.EMAIL: _stub,
@@ -322,7 +380,7 @@ def _init_formatters() -> None:
     Called once on first get_formatter() call in CHANNELS_MODE=real.
     Uses StubFormatter when credentials are not configured.
     """
-    global _initialized
+    global _bot, _initialized
 
     # -- Telegram --
     token = settings.telegram_bot_token
@@ -331,6 +389,7 @@ def _init_formatters() -> None:
             from aiogram import Bot
 
             bot = Bot(token=token)
+            _bot = bot
             _FORMATTERS[DeliveryChannel.TELEGRAM] = TelegramFormatter(
                 bot=bot,
                 bot_url=settings.telegram_bot_url,
@@ -363,8 +422,29 @@ def get_formatter(channel: str) -> ChannelFormatter:
 
 
 def reset_formatters() -> None:
-    """Reset lazy-initialized formatters (tests / config reload)."""
+    """Reset lazy-initialized formatters to stubs (tests).
+
+    Does NOT close a live Bot session -- use close_formatters() on a
+    real shutdown path.
+    """
     global _initialized
     _initialized = False
     for channel in _FORMATTERS:
         _FORMATTERS[channel] = _stub
+
+
+async def close_formatters() -> None:
+    """Close network resources held by real formatters, then reset.
+
+    Called on worker/API shutdown. Safe to call when nothing was
+    initialized (stub mode): no-op apart from the reset.
+    """
+    global _bot
+    if _bot is not None:
+        try:
+            await _bot.session.close()
+            logger.info("telegram_bot_session_closed")
+        except Exception:
+            logger.exception("telegram_bot_session_close_failed")
+        _bot = None
+    reset_formatters()

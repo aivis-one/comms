@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     notification_poll_interval_seconds: int = 5
     notification_max_backoff_seconds: int = 60
     notification_max_delivery_attempts: int = 3
+    # Max notifications picked per worker batch; the tail is picked up
+    # on the next tick (review 1.1: unbounded backlog fetch).
+    notification_batch_size: int = 50
+    # Per-delivery retry backoff: base * 2**(attempts-1), capped.
+    # Defaults give ~30s/60s between the three attempts -- comparable
+    # to the cbshome donor's 1-minute worker tick, where retries were
+    # meaningful (review 1.1: retries burned within seconds).
+    notification_retry_backoff_base_seconds: int = 30
+    notification_retry_backoff_max_seconds: int = 600
 
     # -- Computed properties --
 

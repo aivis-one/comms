@@ -30,6 +30,7 @@ from sqlalchemy import select
 from app.core.config import APP_VERSION, settings
 from app.core.database import dispose_engine, get_engine
 from app.core.logging import setup_logging
+from app.engine.formatters import close_formatters
 
 logger = structlog.get_logger()
 
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         channels_mode=settings.channels_mode,
     )
     yield
+    await close_formatters()
     await dispose_engine()
     logger.info("comms_stopped")
 

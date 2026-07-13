@@ -32,11 +32,12 @@
 # =============================================================================
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import Recipient
@@ -80,7 +81,7 @@ async def create_notification(
     target_type: str,
     target_value: str,
     channels: list[str] | None = None,
-    action_data: dict | None = None,  # type: ignore[type-arg]
+    action_data: dict[str, Any] | None = None,
     priority: int = 5,
     scheduled_at: datetime | None = None,
     expiry_at: datetime | None = None,
@@ -263,15 +264,22 @@ async def deliver_notification(
     - Concurrent delivery via asyncio.gather + Semaphore.
     - asyncio.wait_for with timeout per formatter call.
     - PermanentDeliveryError -> immediate FAILED, no attempts increment.
+    - Transient failure gates the next attempt via next_retry_at
+      (exponential backoff, review 1.1); gated deliveries are skipped.
     - Error messages sanitized to prevent credential leaks.
 
     Args:
         session: Active DB session (caller commits).
         notification: The notification whose deliveries to process.
     """
+    now = datetime.now(UTC)
     stmt = select(NotificationDelivery).where(
         NotificationDelivery.notification_id == notification.id,
         NotificationDelivery.status == DeliveryStatus.PENDING,
+        or_(
+            NotificationDelivery.next_retry_at.is_(None),
+            NotificationDelivery.next_retry_at <= now,
+        ),
     )
     result = await session.execute(stmt)
     deliveries = list(result.scalars().all())
@@ -328,6 +336,18 @@ async def deliver_notification(
                 delivery.error_message = outcome.error
                 if delivery.attempts >= max_attempts:
                     delivery.status = DeliveryStatus.FAILED
+                else:
+                    # Exponential backoff gate: base * 2**(attempts-1),
+                    # capped. Without it all attempts burned within one
+                    # poll interval (review 1.1).
+                    backoff_seconds = min(
+                        settings.notification_retry_backoff_base_seconds
+                        * 2 ** (delivery.attempts - 1),
+                        settings.notification_retry_backoff_max_seconds,
+                    )
+                    delivery.next_retry_at = datetime.now(UTC) + timedelta(
+                        seconds=backoff_seconds,
+                    )
 
     await session.flush()
 
@@ -463,7 +483,7 @@ async def list_recipient_deliveries(
     per_page: int = 20,
     type_filter: str | None = None,
     channel_filter: str | None = None,
-) -> tuple[list[dict], int]:  # type: ignore[type-arg]
+) -> tuple[list[dict[str, Any]], int]:
     """List sent deliveries for a recipient with parent notification data.
 
     Only deliveries with status=sent are returned (the recipient sees
@@ -483,7 +503,7 @@ async def list_recipient_deliveries(
     """
     conditions = [
         NotificationDelivery.recipient_id == recipient_id,
-        NotificationDelivery.status == DeliveryStatus.SENT.value,
+        NotificationDelivery.status == DeliveryStatus.SENT,
     ]
 
     if type_filter:
@@ -516,7 +536,7 @@ async def list_recipient_deliveries(
     result = await session.execute(stmt)
     rows = result.all()
 
-    items: list[dict] = []  # type: ignore[type-arg]
+    items: list[dict[str, Any]] = []
     for delivery, notification in rows:
         items.append({
             "id": delivery.id,
@@ -551,7 +571,7 @@ async def get_unread_count(
         .select_from(NotificationDelivery)
         .where(
             NotificationDelivery.recipient_id == recipient_id,
-            NotificationDelivery.status == DeliveryStatus.SENT.value,
+            NotificationDelivery.status == DeliveryStatus.SENT,
             NotificationDelivery.read_at.is_(None),
         )
     )
@@ -605,7 +625,7 @@ async def mark_all_read(
         update(NotificationDelivery)
         .where(
             NotificationDelivery.recipient_id == recipient_id,
-            NotificationDelivery.status == DeliveryStatus.SENT.value,
+            NotificationDelivery.status == DeliveryStatus.SENT,
             NotificationDelivery.read_at.is_(None),
         )
         .values(read_at=datetime.now(UTC))

@@ -21,6 +21,8 @@
 #   - Locale fallback chain: requested -> deploy default locale.
 # =============================================================================
 
+from typing import Any
+
 import structlog
 
 from app.core.config import settings
@@ -29,7 +31,7 @@ from app.engine.registry import registry
 logger = structlog.get_logger()
 
 
-class SafeDict(dict):  # type: ignore[type-arg]
+class SafeDict(dict[str, Any]):
     """Dict that returns '{key}' for missing keys instead of raising.
 
     Used with str.format_map() to safely render templates when some
@@ -46,7 +48,7 @@ def render(
     channel: str,
     field: str,
     locale: str | None = None,
-    variables: dict | None = None,  # type: ignore[type-arg]
+    variables: dict[str, Any] | None = None,
 ) -> str | None:
     """Render a notification template with variable substitution.
 
@@ -54,6 +56,11 @@ def render(
       1. Requested locale
       2. Fallback to the deploy default locale
       3. None -- caller falls back to the stored title/body
+
+    A broken format spec in the template (e.g. "{amount:,.2f}" against
+    a string variable) also returns None with a warning -- a template
+    config error must not burn delivery retries (review 1.1); the
+    caller's stored-value fallback covers it.
 
     Args:
         notification_type: Registered type key (e.g. "booking_confirmed").
@@ -87,4 +94,15 @@ def render(
         return None
 
     safe_vars = SafeDict(variables or {})
-    return template_str.format_map(safe_vars)
+    try:
+        return template_str.format_map(safe_vars)
+    except (ValueError, TypeError, IndexError) as exc:
+        logger.warning(
+            "template_render_error",
+            type=notification_type,
+            channel=channel,
+            field=field,
+            locale=requested,
+            error=str(exc)[:200],
+        )
+        return None

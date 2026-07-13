@@ -40,8 +40,8 @@
 | Phase | Кратко (детали -- в архдоке) | Репо | Зависимость | Тест-банд | Статус |
 |-------|------------------------------|------|-------------|-----------|--------|
 | **1** | Скелет сервиса + канонический движок (слияние: база cbshome + `reminders` VELO) + CI-workflow | comms | -- | assign at issue | **READY TO ISSUE** |
-| 2 | Точки расширения (профиль, синк-проекции identity/группы) + префы-категории + гейтинг + тихие часы | comms | 1 | assign at issue | NOT STARTED |
-| 3 | Транспорт: HTTP-API + Redis Streams consumer + контракт outbox + обратный колбэк + диплинк-форматтер | comms | 2 | assign at issue | NOT STARTED |
+| 2 | Точки расширения: профиль (типы + шаблоны YAML, загрузчик, валидатор, локали/фолбэк) + синк-проекции identity/группы + префы-категории + гейтинг + тихие часы | comms | 1 | assign at issue | NOT STARTED |
+| 3 | Транспорт: HTTP-API + Redis Streams consumer + контракт outbox + обратный колбэк + диплинк-форматтер + **презентация канала** (кнопка / disable_preview / silent; приоритет шаблон < channel_options) | comms | 2 | assign at issue | NOT STARTED |
 | 4 | Messaging core (Thread/Message/ReadState/Section, дедуп, оператор, claim, видимость, инвариант) + сообщение -> нотификация + колбэк | comms | 3 | assign at issue | NOT STARTED |
 | 5 | Ops-тулкит: общее тело + профили окружений (velo test/prod), тонкий бутстрап в `/tmp` (интерактивный запрос доступа к приватному `ops`, без ключей в файле), per-VPS инсталлер, shared network, БД comms, CLI с раскатом comms -> продукт | ops | 4 | n/a | NOT STARTED |
 | 6 | Интеграция VELO: outbox + релей, синк identity/групп, профиль VELO, прокси-эндпоинты, приёмник колбэка; фронт (реестр диплинков, бейдж, чат) | velo | 5 + координация VELO-v2 | assign at issue | NOT STARTED |
