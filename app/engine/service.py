@@ -234,8 +234,8 @@ async def resolve_notification(
     # -- Mute gate: drop recipients who muted this type's category --
     # Evaluated at resolve time; for reminders that is the moment the
     # notification comes due, so the mute state is current as of send.
-    # A mute set AFTER deliveries exist is intentionally not
-    # re-checked on retries (documented trade-off).
+    # A mute set AFTER deliveries exist is caught by the second line
+    # at deliver time (late-mute re-check -> DeliveryStatus.SKIPPED).
     category = registry.category_of(notification.type)
     if category is not None:
         muted = await muted_recipient_ids(session, category, recipient_ids)
@@ -296,6 +296,16 @@ async def deliver_notification(
     """Deliver pending deliveries for a notification via formatters.
 
     - Batch-loads Recipient objects for credentials and locale.
+    - LATE-MUTE RE-CHECK (Phase 2.1): the resolve-time mute gate is
+      the first line, but a delivery can sit gated for HOURS (quiet
+      hours stretched the window far past the old 30-60s backoff). So
+      right before sending, recipients who muted the notification's
+      category since resolve are closed out terminally with
+      DeliveryStatus.SKIPPED -- not FAILED (nothing broke), mirroring
+      the notification-level SKIPPED. One batched lookup per pass;
+      checked BEFORE the quiet gate (no point deferring a muted
+      delivery). Attempts and error_message stay untouched (a skip is
+      not an attempt; prior transient history is kept).
     - QUIET HOURS (Phase 2): a delivery whose recipient is inside
       their quiet window is DEFERRED, not sent -- next_retry_at is set
       to the window's end (recipient's timezone) and the existing
@@ -337,6 +347,14 @@ async def deliver_notification(
         r.id: r for r in recipient_result.scalars().all()
     }
 
+    # -- Late-mute re-check: one batched probe per pass --
+    category = registry.category_of(notification.type)
+    muted: set[UUID] = set()
+    if category is not None:
+        muted = await muted_recipient_ids(
+            session, category, list(recipient_ids),
+        )
+
     # -- Concurrent delivery via gather + semaphore --
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DELIVERIES)
     tasks = []
@@ -353,7 +371,16 @@ async def deliver_notification(
             )
             continue
 
-        formatter = get_formatter(delivery.channel)
+        # -- Late-mute gate: muted while gated -> close out, no send --
+        if delivery.recipient_id in muted:
+            delivery.status = DeliveryStatus.SKIPPED
+            logger.info(
+                "delivery_muted_skipped",
+                delivery_id=str(delivery.id),
+                recipient_id=str(delivery.recipient_id),
+                category=category,
+            )
+            continue
 
         # -- Quiet-hours gate: defer, never suppress --
         quiet_until = recipient_quiet_until(recipient, now)
@@ -367,6 +394,7 @@ async def deliver_notification(
             )
             continue
 
+        formatter = get_formatter(delivery.channel)
         tasks.append(
             _deliver_single(
                 semaphore, formatter, notification, delivery, recipient,
@@ -488,7 +516,19 @@ async def rollup_notification(
     That branch stays as a safety net: a PROCESSING notification
     without any deliveries is an anomaly, not a skip.
 
-    Rules (cbshome base, incl. PARTIAL_SENT):
+    SKIPPED deliveries (late mutes, Phase 2.1) are non-events: they
+    are subtracted before the verdict, so they drag the outcome
+    neither toward FAILED nor toward SENT. Matrix:
+      - only skipped              -> notification SKIPPED (late
+        edition of "nobody to deliver to")
+      - skipped + sent            -> sent
+      - skipped + failed          -> failed
+      - skipped + sent + failed   -> partial_sent
+      - skipped + pending         -> stays processing (a gated
+        delivery is still alive; do not finalize early)
+
+    Rules over the remaining statuses (cbshome base, incl.
+    PARTIAL_SENT):
       - All sent         -> sent
       - All failed       -> failed
       - Mix sent+failed  -> partial_sent
@@ -511,9 +551,21 @@ async def rollup_notification(
         notification.status = NotificationStatus.FAILED
         return
 
-    has_pending = DeliveryStatus.PENDING in statuses
-    has_sent = DeliveryStatus.SENT in statuses
-    has_failed = DeliveryStatus.FAILED in statuses
+    # Skips are non-events -- judge the outcome by the rest.
+    active = statuses - {DeliveryStatus.SKIPPED}
+    if not active:
+        notification.status = NotificationStatus.SKIPPED
+        await session.flush()
+        logger.info(
+            "notification_rollup",
+            notification_id=str(notification.id),
+            status=notification.status,
+        )
+        return
+
+    has_pending = DeliveryStatus.PENDING in active
+    has_sent = DeliveryStatus.SENT in active
+    has_failed = DeliveryStatus.FAILED in active
 
     if has_pending:
         # Still processing -- don't change status.

@@ -58,9 +58,12 @@ def render(
       3. None -- caller falls back to the stored title/body
 
     A broken format spec in the template (e.g. "{amount:,.2f}" against
-    a string variable) also returns None with a warning -- a template
+    a string variable) also returns None with a warning, as does
+    attribute access on a JSON variable ("{user.name}") -- a template
     config error must not burn delivery retries (review 1.1); the
-    caller's stored-value fallback covers it.
+    caller's stored-value fallback covers it. Second line of defense:
+    the profile validator (app/engine/profile.py) rejects these at
+    startup, this guard covers templates registered past it.
 
     Args:
         notification_type: Registered type key (e.g. "booking_confirmed").
@@ -96,7 +99,7 @@ def render(
     safe_vars = SafeDict(variables or {})
     try:
         return template_str.format_map(safe_vars)
-    except (ValueError, TypeError, IndexError) as exc:
+    except (ValueError, TypeError, IndexError, AttributeError) as exc:
         logger.warning(
             "template_render_error",
             type=notification_type,

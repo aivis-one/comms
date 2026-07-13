@@ -1,11 +1,14 @@
 # =============================================================================
-# COMMS Service -- Sync receiver tests (Phase 2 item 4)
+# COMMS Service -- Sync receiver tests (Phase 2 item 4 + Phase 2.1 item 2)
 # =============================================================================
 # Service-level receivers for the product's `user_upserted` /
 # `group_changed` events (transport is Phase 3; these functions ARE
 # the contract). Covered:
 #   - upsert creates / updates / never duplicates
-#   - re-sync does NOT touch comms-owned preference fields
+#   - timezone is a SYNC field (Phase 2.1): re-sync updates it,
+#     snapshot semantics (None overwrites to NULL), unknown values are
+#     stored with a warning, never rejected (poison-pill rule)
+#   - re-sync does NOT touch comms-owned quiet_* preference fields
 #   - active=False drops the recipient out of USER resolution
 #   - group add/remove is idempotent both ways
 #   - group add for an unsynced recipient is a sync-ordering error
@@ -18,6 +21,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.audience.models import GroupMembership, Recipient
 from app.audience.sync import group_changed, user_upserted
@@ -35,7 +39,7 @@ async def _recipient_count(session: AsyncSession) -> int:
 
 
 class TestUserUpserted:
-    """Identity sync: create, update, idempotency, pref ownership."""
+    """Identity sync: create, update, idempotency, field ownership."""
 
     async def test_creates_recipient(self, db_session: AsyncSession) -> None:
         """First event for an id creates the projection row."""
@@ -47,12 +51,14 @@ class TestUserUpserted:
             telegram_id=tg,
             email="alpha@example.test",
             locale="ru",
+            timezone="Europe/Berlin",
             active=True,
         )
         assert recipient.id == recipient_id
         assert recipient.telegram_id == tg
         assert recipient.email == "alpha@example.test"
         assert recipient.locale == "ru"
+        assert recipient.timezone == "Europe/Berlin"
         assert recipient.active is True
 
     async def test_updates_in_place_without_duplicates(
@@ -66,6 +72,7 @@ class TestUserUpserted:
             telegram_id=next_phase2_telegram_id(),
             email=None,
             locale="en",
+            timezone="UTC",
             active=True,
         )
         new_tg = next_phase2_telegram_id()
@@ -75,18 +82,20 @@ class TestUserUpserted:
             telegram_id=new_tg,
             email="beta@example.test",
             locale="de",
+            timezone="Asia/Tokyo",
             active=False,
         )
         assert updated.telegram_id == new_tg
         assert updated.email == "beta@example.test"
         assert updated.locale == "de"
+        assert updated.timezone == "Asia/Tokyo"
         assert updated.active is False
         assert await _recipient_count(db_session) == 1
 
-    async def test_resync_does_not_touch_preferences(
+    async def test_resync_updates_timezone_keeps_quiet_prefs(
         self, db_session: AsyncSession,
     ) -> None:
-        """Ownership boundary: sync writes only its five fields."""
+        """Ownership split: timezone is synced, quiet_* survive."""
         recipient_id = uuid4()
         recipient = await user_upserted(
             db_session,
@@ -94,10 +103,11 @@ class TestUserUpserted:
             telegram_id=next_phase2_telegram_id(),
             email=None,
             locale="en",
+            timezone="Europe/Berlin",
             active=True,
         )
-        # Comms-owned preference fields, set outside the sync path.
-        recipient.timezone = "Europe/Berlin"
+        # Comms-owned quiet-hours preferences, set outside the sync
+        # path (the prefs API writes exactly these fields).
         recipient.quiet_from = time(22, 0)
         recipient.quiet_to = time(8, 0)
         recipient.quiet_days = [5, 6]
@@ -109,14 +119,68 @@ class TestUserUpserted:
             telegram_id=next_phase2_telegram_id(),
             email="resync@example.test",
             locale="ru",
+            timezone="Asia/Tokyo",
             active=True,
         )
-        assert recipient.timezone == "Europe/Berlin"
+        # Sync fields moved with the event...
+        assert recipient.locale == "ru"
+        assert recipient.timezone == "Asia/Tokyo"
+        # ...while the comms-owned preferences did not.
         assert recipient.quiet_from == time(22, 0)
         assert recipient.quiet_to == time(8, 0)
         assert recipient.quiet_days == [5, 6]
-        # ...while the sync fields did change.
-        assert recipient.locale == "ru"
+
+    async def test_timezone_none_overwrites_to_null(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Snapshot semantics: None in the event clears the value.
+
+        "None means keep" would be a partial patch smuggled into a
+        snapshot contract; DEFAULT_TIMEZONE picks up at computation.
+        """
+        recipient_id = uuid4()
+        recipient = await user_upserted(
+            db_session,
+            recipient_id=recipient_id,
+            telegram_id=next_phase2_telegram_id(),
+            email=None,
+            locale="en",
+            timezone="Europe/Berlin",
+            active=True,
+        )
+        await user_upserted(
+            db_session,
+            recipient_id=recipient_id,
+            telegram_id=next_phase2_telegram_id(),
+            email=None,
+            locale="en",
+            timezone=None,
+            active=True,
+        )
+        assert recipient.timezone is None
+
+    async def test_unknown_timezone_stored_with_warning(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Poison-pill rule: never reject the event -- warn at intake,
+        store as-is, degrade to the default at computation time."""
+        recipient_id = uuid4()
+        with capture_logs() as logs:
+            recipient = await user_upserted(
+                db_session,
+                recipient_id=recipient_id,
+                telegram_id=next_phase2_telegram_id(),
+                email=None,
+                locale="en",
+                timezone="Mars/Olympus",
+                active=True,
+            )
+        assert recipient.timezone == "Mars/Olympus"
+        assert any(
+            log["event"] == "invalid_timezone_synced"
+            and log["timezone"] == "Mars/Olympus"
+            for log in logs
+        )
 
     async def test_deactivated_recipient_leaves_user_resolution(
         self, db_session: AsyncSession,
@@ -129,6 +193,7 @@ class TestUserUpserted:
             telegram_id=next_phase2_telegram_id(),
             email=None,
             locale="en",
+            timezone=None,
             active=True,
         )
         assert await resolve_targets(
@@ -141,6 +206,7 @@ class TestUserUpserted:
             telegram_id=next_phase2_telegram_id(),
             email=None,
             locale="en",
+            timezone=None,
             active=False,
         )
         assert await resolve_targets(
@@ -158,6 +224,7 @@ class TestGroupChanged:
             telegram_id=next_phase2_telegram_id(),
             email=None,
             locale="en",
+            timezone=None,
             active=True,
         )
 
@@ -226,6 +293,7 @@ class TestResolverSeesSyncedData:
             telegram_id=next_phase2_telegram_id(),
             email=None,
             locale="en",
+            timezone=None,
             active=True,
         )
         bravo = await user_upserted(
@@ -234,6 +302,7 @@ class TestResolverSeesSyncedData:
             telegram_id=next_phase2_telegram_id(),
             email=None,
             locale="en",
+            timezone=None,
             active=True,
         )
         await group_changed(

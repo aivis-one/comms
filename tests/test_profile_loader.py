@@ -333,3 +333,119 @@ class TestLocaleFallbackChain:
             "unit_event", "telegram", "body",
             locale="en", variables={"body": "B"},
         ) == "B [{extra}]"
+
+
+class TestFormatSpecProbing:
+    """Phase 2.1 item 1: the dry-run probe accepts a spec iff at
+    least one JSON scalar type (str, int, float) accepts it."""
+
+    def test_numeric_specs_pass_validation_and_render(
+        self, tmp_path: Path,
+    ) -> None:
+        """Money/number/percent/padding specs load AND render.
+
+        This is the exact false positive of the original dry run:
+        {amount:,.2f} is valid at runtime (numbers pass through
+        unescaped) but the string-placeholder dry run rejected it.
+        """
+        root = _write_profile(
+            tmp_path,
+            "money_event: {}\n",
+            {
+                "en": (
+                    "money_event:\n"
+                    "  telegram:\n"
+                    '    body: "Total: {amount:,.2f} / {n:03d}'
+                    ' / {x:.1%} / {s:>4}"\n'
+                ),
+            },
+        )
+        profile = load_profile(FileProfileSource(root))
+        registry.reset()
+        install_profile(profile)
+        assert render(
+            "money_event", "telegram", "body",
+            locale="en",
+            variables={"amount": 1234.5, "n": 7, "x": 0.256, "s": "hi"},
+        ) == "Total: 1,234.50 / 007 / 25.6% /   hi"
+
+    def test_garbage_spec_still_fatal(self, tmp_path: Path) -> None:
+        """A spec no JSON scalar accepts kills startup (true positive)."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": 'unit_event:\n  telegram:\n    body: "{a:zzz}"\n'},
+        )
+        with pytest.raises(ProfileError, match="format spec"):
+            load_profile(FileProfileSource(root))
+
+    def test_strftime_spec_is_fatal(self, tmp_path: Path) -> None:
+        """Date-like specs are true positives: variables travel via
+        JSONB, a datetime can never reach render(), so {when:%d.%m}
+        is a guaranteed runtime failure. Dates arrive pre-formatted."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {
+                "en": (
+                    "unit_event:\n"
+                    "  telegram:\n"
+                    '    body: "{when:%d.%m %H:%M}"\n'
+                ),
+            },
+        )
+        with pytest.raises(ProfileError, match="format spec"):
+            load_profile(FileProfileSource(root))
+
+    def test_attribute_access_rejected_with_hint(
+        self, tmp_path: Path,
+    ) -> None:
+        """{user.name} dies at validation: JSON objects arrive as
+        dicts, getattr fails at runtime -- the hint points at item
+        access instead."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": 'unit_event:\n  telegram:\n    body: "{user.name}"\n'},
+        )
+        with pytest.raises(ProfileError, match="item access"):
+            load_profile(FileProfileSource(root))
+
+    def test_item_access_passes_and_renders(self, tmp_path: Path) -> None:
+        """{user[name]} works on the JSON dicts that actually arrive."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": 'unit_event:\n  telegram:\n    body: "Hi {user[name]}"\n'},
+        )
+        profile = load_profile(FileProfileSource(root))
+        registry.reset()
+        install_profile(profile)
+        assert render(
+            "unit_event", "telegram", "body",
+            locale="en",
+            variables={"user": {"name": "Zo"}},
+        ) == "Hi Zo"
+
+    def test_nested_spec_passes(self, tmp_path: Path) -> None:
+        """Nested specs ({x:{width}.2f}) expand and validate."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": 'unit_event:\n  telegram:\n    body: "{x:{width}.2f}"\n'},
+        )
+        load_profile(FileProfileSource(root))
+
+    def test_render_survives_attribute_access_at_runtime(self) -> None:
+        """Second line of defense: a template registered PAST the
+        validator with attribute access falls back (None + warning)
+        instead of burning delivery attempts."""
+        registry.register_templates(
+            "en",
+            {"unit_event": {"telegram": {"note": "{user.name}"}}},
+        )
+        assert render(
+            "unit_event", "telegram", "note",
+            locale="en",
+            variables={"user": {"name": "Zo"}},
+        ) is None

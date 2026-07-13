@@ -86,16 +86,20 @@ class Recipient(TimestampMixin, Base):
         index=True,
     )
 
-    # -- Quiet-hours preferences (Phase 2) --
-    # NOT sync fields: the product does not own them (they are comms
-    # preferences), so user_upserted must never touch them.
-
-    # IANA timezone for quiet-hours math. Nullable: falls back to
-    # settings.default_timezone when the recipient never set one.
+    # -- Timezone (sync field, Phase 2.1) --
+    # IANA timezone for quiet-hours math. Product-owned identity
+    # (e.g. VELO users.timezone) synced via user_upserted alongside
+    # locale. Nullable: falls back to settings.default_timezone when
+    # the product does not track it.
     timezone: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
     )
+
+    # -- Quiet-hours preferences (Phase 2) --
+    # Comms-owned: the recipient sets these through the prefs API, the
+    # product does not know them, so user_upserted must never touch
+    # them.
 
     # Quiet window: local wall-clock start/end. quiet_from >= quiet_to
     # means the window crosses midnight (e.g. 22:00 -> 08:00).

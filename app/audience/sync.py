@@ -9,32 +9,72 @@
 # Until then they are the contract -- tests call them directly.
 #
 # EVENT CONTRACT (what the transport must deliver):
-#   user_upserted: {recipient_id, telegram_id, email, locale, active}
-#     -- full snapshot of the FIVE sync-owned fields; the product is
-#        the source of truth for them and every event carries all of
-#        them (no partial patches).
+#   user_upserted: {recipient_id, telegram_id, email, locale,
+#                   timezone?, active}
+#     -- full snapshot of the SIX sync-owned identity fields; the
+#        product is the source of truth for them and every event
+#        carries all of them (no partial patches). `timezone` is
+#        optional in the payload: a product that does not track it
+#        maps the absence to None, and comms falls back to
+#        DEFAULT_TIMEZONE at quiet-hours computation time.
 #   group_changed: {group_key, recipient_id, member}
 #     -- member=True adds the pair, member=False removes it.
 #
 # IDEMPOTENCY: both receivers are safe to replay (at-least-once
 # transports re-deliver). Re-applying the same event is a no-op.
 #
-# OWNERSHIP BOUNDARY: user_upserted writes ONLY the five sync fields.
-# The comms-owned preference fields on Recipient (timezone, quiet_*)
-# are never touched -- a re-sync must not wipe a recipient's settings.
-# That is why this is a field-by-field upsert and not a session.merge.
+# OWNERSHIP BOUNDARY: user_upserted writes ONLY the six identity
+# fields above. Snapshot semantics apply to all of them: timezone=None
+# in the event OVERWRITES a previously synced value with NULL ("None
+# means keep" would be a partial patch smuggled into a snapshot
+# contract). The comms-owned preference fields on Recipient
+# (quiet_from / quiet_to / quiet_days) are never touched -- a re-sync
+# must not wipe a recipient's settings. That is why this is a
+# field-by-field upsert and not a session.merge.
+#
+# POISON-PILL RULE: a sync event is NEVER rejected for a bad value
+# (that would jam the product's at-least-once stream on one row).
+# An unknown timezone is stored as-is with a loud warning here (early
+# signal) and degrades to DEFAULT_TIMEZONE at computation time
+# (app/audience/quiet_hours.py).
 # =============================================================================
 
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
+from app.core.config import settings
 from app.core.exceptions import NotFoundError
 
 logger = structlog.get_logger()
+
+
+def _warn_if_unknown_timezone(
+    recipient_id: UUID,
+    timezone: str | None,
+) -> None:
+    """Early signal for an unresolvable synced timezone.
+
+    Never rejects (poison-pill rule): the value is stored as-is and
+    quiet-hours math degrades to DEFAULT_TIMEZONE with its own warning
+    at computation time. This one fires at intake so the problem shows
+    up in logs when the sync happens, not when a delivery is due.
+    """
+    if timezone is None:
+        return
+    try:
+        ZoneInfo(timezone)
+    except (KeyError, ValueError):
+        logger.warning(
+            "invalid_timezone_synced",
+            recipient_id=str(recipient_id),
+            timezone=timezone,
+            fallback=settings.default_timezone,
+        )
 
 
 async def user_upserted(
@@ -44,14 +84,21 @@ async def user_upserted(
     telegram_id: int | None,
     email: str | None,
     locale: str,
+    timezone: str | None,
     active: bool,
 ) -> Recipient:
     """Apply a `user_upserted` sync event (create or update).
 
     recipient_id is the PRODUCT user id (shared id-space, Model B).
-    Writes only the sync-owned fields; preference fields survive
-    re-syncs untouched. Idempotent.
+    Writes only the sync-owned identity fields (incl. timezone, which
+    the product owns -- e.g. VELO users.timezone); the comms-owned
+    quiet_* preference fields survive re-syncs untouched. `timezone`
+    is a required parameter on purpose: the transport must map "field
+    absent in payload" to None explicitly (snapshot discipline), not
+    get it silently via a default. Idempotent.
     """
+    _warn_if_unknown_timezone(recipient_id, timezone)
+
     recipient = await session.get(Recipient, recipient_id)
     if recipient is None:
         recipient = Recipient(
@@ -59,6 +106,7 @@ async def user_upserted(
             telegram_id=telegram_id,
             email=email,
             locale=locale,
+            timezone=timezone,
             active=active,
         )
         session.add(recipient)
@@ -70,10 +118,12 @@ async def user_upserted(
         )
         return recipient
 
-    # Field-by-field on purpose: ONLY the product-owned sync fields.
+    # Field-by-field on purpose: ONLY the product-owned identity
+    # fields; quiet_* preferences stay untouched.
     recipient.telegram_id = telegram_id
     recipient.email = email
     recipient.locale = locale
+    recipient.timezone = timezone
     recipient.active = active
     await session.flush()
     logger.info(

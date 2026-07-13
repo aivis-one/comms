@@ -4,7 +4,14 @@
 #
 # Read/write API for per-recipient notification preferences:
 #   - category mutes (CategoryMute rows; presence = muted),
-#   - quiet hours (timezone + window on the Recipient row).
+#   - quiet hours (window on the Recipient row).
+#
+# TIMEZONE IS NOT A PREFERENCE (Phase 2.1): it is product-owned
+# identity synced via user_upserted (a re-sync would silently clobber
+# anything written here, so there is deliberately NO set_timezone).
+# "The user changed their timezone" is a PRODUCT feature: the product
+# updates its own user record and syncs. RecipientPreferences exposes
+# the synced value read-only for display.
 #
 # Categories are PROFILE vocabulary: the type dictionary maps each
 # type to a category (family granularity -- reminder_24h/1h/10min all
@@ -22,7 +29,6 @@
 from dataclasses import dataclass
 from datetime import time
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import select
@@ -37,7 +43,11 @@ logger = structlog.get_logger()
 
 @dataclass(frozen=True)
 class RecipientPreferences:
-    """Snapshot of one recipient's preferences."""
+    """Snapshot of one recipient's preferences.
+
+    `timezone` is read-only here: sync-owned (see module docstring),
+    included for display alongside the quiet-hours window it governs.
+    """
 
     recipient_id: UUID
     muted_categories: frozenset[str]
@@ -168,30 +178,6 @@ async def set_quiet_hours(
         quiet_from=quiet_from.isoformat(),
         quiet_to=quiet_to.isoformat(),
         days=normalized,
-    )
-
-
-async def set_timezone(
-    session: AsyncSession,
-    recipient_id: UUID,
-    timezone: str | None,
-) -> None:
-    """Set or clear the recipient's IANA timezone."""
-    recipient = await _get_recipient(session, recipient_id)
-    if timezone is not None:
-        try:
-            ZoneInfo(timezone)
-        except (KeyError, ValueError) as exc:
-            raise ValidationError(
-                f"Invalid timezone: {timezone!r}. Must be an IANA name "
-                f"(e.g. 'Europe/Berlin')."
-            ) from exc
-    recipient.timezone = timezone
-    await session.flush()
-    logger.info(
-        "timezone_set",
-        recipient_id=str(recipient_id),
-        timezone=timezone,
     )
 
 

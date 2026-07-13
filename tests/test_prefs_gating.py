@@ -3,13 +3,18 @@
 # =============================================================================
 # Item 5: preference API -- category mutes (idempotent, validated
 #   against the profile), quiet-hours window (all-or-nothing, day
-#   normalization), timezone.
+#   normalization). Timezone is NOT settable here since Phase 2.1
+#   (sync-owned; read-only in RecipientPreferences).
 # Item 6: gating -- a muted recipient gets NO deliveries (gated at
 #   resolve, family granularity via the type dictionary); quiet hours
 #   DEFER delivery via next_retry_at (never suppress), including
 #   backoff retries that land inside a window.
 # Item 7: SKIPPED -- empty-after-mute audiences end SKIPPED; the
 #   status is terminal (invisible to the poll, immune to rollup).
+# Phase 2.1 item 3: LATE MUTES -- a mute set while a delivery sits
+#   gated (backoff / quiet hours) closes it out with
+#   DeliveryStatus.SKIPPED at deliver time; rollup treats skips as
+#   non-events (matrix covered below).
 #
 # Recipients here draw telegram_ids from the Phase 2 band 81000-81999.
 # =============================================================================
@@ -29,7 +34,6 @@ from app.audience.prefs import (
     muted_recipient_ids,
     set_category_muted,
     set_quiet_hours,
-    set_timezone,
 )
 from app.audience.quiet_hours import recipient_quiet_until
 from app.core.database import get_session_factory
@@ -232,21 +236,20 @@ class TestPreferenceApi:
                 quiet_from=time(22, 0), quiet_to=time(8, 0), days=[0, 8],
             )
 
-    async def test_timezone_roundtrip_and_validation(
+    async def test_preferences_expose_synced_timezone_readonly(
         self, db_session: AsyncSession,
     ) -> None:
-        """Valid IANA names round-trip; junk bounces; None clears."""
+        """Timezone is sync-owned (Phase 2.1): prefs only display it.
+
+        There is deliberately no set_timezone -- a re-sync would
+        silently clobber it. The snapshot mirrors whatever sync wrote.
+        """
         recipient = await _phase2_recipient(db_session)
-        await set_timezone(db_session, recipient.id, "Europe/Berlin")
+        recipient.timezone = "Europe/Berlin"
+        await db_session.flush()
+
         prefs = await get_preferences(db_session, recipient.id)
         assert prefs.timezone == "Europe/Berlin"
-
-        with pytest.raises(ValidationError, match="IANA"):
-            await set_timezone(db_session, recipient.id, "Mars/Olympus")
-
-        await set_timezone(db_session, recipient.id, None)
-        prefs = await get_preferences(db_session, recipient.id)
-        assert prefs.timezone is None
 
 
 class TestMuteGating:
@@ -503,3 +506,141 @@ class TestQuietHoursGating:
         )
         assert expected is not None
         assert delivery.next_retry_at == expected
+
+
+class TestLateMuteAtDeliver:
+    """Phase 2.1 item 3: mutes set after resolve close gated
+    deliveries out with DeliveryStatus.SKIPPED at deliver time."""
+
+    async def test_late_mute_closes_deferred_delivery(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Done-when scenario: delivery created -> mute -> gate opens
+        -> NO send; delivery and notification end SKIPPED."""
+        recipient = await _phase2_recipient(db_session)
+        quiet_from, quiet_to, days = _window_around_now()
+        await set_quiet_hours(
+            db_session, recipient.id,
+            quiet_from=quiet_from, quiet_to=quiet_to, days=days,
+        )
+        notification = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.USER,
+            target_value=str(recipient.id),
+            channels=["telegram"],
+        )
+        await db_session.commit()
+
+        # Pass 1: quiet-deferred (delivery exists, nothing sent yet).
+        assert await process_pending_notifications() == 1
+        (delivery,) = await _fetch_deliveries(notification.id)
+        assert delivery.status == DeliveryStatus.PENDING
+
+        # The recipient mutes the category while the delivery waits.
+        await set_category_muted(
+            db_session, recipient.id, "unit_updates", True,
+        )
+        await db_session.commit()
+        await _force_retry_due(delivery.id)
+
+        # Gate opens: an unmuted delivery WOULD send via the stub.
+        await process_pending_notifications()
+
+        (delivery,) = await _fetch_deliveries(notification.id)
+        assert delivery.status == DeliveryStatus.SKIPPED
+        assert delivery.attempts == 0  # a skip is not an attempt
+        assert delivery.sent_at is None
+        fresh = await _fetch_notification(notification.id)
+        assert fresh.status == NotificationStatus.SKIPPED
+
+    async def test_late_mute_mixed_audience_keeps_history(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """One of two mutes while backoff-gated: the muted delivery
+        closes SKIPPED with its transient history intact, the other
+        sends, the notification rolls up SENT."""
+        muted = await _phase2_recipient(db_session)
+        listening = await _phase2_recipient(db_session)
+        notification = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.ALL,
+            target_value="*",
+            channels=["telegram"],
+        )
+        await db_session.commit()
+
+        # Pass 1: both fail transiently -> attempts 1, backoff-gated.
+        with patch(
+            "app.engine.service.get_formatter",
+            return_value=_FailingFormatter(),
+        ):
+            await process_pending_notifications()
+
+        deliveries = await _fetch_deliveries(notification.id)
+        assert all(d.attempts == 1 for d in deliveries)
+
+        # Late mute for one of the two, then the gates open.
+        await set_category_muted(db_session, muted.id, "unit_updates", True)
+        await db_session.commit()
+        for delivery in deliveries:
+            await _force_retry_due(delivery.id)
+
+        await process_pending_notifications()
+
+        by_recipient = {
+            d.recipient_id: d
+            for d in await _fetch_deliveries(notification.id)
+        }
+        skipped = by_recipient[muted.id]
+        sent = by_recipient[listening.id]
+        assert skipped.status == DeliveryStatus.SKIPPED
+        assert skipped.attempts == 1  # prior transient history kept
+        assert skipped.error_message is not None
+        assert sent.status == DeliveryStatus.SENT
+        fresh = await _fetch_notification(notification.id)
+        assert fresh.status == NotificationStatus.SENT
+
+    async def test_rollup_matrix_with_skipped(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Skips are non-events: the verdict comes from the rest."""
+        cases: list[tuple[str, str, str]] = [
+            (DeliveryStatus.SKIPPED, DeliveryStatus.SENT,
+             NotificationStatus.SENT),
+            (DeliveryStatus.SKIPPED, DeliveryStatus.FAILED,
+             NotificationStatus.FAILED),
+            (DeliveryStatus.SKIPPED, DeliveryStatus.PENDING,
+             NotificationStatus.PROCESSING),
+            (DeliveryStatus.SKIPPED, DeliveryStatus.SKIPPED,
+             NotificationStatus.SKIPPED),
+        ]
+        await _phase2_recipient(db_session)
+        await _phase2_recipient(db_session)
+
+        for status_a, status_b, expected in cases:
+            notification = await create_notification(
+                db_session,
+                type="unit_event",
+                title="T",
+                body="B",
+                target_type=TargetType.ALL,
+                target_value="*",
+                channels=["telegram"],
+            )
+            deliveries = await resolve_notification(db_session, notification)
+            assert len(deliveries) == 2
+            deliveries[0].status = status_a
+            deliveries[1].status = status_b
+            await db_session.flush()
+
+            await rollup_notification(db_session, notification)
+            assert notification.status == expected, (
+                f"{status_a}+{status_b} -> expected {expected}, "
+                f"got {notification.status}"
+            )

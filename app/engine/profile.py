@@ -23,8 +23,14 @@
 #   - tree shape (mappings at every level, strings at the leaves);
 #   - the YAML flow-mapping trap: a bare `body: {title}` parses as a
 #     dict, not a string -- caught with an explicit hint;
-#   - a dry run of every template through format_map(SafeDict()) so a
-#     broken format spec kills the service now, not on delivery;
+#   - a dry run of every template through format_map with a PROBE
+#     value whose __format__ accepts a spec iff at least one JSON
+#     scalar type (str, int, float) accepts it. Money/number specs
+#     ({amount:,.2f}) pass; garbage ({a:zzz}) and strftime specs
+#     ({when:%d.%m}) die at startup -- variables travel through JSONB,
+#     so a datetime can never reach render() and date-like specs are
+#     true positives. Attribute access ({user.name}) is rejected too:
+#     JSON objects arrive as dicts, use item access ({user[name]}).
 #   - templates for types missing from the dictionary -> loud warning
 #     (not fatal: additive contract, profile may ship templates ahead
 #     of enabling a type).
@@ -44,7 +50,6 @@ import yaml
 from app.core.config import settings
 from app.core.exceptions import ProfileError
 from app.engine.registry import ProfileRegistry, TemplateTree, registry
-from app.engine.template_engine import SafeDict
 
 logger = structlog.get_logger()
 
@@ -278,6 +283,56 @@ def _parse_template_tree(
     return tree
 
 
+class _FormatProbe:
+    """Dry-run stand-in for one template variable.
+
+    __format__ accepts a spec iff at least one JSON scalar runtime
+    type (str, int, float) accepts it -- i.e. there EXISTS a value the
+    template would render with. datetime is deliberately NOT probed:
+    (a) datetime.__format__ delegates to strftime, which swallows any
+    garbage literally -- the probe would accept everything and stop
+    detecting anything; (b) template variables travel through the
+    action_data JSONB column, so a datetime can never reach render()
+    -- date-like specs are guaranteed runtime failures, rejecting them
+    here is a true positive. Contract: the product sends dates as
+    pre-formatted strings (same principle as pre-rendered digests).
+
+    Item access returns another probe ({user[name]} works on the JSON
+    dicts that actually arrive). Attribute access is deliberately NOT
+    provided: getattr on a dict fails at runtime, so {user.name} must
+    die at validation, not on the delivery path.
+    """
+
+    def __format__(self, spec: str) -> str:
+        if not spec:
+            return ""
+        for probe_value in ("", 0, 0.0):
+            try:
+                format(probe_value, spec)
+            except (ValueError, TypeError):
+                continue
+            return ""
+        raise ValueError(
+            f"format spec {spec!r} is not valid for any JSON scalar "
+            f"type (str, int, float)"
+        )
+
+    def __getitem__(self, key: object) -> "_FormatProbe":
+        return self
+
+    def __str__(self) -> str:
+        # For the !s conversion: the result is a str, so the spec is
+        # then checked against str semantics -- same as at runtime.
+        return ""
+
+
+class _ProbeDict(dict[str, Any]):
+    """format_map mapping for the dry run: every name is a probe."""
+
+    def __missing__(self, key: str) -> _FormatProbe:
+        return _FormatProbe()
+
+
 def _validate_leaf(
     locale: str,
     type_key: str,
@@ -303,13 +358,20 @@ def _validate_leaf(
             f"{where} must be a string, got {type(template).__name__}"
         )
     try:
-        # Dry run: SafeDict absorbs missing variables, so the ONLY
-        # failures left are broken format specs -- exactly what must
-        # kill startup instead of surfacing on the delivery path.
-        template.format_map(SafeDict())
-    except (ValueError, TypeError, IndexError) as exc:
+        # Dry run against probes: parser errors (unbalanced braces,
+        # bad conversions) and specs no JSON scalar accepts surface
+        # here -- exactly what must kill startup instead of the
+        # delivery path. Specs valid for SOME runtime value pass.
+        template.format_map(_ProbeDict())
+    except AttributeError as exc:
         raise ProfileError(
-            f"{where} has a broken format spec: {exc}. "
+            f"{where} uses attribute access on a template variable "
+            f"({exc}). Variables are JSON values, so `{{user.name}}` "
+            f"fails at runtime -- use item access (`{{user[name]}}`)."
+        ) from exc
+    except (ValueError, TypeError, IndexError, KeyError) as exc:
+        raise ProfileError(
+            f"{where} has a broken format spec or field path: {exc}. "
             f"Template language is str.format_map -- check braces "
             f"and format specs."
         ) from exc

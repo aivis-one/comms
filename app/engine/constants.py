@@ -29,8 +29,12 @@
 #   (FAILED would drown real alerts) nor a delivery (SENT would hide
 #   a broken sync).
 #
-# DELIVERY STATUS LIFECYCLE:
-#   pending -> sent | failed
+# DELIVERY STATUS LIFECYCLE (SKIPPED added in Phase 2.1):
+#   pending -> sent | failed | skipped
+#
+#   SKIPPED (terminal) -- the recipient muted the notification's
+#   category while the delivery sat gated (backoff or quiet hours).
+#   Mirrors the notification-level SKIPPED: not a fault, not a send.
 # =============================================================================
 
 import enum
@@ -57,6 +61,11 @@ class DeliveryStatus(enum.StrEnum):
     PENDING = "pending"
     SENT = "sent"
     FAILED = "failed"
+    # Terminal: the recipient muted the category after the delivery
+    # row was created (late mute, re-checked at deliver time). Varchar
+    # column -- no DDL needed (append-only), same as the notification
+    # SKIPPED.
+    SKIPPED = "skipped"
 
 
 class DeliveryChannel(enum.StrEnum):
