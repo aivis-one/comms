@@ -218,6 +218,17 @@ class TestTelegramDeliver:
         with pytest.raises(PermanentDeliveryError):
             await fmt.deliver(_notification(), _delivery(), _recipient())
 
+    async def test_invalid_button_url_is_permanent(self) -> None:
+        """Review 1.2: button URL derives from immutable action_data --
+        deterministic failure, a retry cannot fix it."""
+        error = TelegramAPIError(
+            method=SimpleNamespace(),  # type: ignore[arg-type]
+            message="Bad Request: BUTTON_URL_INVALID",
+        )
+        fmt = TelegramFormatter(bot=_FakeBot(error=error), bot_url=BOT_URL)
+        with pytest.raises(PermanentDeliveryError):
+            await fmt.deliver(_notification(), _delivery(), _recipient())
+
     async def test_transient_error_reraised(self) -> None:
         """Non-permanent Telegram errors bubble up for retry."""
         error = TelegramAPIError(

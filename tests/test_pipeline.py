@@ -376,6 +376,65 @@ class TestRetryBackoff:
             delta = (delivery.next_retry_at - before).total_seconds()
             assert 190 <= delta <= 215
 
+    async def test_gated_notification_invisible_to_batch(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Review 1.2: while every delivery is gated, the batch skips
+        the notification entirely -- no idle locks, processed == 0
+        (the worker loop can back off) -- while fresh work still flows."""
+        recipient = await create_recipient(db_session)
+        gated = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.USER,
+            target_value=str(recipient.id),
+            channels=["telegram"],
+        )
+        await db_session.commit()
+
+        with patch(
+            "app.engine.service.get_formatter",
+            return_value=_FailingFormatter(),
+        ):
+            # Attempt 1 -> delivery gated into the future.
+            assert await process_pending_notifications() == 1
+            (delivery,) = await _fetch_deliveries(gated.id)
+            assert delivery.attempts == 1
+            assert delivery.next_retry_at is not None
+
+            # Gate closed -> the batch sees NOTHING (processed == 0,
+            # so the worker loop's backoff engages).
+            assert await process_pending_notifications() == 0
+            (delivery,) = await _fetch_deliveries(gated.id)
+            assert delivery.attempts == 1
+
+            # A fresh notification still flows while the first is gated.
+            fresh = await create_notification(
+                db_session,
+                type="unit_event",
+                title="F",
+                body="B",
+                target_type=TargetType.USER,
+                target_value=str(recipient.id),
+                channels=["telegram"],
+            )
+            await db_session.commit()
+            assert await process_pending_notifications() == 1
+            (fresh_delivery,) = await _fetch_deliveries(fresh.id)
+            assert fresh_delivery.attempts == 1
+
+            # Both gated now -> batch empty again.
+            assert await process_pending_notifications() == 0
+
+            # Window passes -> the gated one is visible again.
+            await _force_retry_due(delivery.id)
+            assert await process_pending_notifications() == 1
+
+        (delivery,) = await _fetch_deliveries(gated.id)
+        assert delivery.attempts == 2
+
     async def test_backoff_capped(
         self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

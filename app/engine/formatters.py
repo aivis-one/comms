@@ -134,6 +134,9 @@ _PERMANENT_ERRORS = frozenset({
     # from broken HTML in the template itself -- a config error that a
     # retry cannot fix.
     "can't parse entities",
+    # Review 1.2: the button URL is built from immutable action_data --
+    # an invalid URL is deterministic, retrying cannot fix it.
+    "button_url_invalid",
 })
 
 

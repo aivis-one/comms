@@ -41,12 +41,12 @@
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, or_, select, update
 
 from app.core.config import settings
 from app.core.database import get_session_factory
-from app.engine.constants import NotificationStatus
-from app.engine.models import Notification
+from app.engine.constants import DeliveryStatus, NotificationStatus
+from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
     deliver_notification,
     resolve_notification,
@@ -93,14 +93,35 @@ async def process_pending_notifications() -> int:
             logger.exception("notification_expire_error")
 
     # -- Step 1: Collect IDs of notifications to process --
+    # Review 1.2: PENDING rows are always ready (not yet resolved).
+    # PROCESSING rows are picked only when at least one delivery is
+    # actually attemptable (pending + retry gate open) -- otherwise a
+    # gated notification would be locked and no-op'ed every tick, and
+    # the no-op "processed" count would keep the worker loop from
+    # backing off for the whole backoff window.
     async with factory() as session:
+        ready_delivery = (
+            select(NotificationDelivery.id)
+            .where(
+                NotificationDelivery.notification_id == Notification.id,
+                NotificationDelivery.status == DeliveryStatus.PENDING,
+                or_(
+                    NotificationDelivery.next_retry_at.is_(None),
+                    NotificationDelivery.next_retry_at <= now,
+                ),
+            )
+            .exists()
+        )
         stmt = (
             select(Notification.id)
             .where(
-                Notification.status.in_([
-                    NotificationStatus.PENDING,
-                    NotificationStatus.PROCESSING,
-                ]),
+                or_(
+                    Notification.status == NotificationStatus.PENDING,
+                    and_(
+                        Notification.status == NotificationStatus.PROCESSING,
+                        ready_delivery,
+                    ),
+                ),
                 Notification.scheduled_at <= now,
             )
             .order_by(Notification.priority, Notification.scheduled_at)
