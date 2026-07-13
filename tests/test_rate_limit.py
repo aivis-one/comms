@@ -150,6 +150,8 @@ class TestRateLimitDeferral:
         assert len(deferred) == 1
         # No expiry on this notification -> the causality flag is off.
         assert deferred[0]["beyond_expiry"] is False
+        # 42s is well under the trust ceiling -> honored as-is.
+        assert deferred[0]["capped"] is False
 
         delivery = await _fetch_delivery(notification.id)
         assert delivery.status == DeliveryStatus.PENDING
@@ -250,26 +252,39 @@ class TestRateLimitDeferral:
         self, db_session: AsyncSession,
     ) -> None:
         """Phase 2.3: retry_after is UNTRUSTED channel output -- a
-        pathological value (ms-vs-s mixup, buggy server) must not park
-        the delivery for hours. Honored wait is capped at
-        notification_retry_backoff_max_seconds; jitter rides on top of
-        the CAPPED value."""
+        pathological value must not park the delivery for hours. The
+        honored wait is capped at the DEDICATED trust knob
+        (notification_max_retry_after_seconds, generous by design);
+        jitter rides on top of the CAPPED value; the override is
+        named in the log (capped=true is an alarm signal)."""
         _, notification = await _rate_limited_setup(db_session)
-        cap = settings.notification_retry_backoff_max_seconds  # 600
+        cap = settings.notification_max_retry_after_seconds
 
         before = datetime.now(UTC)
-        with patch(
-            "app.engine.service.get_formatter",
-            return_value=_RateLimitedFormatter(retry_after=3600.0),
+        with (
+            patch(
+                "app.engine.service.get_formatter",
+                return_value=_RateLimitedFormatter(
+                    retry_after=float(cap * 2),
+                ),
+            ),
+            capture_logs() as logs,
         ):
             assert await process_pending_notifications() == 1
+
+        deferred = [
+            log for log in logs
+            if log["event"] == "delivery_rate_limit_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0]["capped"] is True
 
         delivery = await _fetch_delivery(notification.id)
         assert delivery.status == DeliveryStatus.PENDING
         assert delivery.attempts == 0
         assert delivery.rate_limit_deferrals == 1
         assert delivery.next_retry_at is not None
-        # cap + jitter(1..2), NOT the server-named hour.
+        # cap + jitter(1..2), NOT the server-named double.
         low = before + timedelta(seconds=cap)
         high = datetime.now(UTC) + timedelta(seconds=cap + 2)
         assert low <= delivery.next_retry_at <= high

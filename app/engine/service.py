@@ -325,8 +325,9 @@ async def deliver_notification(
     - CHANNEL RATE LIMIT (Phase 2.2): a 429 is "come back later", not
       a message failure -- the delivery is deferred via next_retry_at
       using the SERVER-NAMED retry_after (capped at
-      notification_retry_backoff_max_seconds -- the channel's word is
-      untrusted input; +1-2s jitter against thundering herd), without
+      notification_max_retry_after_seconds -- a dedicated trust limit
+      on channel-named waits, generous so capping stays exceptional;
+      +1-2s jitter against thundering herd), without
       burning an attempt; a per-delivery deferral budget
       (rate_limit_deferrals vs
       settings.notification_max_rate_limit_deferrals) bounds the
@@ -450,21 +451,26 @@ async def deliver_notification(
                     delivery.rate_limit_deferrals += 1
                     # CAP the honored server wait (Phase 2.3):
                     # retry_after is UNTRUSTED channel output steering
-                    # our scheduler -- a buggy server or a ms-vs-s mixup
-                    # would park the delivery for hours without burning
-                    # an attempt. Reuses backoff_max on purpose: "no
-                    # failure-driven gate exceeds X" is one coherent
-                    # policy (quiet hours are a user preference, a
-                    # different category). Deliberate trade-off: a
-                    # LEGITIMATE flood-wait longer than the cap now
-                    # burns the deferral budget in cap-sized bites and
-                    # ends in an explicit FAILED with full history --
-                    # better observability than silently parking for
-                    # hours on a value we cannot verify.
+                    # our scheduler -- a pathological value (ms-vs-s
+                    # mixup, buggy server) must not park the delivery
+                    # for hours. The ceiling is a dedicated TRUST knob
+                    # (max_retry_after), deliberately generous so that
+                    # capping stays EXCEPTIONAL: capped=true below
+                    # means "the channel asked to wait longer than we
+                    # are willing to honor" -- overriding the very
+                    # server that rate-limits us is the road to bot
+                    # bans if it ever becomes routine. Pairs with
+                    # rate_limit_deferrals as a promotion signal for
+                    # the broadcast-hardening backlog. A LEGITIMATE
+                    # wait beyond the cap burns the deferral budget in
+                    # cap-sized bites and ends in an explicit FAILED
+                    # with full history -- better observability than
+                    # silently parking on a value we cannot verify.
                     honored = min(
                         outcome.retry_after,
-                        float(settings.notification_retry_backoff_max_seconds),
+                        float(settings.notification_max_retry_after_seconds),
                     )
+                    capped = outcome.retry_after > honored
                     # Jitter on top (added AFTER the cap -- the jitter
                     # is ours, not the server's): every delivery
                     # deferred by one burst must NOT wake in the same
@@ -485,6 +491,7 @@ async def deliver_notification(
                         "delivery_rate_limit_deferred",
                         delivery_id=str(delivery.id),
                         retry_after=outcome.retry_after,
+                        capped=capped,
                         deferrals=delivery.rate_limit_deferrals,
                         budget=budget,
                         beyond_expiry=beyond_expiry,

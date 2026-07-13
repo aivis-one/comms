@@ -88,9 +88,19 @@ class Settings(BaseSettings):
     # to the cbshome donor's 1-minute worker tick, where retries were
     # meaningful (review 1.1: retries burned within seconds).
     notification_retry_backoff_base_seconds: int = 30
-    # Double duty (Phase 2.3): also caps the honored 429 retry_after
-    # -- "no failure-driven gate exceeds this" is one policy knob.
     notification_retry_backoff_max_seconds: int = 600
+
+    # Phase 2.3: TRUST limit on the channel-named 429 wait -- a
+    # SEPARATE knob from our backoff policy on purpose. backoff_max
+    # is OUR retry policy; this is how far we trust the SERVER's
+    # word. Deliberately generous (an hour): the cap is protection
+    # from absurdity (ms-vs-s mixups, buggy servers), not a working
+    # mode -- capping must stay exceptional, so that capped=true in
+    # the deferral log remains an ALARM ("we overrode the server
+    # that rate-limits us" -- the road to bot bans if routine), not
+    # noise. Telegram legitimately asks for 1000-3000s on serious
+    # flood waits; those must be honored, not capped.
+    notification_max_retry_after_seconds: int = 3600
 
     # Phase 2.2: how many channel rate-limit (429) deferrals a single
     # delivery gets before a 429 degrades to a regular transient
@@ -154,6 +164,14 @@ class Settings(BaseSettings):
                 "NOTIFICATION_MAX_RATE_LIMIT_DEFERRALS must be >= 0 "
                 "(0 disables 429 deferrals: every 429 is a regular "
                 "transient failure)."
+            )
+
+        if self.notification_max_retry_after_seconds <= 0:
+            raise ValueError(
+                "NOTIFICATION_MAX_RETRY_AFTER_SECONDS must be > 0 "
+                "(it bounds how long a channel-named 429 wait is "
+                "honored; 0 would turn every deferral into an "
+                "immediate re-poll)."
             )
 
         return self
