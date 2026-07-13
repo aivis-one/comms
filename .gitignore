@@ -21,3 +21,4 @@ venv/
 .vscode/
 /docs/
 /tmp/
+.DS_Store
