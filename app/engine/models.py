@@ -56,6 +56,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
+from app.core.constants import MAX_TYPE_KEY_LEN
 from app.core.database import Base
 from app.core.mixins import UUIDMixin
 from app.engine.constants import DeliveryStatus, NotificationStatus
@@ -67,9 +68,11 @@ class Notification(UUIDMixin, Base):
     __tablename__ = "notifications"
 
     # Domain type key, validated against the profile registry
-    # (NOT a hardcoded enum -- see app/engine/registry.py).
+    # (NOT a hardcoded enum -- see app/engine/registry.py). Width is
+    # the shared constant so the profile validator checks against the
+    # same number the column declares (Phase 3a item 6).
     type: Mapped[str] = mapped_column(
-        String(50),
+        String(MAX_TYPE_KEY_LEN),
         nullable=False,
         index=True,
     )

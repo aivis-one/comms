@@ -451,6 +451,79 @@ class TestFormatSpecProbing:
         ) is None
 
 
+class TestPresentationLeafValidation:
+    """Phase 3a item 1: flag fields (disable_preview / silent) must be
+    YAML booleans; button_text is an ordinary template string and is
+    dry-run like title/body."""
+
+    def test_flag_as_quoted_string_is_fatal(self, tmp_path: Path) -> None:
+        """A quoted "true" is a STRING -- the single most likely
+        authoring mistake for a flag."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": 'unit_event:\n  telegram:\n    silent: "true"\n'},
+        )
+        with pytest.raises(ProfileError, match=r"boolean"):
+            load_profile(FileProfileSource(root))
+
+    def test_flag_as_int_is_fatal(self, tmp_path: Path) -> None:
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": "unit_event:\n  telegram:\n    disable_preview: 1\n"},
+        )
+        with pytest.raises(ProfileError, match=r"boolean"):
+            load_profile(FileProfileSource(root))
+
+    def test_bare_booleans_pass(self, tmp_path: Path) -> None:
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": (
+                "unit_event:\n  telegram:\n"
+                "    disable_preview: false\n    silent: true\n"
+            )},
+        )
+        profile = load_profile(FileProfileSource(root))
+        tree = profile.templates["en"]["unit_event"]["telegram"]
+        assert tree["disable_preview"] is False
+        assert tree["silent"] is True
+
+    def test_button_text_is_dry_run_like_any_template(
+        self, tmp_path: Path,
+    ) -> None:
+        """button_text is a template string: a broken format spec dies
+        at startup, exactly like a broken title/body."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": (
+                'unit_event:\n  telegram:\n    button_text: "{x:zzz}"\n'
+            )},
+        )
+        with pytest.raises(ProfileError, match=r"button_text"):
+            load_profile(FileProfileSource(root))
+
+    def test_resolve_flag_locale_chain(self) -> None:
+        """resolve_flag walks requested -> default locale, per field;
+        absent everywhere -> None (channel default applies)."""
+        from app.engine.template_engine import resolve_flag
+
+        registry.register_templates(
+            "en",
+            {"unit_plain": {"telegram": {"silent": True}}},
+        )
+        # Requested locale has no sheet -> falls back to default (en).
+        assert resolve_flag(
+            "unit_plain", "telegram", "silent", locale="ru",
+        ) is True
+        # Absent everywhere -> None.
+        assert resolve_flag(
+            "unit_plain", "telegram", "disable_preview", locale="ru",
+        ) is None
+
+
 class TestKeyLengthValidation:
     """Phase 2.2 item 2: profile keys are length-checked at startup
     against the ACTUAL widths of the DB columns they land in -- a
@@ -478,12 +551,21 @@ class TestKeyLengthValidation:
         profile = load_profile(FileProfileSource(root))
         assert "k" * 50 in profile.types
 
-    def test_column_length_guard_raises_not_asserts(self) -> None:
-        """Phase 2.3: the introspection guard is a REAL runtime check
-        (survives `python -O`) -- a non-String column raises loudly."""
-        from app.engine.profile import _string_column_length
+    def test_constants_match_actual_column_widths(self) -> None:
+        """Phase 3a item 6: the widths moved from model introspection
+        to shared constants (app/core/constants.py) to break the
+        engine<->audience package cycle. This test is what keeps the
+        constants HONEST: if a migration ever widens a column without
+        touching the constant (or vice versa), it fails here -- the
+        cross-package import lives in the test, not in app code."""
+        from sqlalchemy import String
 
-        with pytest.raises(RuntimeError, match="String column"):
-            _string_column_length(
-                Notification.__table__.c["created_at"],  # DateTime
-            )
+        from app.audience.models import CategoryMute
+        from app.core.constants import MAX_CATEGORY_LEN, MAX_TYPE_KEY_LEN
+
+        type_col = Notification.__table__.c["type"].type
+        category_col = CategoryMute.__table__.c["category"].type
+        assert isinstance(type_col, String)
+        assert isinstance(category_col, String)
+        assert type_col.length == MAX_TYPE_KEY_LEN
+        assert category_col.length == MAX_CATEGORY_LEN

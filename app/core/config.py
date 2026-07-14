@@ -100,6 +100,11 @@ class Settings(BaseSettings):
     # that rate-limits us" -- the road to bot bans if routine), not
     # noise. Telegram legitimately asks for 1000-3000s on serious
     # flood waits; those must be honored, not capped.
+    # NOTE (Phase 3a fix D): the proportional 429 jitter (up to +50%,
+    # see _RATE_LIMIT_JITTER_MAX_FRACTION in app/engine/service.py)
+    # rides ON TOP of the capped value and is one-sided (never earlier
+    # than the server asked) -- the effective wait ceiling is
+    # cap x 1.5, not cap.
     notification_max_retry_after_seconds: int = 3600
 
     # Phase 2.2: how many channel rate-limit (429) deferrals a single
@@ -109,6 +114,26 @@ class Settings(BaseSettings):
     # retry_after values (3-30s) the default buys minutes of honest
     # waiting -- far beyond any realistic burst at current scale.
     notification_max_rate_limit_deferrals: int = 10
+
+    # Phase 3a item 5: retention of TERMINAL notifications (SENT /
+    # FAILED / SKIPPED / EXPIRED) -- rows older than this are deleted
+    # in batches by the worker's retention pass, deliveries follow by
+    # FK cascade. Age is measured on created_at.
+    # SEMANTICS (fix I): <= 0 means retention is DISABLED -- never
+    # "delete everything now". A stray RETENTION_DAYS=0 in env must
+    # not become an irreversible wipe of the whole history; disabling
+    # is loud (worker startup log).
+    notification_retention_days: int = 90
+
+    # Phase 3a fix H: the retention pass runs on its OWN slow cadence,
+    # not on the 5s worker tick -- the batched DELETE scans without an
+    # index (acknowledged, BL-3) and days-granular retention gains
+    # nothing from second-granular scheduling. Per-process monotonic
+    # gate in app/engine/worker.py. Strictly > 0 (fix I): 0 is a
+    # config error at startup, NOT "every tick" -- someone writing 0
+    # to mean "off" must not get the hottest possible cadence; "off"
+    # is NOTIFICATION_RETENTION_DAYS <= 0.
+    notification_retention_interval_seconds: int = 3600
 
     # -- Computed properties --
 
@@ -172,6 +197,14 @@ class Settings(BaseSettings):
                 "(it bounds how long a channel-named 429 wait is "
                 "honored; 0 would turn every deferral into an "
                 "immediate re-poll)."
+            )
+
+        if self.notification_retention_interval_seconds <= 0:
+            raise ValueError(
+                "NOTIFICATION_RETENTION_INTERVAL_SECONDS must be > 0. "
+                "To disable retention set "
+                "NOTIFICATION_RETENTION_DAYS to 0 or a negative "
+                "value; interval 0 does NOT mean 'every tick'."
             )
 
         return self

@@ -15,8 +15,15 @@
 # and per-type preference categories for mute gating.
 #
 # TEMPLATE STRUCTURE (same shape as cbshome YAML, held in memory):
-#   {locale: {type: {channel: {field: template_str}}}}
+#   {locale: {type: {channel: {field: leaf}}}}
 #   e.g. templates["en"]["booking_confirmed"]["telegram"]["body"]
+#
+#   Since Phase 3a (item 1) the sheet owns PRESENTATION, not only
+#   text: a leaf is either a template STRING (title / body / subject /
+#   button_text / ...) or a presentation FLAG (bool: disable_preview /
+#   silent). The two kinds are read through separate, type-disciplined
+#   accessors (get_template / get_flag) so a bool can never leak into
+#   a rendered message as "True".
 #
 # THREADING:
 #   Registration happens at startup / test setup, before the worker or
@@ -29,8 +36,9 @@ import structlog
 
 logger = structlog.get_logger()
 
-# Nested template mapping: {type: {channel: {field: template_str}}}.
-TemplateTree = dict[str, dict[str, dict[str, str]]]
+# Nested template mapping: {type: {channel: {field: leaf}}}; a leaf
+# is a template string or a presentation flag (Phase 3a item 1).
+TemplateTree = dict[str, dict[str, dict[str, str | bool]]]
 
 
 class ProfileRegistry:
@@ -118,14 +126,47 @@ class ProfileRegistry:
         channel: str,
         field: str,
     ) -> str | None:
-        """Look up a template string; None if any level is missing."""
-        value = (
+        """Look up a template string; None if missing or not a string.
+
+        Presentation FLAGS (bool leaves, Phase 3a item 1) are
+        deliberately invisible here: the old str() cast would turn
+        True into the rendered text "True". Flags go through
+        get_flag().
+        """
+        value = self._get_leaf(locale, type_key, channel, field)
+        return value if isinstance(value, str) else None
+
+    def get_flag(
+        self,
+        locale: str,
+        type_key: str,
+        channel: str,
+        field: str,
+    ) -> bool | None:
+        """Look up a presentation flag; None if missing or not a bool.
+
+        Mirror of get_template's type discipline (Phase 3a item 1).
+        The profile validator enforces bool for flag fields at load
+        time; anything registered past it that is not a bool resolves
+        to None here, and the channel default applies.
+        """
+        value = self._get_leaf(locale, type_key, channel, field)
+        return value if isinstance(value, bool) else None
+
+    def _get_leaf(
+        self,
+        locale: str,
+        type_key: str,
+        channel: str,
+        field: str,
+    ) -> str | bool | None:
+        """Raw leaf lookup shared by the typed accessors."""
+        return (
             self._templates.get(locale, {})
             .get(type_key, {})
             .get(channel, {})
             .get(field)
         )
-        return None if value is None else str(value)
 
     # -- Lifecycle --
 

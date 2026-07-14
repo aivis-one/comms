@@ -57,5 +57,8 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      - name: Domain-literal fence (arch doc §2.6 / decision 13)
+        run: python scripts/check_domain_literals.py
+
       - name: Type check (mypy)
         run: mypy app

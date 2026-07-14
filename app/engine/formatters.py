@@ -17,10 +17,13 @@
 #   - Message building, inline deep-link button, channel_options
 #     handling and the injected-Bot constructor come from velo
 #     (the richer donor for the send path).
-#   - format_deep_link is PORTED AS-IS from velo (handoff item 4);
-#     only the bot URL source moved to comms config
-#     (settings.telegram_bot_url). Everything else around deep links
-#     is Phase 3 scope and deliberately untouched.
+#   - format_deep_link enforces the ONE-PARAMETER encoding rule
+#     (Phase 3a item 3, arch doc §2.6): the whole ?startapp= value is
+#     validated (charset [A-Za-z0-9_-], 64 chars) AT LINK BUILD;
+#     violations are config errors -> loud PermanentDeliveryError with
+#     the greppable "deep link:" prefix, never a silently broken
+#     button. The velo heritage of joining values with "_" is gone --
+#     it could not be parsed back.
 #   - Permanent-error detection merges velo's _PERMANENT_ERRORS
 #     substrings (richer) with cbshome's exception-based contract:
 #     the formatter RAISES PermanentDeliveryError instead of returning
@@ -50,7 +53,7 @@ from app.audience.models import Recipient
 from app.core.config import settings
 from app.engine.constants import DeliveryChannel
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.template_engine import render
+from app.engine.template_engine import render, resolve_flag
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -156,6 +159,16 @@ _PERMANENT_ERRORS = frozenset({
 })
 
 
+# Deep-link encoding limits (Phase 3a item 3, arch doc §2.6).
+# Telegram's ?startapp= payload is fragile: charset [A-Za-z0-9_-] and
+# at most 64 characters -- for the WHOLE value, action and parameter
+# together. Validated at link build; a violation is a CONFIG error
+# (action_data is immutable -> deterministic, same logic as
+# button_url_invalid) and must fail LOUDLY, not ship a dead button.
+_STARTAPP_ALLOWED_RE = re.compile(r"[A-Za-z0-9_-]+")
+_STARTAPP_MAX_LEN = 64
+
+
 class TelegramFormatter:
     """Deliver notifications via Telegram Bot API (aiogram 3.x).
 
@@ -179,17 +192,38 @@ class TelegramFormatter:
     ) -> str | None:
         """Convert action_data to a Telegram WebApp deep link.
 
-        PORTED AS-IS from velo (Phase 7.3). Deep-link work beyond this
-        transfer is Phase 3 scope.
+        ENCODING RULE (Phase 3a item 3, arch doc §2.6): at most ONE
+        parameter. The velo heritage of joining several values with
+        "_" cannot be unpacked -- the separator is legal inside the
+        values -- so multi-parameter targets are forbidden outright.
+        Composite targets belong behind an OPAQUE TOKEN minted by the
+        product, never packed field-by-field into the string.
 
-        Format: {bot_url}?startapp={action}__{param1}_{param2}
+        The ASSEMBLED value ({action} or {action}__{param}) is
+        validated here, at link build: charset [A-Za-z0-9_-] and the
+        64-char limit apply to the whole thing. A violation is a
+        CONFIG error -- action_data is immutable, so the failure is
+        deterministic and a retry cannot fix it (same logic as
+        button_url_invalid, review 1.2) -- and raises
+        PermanentDeliveryError whose message starts with the STABLE
+        "deep link:" prefix: encoding failures are greppable in
+        NotificationDelivery.error_message.
+
+        The domain comes from env (settings.telegram_bot_url via the
+        constructor) -- no domain literals in code (item 4,
+        decision 13).
 
         Args:
             action_data: {"action": "open_practice",
-                          "params": {"practice_id": "uuid"}}
+                          "params": {"practice_id": "<uuid>"}}
 
         Returns:
-            Deep link URL or None if no action_data.
+            Deep link URL, or None when there is nothing to link
+            (no action_data / no action).
+
+        Raises:
+            PermanentDeliveryError: More than one parameter, or the
+                assembled startapp value violates charset/length.
         """
         if not action_data:
             return None
@@ -198,12 +232,34 @@ class TelegramFormatter:
         if not action:
             return None
 
-        params = action_data.get("params", {})
-        if params:
-            param_str = "_".join(str(v) for v in params.values())
-            return f"{self._bot_url}?startapp={action}__{param_str}"
+        params = action_data.get("params") or {}
+        if len(params) > 1:
+            raise PermanentDeliveryError(
+                f"deep link: action {action!r} carries {len(params)} "
+                f"parameters ({sorted(params)}); the startapp encoding "
+                f"fits at most ONE. Put composite targets behind an "
+                f"opaque token on the product side."
+            )
 
-        return f"{self._bot_url}?startapp={action}"
+        if params:
+            (value,) = params.values()
+            startapp = f"{action}__{value}"
+        else:
+            startapp = str(action)
+
+        if len(startapp) > _STARTAPP_MAX_LEN:
+            raise PermanentDeliveryError(
+                f"deep link: startapp value is {len(startapp)} chars, "
+                f"the Telegram limit is {_STARTAPP_MAX_LEN}: "
+                f"{startapp[:80]!r}"
+            )
+        if not _STARTAPP_ALLOWED_RE.fullmatch(startapp):
+            raise PermanentDeliveryError(
+                f"deep link: startapp value contains characters outside "
+                f"[A-Za-z0-9_-]: {startapp!r}"
+            )
+
+        return f"{self._bot_url}?startapp={startapp}"
 
     async def deliver(
         self,
@@ -213,14 +269,27 @@ class TelegramFormatter:
     ) -> bool:
         """Send a Telegram message to the recipient.
 
-        Renders title/body templates for the recipient's locale
-        (falling back to the stored values), builds an HTML message,
-        and attaches an inline deep-link button when action_data
-        carries an action.
+        COMPOSITION RULE (Phase 3a item 2): the markup source follows
+        the CONTENT source, per field. A template-rendered field is
+        trusted and goes into the message VERBATIM -- the sheet owns
+        its own markup, nothing is injected on top. A stored-fallback
+        field is untrusted content (escaped), so the SERVICE supplies
+        its presentation: the stored title keeps the historical <b>
+        wrap, the stored body stays plain. Mixed cases fall out of the
+        same per-field rule: a template body next to a stored title
+        bolds ONLY the title, and vice versa. The "\n\n" join is
+        structure, not markup -- a per-field template cannot express
+        the seam between two fields.
+
+        PRESENTATION (Phase 3a item 1): button_text / disable_preview
+        / silent resolve template sheet (localizable default) <
+        channel_options (per-delivery override); the deep-link button
+        appears when action_data carries an action.
 
         Raises:
-            PermanentDeliveryError: If the recipient has no telegram_id
-                or the Telegram API reports a permanent failure.
+            PermanentDeliveryError: If the recipient has no telegram_id,
+                the deep link cannot be encoded (item 3), or the
+                Telegram API reports a permanent failure.
         """
         if not recipient.telegram_id:
             raise PermanentDeliveryError("Recipient has no telegram_id")
@@ -232,8 +301,11 @@ class TelegramFormatter:
 
         # Trust boundary (review 1.1): the TEMPLATE is trusted and may
         # carry HTML; VARIABLE VALUES and the stored title/body are not
-        # and are escaped before entering ParseMode.HTML.
-        variables = _escape_html_variables(build_variables(notification))
+        # and are escaped before entering ParseMode.HTML. The RAW
+        # values are kept for the button label -- a plain-text surface
+        # (see the button block below).
+        raw_variables = build_variables(notification)
+        variables = _escape_html_variables(raw_variables)
         locale = recipient.locale or settings.default_locale
 
         rendered_title = render(
@@ -243,10 +315,12 @@ class TelegramFormatter:
             locale=locale,
             variables=variables,
         )
+        # Markup follows the content source (see docstring): only the
+        # stored-fallback title gets the service-supplied <b> wrap.
         title = (
             rendered_title
             if rendered_title is not None
-            else escape(notification.title)
+            else f"<b>{escape(notification.title)}</b>"
         )
         rendered_body = render(
             notification_type=notification.type,
@@ -261,14 +335,42 @@ class TelegramFormatter:
             else escape(notification.body)
         )
 
-        text = f"<b>{title}</b>\n\n{body}"
+        text = f"{title}\n\n{body}"
 
         # Build inline keyboard if a deep link is available.
         deep_link = self.format_deep_link(notification.action_data)
         channel_options = delivery.channel_options
         keyboard = None
         if deep_link:
+            # BUTTON TEXT (Phase 3a item 1 / fix A), priority low ->
+            # high: hardcoded "Open" < template sheet field
+            # "button_text" (localizable default, same locale chain as
+            # title/body) < channel_options["button_text"]. Same key
+            # on both sides on purpose: the override is literal --
+            # same key, different source, channel_options win.
+            #
+            # THIRD RENDERING MODE (fix F) -- do NOT "fix" this by
+            # escaping: title/body enter ParseMode.HTML and take
+            # ESCAPED variables; the button label is PLAIN TEXT
+            # (Telegram does not parse HTML inside inline-button
+            # labels), so its template renders with RAW variables.
+            # Escaping here would show a literal "&amp;" to the user;
+            # there is no injection surface -- markup is not
+            # interpreted, and the URL is validated separately.
+            # Asymmetry, on purpose: the SHEET value is a TEMPLATE
+            # (rendered per locale, dry-run checked at startup); the
+            # channel_options value is a per-delivery LITERAL from the
+            # producer and is not format_map'ed.
             button_text = "Open"
+            rendered_button = render(
+                notification_type=notification.type,
+                channel=DeliveryChannel.TELEGRAM,
+                field="button_text",
+                locale=locale,
+                variables=raw_variables,
+            )
+            if rendered_button is not None:
+                button_text = rendered_button
             if channel_options and "button_text" in channel_options:
                 button_text = channel_options["button_text"]
             keyboard = InlineKeyboardMarkup(
@@ -277,12 +379,24 @@ class TelegramFormatter:
                 ]
             )
 
-        # Apply channel_options overrides.
-        disable_preview = True
-        silent = False
+        # PRESENTATION FLAGS (Phase 3a item 1), priority low -> high:
+        # channel default < template sheet flag (bool leaf, resolved
+        # through the same per-field locale chain as the texts) <
+        # channel_options override.
+        sheet_preview = resolve_flag(
+            notification.type, DeliveryChannel.TELEGRAM,
+            "disable_preview", locale,
+        )
+        disable_preview = True if sheet_preview is None else sheet_preview
+        sheet_silent = resolve_flag(
+            notification.type, DeliveryChannel.TELEGRAM, "silent", locale,
+        )
+        silent = False if sheet_silent is None else sheet_silent
         if channel_options:
-            disable_preview = channel_options.get("disable_preview", True)
-            silent = channel_options.get("silent", False)
+            disable_preview = channel_options.get(
+                "disable_preview", disable_preview,
+            )
+            silent = channel_options.get("silent", silent)
 
         try:
             await self._bot.send_message(

@@ -42,6 +42,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.constants import MAX_CATEGORY_LEN
 from app.core.database import Base
 from app.core.mixins import TimestampMixin
 
@@ -175,8 +176,11 @@ class CategoryMute(Base):
         primary_key=True,
     )
 
+    # Width is the shared constant so the profile validator checks
+    # categories against the same number the column declares
+    # (Phase 3a item 6).
     category: Mapped[str] = mapped_column(
-        String(50),
+        String(MAX_CATEGORY_LEN),
         primary_key=True,
     )
 

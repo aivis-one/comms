@@ -16,3 +16,22 @@ unit_event:
     body: "{body} [{extra}]"
   email:
     subject: "COMMS: {title}"
+
+# Presentation keys (Phase 3a item 1): the sheet owns PRESENTATION,
+# not only text -- per (type, channel). Reference shape:
+#   button_text     -- localizable TEMPLATE for the inline deep-link
+#                      button label (plain text: inline-button labels
+#                      are not HTML-parsed, so its variables are NOT
+#                      escaped);
+#   disable_preview -- YAML BOOLEAN (unquoted true/false; a quoted
+#                      "true" is a string and fails validation);
+#   silent          -- YAML BOOLEAN, Telegram disable_notification.
+# channel_options with the SAME keys override these per delivery
+# (priority: sheet < channel_options).
+unit_presented:
+  telegram:
+    title: "{title}"
+    body: "{body}"
+    button_text: "Open {title}"
+    disable_preview: false
+    silent: true

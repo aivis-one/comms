@@ -10,7 +10,9 @@
 #     2. deliver  -- call channel formatters
 #     3. rollup   -- update notification status from delivery statuses
 #
-#   Plus: expire overdue notifications, delete expired delivered ones.
+#   Plus: expire overdue notifications, delete expired delivered
+#   ones, and (on its own slow cadence -- see app/engine/worker.py)
+#   drain terminal notifications past retention (Phase 3a item 5).
 #
 # CALLED BY:
 #   app/engine/worker.py (run_notification_batch) -- which the separate
@@ -38,7 +40,8 @@
 #   Expires both PENDING and PROCESSING notifications past expiry_at.
 # =============================================================================
 
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import and_, delete, or_, select, update
@@ -48,6 +51,7 @@ from app.core.database import get_session_factory
 from app.engine.constants import DeliveryStatus, NotificationStatus
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
+    delete_terminal_notifications_batch,
     deliver_notification,
     resolve_notification,
     rollup_notification,
@@ -235,3 +239,90 @@ async def cleanup_expired_notifications() -> int:
             await session.rollback()
             logger.exception("notification_cleanup_error")
             return 0
+
+
+# Phase 3a item 5: rows deleted per retention batch. One batch = one
+# transaction (bounded FK cascade); the drain loop below commits
+# between batches. Module-level so tests can shrink it to force a
+# multi-batch drain.
+_RETENTION_BATCH_SIZE = 1000
+
+
+async def cleanup_terminal_notifications() -> int:
+    """Retention pass: drain terminal notifications older than
+    NOTIFICATION_RETENTION_DAYS, in batches (Phase 3a item 5).
+
+    Orchestration only (fix C): the service supplies ONE commit-free
+    batch (delete_terminal_notifications_batch); this loop owns the
+    commits -- one per batch, so a 90-day backlog never becomes one
+    long transaction -- and drains until a batch comes back short.
+
+    DISABLED (fix I): settings.notification_retention_days <= 0 means
+    retention is OFF -- return 0 without touching anything ("delete
+    everything" must never fall out of the cutoff arithmetic; the
+    worker startup log names the disabled state loudly). The guard
+    lives HERE, not only behind the worker's cadence gate, because
+    tests call this function directly.
+
+    Scheduling lives in app/engine/worker.py (fix H): the pass runs on
+    its own slow cadence (NOTIFICATION_RETENTION_INTERVAL_SECONDS),
+    not on the worker tick. Every pass logs its duration -- that is
+    the observable value of the BL-3 promotion trigger.
+
+    KNOWN CEILING (acknowledged by design -- dispatch plan BL-3):
+      1. Mechanics: the batch select filters on (status, created_at)
+         with no matching index -> each pass seq-scans the
+         notifications table as it grows.
+      2. Status: acknowledged by design.
+      3. Backlog ref: BL-3 (dispatch plan §6a).
+      4. Promotion trigger (observable, via the retention_pass log):
+         a pass stably longer than ~1 second OR terminal rows on the
+         order of a million.
+      5. Agreed fix: ONE migration -- a partial index on created_at
+         with a predicate over the terminal statuses.
+      6. Rejected: an index NOW (write amplification on a hot table
+         for a query that is cheap at current scale and rare by
+         cadence); an unbounded DELETE (one long transaction + its FK
+         cascade). Also rejected: DB coordination of the cadence gate
+         -- it is PER-PROCESS on purpose (two workers -> two cheap
+         scans per interval, idempotent and harmless); do not "fix"
+         it with a distributed lock.
+
+    Returns:
+        Total number of notifications deleted this pass.
+    """
+    retention_days = settings.notification_retention_days
+    if retention_days <= 0:
+        return 0
+
+    factory = get_session_factory()
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    started = time.monotonic()
+    total = 0
+
+    async with factory() as session:
+        try:
+            while True:
+                deleted = await delete_terminal_notifications_batch(
+                    session,
+                    cutoff=cutoff,
+                    limit=_RETENTION_BATCH_SIZE,
+                )
+                await session.commit()
+                total += deleted
+                if deleted < _RETENTION_BATCH_SIZE:
+                    break
+        except Exception:
+            await session.rollback()
+            logger.exception("retention_pass_error", deleted=total)
+            return total
+
+    # Logged EVERY pass, empty ones included: a slow empty scan is
+    # exactly the BL-3 trigger signal.
+    logger.info(
+        "retention_pass",
+        deleted=total,
+        duration_ms=round((time.monotonic() - started) * 1000, 1),
+        retention_days=retention_days,
+    )
+    return total

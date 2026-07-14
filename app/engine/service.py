@@ -38,7 +38,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import Recipient
@@ -71,6 +71,13 @@ _VALID_CHANNELS = frozenset(e.value for e in DeliveryChannel)
 
 # Timeout for a single formatter.deliver() call.
 _DELIVER_TIMEOUT_SECONDS = 30
+
+# Phase 3a item 7: 429 jitter as a FRACTION of the honored wait
+# (uniform(0, fraction) x honored, one-sided -- see the deferral
+# block in _process_single_notification and fix D note in config.py).
+# 0.5 spreads one burst's herd over half its own wait window: wide
+# enough to decorrelate, still the same order as the server's ask.
+_RATE_LIMIT_JITTER_MAX_FRACTION = 0.5
 
 # Max concurrent formatter.deliver() calls per notification.
 _MAX_CONCURRENT_DELIVERIES = 20
@@ -327,7 +334,8 @@ async def deliver_notification(
       using the SERVER-NAMED retry_after (capped at
       notification_max_retry_after_seconds -- a dedicated trust limit
       on channel-named waits, generous so capping stays exceptional;
-      +1-2s jitter against thundering herd), without
+      plus proportional one-sided jitter, up to +50% of the honored
+      wait, against thundering herd -- Phase 3a item 7), without
       burning an attempt; a per-delivery deferral budget
       (rate_limit_deferrals vs
       settings.notification_max_rate_limit_deferrals) bounds the
@@ -475,7 +483,19 @@ async def deliver_notification(
                     # is ours, not the server's): every delivery
                     # deferred by one burst must NOT wake in the same
                     # tick and 429 again (thundering herd).
-                    delay = honored + random.uniform(1.0, 2.0)
+                    # PROPORTIONAL (Phase 3a item 7): a fixed 1-2s
+                    # spreads a 3s wait fine and a 3000s flood wait not
+                    # at all -- the spread must scale with the wait.
+                    # ONE-SIDED (fix D): uniform(0, max) never wakes a
+                    # delivery EARLIER than the server asked; the
+                    # effective ceiling is cap x (1 + max fraction) =
+                    # cap x 1.5 (documented on the cap knob in
+                    # app/core/config.py).
+                    delay = honored * (
+                        1.0 + random.uniform(
+                            0.0, _RATE_LIMIT_JITTER_MAX_FRACTION,
+                        )
+                    )
                     next_retry_at = datetime.now(UTC) + timedelta(
                         seconds=delay,
                     )
@@ -718,6 +738,58 @@ async def rollup_notification(
 # ---------------------------------------------------------------------------
 # In-app inbox functions (cbshome Sprint 8.3; HTTP surface is Phase 3)
 # ---------------------------------------------------------------------------
+
+
+# Phase 3a item 5: terminal statuses subject to retention, AS SPECCED:
+# SENT / FAILED / SKIPPED / EXPIRED. PARTIAL_SENT is deliberately NOT
+# in the spec's list (flagged in the phase report; test_retention pins
+# the kept behavior) -- do not add it here without a Master-chat
+# decision.
+_RETENTION_TERMINAL_STATUSES = (
+    NotificationStatus.SENT,
+    NotificationStatus.FAILED,
+    NotificationStatus.SKIPPED,
+    NotificationStatus.EXPIRED,
+)
+
+
+async def delete_terminal_notifications_batch(
+    session: AsyncSession,
+    *,
+    cutoff: datetime,
+    limit: int,
+) -> int:
+    """Delete ONE batch of terminal notifications older than cutoff.
+
+    COMMIT-FREE (P-01: the service never commits) -- returns the
+    number of rows deleted in this batch; the caller (the retention
+    pass in app/engine/processor.py, fix C) owns the drain loop and
+    the per-batch commit. Deliveries follow by FK cascade.
+
+    The batch is picked oldest-first via an IN subquery (ORDER BY
+    created_at LIMIT n): DELETE ... LIMIT is not portable SQL, and the
+    subquery bounds each transaction to `limit` rows plus their
+    cascade -- an unbounded DELETE over a 90-day backlog was rejected
+    in the handoff (one long transaction + cascade).
+
+    Age is measured on created_at: terminal rows are immutable and the
+    model carries no updated_at.
+    """
+    batch_ids = (
+        select(Notification.id)
+        .where(
+            Notification.status.in_(_RETENTION_TERMINAL_STATUSES),
+            Notification.created_at < cutoff,
+        )
+        .order_by(Notification.created_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        delete(Notification).where(Notification.id.in_(batch_ids)),
+    )
+    deleted: int = result.rowcount  # type: ignore[attr-defined]
+    return deleted
 
 
 async def list_recipient_deliveries(

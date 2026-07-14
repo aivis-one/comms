@@ -9,6 +9,7 @@
 #
 #       80000-80999   comms Phase 1 (engine tests)
 #       81000-81999   comms Phase 2 (profile / prefs / gating tests)
+#       82000-82999   comms Phase 3a (presentation / retention tests)
 #
 #   83xxx and 89xxx belong to VELO's own suites -- never use them
 #   here. The band allocators below hand out ids and refuse to
@@ -50,6 +51,22 @@ def next_phase2_telegram_id() -> int:
     if tid > PHASE2_TELEGRAM_ID_BAND_END:
         raise RuntimeError(
             "comms test telegram_id band 81000-81999 exhausted"
+        )
+    return tid
+
+
+PHASE3A_TELEGRAM_ID_BAND_START = 82000
+PHASE3A_TELEGRAM_ID_BAND_END = 82999
+
+_phase3a_telegram_id_counter = itertools.count(PHASE3A_TELEGRAM_ID_BAND_START)
+
+
+def next_phase3a_telegram_id() -> int:
+    """Next telegram_id from the comms Phase 3a band (82000-82999)."""
+    tid = next(_phase3a_telegram_id_counter)
+    if tid > PHASE3A_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 82000-82999 exhausted"
         )
     return tid
 

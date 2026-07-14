@@ -280,6 +280,69 @@ class TestDeliverAndRollup:
         fresh = await _fetch_notification(notification.id)
         assert fresh.status == NotificationStatus.FAILED
 
+    async def test_deep_link_encoding_failure_is_greppable(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Phase 3a item 3, end to end: a real TelegramFormatter hits
+        the encoding rule (two params) inside deliver -> the delivery
+        FAILS permanently and error_message starts with the STABLE
+        "deep link:" prefix. The final select IS the operational query
+        the product uses to find encoding failures (see the phase
+        report)."""
+        from sqlalchemy import select
+
+        from app.engine.formatters import TelegramFormatter
+        from tests.helpers import next_phase3a_telegram_id
+        from tests.test_formatters import _FakeBot
+
+        recipient = await create_recipient(
+            db_session, telegram_id=next_phase3a_telegram_id(),
+        )
+        notification = await create_notification(
+            db_session,
+            type="unit_event",
+            title="T",
+            body="B",
+            target_type=TargetType.USER,
+            target_value=str(recipient.id),
+            channels=["telegram"],
+            action_data={
+                "action": "open_practice",
+                "params": {"practice_id": "p1", "slot_id": "s1"},
+            },
+        )
+        await db_session.commit()
+
+        with patch(
+            "app.engine.service.get_formatter",
+            return_value=TelegramFormatter(
+                bot=_FakeBot(), bot_url="https://t.me/comms_testbot",
+            ),
+        ):
+            await process_pending_notifications()
+
+        (delivery,) = await _fetch_deliveries(notification.id)
+        assert delivery.status == DeliveryStatus.FAILED
+        assert delivery.attempts == 0
+        assert delivery.error_message is not None
+        assert delivery.error_message.startswith("deep link:")
+
+        # The operational query: encoding failures by prefix.
+        factory = get_session_factory()
+        async with factory() as session:
+            rows = (
+                await session.execute(
+                    select(NotificationDelivery).where(
+                        NotificationDelivery.status
+                        == DeliveryStatus.FAILED,
+                        NotificationDelivery.error_message.like(
+                            "deep link:%",
+                        ),
+                    )
+                )
+            ).scalars().all()
+        assert [row.id for row in rows] == [delivery.id]
+
     async def test_partial_sent_rollup(
         self, db_session: AsyncSession,
     ) -> None:

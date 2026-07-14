@@ -23,6 +23,10 @@
 #   - tree shape (mappings at every level, strings at the leaves);
 #   - the YAML flow-mapping trap: a bare `body: {title}` parses as a
 #     dict, not a string -- caught with an explicit hint;
+#   - presentation FLAG fields (Phase 3a item 1: disable_preview /
+#     silent) must be YAML booleans; every other leaf (title / body /
+#     subject / button_text / unknown-but-tolerated fields) must be a
+#     template string and is dry-run like any template;
 #   - a dry run of every template through format_map with a PROBE
 #     value whose __format__ accepts a spec iff at least one JSON
 #     scalar type (str, int, float) accepts it. Money/number specs
@@ -31,10 +35,15 @@
 #     so a datetime can never reach render() and date-like specs are
 #     true positives. Attribute access ({user.name}) is rejected too:
 #     JSON objects arrive as dicts, use item access ({user[name]}).
-#   - type keys and categories are length-checked against the ACTUAL
-#     widths of the DB columns they land in (notifications.type,
+#   - type keys and categories are length-checked against the widths
+#     of the DB columns they land in (notifications.type,
 #     category_mutes.category) -- a too-long key would otherwise
-#     DataError at create/mute time instead of at startup;
+#     DataError at create/mute time instead of at startup. Widths come
+#     from app/core/constants.py, SHARED with the column declarations
+#     (Phase 3a item 6: the Phase 2 introspection made engine/profile
+#     import audience/models while audience/prefs already imports
+#     engine/registry -- a package cycle; a consistency test now keeps
+#     the constants honest instead);
 #   - templates for types missing from the dictionary -> loud warning
 #     (not fatal: additive contract, profile may ship templates ahead
 #     of enabling a type).
@@ -50,13 +59,10 @@ from typing import Any, Protocol
 
 import structlog
 import yaml
-from sqlalchemy import String
-from sqlalchemy.sql.elements import KeyedColumnElement
 
-from app.audience.models import CategoryMute
 from app.core.config import settings
+from app.core.constants import MAX_CATEGORY_LEN, MAX_TYPE_KEY_LEN
 from app.core.exceptions import ProfileError
-from app.engine.models import Notification
 from app.engine.registry import ProfileRegistry, TemplateTree, registry
 
 logger = structlog.get_logger()
@@ -65,46 +71,22 @@ logger = structlog.get_logger()
 _TYPES_FILE = "types.yaml"
 _TEMPLATES_SUBDIR = "templates"
 
-
-def _string_column_length(column: "KeyedColumnElement[Any]") -> int:
-    """Width of a String column, introspected -- never hardcoded.
-
-    Profile keys land in DB columns; validating against the ACTUAL
-    column widths keeps this check honest if a migration ever widens
-    them. Deliberate coupling to the model layer (profile ->
-    engine/audience models); the models import nothing back, so no
-    cycle.
-
-    Explicit raises, not asserts (Phase 2.3): these are REAL runtime
-    checks of model shape, and `python -O` strips asserts -- a
-    narrowing-only assert may vanish, a validation must not.
-    """
-    column_type = column.type
-    if not isinstance(column_type, String):
-        raise RuntimeError(
-            f"Profile length validation expects a String column, "
-            f"got {type(column_type).__name__} for {column.key!r}. "
-            f"Model shape changed -- update _string_column_length "
-            f"call sites."
-        )
-    if column_type.length is None:
-        raise RuntimeError(
-            f"Profile length validation expects a BOUNDED String "
-            f"column, but {column.key!r} has no length. Model shape "
-            f"changed -- update _string_column_length call sites."
-        )
-    return column_type.length
+# Presentation FLAG fields of a template sheet (Phase 3a item 1):
+# bool leaves, read via registry.get_flag. Everything else on a sheet
+# is a template STRING (dry-run validated). Field-name based on
+# purpose -- the rule holds for any channel, so a future channel
+# reusing "silent" inherits the bool discipline for free.
+_FLAG_FIELDS = frozenset({"disable_preview", "silent"})
 
 
-# Type keys are stored in Notification.type; categories in
-# CategoryMute.category. A key longer than the column would DataError
-# at create_notification / mute time -- fail at startup instead.
-_TYPE_KEY_MAX_LENGTH = _string_column_length(
-    Notification.__table__.c["type"],
-)
-_CATEGORY_MAX_LENGTH = _string_column_length(
-    CategoryMute.__table__.c["category"],
-)
+# Type keys are stored in notifications.type; categories in
+# category_mutes.category. A key longer than the column would
+# DataError at create_notification / mute time -- fail at startup
+# instead. The limits are the SHARED constants the column
+# declarations use (app/core/constants.py); a unit test pins them to
+# the actual mapped column widths.
+_TYPE_KEY_MAX_LENGTH = MAX_TYPE_KEY_LEN
+_CATEGORY_MAX_LENGTH = MAX_CATEGORY_LEN
 
 
 # -----------------------------------------------------------------------------
@@ -317,7 +299,7 @@ def _parse_template_tree(
                 f"templates/{locale}.yaml: {type_key} must map channels "
                 f"to fields, got {type(channels).__name__}"
             )
-        tree_channels: dict[str, dict[str, str]] = {}
+        tree_channels: dict[str, dict[str, str | bool]] = {}
         for channel, fields in channels.items():
             if not isinstance(channel, str) or not channel:
                 raise ProfileError(
@@ -331,7 +313,7 @@ def _parse_template_tree(
                     f"map fields to template strings, "
                     f"got {type(fields).__name__}"
                 )
-            tree_fields: dict[str, str] = {}
+            tree_fields: dict[str, str | bool] = {}
             for fname, template in fields.items():
                 if not isinstance(fname, str) or not fname:
                     raise ProfileError(
@@ -403,13 +385,30 @@ def _validate_leaf(
     fname: str,
     template: Any,
 ) -> None:
-    """Validate a single template leaf: must be a string that renders.
+    """Validate a single template leaf.
+
+    Flag fields (_FLAG_FIELDS) must be booleans; every other field
+    must be a template string that survives a dry run.
 
     The dict case gets a dedicated message: in YAML a bare
     `body: {title}` is a FLOW MAPPING (a dict {"title": None}), not
     the string "{title}" -- the single most likely authoring mistake.
     """
     where = f"templates/{locale}.yaml: {type_key}.{channel}.{fname}"
+    if fname in _FLAG_FIELDS:
+        # Presentation flags (Phase 3a item 1) are booleans, not
+        # templates: no rendering, no dry run. Strict bool -- a quoted
+        # "true" is a string and a 1 is an int; both are authoring
+        # mistakes that must die at startup, not resolve to a
+        # surprising default on the delivery path.
+        if not isinstance(template, bool):
+            raise ProfileError(
+                f"{where} is a presentation flag and must be a YAML "
+                f"boolean (true / false), got "
+                f"{type(template).__name__}. Unquoted true/false only "
+                f'-- "true" in quotes is a string.'
+            )
+        return
     if isinstance(template, dict):
         raise ProfileError(
             f"{where} is a mapping, not a string. In YAML a bare "

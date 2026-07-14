@@ -109,3 +109,32 @@ def render(
             error=str(exc)[:200],
         )
         return None
+
+
+def resolve_flag(
+    notification_type: str,
+    channel: str,
+    field: str,
+    locale: str | None = None,
+) -> bool | None:
+    """Resolve a presentation flag (Phase 3a item 1).
+
+    Same per-field locale fallback as render(): requested locale ->
+    deploy default locale -> None (the caller applies the channel
+    default). Per-field on purpose: a locale file may override the
+    texts and leave the flags to the default locale -- each field
+    walks the chain independently, exactly like the text fields do.
+
+    No third step: flags have no "stored" counterpart on the
+    notification, the channel default is the end of the chain.
+    """
+    requested = locale or settings.default_locale
+
+    value = registry.get_flag(requested, notification_type, channel, field)
+
+    if value is None and requested != settings.default_locale:
+        value = registry.get_flag(
+            settings.default_locale, notification_type, channel, field,
+        )
+
+    return value

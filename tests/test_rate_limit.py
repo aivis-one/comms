@@ -3,7 +3,8 @@
 # =============================================================================
 # A 429 is "come back later", not a message failure:
 #   - the delivery is deferred via next_retry_at using the
-#     SERVER-NAMED retry_after (+1-2s jitter), attempts untouched;
+#     SERVER-NAMED retry_after (+ proportional one-sided jitter,
+#     up to +50% -- Phase 3a item 7), attempts untouched;
 #   - a per-delivery budget (rate_limit_deferrals) bounds the loop:
 #     past settings.notification_max_rate_limit_deferrals a 429
 #     degrades to a regular transient failure, so termination is
@@ -158,9 +159,11 @@ class TestRateLimitDeferral:
         assert delivery.attempts == 0
         assert delivery.rate_limit_deferrals == 1
         assert delivery.next_retry_at is not None
-        # Server-named wait + 1-2s jitter (slack for test runtime).
+        # Server-named wait + proportional one-sided jitter (Phase 3a
+        # item 7): never earlier than the server asked (lower bound is
+        # the wait itself), at most +50% on top.
         low = before + timedelta(seconds=42)
-        high = datetime.now(UTC) + timedelta(seconds=42 + 2)
+        high = datetime.now(UTC) + timedelta(seconds=42 * 1.5)
         assert low <= delivery.next_retry_at <= high
 
         fresh = await _fetch_notification(notification.id)
@@ -284,9 +287,11 @@ class TestRateLimitDeferral:
         assert delivery.attempts == 0
         assert delivery.rate_limit_deferrals == 1
         assert delivery.next_retry_at is not None
-        # cap + jitter(1..2), NOT the server-named double.
+        # cap x [1.0 .. 1.5] (jitter is proportional to the HONORED
+        # wait and one-sided), NOT the server-named double. cap x 1.5
+        # is the documented effective ceiling (fix D).
         low = before + timedelta(seconds=cap)
-        high = datetime.now(UTC) + timedelta(seconds=cap + 2)
+        high = datetime.now(UTC) + timedelta(seconds=cap * 1.5)
         assert low <= delivery.next_retry_at <= high
 
     async def test_429_deferral_flags_beyond_expiry(

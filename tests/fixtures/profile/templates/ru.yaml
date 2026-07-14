@@ -9,3 +9,10 @@
 unit_event:
   telegram:
     body: "RU: {body}"
+
+# Presentation keys are locale-resolved PER FIELD like the texts:
+# ru overrides button_text only; disable_preview / silent fall back
+# to the default locale (en).
+unit_presented:
+  telegram:
+    button_text: "Открыть {title}"

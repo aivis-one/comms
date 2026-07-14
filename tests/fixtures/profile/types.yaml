@@ -31,3 +31,8 @@ unit_rem_10m:
 # A type with an EMPTY spec: legal (no category -> never mute-gated,
 # no templates required -- stored title/body are the fallback).
 unit_plain: {}
+
+# Presentation-keys demo (Phase 3a item 1): the template sheet for
+# this type carries button_text / disable_preview / silent -- see
+# templates/en.yaml for the reference shape.
+unit_presented: {}
