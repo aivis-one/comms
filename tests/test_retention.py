@@ -80,14 +80,16 @@ class TestRetentionPass:
     async def test_old_terminal_deleted_fresh_and_active_kept(
         self, db_session: AsyncSession,
     ) -> None:
-        """All four SPECCED terminal statuses past retention_days go;
-        a fresh terminal row and an old ACTIVE row stay."""
+        """All five terminal statuses past retention_days go
+        (PARTIAL_SENT included since Phase 3a.1); a fresh terminal row
+        and an old ACTIVE row stay."""
         old_terminal = [
             await _make_notification(
                 db_session, status=status, age_days=100,
             )
             for status in (
                 NotificationStatus.SENT,
+                NotificationStatus.PARTIAL_SENT,
                 NotificationStatus.FAILED,
                 NotificationStatus.SKIPPED,
                 NotificationStatus.EXPIRED,
@@ -121,22 +123,23 @@ class TestRetentionPass:
         assert await cleanup_terminal_notifications() == 0
         assert await _remaining_ids() == {kept.id}
 
-    async def test_partial_sent_is_kept_per_spec(
+    async def test_partial_sent_is_retained_away(
         self, db_session: AsyncSession,
     ) -> None:
-        """PARTIAL_SENT is terminal but deliberately NOT in the spec's
-        retention list (SENT/FAILED/SKIPPED/EXPIRED) -- this test PINS
-        the specced behavior. Flagged in the phase report: old
-        partial_sent rows accumulate until Master-chat decides."""
-        kept = await _make_notification(
+        """Phase 3a.1: PARTIAL_SENT is IN the retention set. The
+        original spec list missed it (flagged in the Phase 3a report,
+        ruled in by Master-chat) -- without retention these rows would
+        be immortal: polling never picks them up, rollup never returns
+        to them."""
+        await _make_notification(
             db_session,
             status=NotificationStatus.PARTIAL_SENT,
             age_days=365,
         )
         await db_session.commit()
 
-        assert await cleanup_terminal_notifications() == 0
-        assert await _remaining_ids() == {kept.id}
+        assert await cleanup_terminal_notifications() == 1
+        assert await _remaining_ids() == set()
 
     async def test_deliveries_cascade(
         self, db_session: AsyncSession,

@@ -740,13 +740,16 @@ async def rollup_notification(
 # ---------------------------------------------------------------------------
 
 
-# Phase 3a item 5: terminal statuses subject to retention, AS SPECCED:
-# SENT / FAILED / SKIPPED / EXPIRED. PARTIAL_SENT is deliberately NOT
-# in the spec's list (flagged in the phase report; test_retention pins
-# the kept behavior) -- do not add it here without a Master-chat
-# decision.
+# Phase 3a item 5: terminal statuses subject to retention -- ALL five
+# of them. PARTIAL_SENT was missing from the original spec list; the
+# Phase 3a report flagged it (rows would be immortal: polling never
+# picks them up, rollup never returns to them) and Master-chat ruled
+# it IN (Phase 3a.1): a partial send is no less finished than a full
+# one, and 90 days covers any incident review. Active statuses
+# (PENDING / PROCESSING) must never appear here.
 _RETENTION_TERMINAL_STATUSES = (
     NotificationStatus.SENT,
+    NotificationStatus.PARTIAL_SENT,
     NotificationStatus.FAILED,
     NotificationStatus.SKIPPED,
     NotificationStatus.EXPIRED,

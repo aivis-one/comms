@@ -115,8 +115,9 @@ class Settings(BaseSettings):
     # waiting -- far beyond any realistic burst at current scale.
     notification_max_rate_limit_deferrals: int = 10
 
-    # Phase 3a item 5: retention of TERMINAL notifications (SENT /
-    # FAILED / SKIPPED / EXPIRED) -- rows older than this are deleted
+    # Phase 3a item 5 (+3a.1): retention of TERMINAL notifications
+    # (SENT / PARTIAL_SENT / FAILED / SKIPPED / EXPIRED) -- rows older
+    # than this are deleted
     # in batches by the worker's retention pass, deliveries follow by
     # FK cascade. Age is measured on created_at.
     # SEMANTICS (fix I): <= 0 means retention is DISABLED -- never
