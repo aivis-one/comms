@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     # configured channels (Phase 1: telegram).
     channels_mode: str = "stub"
 
+    # -- Service-to-service authorization (Phase 3b item 1) --
+    # The comms API is INTERNAL (arch decision 14): only the product
+    # backend calls it, over the shared Docker network, presenting this
+    # shared secret as "Authorization: Bearer <token>". Verified by the
+    # FastAPI dependency in app/api/deps.py. NEVER logged (same
+    # principle as the formatter's secret sanitizer).
+    # Empty token: startup ERROR in real mode (an unauthenticated
+    # "internal" API is effectively open), loud warning + auth disabled
+    # in stub mode (local dev / tests).
+    comms_service_token: str = ""
+
     # -- Telegram (shared bot with the product, see arch doc §7) --
     telegram_bot_token: str = ""
     # Base URL for deep-link buttons, e.g. "https://t.me/velo_testbot".
@@ -73,7 +84,7 @@ class Settings(BaseSettings):
     # comms-profile/ (mount mechanics are Phase 5); tests point it at
     # the fixture directory in this repo. Empty is tolerated ONLY in
     # development (the Phase 1 stub-profile behavior for tests) --
-    # see app/engine/profile.py: install_profile_from_settings.
+    # see app/profile/loader.py: install_profile_from_settings.
     templates_dir: str = ""
 
     # -- Notification engine --
@@ -175,6 +186,39 @@ class Settings(BaseSettings):
                 f"Invalid CHANNELS_MODE: {self.channels_mode}. "
                 f"Valid: {', '.join(sorted(_VALID_CHANNELS_MODES))}"
             )
+
+        # Phase 3b item 4 (3a flag 7.3): real mode with missing telegram
+        # credentials must die AT STARTUP, not on the delivery path --
+        # an empty bot URL turns every deep-link button into a
+        # BUTTON_URL_INVALID storm of permanent FAILED deliveries, and
+        # an empty token fails every send. Stub mode stays exempt
+        # (tests/CI run without credentials by design).
+        if self.channels_mode == "real":
+            if not self.telegram_bot_token:
+                raise ValueError(
+                    "TELEGRAM_BOT_TOKEN is required when "
+                    "CHANNELS_MODE=real: without it every telegram "
+                    "send fails. Set it in the .env file."
+                )
+            if not self.telegram_bot_url:
+                raise ValueError(
+                    "TELEGRAM_BOT_URL is required when "
+                    "CHANNELS_MODE=real: deep-link buttons would be "
+                    "built from an empty base and every buttoned "
+                    "delivery would permanently fail with "
+                    "BUTTON_URL_INVALID. Set it in the .env file."
+                )
+            # Phase 3b item 1: an "internal" API without its shared
+            # secret is effectively open -- same fail-at-startup
+            # philosophy. In stub mode an empty token merely disables
+            # auth (loud warning at startup, see app/main.py).
+            if not self.comms_service_token:
+                raise ValueError(
+                    "COMMS_SERVICE_TOKEN is required when "
+                    "CHANNELS_MODE=real: the comms API is internal "
+                    "(arch decision 14) and must not run open. Set "
+                    "it in the .env file."
+                )
 
         try:
             ZoneInfo(self.default_timezone)

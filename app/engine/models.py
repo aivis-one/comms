@@ -68,7 +68,7 @@ class Notification(UUIDMixin, Base):
     __tablename__ = "notifications"
 
     # Domain type key, validated against the profile registry
-    # (NOT a hardcoded enum -- see app/engine/registry.py). Width is
+    # (NOT a hardcoded enum -- see app/profile/registry.py). Width is
     # the shared constant so the profile validator checks against the
     # same number the column declares (Phase 3a item 6).
     type: Mapped[str] = mapped_column(

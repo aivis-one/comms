@@ -38,7 +38,7 @@ from app.engine.formatters import (
     sanitize_error,
 )
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.registry import registry
+from app.profile.registry import registry
 from tests.helpers import next_telegram_id
 
 BOT_URL = "https://t.me/comms_testbot"

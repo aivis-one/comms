@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute, Recipient
 from app.core.exceptions import NotFoundError, ValidationError
-from app.engine.registry import registry
+from app.profile.registry import registry
 
 logger = structlog.get_logger()
 

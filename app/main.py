@@ -2,10 +2,11 @@
 # COMMS Service -- Application Entry Point
 # =============================================================================
 #
-# Minimal FastAPI application for Phase 1: /health and /ready only.
-# The product-facing HTTP API (inbox endpoints, enqueue) is Phase 3
-# transport work; the in-app inbox SERVICE functions already exist in
-# app/engine/service.py and get their HTTP surface then.
+# Minimal FastAPI application: /health and /ready (unversioned,
+# UNAUTHENTICATED -- installer/docker healthchecks carry no secret)
+# plus the internal product-facing API under /api/v1 (app/api/):
+# inbox (the in-app bell) and the E8 preferences facade, both guarded
+# by the service-to-service bearer token (Phase 3b).
 #
 # The notification worker does NOT run inside this process (unlike the
 # donors, which ticked daemons in the API lifespan). It is a separate
@@ -27,11 +28,14 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from app.api.errors import register_error_handlers
+from app.api.inbox import router as inbox_router
+from app.api.prefs import router as prefs_router
 from app.core.config import APP_VERSION, settings
 from app.core.database import dispose_engine, get_engine
 from app.core.logging import setup_logging
 from app.engine.formatters import close_formatters
-from app.engine.profile import install_profile_from_settings
+from app.profile.loader import install_profile_from_settings
 
 logger = structlog.get_logger()
 
@@ -46,6 +50,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     setup_logging()
     install_profile_from_settings()
+    if not settings.comms_service_token:
+        # Only reachable in stub mode: real mode refuses to start
+        # without the token (app/core/config.py). Loud on purpose --
+        # an open "internal" API must be a visible choice, not a
+        # silent default.
+        logger.warning(
+            "service_auth_disabled",
+            reason="COMMS_SERVICE_TOKEN is empty",
+            channels_mode=settings.channels_mode,
+        )
     logger.info(
         "comms_started",
         version=APP_VERSION,
@@ -63,6 +77,9 @@ app = FastAPI(
     version=APP_VERSION,
     lifespan=lifespan,
 )
+register_error_handlers(app)
+app.include_router(inbox_router)
+app.include_router(prefs_router)
 
 
 async def _db_ok() -> bool:

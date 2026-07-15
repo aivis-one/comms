@@ -14,7 +14,7 @@
 #   Notification types and templates come from the profile registry.
 #   Since Phase 2 the test profile lives ON DISK as a real fixture
 #   directory (tests/fixtures/profile: types.yaml + templates/) and is
-#   loaded through the REAL loader (app/engine/profile.py) -- every
+#   loaded through the REAL loader (app/profile/loader.py) -- every
 #   test run exercises the same code path the service uses at startup,
 #   and the fixture YAML doubles as the reference shape for the
 #   product's comms-profile/.
@@ -44,8 +44,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.database import dispose_engine, get_session_factory
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.profile import FileProfileSource, install_profile, load_profile
-from app.engine.registry import registry
+from app.profile.loader import FileProfileSource, install_profile, load_profile
+from app.profile.registry import registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

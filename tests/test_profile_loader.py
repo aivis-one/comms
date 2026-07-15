@@ -30,15 +30,15 @@ from app.core.exceptions import ProfileError
 from app.engine.constants import TargetType
 from app.engine.formatters import TelegramFormatter
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.profile import (
+from app.engine.service import create_notification
+from app.engine.template_engine import render
+from app.profile.loader import (
     FileProfileSource,
     install_profile,
     install_profile_from_settings,
     load_profile,
 )
-from app.engine.registry import registry
-from app.engine.service import create_notification
-from app.engine.template_engine import render
+from app.profile.registry import registry
 from tests.conftest import FIXTURE_PROFILE_DIR
 from tests.helpers import next_phase2_telegram_id
 

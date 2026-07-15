@@ -21,8 +21,8 @@ import structlog
 from app.core.database import dispose_engine
 from app.core.logging import setup_logging
 from app.engine.formatters import close_formatters
-from app.engine.profile import install_profile_from_settings
 from app.engine.worker import run_worker_loop
+from app.profile.loader import install_profile_from_settings
 
 logger = structlog.get_logger()
 

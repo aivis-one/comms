@@ -38,7 +38,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import Recipient
@@ -60,8 +60,8 @@ from app.engine.formatters import (
     sanitize_error,
 )
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.registry import registry
 from app.engine.resolver import resolve_targets
+from app.profile.registry import registry
 
 logger = structlog.get_logger()
 
@@ -795,32 +795,86 @@ async def delete_terminal_notifications_batch(
     return deleted
 
 
+def _navigation_intent(
+    action_data: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Extract the NAVIGATIONAL subset of action_data for the inbox.
+
+    action_data carries TWO things (arch §2.3): the deep-link intent
+    ({action, params}) and the template variables. The variables are
+    internal rendering material -- already substituted into the
+    title/body the inbox returns -- and must NOT leak into the frozen
+    inbox contract (Master-chat review, Phase 3b amendment A). The
+    frontend needs exactly one thing from action_data: where a tap
+    goes.
+
+    Whitelist, not blacklist: only "action" (and "params", when
+    present and non-empty) survive. No action -> None (the item is
+    not tappable). The params dict is passed through as-is -- shape
+    validation belongs to the producer (Phase 3c), not to a read path.
+    """
+    if not action_data:
+        return None
+    action = action_data.get("action")
+    if not action:
+        return None
+    intent: dict[str, Any] = {"action": action}
+    params = action_data.get("params")
+    if params:
+        intent["params"] = params
+    return intent
+
+
+# Hard ceiling on the inbox page size -- a page is a UI unit, not an
+# export API; anything bigger belongs to a different endpoint.
+INBOX_MAX_PAGE_SIZE = 100
+
+
 async def list_recipient_deliveries(
     session: AsyncSession,
     recipient_id: UUID,
     *,
-    page: int = 1,
-    per_page: int = 20,
+    limit: int = 20,
+    cursor: tuple[datetime, UUID] | None = None,
     type_filter: str | None = None,
     channel_filter: str | None = None,
-) -> tuple[list[dict[str, Any]], int]:
-    """List sent deliveries for a recipient with parent notification data.
+) -> tuple[list[dict[str, Any]], tuple[datetime, UUID] | None]:
+    """List sent deliveries for a recipient, keyset-paginated.
 
     Only deliveries with status=sent are returned (the recipient sees
     only what was actually delivered). Results enriched with title,
-    body, type, action_data, priority from the parent Notification.
+    body, type and the NAVIGATIONAL action_data subset from the parent
+    Notification, newest-first.
+
+    KEYSET (Phase 3b item 2, replaces the Phase 1 offset version --
+    offset pagination re-scans every skipped row and shifts under
+    concurrent inserts; its only consumers were tests):
+      - order: (sent_at DESC, id DESC). sent_at alone is not unique
+        (one notification fans out a batch of deliveries within the
+        same timestamp resolution), so the delivery id breaks ties --
+        together they are a stable total order.
+      - cursor: the (sent_at, id) pair of the LAST row of the previous
+        page; the next page is WHERE (sent_at, id) < (cursor) in that
+        order (a Postgres row-value comparison).
+      - limit+1 rows are fetched to learn whether a next page exists
+        without a COUNT.
 
     Args:
         session: Active DB session (read-only).
         recipient_id: Recipient (= product user) id.
-        page: Page number (1-based).
-        per_page: Items per page.
+        limit: Page size (clamped to 1..INBOX_MAX_PAGE_SIZE).
+        cursor: (sent_at, id) of the last row already seen, or None
+            for the first page.
         type_filter: Filter by Notification.type (exact match).
         channel_filter: Filter by NotificationDelivery.channel.
 
     Returns:
-        (items, total) where items are plain dicts.
+        (items, next_cursor) where items are plain dicts and
+        next_cursor is the (sent_at, id) pair to request the next page
+        with, or None when this page is the last.
     """
+    limit = max(1, min(limit, INBOX_MAX_PAGE_SIZE))
+
     conditions = [
         NotificationDelivery.recipient_id == recipient_id,
         NotificationDelivery.status == DeliveryStatus.SENT,
@@ -830,17 +884,14 @@ async def list_recipient_deliveries(
         conditions.append(Notification.type == type_filter)
     if channel_filter:
         conditions.append(NotificationDelivery.channel == channel_filter)
-
-    count_stmt = (
-        select(func.count())
-        .select_from(NotificationDelivery)
-        .join(
-            Notification,
-            NotificationDelivery.notification_id == Notification.id,
+    if cursor is not None:
+        # Row-value comparison: tuple_(cols) against a plain Python
+        # tuple of the cursor values -- Postgres evaluates
+        # (sent_at, id) < (:sent_at, :id) natively.
+        conditions.append(
+            tuple_(NotificationDelivery.sent_at, NotificationDelivery.id)
+            < cursor
         )
-        .where(*conditions)
-    )
-    total = (await session.execute(count_stmt)).scalar_one()
 
     stmt = (
         select(NotificationDelivery, Notification)
@@ -849,12 +900,17 @@ async def list_recipient_deliveries(
             NotificationDelivery.notification_id == Notification.id,
         )
         .where(*conditions)
-        .order_by(NotificationDelivery.sent_at.desc())
-        .offset((page - 1) * per_page)
-        .limit(per_page)
+        .order_by(
+            NotificationDelivery.sent_at.desc(),
+            NotificationDelivery.id.desc(),
+        )
+        .limit(limit + 1)
     )
     result = await session.execute(stmt)
     rows = result.all()
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
 
     items: list[dict[str, Any]] = []
     for delivery, notification in rows:
@@ -868,32 +924,46 @@ async def list_recipient_deliveries(
             "type": notification.type,
             "title": notification.title,
             "body": notification.body,
-            "action_data": {
-                k: v for k, v in (notification.action_data or {}).items()
-                if not k.startswith("_")
-            } or None,
+            "action_data": _navigation_intent(notification.action_data),
             "priority": notification.priority,
         })
 
-    return items, total
+    next_cursor: tuple[datetime, UUID] | None = None
+    if has_more and rows:
+        last_delivery, _ = rows[-1]
+        # sent_at is non-null for every status=sent row by pipeline
+        # construction; assert keeps mypy honest about the invariant.
+        assert last_delivery.sent_at is not None
+        next_cursor = (last_delivery.sent_at, last_delivery.id)
+
+    return items, next_cursor
 
 
 async def get_unread_count(
     session: AsyncSession,
     recipient_id: UUID,
+    *,
+    channel: str | None = None,
 ) -> int:
     """Count unread sent deliveries for the badge counter.
 
-    Unread = status=sent AND read_at IS NULL.
+    Unread = status=sent AND read_at IS NULL. `channel` scopes the
+    count (the inbox badge counts in_app only -- a telegram delivery
+    is never "read" and its read_at stays NULL forever; counting it
+    would inflate the badge permanently). None = all channels
+    (service-level generality).
     """
+    conditions = [
+        NotificationDelivery.recipient_id == recipient_id,
+        NotificationDelivery.status == DeliveryStatus.SENT,
+        NotificationDelivery.read_at.is_(None),
+    ]
+    if channel is not None:
+        conditions.append(NotificationDelivery.channel == channel)
     stmt = (
         select(func.count())
         .select_from(NotificationDelivery)
-        .where(
-            NotificationDelivery.recipient_id == recipient_id,
-            NotificationDelivery.status == DeliveryStatus.SENT,
-            NotificationDelivery.read_at.is_(None),
-        )
+        .where(*conditions)
     )
     result = await session.execute(stmt)
     return result.scalar_one()
@@ -933,21 +1003,28 @@ async def mark_delivery_read(
 async def mark_all_read(
     session: AsyncSession,
     recipient_id: UUID,
+    *,
+    channel: str | None = None,
 ) -> int:
     """Mark all sent deliveries as read for a recipient.
 
     Only updates deliveries with status=sent AND read_at IS NULL.
+    `channel` scopes the update (the inbox read-all touches in_app
+    only); None = all channels.
 
     Returns:
         Number of deliveries marked as read.
     """
+    conditions = [
+        NotificationDelivery.recipient_id == recipient_id,
+        NotificationDelivery.status == DeliveryStatus.SENT,
+        NotificationDelivery.read_at.is_(None),
+    ]
+    if channel is not None:
+        conditions.append(NotificationDelivery.channel == channel)
     stmt = (
         update(NotificationDelivery)
-        .where(
-            NotificationDelivery.recipient_id == recipient_id,
-            NotificationDelivery.status == DeliveryStatus.SENT,
-            NotificationDelivery.read_at.is_(None),
-        )
+        .where(*conditions)
         .values(read_at=datetime.now(UTC))
     )
     result = await session.execute(stmt)

@@ -10,9 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ValidationError
 from app.engine.constants import TargetType
-from app.engine.registry import registry
 from app.engine.service import create_notification
 from app.engine.template_engine import SafeDict, render
+from app.profile.registry import registry
 
 
 class TestRegistry:

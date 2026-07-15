@@ -10,7 +10,7 @@
 # DE-DOMAINIZATION (the key difference from both donors):
 #   There is NO NotificationType enum here. Notification types are
 #   domain vocabulary -- they are registered by the per-deploy product
-#   profile (app/engine/registry.py). The engine validates types
+#   profile (app/profile/registry.py). The engine validates types
 #   against the registry, never against a hardcoded enum.
 #
 #   TargetType is likewise generic: USER / GROUP / ALL. The donors'

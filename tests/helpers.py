@@ -71,6 +71,26 @@ def next_phase3a_telegram_id() -> int:
     return tid
 
 
+PHASE3B_TELEGRAM_ID_BAND_START = 84000
+PHASE3B_TELEGRAM_ID_BAND_END = 84999
+
+_phase3b_telegram_id_counter = itertools.count(PHASE3B_TELEGRAM_ID_BAND_START)
+
+
+def next_phase3b_telegram_id() -> int:
+    """Next telegram_id from the comms Phase 3b band (84000-84999).
+
+    83000-83999 is SKIPPED on purpose: VELO facts live there (see the
+    band registry in the dispatch plan; discovered in Phase 1).
+    """
+    tid = next(_phase3b_telegram_id_counter)
+    if tid > PHASE3B_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 84000-84999 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,

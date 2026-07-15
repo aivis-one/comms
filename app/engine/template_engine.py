@@ -26,7 +26,7 @@ from typing import Any
 import structlog
 
 from app.core.config import settings
-from app.engine.registry import registry
+from app.profile.registry import registry
 
 logger = structlog.get_logger()
 
@@ -62,7 +62,7 @@ def render(
     attribute access on a JSON variable ("{user.name}") -- a template
     config error must not burn delivery retries (review 1.1); the
     caller's stored-value fallback covers it. Second line of defense:
-    the profile validator (app/engine/profile.py) rejects these at
+    the profile validator (app/profile/loader.py) rejects these at
     startup, this guard covers templates registered past it.
 
     Args:
