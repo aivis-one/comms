@@ -389,13 +389,21 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
     # Version barrier (review 3c amendment A): validated on EVERY
     # event, from day one with a single version -- a v2 payload must
     # land in the DLQ, never be silently parsed under v1 semantics.
+    # STRICTLY an int (review 3c.1): Python's `True == 1` and
+    # `1.0 == 1` would otherwise let "v": true / "v": 1.0 slip through
+    # a bare membership test -- the barrier must be at least as strict
+    # as the scalar discipline it guards (_int rejects bool too).
     version = data.get("v")
-    if version not in SUPPORTED_SCHEMA_VERSIONS:
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise ValidationError(
             f"{event}: unsupported schema version {version!r} "
             f"(supported: "
-            f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}); "
-            f"a missing 'v' is a producer bug"
+            f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}, strictly an "
+            f"integer); a missing 'v' is a producer bug"
         )
 
     if event == EVENT_NOTIFICATION_REQUEST:

@@ -17,8 +17,10 @@
 # types against the registry (via create_notification), so a consumer
 # without a profile would dead-letter every request.
 #
-# Handles SIGTERM/SIGINT by cancelling the loop task; the current
-# entry finishes its own transaction + ack cleanly.
+# Handles SIGTERM/SIGINT by cancelling the loop task. An entry caught
+# mid-flight rolls back UNACKED (cancellation interrupts inner
+# awaits); the next start's pending drain replays it -- at-least-once
+# holds by replay, not by graceful completion (review 3c.1).
 # =============================================================================
 
 import asyncio

@@ -89,6 +89,17 @@ class TestVersionBarrier:
                 _envelope("notification_request", _request_data(v=2))
             )
 
+    def test_bool_and_float_v_rejected(self) -> None:
+        """Python's True == 1 and 1.0 == 1 must not open the barrier:
+        'v' is strictly a JSON integer (review 3c.1)."""
+        for bad_v in (True, 1.0):
+            with pytest.raises(
+                ValidationError, match="unsupported schema",
+            ):
+                parse_event(_envelope(
+                    "notification_request", _request_data(v=bad_v),
+                ))
+
     def test_v1_passes_all_events(self) -> None:
         rid = str(uuid4())
         assert isinstance(

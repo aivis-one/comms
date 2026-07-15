@@ -112,10 +112,13 @@ class StreamConsumer:
     async def run(self) -> None:
         """Consume forever: drain own pending, then follow new entries.
 
-        Cancellation-safe: the current entry finishes its transaction
-        and ack before the CancelledError propagates (asyncio only
-        interrupts at await points inside redis/db calls, which each
-        entry brackets with its own transaction).
+        Cancellation-safe in the at-least-once sense (review 3c.1
+        wording fix): a CancelledError landing on an INNER await
+        interrupts the current entry mid-flight -- its transaction
+        rolls back and the entry stays UNACKED. Correctness is held by
+        the replay, not by graceful completion: the next start's
+        pending drain re-processes it (and dedup collapses a replayed
+        notification_request).
         """
         await self.ensure_group()
         drained = await self._drain_pending()
@@ -272,18 +275,23 @@ class StreamConsumer:
         """Dead-letter the original entry with diagnostics attached.
 
         The DLQ entry carries the ORIGINAL envelope fields verbatim
-        (re-ingestable after a fix) plus error metadata. The stream is
-        capped (approximate MAXLEN) so a misbehaving producer cannot
-        grow it without bound.
+        (re-ingestable after a fix) plus error metadata under the
+        _dlq_ prefix (review 3c.1): un-prefixed names could collide
+        with fields of a thoroughly broken producer's entry and
+        silently overwrite them -- breaking the "verbatim" promise
+        exactly on the records where the evidence matters most. The
+        prefix also self-documents which fields the CONSUMER added.
+        The stream is capped (approximate MAXLEN) so a misbehaving
+        producer cannot grow it without bound.
         """
         # redis-py's FieldT alias is invariant in dict params, so a
         # plain dict[str, str] does not satisfy it; alias it exactly.
         payload: dict[FieldT, EncodableT] = {
             _field_str(k): _field_str(v) for k, v in fields.items()
         }
-        payload["error"] = reason
-        payload["attempts"] = str(attempts)
-        payload["source_entry_id"] = _id_str(entry_id)
+        payload["_dlq_error"] = reason
+        payload["_dlq_attempts"] = str(attempts)
+        payload["_dlq_source_entry_id"] = _id_str(entry_id)
         await self._redis.xadd(
             self._dlq,
             payload,

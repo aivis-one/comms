@@ -370,8 +370,8 @@ class TestOrderingRetry:
 
         entries = await redis.xrange(settings.dlq_stream)
         fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
-        assert "retries exhausted" in fields["error"]
-        assert int(fields["attempts"]) == 5  # 1 try + 4 fast retries
+        assert "retries exhausted" in fields["_dlq_error"]
+        assert int(fields["_dlq_attempts"]) == 5  # 1 try + 4 fast retries
 
 
 class TestPoisonPill:
@@ -402,7 +402,7 @@ class TestPoisonPill:
 
         assert await redis.xlen(settings.dlq_stream) == 3
         reasons = [
-            {k.decode(): v.decode() for k, v in fields.items()}["error"]
+            {k.decode(): v.decode() for k, v in fields.items()}["_dlq_error"]
             for _id, fields in await redis.xrange(settings.dlq_stream)
         ]
         assert any("not valid JSON" in r for r in reasons)
@@ -427,10 +427,13 @@ class TestPoisonPill:
         await _run_until(StreamConsumer(redis), dead_lettered)
         entries = await redis.xrange(settings.dlq_stream)
         fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
-        assert "Unregistered notification type" in fields["error"]
-        # Original envelope preserved verbatim for re-ingestion.
+        assert "Unregistered notification type" in fields["_dlq_error"]
+        # Original envelope preserved verbatim for re-ingestion; the
+        # consumer's diagnostics live under the _dlq_ prefix and can
+        # never shadow producer fields (review 3c.1).
         assert fields["event"] == "notification_request"
         assert "not_in_profile" in fields["data"]
+        assert fields["_dlq_source_entry_id"]
 
 
 class TestEntrypoint:
