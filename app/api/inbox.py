@@ -55,6 +55,14 @@
 # recipient_id simply has an empty inbox and a zero badge. The proxy
 # only ever asks for users it has authorized, and "empty" is the
 # honest answer for a recipient comms has not (yet) synced.
+#
+# TRUST MODEL (part of the frozen contract, review 3b): comms does NOT
+# verify that recipient_id belongs to the calling end user -- there is
+# no per-recipient authorization here at all. The shared service token
+# authenticates the PRODUCT (arch decision 14), and the product proxy
+# is the sole owner of the "user X may only read/mark user X's inbox"
+# check. Phase 6 MUST substitute the recipient_id server-side from its
+# own authenticated session, never accept it from the client.
 # =============================================================================
 
 import base64

@@ -62,6 +62,15 @@
 # 1..7 but the wire form speaks E8 codes mon..sun -- converted HERE,
 # inside comms, both directions. The product receives the finished E8
 # form; if every client re-converted, this would be half a facade.
+#
+# TRUST MODEL (part of the frozen contract, review 3b): comms does NOT
+# verify that recipient_id belongs to the calling end user -- there is
+# no per-recipient authorization here at all. The shared service token
+# authenticates the PRODUCT (arch decision 14), and the product proxy
+# is the sole owner of the "user X may only read/write user X's
+# preferences" check. Phase 6 MUST substitute the recipient_id
+# server-side from its own authenticated session, never accept it
+# from the client.
 # =============================================================================
 
 from datetime import time
@@ -182,9 +191,20 @@ def _facade_form(prefs: RecipientPreferences) -> dict[str, Any]:
     schedule: dict[str, Any] | None = None
     if prefs.quiet_from is not None:
         # set_quiet_hours is all-or-nothing: quiet_from set implies
-        # quiet_to and quiet_days set.
-        assert prefs.quiet_to is not None
-        assert prefs.quiet_days is not None
+        # quiet_to and quiet_days set. An explicit check, not an
+        # assert (Phase 2.3 precedent): asserts vanish under
+        # `python -O`, and a half-window (only reachable by manual DB
+        # surgery) would then surface as an opaque strftime(None)
+        # traceback. RuntimeError, NOT ValidationError: this is store
+        # corruption, not client input -- the caller must see a 500,
+        # not be told its request was wrong.
+        if prefs.quiet_to is None or prefs.quiet_days is None:
+            raise RuntimeError(
+                f"Recipient {prefs.recipient_id} has a partial "
+                f"quiet-hours window (quiet_from set, quiet_to/days "
+                f"missing) -- the store violates the all-or-nothing "
+                f"invariant; fix the row"
+            )
         schedule = {
             "from": prefs.quiet_from.strftime("%H:%M"),
             "to": prefs.quiet_to.strftime("%H:%M"),
