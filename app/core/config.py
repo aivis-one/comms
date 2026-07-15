@@ -53,6 +53,34 @@ class Settings(BaseSettings):
     # configured channels (Phase 1: telegram).
     channels_mode: str = "stub"
 
+    # -- Event transport, push side (Phase 3c) --
+    # The consumer process (`python -m app.consumer`) reads the
+    # product's event stream via a Redis consumer group. Nobody else
+    # needs Redis (API/worker are DB-only), so an empty redis_url is
+    # validated at CONSUMER startup (app/consumer.py), not here --
+    # deliberately not coupled to channels_mode.
+    # Names below are FROZEN CONTRACT surface (Phase 3c item 7): the
+    # product's outbox relay XADDs into comms_events_stream; the DLQ
+    # is derived as f"{comms_events_stream}:dlq" (see dlq_stream).
+    redis_url: str = ""
+    comms_events_stream: str = "comms:events"
+    comms_consumer_group: str = "comms"
+    # STABLE consumer name (not hostname/pid): after a restart the
+    # same name re-reads its own pending entries (XREADGROUP "0"), so
+    # unacked messages replay without XAUTOCLAIM machinery. One
+    # consumer per deploy by design.
+    comms_consumer_name: str = "comms-1"
+    # XREADGROUP batch size / block timeout, and the cap on the DLQ
+    # stream length (approximate MAXLEN trimming).
+    consumer_batch_size: int = 32
+    consumer_block_ms: int = 5000
+    dlq_maxlen: int = 10000
+
+    @property
+    def dlq_stream(self) -> str:
+        """Dead-letter stream name, derived from the main stream."""
+        return f"{self.comms_events_stream}:dlq"
+
     # -- Service-to-service authorization (Phase 3b item 1) --
     # The comms API is INTERNAL (arch decision 14): only the product
     # backend calls it, over the shared Docker network, presenting this

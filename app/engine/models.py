@@ -56,7 +56,12 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
-from app.core.constants import MAX_TYPE_KEY_LEN
+from app.core.constants import (
+    MAX_BODY_LEN,
+    MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_TITLE_LEN,
+    MAX_TYPE_KEY_LEN,
+)
 from app.core.database import Base
 from app.core.mixins import UUIDMixin
 from app.engine.constants import DeliveryStatus, NotificationStatus
@@ -78,12 +83,12 @@ class Notification(UUIDMixin, Base):
     )
 
     title: Mapped[str] = mapped_column(
-        String(500),
+        String(MAX_TITLE_LEN),
         nullable=False,
     )
 
     body: Mapped[str] = mapped_column(
-        String(5000),
+        String(MAX_BODY_LEN),
         nullable=False,
     )
 
@@ -96,6 +101,35 @@ class Notification(UUIDMixin, Base):
     target_value: Mapped[str] = mapped_column(
         String(200),
         nullable=False,
+    )
+
+    # Producer-supplied dedup key for stream-ingested notification
+    # requests (Phase 3c item 2): at-least-once delivery replays are
+    # collapsed by the partial unique index on this column (migration
+    # 0005); NULL for notifications created by other paths (tests,
+    # future internal producers) -- NULLs never collide.
+    #
+    # KNOWN CEILING -- dedup window is bounded by retention.
+    # Mechanics: dedup is reliable only while the stream's trim
+    # horizon < NOTIFICATION_RETENTION_DAYS -- retention deletes the
+    # notification row, freeing its key, so a replay arriving AFTER
+    # the row is purged creates a duplicate. With retention disabled
+    # (NOTIFICATION_RETENTION_DAYS <= 0, 3a.1) the window is infinite
+    # (safe; table growth is retention's concern, not dedup's).
+    # Status: acknowledged by design (Phase 3c review, part C).
+    # Backlog: covered by the marker itself, no BL entry -- config
+    # relationship, not code work.
+    # Unfreeze trigger: stream trim horizon configured anywhere near
+    # NOTIFICATION_RETENTION_DAYS, or replay-after-purge observed.
+    # Agreed fix shape: none needed while the inequality holds; if it
+    # ever breaks, a dedicated processed-keys table with its OWN
+    # retention decoupled from notifications.
+    # Rejected: a separate processed_events table NOW -- it merely
+    # moves the same retention question to a second table.
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN),
+        nullable=True,
+        default=None,
     )
 
     # Deep-link intent + template variables + internal keys ("_channels").

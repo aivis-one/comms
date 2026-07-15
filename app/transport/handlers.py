@@ -1,0 +1,135 @@
+# =============================================================================
+# COMMS Service -- Event Handlers (Phase 3c)
+# =============================================================================
+#
+# The bridge from parsed events to the EXISTING service layer -- no
+# business logic of its own:
+#
+#   NotificationRequest -> engine.create_notification (+ dedup by the
+#                          idempotency_key unique index, item 2/3)
+#   UserUpserted        -> audience.sync.user_upserted   (item 4)
+#   GroupChanged        -> audience.sync.group_changed   (item 4)
+#
+# The Phase 2 sync functions are called AS-IS (the handoff's explicit
+# rule: wire them, do not rewrite them).
+#
+# Error classification (consumed by consumer.py):
+#   ValidationError -- terminal (unregistered type, invalid channel):
+#                      the event will never succeed -> DLQ + ACK.
+#   NotFoundError   -- retryable: group_changed arrived before its
+#                      user_upserted (momentary sync lag) -> bounded
+#                      backoff, then DLQ.
+#   HandleResult.DUPLICATE -- not an error: an at-least-once replay
+#                      collapsed by the unique index -> ACK, no DLQ.
+#
+# Each event is handled inside ITS OWN session/transaction (the
+# consumer opens it): a failed event rolls back completely and never
+# poisons its neighbors in the batch.
+# =============================================================================
+
+import enum
+
+import structlog
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.audience import sync
+from app.engine.service import create_notification
+from app.transport.events import (
+    NotificationRequest,
+    ParsedEvent,
+    UserUpserted,
+)
+
+logger = structlog.get_logger()
+
+
+class HandleResult(enum.StrEnum):
+    PROCESSED = "processed"
+    DUPLICATE = "duplicate"
+
+
+async def handle_event(
+    session: AsyncSession, event: ParsedEvent
+) -> HandleResult:
+    """Apply one parsed event to the database.
+
+    The caller owns the session lifecycle (commit on return, rollback
+    on raise). Raises ValidationError (terminal) or NotFoundError
+    (retryable) -- see the module header for the classification.
+    """
+    if isinstance(event, NotificationRequest):
+        return await _handle_notification_request(session, event)
+    if isinstance(event, UserUpserted):
+        await sync.user_upserted(
+            session,
+            recipient_id=event.recipient_id,
+            telegram_id=event.telegram_id,
+            email=event.email,
+            locale=event.locale,
+            timezone=event.timezone,
+            active=event.active,
+        )
+        return HandleResult.PROCESSED
+    # GroupChanged. May raise NotFoundError when the recipient has not
+    # been synced yet (user_upserted lagging) -- classified RETRYABLE
+    # by the consumer.
+    await sync.group_changed(
+        session,
+        group_key=event.group_key,
+        recipient_id=event.recipient_id,
+        member=event.member,
+    )
+    return HandleResult.PROCESSED
+
+
+async def _handle_notification_request(
+    session: AsyncSession, event: NotificationRequest
+) -> HandleResult:
+    """Materialize a notification request; collapse replays.
+
+    The DATABASE is the dedup arbiter: the partial unique index on
+    notifications.idempotency_key (migration 0005) turns a replayed
+    insert into an IntegrityError on flush -- caught here, reported as
+    DUPLICATE. No pre-flight SELECT: a check-then-insert would race
+    with itself under redelivery, the constraint cannot.
+    """
+    try:
+        # SAVEPOINT so the IntegrityError rolls back only this insert,
+        # keeping the outer session usable for the caller's commit.
+        async with session.begin_nested():
+            notification = await create_notification(
+                session,
+                type=event.type,
+                title=event.title,
+                body=event.body,
+                target_type=event.target_type,
+                target_value=event.target_value,
+                channels=event.channels,
+                action_data=event.action_data,
+                priority=event.priority,
+                scheduled_at=event.scheduled_at,
+                expiry_at=event.expiry_at,
+                idempotency_key=event.idempotency_key,
+            )
+    except IntegrityError as exc:
+        # Only OUR unique index means "duplicate" -- any other
+        # integrity violation is a real bug and must not be silently
+        # swallowed as a replay.
+        if "uq_notifications_idempotency_key" not in str(exc.orig):
+            raise
+        logger.info(
+            "notification_request_duplicate",
+            idempotency_key=event.idempotency_key,
+            type=event.type,
+        )
+        return HandleResult.DUPLICATE
+
+    logger.info(
+        "notification_request_materialized",
+        notification_id=str(notification.id),
+        idempotency_key=event.idempotency_key,
+        type=event.type,
+        target=f"{event.target_type}:{event.target_value}",
+    )
+    return HandleResult.PROCESSED

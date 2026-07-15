@@ -71,6 +71,22 @@ def next_phase3a_telegram_id() -> int:
     return tid
 
 
+PHASE3C_TELEGRAM_ID_BAND_START = 85000
+PHASE3C_TELEGRAM_ID_BAND_END = 85999
+
+_phase3c_telegram_id_counter = itertools.count(PHASE3C_TELEGRAM_ID_BAND_START)
+
+
+def next_phase3c_telegram_id() -> int:
+    """Next telegram_id from the comms Phase 3c band (85000-85999)."""
+    tid = next(_phase3c_telegram_id_counter)
+    if tid > PHASE3C_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 85000-85999 exhausted"
+        )
+    return tid
+
+
 PHASE3B_TELEGRAM_ID_BAND_START = 84000
 PHASE3B_TELEGRAM_ID_BAND_END = 84999
 

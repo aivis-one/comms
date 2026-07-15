@@ -96,6 +96,7 @@ async def create_notification(
     priority: int = 5,
     scheduled_at: datetime | None = None,
     expiry_at: datetime | None = None,
+    idempotency_key: str | None = None,
 ) -> Notification:
     """Create a new Notification record.
 
@@ -106,6 +107,10 @@ async def create_notification(
         body: Notification body text.
         target_type: TargetType value (user, group, all).
         target_value: Bare target specifier ("<uuid>", "<group_key>", "*").
+        idempotency_key: Producer-supplied dedup key (stream ingest,
+            Phase 3c); the partial unique index makes the database the
+            dedup arbiter -- the caller catches IntegrityError on
+            flush and treats it as a duplicate. None = no dedup.
         channels: Delivery channels. Defaults to ["in_app"].
         action_data: Optional JSONB action payload (deep-link intent +
             template variables).
@@ -156,6 +161,7 @@ async def create_notification(
         priority=priority,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
+        idempotency_key=idempotency_key,
         status=NotificationStatus.PENDING,
     )
     session.add(notification)
