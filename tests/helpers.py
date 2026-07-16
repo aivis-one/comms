@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
+from app.messaging.models import Section
 
 TELEGRAM_ID_BAND_START = 80000
 TELEGRAM_ID_BAND_END = 80999
@@ -107,6 +108,26 @@ def next_phase3b_telegram_id() -> int:
     return tid
 
 
+PHASE4A_TELEGRAM_ID_BAND_START = 86000
+PHASE4A_TELEGRAM_ID_BAND_END = 86999
+
+_phase4a_telegram_id_counter = itertools.count(PHASE4A_TELEGRAM_ID_BAND_START)
+
+
+def next_phase4a_telegram_id() -> int:
+    """Next telegram_id from the comms Phase 4a band (86000-86999).
+
+    85000-85999 belongs to Phase 3c; 83xxx / 89xxx are VELO's -- never
+    reused here.
+    """
+    tid = next(_phase4a_telegram_id_counter)
+    if tid > PHASE4A_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 86000-86999 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,
@@ -144,3 +165,16 @@ async def add_to_group(
     session.add(membership)
     await session.flush()
     return membership
+
+
+async def create_section(
+    session: AsyncSession,
+    *,
+    key: str,
+    label: str | None = None,
+) -> Section:
+    """Create a messaging Section row (Phase 4a)."""
+    section = Section(key=key, label=label if label is not None else key)
+    session.add(section)
+    await session.flush()
+    return section

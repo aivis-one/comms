@@ -31,6 +31,15 @@ from app.core.database import Base
 # Phase 1: notification engine
 from app.engine.models import Notification, NotificationDelivery  # noqa: F401
 
+# Phase 4a: messaging data layer (threads / messages / read state /
+# sections)
+from app.messaging.models import (  # noqa: F401
+    Message,
+    Section,
+    Thread,
+    ThreadReadState,
+)
+
 # ---------------------------------------------------------------------------
 
 config = context.config

@@ -1,0 +1,268 @@
+# =============================================================================
+# COMMS Service -- Messaging Models (Phase 4a)
+# =============================================================================
+#
+# The messaging data layer (arch doc §2.4). Product-neutral: the
+# "master" is just a recipient, a "practice" is an opaque subject_ref.
+#
+# SCHEMA INVARIANTS LIVE IN THE MIGRATION. Following the repo practice
+# (notifications.idempotency_key, migration 0005), every messaging
+# constraint and index -- the two dedup partial unique indexes, the
+# subject_ref both-or-neither CHECK, the section key uniqueness, the
+# read/unread composite index -- is declared in migration 0006, not in
+# __table_args__. The models declare columns and simple single-column
+# FK indexes only; the migration is the one place to review the
+# invariants.
+#
+# WHY operator_target IS A POLYMORPHIC PAIR (not two FK columns):
+#   operator_value is a recipient id for the USER form and a section id
+#   for the SECTION form -- both UUIDs, but two different tables, so a
+#   single column cannot carry a hard FK. It is kept NON-NULL so the
+#   dedup indexes stay clean (two NULLs never collide in Postgres, so a
+#   nullable operator would quietly break "one eternal dm"). Its
+#   referent is verified in the service on creation, both forms
+#   (threads.create_or_get_thread) -- the compensation for the missing
+#   DB-level FK.
+#
+# RECIPIENT REFERENCES: client / sender / participant are real FKs to
+# the audience-owned recipients table (referenced BY NAME -- messaging
+# does not import app.audience). ondelete is RESTRICT, not the repo's
+# usual CASCADE: a thread is immortal by thread_id, so a recipient that
+# a conversation references must not be shredded by a silent cascade
+# (see migration 0006 for the full rationale).
+# =============================================================================
+
+from datetime import datetime
+from uuid import UUID
+
+from sqlalchemy import DateTime, ForeignKey, Integer, String, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.database import Base
+from app.core.mixins import TimestampMixin, UUIDMixin
+from app.messaging.constants import (
+    MAX_MESSAGE_BODY_LEN,
+    MAX_SECTION_KEY_LEN,
+    MAX_SECTION_LABEL_LEN,
+    MAX_SUBJECT_ID_LEN,
+    MAX_SUBJECT_TYPE_LEN,
+    MAX_THREAD_TITLE_LEN,
+    ThreadStatus,
+)
+
+
+class Section(UUIDMixin, Base):
+    """A first-class support section (arch doc §2.4, v1 minimal).
+
+    Only id / key / label. The operator<->section MEMBERSHIP is
+    trivial in v1 (any agent serves every section) and belongs to
+    Phase 4b -- this table exists so that a thread's
+    operator_target=section:<id> can point at a real row.
+    """
+
+    __tablename__ = "sections"
+
+    # Opaque product-facing key ("support", "billing", ...). UNIQUE is
+    # enforced by uq_sections_key (migration 0006) -- kept out of the
+    # model for the same reason the notifications idempotency index
+    # lives only in the migration.
+    key: Mapped[str] = mapped_column(
+        String(MAX_SECTION_KEY_LEN),
+        nullable=False,
+    )
+
+    label: Mapped[str] = mapped_column(
+        String(MAX_SECTION_LABEL_LEN),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<Section id={self.id} key={self.key!r}>"
+
+
+class Thread(UUIDMixin, TimestampMixin, Base):
+    """A conversation with a stable identity (arch doc §2.4).
+
+    identity = thread_id: the dedup key is applied ONLY at creation
+    (the two partial unique indexes in migration 0006), so a future
+    retag (4b) preserves the thread and its history. `assignee`,
+    `assigned_at`, `status` and `operator_target` are FIELDS here;
+    their BEHAVIOR (claim, visibility, transitions) is Phase 4b.
+    """
+
+    __tablename__ = "threads"
+
+    # The recipient this thread is with (VELO: the client user).
+    client: Mapped[UUID] = mapped_column(
+        ForeignKey("recipients.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    # operator_target = (operator_kind, operator_value). Polymorphic:
+    # operator_value is a recipients.id (USER) or a sections.id
+    # (SECTION). No hard FK (two target tables); non-null keeps the
+    # dedup indexes clean. See module header.
+    operator_kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+    operator_value: Mapped[UUID] = mapped_column(
+        nullable=False,
+    )
+
+    # -- Assignment axis (FIELDS only; claim + its referential handling
+    #    are Phase 4b). assignee is deliberately NOT an FK here: it is
+    #    the sibling of operator_value on the operator axis, which 4b
+    #    owns; 4a never sets it (no claim), so wiring its FK/ondelete
+    #    alongside claim semantics is 4b's call. --
+    assignee: Mapped[UUID | None] = mapped_column(
+        nullable=True,
+    )
+    assigned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # Dedup discriminator for the SUBJECTLESS case (arch doc §2.4).
+    kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+
+    # subject_ref = (subject_type, subject_id), OPAQUE to comms (never
+    # parsed). Both-or-neither is enforced by a CHECK in migration
+    # 0006.
+    subject_type: Mapped[str | None] = mapped_column(
+        String(MAX_SUBJECT_TYPE_LEN),
+        nullable=True,
+    )
+    subject_id: Mapped[str | None] = mapped_column(
+        String(MAX_SUBJECT_ID_LEN),
+        nullable=True,
+    )
+
+    title: Mapped[str | None] = mapped_column(
+        String(MAX_THREAD_TITLE_LEN),
+        nullable=True,
+    )
+    priority: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    # Lifecycle status. Values LOCKED to open/resolved/closed (§2.4);
+    # transitions are Phase 4b. Varchar + StrEnum value, no CHECK
+    # (append-only), same shape as Notification.status.
+    status: Mapped[str] = mapped_column(
+        String(20),
+        default=ThreadStatus.OPEN,
+        server_default=ThreadStatus.OPEN.value,
+        nullable=False,
+    )
+
+    # Activity marker = time of the last message. This is the socket
+    # the 4b auto-close pass ("silent N days -> closed") scans; kept
+    # SEPARATE from updated_at so a 4b claim/retag does not look like
+    # thread activity. Its supporting index is deferred to 4b (like the
+    # retention index, BL-3) -- see migration 0006.
+    last_message_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Thread id={self.id} kind={self.kind} "
+            f"status={self.status} client={self.client}>"
+        )
+
+
+class Message(UUIDMixin, Base):
+    """A single message in a thread (arch doc §2.4).
+
+    Immutable once written (append-only history) -- created_at only, no
+    updated_at, mirroring the notification rows. The "message sent"
+    event / notification / callback is NOT here; it is Phase 4c.
+    """
+
+    __tablename__ = "messages"
+
+    thread_id: Mapped[UUID] = mapped_column(
+        ForeignKey("threads.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Author of the message. RESTRICT (history-bearing) -- see the
+    # module header and migration 0006.
+    sender: Mapped[UUID] = mapped_column(
+        ForeignKey("recipients.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    body: Mapped[str] = mapped_column(
+        String(MAX_MESSAGE_BODY_LEN),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Message id={self.id} thread={self.thread_id} "
+            f"sender={self.sender}>"
+        )
+
+
+class ThreadReadState(Base):
+    """Per-participant read pointer for a thread (arch doc §2.4).
+
+    (thread_id, participant) -> last_read_at. Composite PK, no
+    surrogate id -- same shape as CategoryMute. "Unread in a thread" is
+    DERIVED (read_state.count_unread), never stored. The upsert is
+    race-safe and monotonic (read_state.mark_read).
+    """
+
+    __tablename__ = "thread_read_states"
+
+    thread_id: Mapped[UUID] = mapped_column(
+        ForeignKey("threads.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    # The reader (a recipient: the client or an operator). RESTRICT --
+    # see the module header and migration 0006.
+    participant: Mapped[UUID] = mapped_column(
+        ForeignKey("recipients.id", ondelete="RESTRICT"),
+        primary_key=True,
+        index=True,
+    )
+
+    # Everything up to (and including) this instant is read.
+    last_read_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ThreadReadState thread={self.thread_id} "
+            f"participant={self.participant} last_read_at={self.last_read_at}>"
+        )

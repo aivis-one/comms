@@ -44,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.database import dispose_engine, get_session_factory
 from app.engine.models import Notification, NotificationDelivery
+from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.profile.loader import FileProfileSource, install_profile, load_profile
 from app.profile.registry import registry
 
@@ -92,6 +93,14 @@ async def clean_db(apply_migrations: None) -> AsyncGenerator[None, None]:
     """Delete all comms rows before each test (ORM delete, FK order)."""
     factory = get_session_factory()
     async with factory() as session:
+        # Messaging (Phase 4a) -- child-first, and ALL before Recipient:
+        # the client / sender / participant FKs are RESTRICT, so a
+        # recipient cannot be deleted while a thread / message /
+        # read-state still references it.
+        await session.execute(delete(ThreadReadState))
+        await session.execute(delete(Message))
+        await session.execute(delete(Thread))
+        await session.execute(delete(Section))
         await session.execute(delete(NotificationDelivery))
         await session.execute(delete(Notification))
         await session.execute(delete(CategoryMute))
