@@ -9,9 +9,10 @@
 #   processor -- cleanup_terminal_notifications: the drain loop, one
 #                commit per batch; tests call it DIRECTLY, bypassing
 #                the worker's cadence gate (by design);
-#   worker    -- run_notification_batch: the per-process cadence gate
-#                (monotonic timestamp + reset helper), tested with the
-#                processor functions monkeypatched out.
+#   app/worker -- run_worker_batch: the per-process cadence GATES for
+#                BOTH maintenance passes (retention + auto-close, Phase
+#                4b edit 3 moved scheduling here), tested with the
+#                engine batch + passes monkeypatched out.
 # =============================================================================
 
 import time
@@ -25,7 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.engine.processor as processor_module
-import app.engine.worker as worker_module
+import app.worker as worker_module
 from app.core.config import settings
 from app.core.database import get_session_factory
 from app.engine.constants import (
@@ -35,7 +36,11 @@ from app.engine.constants import (
 )
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import cleanup_terminal_notifications
-from app.engine.worker import reset_retention_gate, run_notification_batch
+from app.worker import (
+    reset_auto_close_gate,
+    reset_retention_gate,
+    run_worker_batch,
+)
 from tests.helpers import create_recipient, next_phase3a_telegram_id
 
 
@@ -222,30 +227,28 @@ class TestRetentionPass:
         assert await _remaining_ids() == {ancient.id}
 
 
-class TestRetentionCadenceGate:
-    """Fix H: the worker runs the retention pass on its own slow
-    cadence -- per-process monotonic gate in run_notification_batch.
-    The processor functions are monkeypatched out: these tests are
-    about SCHEDULING, not deletion."""
+class TestWorkerMaintenanceCadence:
+    """Phase 4b edit 3: app/worker.py runs BOTH maintenance passes on
+    their own per-process cadences (retention + auto-close), each with
+    its own monotonic gate + reset helper. The engine batch and both
+    passes are monkeypatched out -- these tests are about SCHEDULING,
+    not deletion/closing."""
 
     @pytest.fixture(autouse=True)
     def _stub_tick(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> Generator[dict[str, int], None, None]:
-        """Reset the gate and replace the tick's processor calls with
-        counters (worker imports them into its own namespace)."""
+        """Reset both gates and replace the tick's calls with counters
+        (app/worker imports them into its own namespace). The engine
+        delivery batch is stubbed as one unit."""
         reset_retention_gate()
-        calls = {"pending": 0, "expired": 0, "retention": 0}
+        reset_auto_close_gate()
+        calls = {"batch": 0, "retention": 0, "auto_close": 0}
         order: list[str] = []
 
-        async def _pending() -> int:
-            calls["pending"] += 1
-            order.append("pending")
-            return 0
-
-        async def _expired() -> int:
-            calls["expired"] += 1
-            order.append("expired")
+        async def _batch() -> int:
+            calls["batch"] += 1
+            order.append("batch")
             return 0
 
         async def _retention() -> int:
@@ -253,56 +256,76 @@ class TestRetentionCadenceGate:
             order.append("retention")
             return 0
 
-        monkeypatch.setattr(
-            worker_module, "process_pending_notifications", _pending,
-        )
-        monkeypatch.setattr(
-            worker_module, "cleanup_expired_notifications", _expired,
-        )
+        async def _auto_close() -> int:
+            calls["auto_close"] += 1
+            order.append("auto_close")
+            return 0
+
+        monkeypatch.setattr(worker_module, "run_notification_batch", _batch)
         monkeypatch.setattr(
             worker_module, "cleanup_terminal_notifications", _retention,
+        )
+        monkeypatch.setattr(
+            worker_module, "auto_close_idle_threads", _auto_close,
         )
         self.calls = calls
         self.order = order
         yield calls
         reset_retention_gate()
+        reset_auto_close_gate()
 
-    async def test_first_tick_runs_retention_immediately(self) -> None:
-        """None-state gate: restart = immediate first pass (a feature
-        -- deploys restart comms, staleness is bounded above)."""
-        await run_notification_batch()
+    async def test_first_tick_runs_both_passes_immediately(self) -> None:
+        """None-state gates: restart = immediate first pass for each."""
+        await run_worker_batch()
         assert self.calls["retention"] == 1
+        assert self.calls["auto_close"] == 1
 
-    async def test_tick_order_is_pending_expiry_retention(self) -> None:
-        """Fix H: deliveries first -- retention never delays them."""
-        await run_notification_batch()
-        assert self.order == ["pending", "expired", "retention"]
+    async def test_tick_order_is_batch_then_maintenance(self) -> None:
+        """Deliveries first -- maintenance never delays them."""
+        await run_worker_batch()
+        assert self.order == ["batch", "retention", "auto_close"]
 
-    async def test_within_interval_is_gated(self) -> None:
-        """Second tick inside the interval: pending + expiry run every
-        tick, retention does not."""
-        await run_notification_batch()
-        await run_notification_batch()
-        assert self.calls["pending"] == 2
-        assert self.calls["expired"] == 2
+    async def test_within_interval_gates_both(self) -> None:
+        """Second tick inside the intervals: the delivery batch runs
+        every tick, both maintenance passes stay gated."""
+        await run_worker_batch()
+        await run_worker_batch()
+        assert self.calls["batch"] == 2
         assert self.calls["retention"] == 1
+        assert self.calls["auto_close"] == 1
 
-    async def test_after_interval_runs_again(self) -> None:
-        """Move the stamp back past the interval -> the gate opens."""
-        await run_notification_batch()
+    async def test_retention_runs_again_after_its_interval(self) -> None:
+        await run_worker_batch()
         interval = settings.notification_retention_interval_seconds
-        worker_module._last_retention_at = (
-            time.monotonic() - interval - 1
-        )
-        await run_notification_batch()
+        worker_module._last_retention_at = time.monotonic() - interval - 1
+        await run_worker_batch()
         assert self.calls["retention"] == 2
 
-    async def test_disabled_never_enters_the_gate(
+    async def test_auto_close_runs_again_after_its_interval(self) -> None:
+        await run_worker_batch()
+        interval = settings.thread_auto_close_interval_seconds
+        worker_module._last_auto_close_at = time.monotonic() - interval - 1
+        await run_worker_batch()
+        assert self.calls["auto_close"] == 2
+
+    async def test_retention_disabled_never_enters_gate(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Fix I: retention_days <= 0 -> the tick never schedules the
-        pass at all (the processor guard is the second line)."""
+        """Fix I: retention_days <= 0 -> retention never scheduled;
+        auto-close is unaffected (its own gate still opens once)."""
         monkeypatch.setattr(settings, "notification_retention_days", 0)
-        await run_notification_batch()
-        await run_notification_batch()
+        await run_worker_batch()
+        await run_worker_batch()
         assert self.calls["retention"] == 0
+        assert self.calls["auto_close"] == 1
+
+    async def test_auto_close_disabled_never_enters_gate(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Symmetric: auto_close_days <= 0 -> auto-close never
+        scheduled; retention is unaffected."""
+        monkeypatch.setattr(settings, "thread_auto_close_days", 0)
+        await run_worker_batch()
+        await run_worker_batch()
+        assert self.calls["auto_close"] == 0
+        assert self.calls["retention"] == 1

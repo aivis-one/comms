@@ -11,12 +11,15 @@
 #     3. rollup   -- update notification status from delivery statuses
 #
 #   Plus: expire overdue notifications, delete expired delivered
-#   ones, and (on its own slow cadence -- see app/engine/worker.py)
+#   ones, and (on its own slow cadence -- scheduled by app/worker.py)
 #   drain terminal notifications past retention (Phase 3a item 5).
 #
 # CALLED BY:
-#   app/engine/worker.py (run_notification_batch) -- which the separate
-#   worker process loops over.
+#   app/engine/worker.py (run_notification_batch) for the delivery
+#   pipeline + expiry; app/worker.py for the retention pass on its own
+#   cadence. The worker LOOP and all maintenance scheduling live in
+#   app/worker.py (the neutral layer above engine and messaging), which
+#   keeps `engine` messaging-free (Phase 4b, edit 3).
 #
 # SESSION MANAGEMENT:
 #   Each notification is processed in its own session/transaction.

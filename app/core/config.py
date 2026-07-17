@@ -175,6 +175,26 @@ class Settings(BaseSettings):
     # is NOTIFICATION_RETENTION_DAYS <= 0.
     notification_retention_interval_seconds: int = 3600
 
+    # Phase 4b item 6: auto-close of idle THREADS. A thread that has
+    # been silent for this many days is moved to `closed` (a status,
+    # NOT a delete -- a thread is immortal by thread_id, and a closed
+    # thread revives on the next client message). Silence is measured
+    # on COALESCE(last_message_at, created_at), so a thread that never
+    # got a message ages from creation.
+    # SEMANTICS (mirrors retention, fix I): <= 0 means auto-close is
+    # DISABLED -- never a mass close. Disabling is loud (worker startup
+    # log). Default 30.
+    thread_auto_close_days: int = 30
+
+    # The auto-close pass runs on its OWN slow cadence (sibling of the
+    # retention pass), NOT on the worker tick and NOT sharing the
+    # retention interval -- two unrelated maintenance frequencies must
+    # not be coupled through one knob. Per-process monotonic gate in
+    # app/worker.py. Strictly > 0: 0 is a config error at startup, NOT
+    # "every tick" -- "off" is THREAD_AUTO_CLOSE_DAYS <= 0. Days-
+    # granular, so an hour is plenty.
+    thread_auto_close_interval_seconds: int = 3600
+
     # -- Computed properties --
 
     @property
@@ -278,6 +298,14 @@ class Settings(BaseSettings):
                 "To disable retention set "
                 "NOTIFICATION_RETENTION_DAYS to 0 or a negative "
                 "value; interval 0 does NOT mean 'every tick'."
+            )
+
+        if self.thread_auto_close_interval_seconds <= 0:
+            raise ValueError(
+                "THREAD_AUTO_CLOSE_INTERVAL_SECONDS must be > 0. "
+                "To disable auto-close set THREAD_AUTO_CLOSE_DAYS to 0 "
+                "or a negative value; interval 0 does NOT mean "
+                "'every tick'."
             )
 
         return self

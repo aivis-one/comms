@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Message, Section, Thread
+from app.messaging.status import apply_client_message_reopen
 
 logger = structlog.get_logger()
 
@@ -94,7 +95,20 @@ def _build_thread(
     title: str | None,
     priority: int | None,
 ) -> Thread:
-    """Construct an unsaved Thread (status defaults to open in the ORM)."""
+    """Construct an unsaved Thread (status defaults to open in the ORM).
+
+    D1(i) (Phase 4b): a USER thread's operator is fixed by the form, so
+    its assignee is PRE-ASSIGNED to operator_value (the master) at
+    creation -- assigned_at set with it (invariant: assignee set <=>
+    assigned_at set). A SECTION thread is created unassigned (claimed
+    later). The pre-assign is why the claim guard `assignee IS NULL`
+    rejects user threads with no special-case.
+    """
+    assignee: UUID | None = None
+    assigned_at: datetime | None = None
+    if operator_kind is OperatorKind.USER:
+        assignee = operator_value
+        assigned_at = datetime.now(UTC)
     return Thread(
         client=client,
         operator_kind=operator_kind,
@@ -104,6 +118,8 @@ def _build_thread(
         subject_id=subject_id,
         title=title,
         priority=priority,
+        assignee=assignee,
+        assigned_at=assigned_at,
     )
 
 
@@ -282,6 +298,12 @@ async def post_message(
     # out-of-order backfilled message must not pull the marker back.
     if thread.last_message_at is None or thread.last_message_at < when:
         thread.last_message_at = when
+    # D5 auto-reopen: a CLIENT message revives a resolved/closed thread
+    # to `open` (operator messages never reopen); a pending close-notify
+    # is voided inside the helper. Sender identity is compared to the
+    # thread's client -- the write-authz for operators lands in 4c.
+    if sender == thread.client:
+        apply_client_message_reopen(thread)
     await session.flush()
     logger.info(
         "message_posted",

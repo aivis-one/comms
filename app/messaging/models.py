@@ -117,13 +117,19 @@ class Thread(UUIDMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    # -- Assignment axis (FIELDS only; claim + its referential handling
-    #    are Phase 4b). assignee is deliberately NOT an FK here: it is
-    #    the sibling of operator_value on the operator axis, which 4b
-    #    owns; 4a never sets it (no claim), so wiring its FK/ondelete
-    #    alongside claim semantics is 4b's call. --
+    # -- Assignment axis. Phase 4b wires the operator axis it inherited
+    #    "soft" from 4a. assignee ALWAYS points into recipients (one
+    #    table) -- for a section thread it is the claiming agent, for a
+    #    user thread it is pre-assigned to operator_value (the master) at
+    #    creation -- so a hard FK is clean here, unlike the polymorphic
+    #    operator_value (which has none). ondelete=RESTRICT for the same
+    #    reason as client/sender/participant (see migration 0006): a
+    #    recipient a thread references is not silently shredded.
+    #    INVARIANT: assignee is set  <=>  assigned_at is set. --
     assignee: Mapped[UUID | None] = mapped_column(
+        ForeignKey("recipients.id", ondelete="RESTRICT"),
         nullable=True,
+        index=True,
     )
     assigned_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -173,6 +179,18 @@ class Thread(UUIDMixin, TimestampMixin, Base):
     # thread activity. Its supporting index is deferred to 4b (like the
     # retention index, BL-3) -- see migration 0006.
     last_message_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # Phase 4b -> 4c handoff socket. Set to the close time when a
+    # SECTION thread reaches `closed` (auto-close OR manual operator
+    # close -- "loud" is a property of the FORM, not the trigger);
+    # NEVER set for user/DM threads ("quiet"). 4b only MARKS here; 4c
+    # reads pending rows, sends the "conversation closed" notification,
+    # and clears the mark. Cleared on client auto-reopen (the close was
+    # voided before 4c sent). Unindexed in 4b -- 4c owns that read.
+    close_notify_pending_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )

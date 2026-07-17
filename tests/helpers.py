@@ -128,6 +128,22 @@ def next_phase4a_telegram_id() -> int:
     return tid
 
 
+PHASE4B_TELEGRAM_ID_BAND_START = 87000
+PHASE4B_TELEGRAM_ID_BAND_END = 87999
+
+_phase4b_telegram_id_counter = itertools.count(PHASE4B_TELEGRAM_ID_BAND_START)
+
+
+def next_phase4b_telegram_id() -> int:
+    """Next telegram_id from the comms Phase 4b band (87000-87999)."""
+    tid = next(_phase4b_telegram_id_counter)
+    if tid > PHASE4B_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 87000-87999 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,

@@ -1,0 +1,246 @@
+# =============================================================================
+# COMMS Service -- Messaging: Operators (Phase 4b, items 1-4)
+# =============================================================================
+#
+# Operator BEHAVIOR over the 4a data layer: resolve, claim, visibility,
+# retag. The operator target is the polymorphic pair from 4a
+# (operator_kind, operator_value) -- see app/messaging/models.py.
+#
+# BL-1 DISCIPLINE: resolve_operator returns a DESCRIPTOR (OperatorScope),
+# never a materialized recipient list. Visibility is expressed as a
+# QUERY (list_visible_threads) -- the set of recipients serving a
+# section is never produced here.
+#
+# NOT here (Phase 4c): write-authz (who may claim / retag / post),
+# message -> notification, the msg_* gate. 4b decides SCOPE (who can
+# SEE, and the atomic ownership of a claim); it does not gate writes.
+# Callers commit.
+# =============================================================================
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from uuid import UUID
+
+import structlog
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import NotFoundError, ValidationError
+from app.messaging.constants import OperatorKind
+from app.messaging.models import Section, Thread
+from app.messaging.threads import _is_dedup_violation
+
+logger = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class OperatorScope:
+    """A thread's resolved operator target (arch doc §2.4).
+
+    A DESCRIPTOR, not a recipient list (BL-1). Downstream code turns it
+    into query predicates (visibility) or an ownership check (claim);
+    the set of agents serving a section is never materialized here.
+
+    kind == USER    -> `value` is the single responsible recipient
+                       (the master; pre-assigned as the thread's
+                       assignee at creation).
+    kind == SECTION -> `value` is the section id. v1 membership is
+                       TRIVIAL: every agent serves every section, so
+                       "does operator X serve this scope" is always
+                       true for a section (rich membership is starred).
+    """
+
+    kind: OperatorKind
+    value: UUID
+
+    @property
+    def is_claimable(self) -> bool:
+        """Section threads are claimed by an agent; a user thread's
+        operator is fixed by the form and never claimed."""
+        return self.kind is OperatorKind.SECTION
+
+
+def resolve_operator(
+    operator_kind: OperatorKind,
+    operator_value: UUID,
+) -> OperatorScope:
+    """Resolve a thread's operator pair into an OperatorScope.
+
+    Pure over the pair (no DB): the referent was validated at creation
+    (4a `_require_operator_referent`). This is the single seam that
+    "resolves" an operator -- retag re-runs it after a section/subject
+    change, and it is where the BL-1 no-materialized-list rule lives.
+    """
+    return OperatorScope(kind=operator_kind, value=operator_value)
+
+
+async def claim_thread(
+    session: AsyncSession,
+    *,
+    thread_id: UUID,
+    operator: UUID,
+    when: datetime | None = None,
+) -> bool:
+    """Atomically claim an unassigned thread for `operator`.
+
+    Conditional UPDATE `assignee = me WHERE id = ? AND assignee IS
+    NULL` + rowcount -- exactly one of two concurrent claimers wins;
+    the loser sees rowcount 0. No special-case for user threads: D1(i)
+    pre-assigns their assignee at creation, so `assignee IS NULL` never
+    matches a user thread and the guard rejects it for free.
+
+    Returns True if THIS call claimed the thread; False if it was
+    already assigned. Raises NotFoundError if the thread does not exist.
+    """
+    now = when if when is not None else datetime.now(UTC)
+    result = await session.execute(
+        update(Thread)
+        .where(Thread.id == thread_id, Thread.assignee.is_(None))
+        .values(assignee=operator, assigned_at=now)
+    )
+    rowcount: int = result.rowcount  # type: ignore[attr-defined]
+    if rowcount == 1:
+        logger.info(
+            "thread_claimed",
+            thread_id=str(thread_id),
+            operator=str(operator),
+        )
+        return True
+
+    # rowcount 0 -> already assigned, OR no such thread. Threads are
+    # immortal (never deleted), so this get is not racy; it only
+    # disambiguates the two failure modes.
+    thread = await session.get(Thread, thread_id)
+    if thread is None:
+        raise NotFoundError(f"thread {thread_id} does not exist")
+    return False
+
+
+async def list_visible_threads(
+    session: AsyncSession,
+    *,
+    operator: UUID,
+    is_supervisor: bool = False,
+) -> Sequence[Thread]:
+    """Threads an operator may SEE, most-recently-active first.
+
+    The set-level form of the OperatorScope rule (resolve_operator):
+        visible(me) = assignee == me
+                      OR (section thread AND unassigned [AND I serve it])
+      - assignee == me covers BOTH a user thread I master (D1(i)
+        pre-assign) and a section thread I have claimed;
+      - an unassigned section thread is in every agent's pool (v1
+        membership is trivial); a foreign user thread (mastered by
+        someone else, assignee != me) is therefore invisible.
+      - v1 membership slot: rich operator<->section membership (starred)
+        adds `AND <section> IN (my_sections)` to the section clause.
+
+    NOTE (P-2, supervisor read-only marker): a supervisor sees EVERYTHING, but this
+    read-only property is NOT enforced by the data layer -- is_supervisor
+    only WIDENS the read. The write-ban (a supervisor must not mutate)
+    rides with write-authz in Phase 4c (§6d), the same seam as the
+    sender write-authz assumption; 4b never gates writes.
+    """
+    stmt = select(Thread)
+    if not is_supervisor:
+        stmt = stmt.where(
+            or_(
+                Thread.assignee == operator,
+                and_(
+                    Thread.operator_kind == OperatorKind.SECTION,
+                    Thread.assignee.is_(None),
+                ),
+            )
+        )
+    stmt = stmt.order_by(
+        func.coalesce(Thread.last_message_at, Thread.created_at).desc(),
+        Thread.id,
+    )
+    result = await session.scalars(stmt)
+    return result.all()
+
+
+async def retag_thread(
+    session: AsyncSession,
+    *,
+    thread_id: UUID,
+    section: UUID,
+    subject_type: str | None = None,
+    subject_id: str | None = None,
+) -> Thread:
+    """Retag a SECTION thread to a new section and/or subject_ref.
+
+    Mutability by operator form (arch doc §2.4): a `user` thread's axes
+    are FROZEN (retag rejected); a `section` thread is retag-capable.
+    Sets (operator_value=section, subject_ref), re-resolves the operator
+    and RESETS assignee (the thread returns to the pool, must be
+    re-claimed). The thread and its history are preserved: thread_id is
+    stable and the dedup key is NOT recomputed -- threads are NEVER
+    merged. The partial unique indexes still guard, so a retag that
+    would duplicate an existing (client, operator, subject) is REJECTED
+    (one thread per entity), not merged.
+
+    # KNOWN CEILING (P-1 -- section lifecycle; acknowledged by design):
+    #   1. Mechanics: operator_value carries NO foreign key (it is the
+    #      polymorphic half of the operator pair -- a recipient for
+    #      user, a section for section), so deleting a `sections` row is
+    #      NOT blocked by the database; a section thread would then
+    #      point at a vanished section.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: BL-5 (section lifecycle -- delete / move).
+    #   4. Promotion trigger: a section-deletion path is introduced, OR
+    #      cbshome onboards section operators (Phase 7) -- until then
+    #      sections have no consumer in v1 (VELO is user-form) and no
+    #      deletion path exists in the code.
+    #   5. Agreed fix: reassign-then-delete -- retag every thread off a
+    #      section onto another/archive section, THEN delete it.
+    #   6. Rejected: a hard FK on operator_value (would break the
+    #      polymorphic pair -- a nullable two-FK design forces NULL into
+    #      the dedup key, and two NULLs never collide -> "one eternal
+    #      dm" quietly breaks); a silent orphan / cascade (would break
+    #      thread immortality by thread_id).
+    """
+    thread = await session.get(Thread, thread_id)
+    if thread is None:
+        raise NotFoundError(f"thread {thread_id} does not exist")
+    if thread.operator_kind != OperatorKind.SECTION:
+        raise ValidationError(
+            "user thread axes are frozen; retag is only allowed on "
+            "section threads"
+        )
+    if (subject_type is None) != (subject_id is None):
+        raise ValidationError(
+            "subject_ref must be both-or-neither: "
+            f"subject_type={subject_type!r} subject_id={subject_id!r}"
+        )
+    if await session.get(Section, section) is None:
+        raise NotFoundError(f"section {section} does not exist")
+
+    # Apply the new tag; re-resolve the operator, reset assignee.
+    new_scope = resolve_operator(OperatorKind.SECTION, section)
+    thread.operator_value = new_scope.value
+    thread.subject_type = subject_type
+    thread.subject_id = subject_id
+    thread.assignee = None
+    thread.assigned_at = None
+    try:
+        # SAVEPOINT: a dedup collision rolls back only this UPDATE and
+        # leaves the outer session usable for the caller's rollback.
+        async with session.begin_nested():
+            await session.flush()
+    except IntegrityError as exc:
+        if not _is_dedup_violation(exc):
+            raise
+        raise ValidationError(
+            "retag would duplicate an existing thread for this entity "
+            "(one thread per entity); threads are never merged"
+        ) from exc
+
+    logger.info(
+        "thread_retagged",
+        thread_id=str(thread_id),
+        section=str(section),
+    )
+    return thread
