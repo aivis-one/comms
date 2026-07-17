@@ -180,7 +180,7 @@ async def create_or_get_thread(
 
     Dedup is applied ONLY here (the thread_id invariant). Raises
     ValidationError on a half-populated subject_ref and NotFoundError
-    if the operator referent does not exist (either form). See module
+    if the client OR operator referent does not exist. See module
     header for the three dedup cases and the race handling.
     """
     if (subject_type is None) != (subject_id is None):
@@ -190,6 +190,12 @@ async def create_or_get_thread(
             "subject_ref must be both-or-neither: "
             f"subject_type={subject_type!r} subject_id={subject_id!r}"
         )
+
+    # Validate the client referent in code (symmetric with the operator
+    # check below): the client FK would otherwise surface a raw
+    # IntegrityError -> 500; a missing referent is a clean 404.
+    if not await _recipient_exists(session, client):
+        raise NotFoundError(f"client recipient {client} does not exist")
 
     await _require_operator_referent(session, operator_kind, operator_value)
 

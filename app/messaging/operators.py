@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind
 from app.messaging.models import Section, Thread
-from app.messaging.threads import _is_dedup_violation
+from app.messaging.threads import _is_dedup_violation, _recipient_exists
 
 logger = structlog.get_logger()
 
@@ -134,8 +134,16 @@ async def claim_thread(
     matches a user thread and the guard rejects it for free.
 
     Returns True if THIS call claimed the thread; False if it was
-    already assigned. Raises NotFoundError if the thread does not exist.
+    already assigned. Raises NotFoundError if the thread does not exist
+    OR the operator referent does not exist.
     """
+    # Validate the operator referent in code: the assignee FK (RESTRICT)
+    # would otherwise surface a raw IntegrityError -> 500 on a bad
+    # operator; a missing referent is a clean 404 (symmetric with how
+    # create_or_get_thread validates its client / operator referents).
+    if not await _recipient_exists(session, operator):
+        raise NotFoundError(f"operator recipient {operator} does not exist")
+
     now = when if when is not None else datetime.now(UTC)
     result = await session.execute(
         update(Thread)

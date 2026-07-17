@@ -279,3 +279,65 @@ class TestListVisible:
         assert resp.status_code == 200
         seen = {t["id"] for t in resp.json()["threads"]}
         assert ids <= seen
+
+
+class TestReferentValidation:
+    """4c.1-B: a bad trusted-actor FK id is a clean 404, not a 500."""
+
+    async def test_create_unknown_client_is_404(
+        self, client: AsyncClient
+    ) -> None:
+        master = await _recipient()  # valid operator referent
+        resp = await client.post(
+            "/api/v1/threads",
+            json={
+                "client": str(uuid4()), "operator_kind": "user",
+                "operator_value": str(master), "kind": "dm",
+            },
+        )
+        assert resp.status_code == 404
+
+    async def test_claim_unknown_operator_is_404(
+        self, client: AsyncClient
+    ) -> None:
+        client_id, section = await _recipient(), await _section()
+        tid = await _ticket(client, client_id, section)
+        resp = await client.post(
+            f"/api/v1/threads/{tid}/claim", json={"operator": str(uuid4())}
+        )
+        assert resp.status_code == 404
+
+
+class TestReadClamp:
+    """4c.1-D: a future last_read_at is clamped to now, so it cannot
+    pre-clear the participant's own badge for messages not yet seen."""
+
+    async def test_future_last_read_at_is_clamped(
+        self, client: AsyncClient
+    ) -> None:
+        client_id, master = await _recipient(), await _recipient()
+        tid = await _dm(client, client_id, master)
+        await client.post(
+            f"/api/v1/threads/{tid}/messages",
+            json={"sender": str(client_id), "body": "m0"},
+        )
+        marked = await client.post(
+            f"/api/v1/threads/{tid}/read",
+            json={
+                "participant": str(master),
+                "last_read_at": "2099-01-01T00:00:00Z",
+            },
+        )
+        assert marked.status_code == 200
+        assert marked.json()["unread"] == 0  # m0 read at (clamped) now
+        # a message posted AFTER the clamped pointer is still unread;
+        # an unclamped 2099 pointer would have hidden it.
+        await client.post(
+            f"/api/v1/threads/{tid}/messages",
+            json={"sender": str(client_id), "body": "m1"},
+        )
+        after = await client.get(
+            f"/api/v1/threads/{tid}/unread-count",
+            params={"participant": str(master)},
+        )
+        assert after.json()["unread"] == 1

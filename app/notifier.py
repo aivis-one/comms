@@ -43,6 +43,18 @@ logger = structlog.get_logger()
 
 _CLOSE_NOTIFY_BATCH_SIZE = 500
 
+# The ONE unique on notifications is the idempotency key. Filter the
+# dedup IntegrityError by that index name (mirroring messaging's
+# _is_dedup_violation) so a FUTURE constraint is NOT silently swallowed
+# as a "duplicate" -- it re-raises and surfaces on the caller path.
+_IDEMPOTENCY_INDEX_NAME = "uq_notifications_idempotency_key"
+
+
+def _is_idempotency_violation(exc: IntegrityError) -> bool:
+    """True iff the IntegrityError is the notifications idempotency
+    unique firing (a benign dedup), not some other constraint."""
+    return _IDEMPOTENCY_INDEX_NAME in str(exc.orig)
+
 # -- Locked preference categories (§2.5, E8-canon). The gate reads a
 # type's category from the profile registry; these are the values the
 # profile must map the chat types to. --
@@ -144,7 +156,9 @@ async def _emit_message_notification(
                 ),
                 idempotency_key=key,
             )
-    except IntegrityError:
+    except IntegrityError as exc:
+        if not _is_idempotency_violation(exc):
+            raise  # a real, non-dedup constraint -- surface it
         logger.info(
             "message_notification_deduped",
             thread_id=str(thread.id),
@@ -260,7 +274,9 @@ async def _emit_close_notification(session: AsyncSession, thread: Thread) -> Non
                 action_data=_open_thread_action_data(thread.id),
                 idempotency_key=key,
             )
-    except IntegrityError:
+    except IntegrityError as exc:
+        if not _is_idempotency_violation(exc):
+            raise  # a real, non-dedup constraint -- surface it
         logger.info("close_notification_deduped", thread_id=str(thread.id))
         return
     logger.info(

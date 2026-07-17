@@ -225,7 +225,17 @@ async def list_threads(
     cursor: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_reader),
 ) -> dict[str, Any]:
-    """The operator's visible threads, most-recently-active first."""
+    """The operator's visible threads, most-recently-active first.
+
+    READ-SCOPING IS THE PROXY'S JOB (frozen trust model). `operator`
+    and especially `is_supervisor` are TRUSTED query params: comms does
+    not know who is a supervisor (no role registry -- only the product
+    does), so it accepts the assertion. `is_supervisor=true` WIDENS the
+    read to EVERY thread. Phase 6 MUST derive both server-side from its
+    authenticated session and MUST NEVER let a client set is_supervisor
+    -- forwarding a client-supplied value here is a full read-authz
+    bypass. Same for the thread_id-only read endpoints (feed / unread).
+    """
     decoded = _decode_cursor(cursor) if cursor is not None else None
     threads, next_cursor = await list_visible_threads(
         session,
@@ -298,10 +308,18 @@ async def mark_thread_read(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
     """Advance the participant's read pointer; return the fresh unread
-    count computed in the SAME transaction (race-safe badge)."""
-    when = payload.last_read_at if payload.last_read_at is not None else (
-        datetime.now(UTC)
-    )
+    count computed in the SAME transaction (race-safe badge).
+
+    A client-supplied last_read_at is clamped to now: the pointer is
+    monotonic (a past value is a no-op), and a FUTURE value would
+    otherwise pre-clear the participant's own badge for messages not
+    yet read. Only the caller's own badge is affected either way.
+    """
+    now = datetime.now(UTC)
+    requested = payload.last_read_at
+    if requested is not None and requested.tzinfo is None:
+        requested = requested.replace(tzinfo=UTC)  # tolerate naive input
+    when = min(requested, now) if requested is not None else now
     await mark_read(
         session,
         thread_id=thread_id,
