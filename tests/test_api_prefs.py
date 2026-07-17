@@ -42,7 +42,10 @@ class TestGetForm:
         response = await client.get(_prefs(recipient_id))
         assert response.status_code == 200
         assert response.json() == {
-            "categories": {"unit_reminder": True, "unit_updates": True},
+            "categories": {
+                "unit_reminder": True, "unit_updates": True,
+                "msg_participants": True, "msg_support": True,
+            },
             "schedule": None,
             "timezone": None,
         }
@@ -71,6 +74,7 @@ class TestPatchCategories:
         # PATCH answers with the FULL updated form.
         assert form["categories"] == {
             "unit_reminder": False, "unit_updates": True,
+            "msg_participants": True, "msg_support": True,
         }
         assert form["schedule"] is None
 
@@ -80,6 +84,7 @@ class TestPatchCategories:
         )
         assert response.json()["categories"] == {
             "unit_reminder": True, "unit_updates": True,
+            "msg_participants": True, "msg_support": True,
         }
 
     async def test_partial_touches_only_listed(
@@ -99,6 +104,7 @@ class TestPatchCategories:
         form = response.json()
         assert form["categories"] == {
             "unit_reminder": False, "unit_updates": False,
+            "msg_participants": True, "msg_support": True,
         }
         assert form["schedule"] == _SCHEDULE
 

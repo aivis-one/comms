@@ -79,6 +79,8 @@ class TestFixtureProfileLoads:
         assert registry.registered_categories() == {
             "unit_updates",
             "unit_reminder",
+            "msg_participants",
+            "msg_support",
         }
 
     def test_templates_registered(self) -> None:

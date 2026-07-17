@@ -23,7 +23,11 @@
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import (
+    AuthorizationError,
+    NotFoundError,
+    ValidationError,
+)
 
 
 def register_error_handlers(app: FastAPI) -> None:
@@ -35,6 +39,15 @@ def register_error_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(AuthorizationError)
+    async def _forbidden(
+        request: Request, exc: AuthorizationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
             content={"detail": str(exc)},
         )
 

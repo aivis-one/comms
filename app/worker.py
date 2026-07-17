@@ -36,6 +36,7 @@ from app.engine.formatters import close_formatters
 from app.engine.processor import cleanup_terminal_notifications
 from app.engine.worker import run_notification_batch
 from app.messaging.processor import auto_close_idle_threads
+from app.notifier import consume_close_notifications
 from app.profile.loader import install_profile_from_settings
 
 logger = structlog.get_logger()
@@ -79,6 +80,11 @@ async def run_worker_batch() -> int:
     global _last_retention_at, _last_auto_close_at
 
     processed = await run_notification_batch()
+
+    # Close-notify consumer (Phase 4c item 2): EVERY tick -- a partial
+    # index over a normally-empty flag set makes it cheap and prompt,
+    # unlike the two growing-table maintenance scans below (own gates).
+    await consume_close_notifications()
 
     if settings.notification_retention_days > 0:
         now = time.monotonic()

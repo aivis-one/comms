@@ -27,11 +27,12 @@
 # path (Phase 4c). Callers commit.
 # =============================================================================
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import column, exists, select, table
+from sqlalchemy import column, exists, select, table, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -311,3 +312,45 @@ async def post_message(
         message_id=str(message.id),
     )
     return message
+
+
+# Thread-feed keyset bounds (Phase 4c) -- mirror the inbox: clamp, do
+# not reject. Kept local (threads.py must not import operators.py --
+# operators imports threads, so a shared constant there would cycle).
+MESSAGE_FEED_MAX_PAGE_SIZE = 100
+MESSAGE_FEED_DEFAULT_PAGE_SIZE = 20
+
+
+async def list_thread_messages(
+    session: AsyncSession,
+    *,
+    thread_id: UUID,
+    limit: int = MESSAGE_FEED_DEFAULT_PAGE_SIZE,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> tuple[Sequence[Message], tuple[datetime, UUID] | None]:
+    """Thread feed: a thread's messages, NEWEST-first, keyset-paginated
+    by (created_at, id) -- the same cursor shape as the inbox and the
+    visible-threads list. `limit` clamps to 1..100 (default 20);
+    `cursor` is the (created_at, id) of the last row already seen and
+    the next page is WHERE (created_at, id) < cursor. An absent thread
+    yields an empty feed (the trust-model "empty is the honest answer").
+    Returns (messages, next_cursor); next_cursor is None on the last
+    page. The opaque wire cursor lives at the API edge.
+    """
+    limit = max(1, min(limit, MESSAGE_FEED_MAX_PAGE_SIZE))
+    stmt = select(Message).where(Message.thread_id == thread_id)
+    if cursor is not None:
+        stmt = stmt.where(tuple_(Message.created_at, Message.id) < cursor)
+    stmt = (
+        stmt.order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit + 1)
+    )
+    rows = list(await session.scalars(stmt))
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor: tuple[datetime, UUID] | None = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = (last.created_at, last.id)
+    return page, next_cursor

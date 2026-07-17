@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +33,11 @@ from app.messaging.models import Section, Thread
 from app.messaging.threads import _is_dedup_violation
 
 logger = structlog.get_logger()
+
+# Keyset page bounds for list_visible_threads -- mirror the inbox
+# (INBOX_MAX_PAGE_SIZE): clamp, do not reject an out-of-range limit.
+VISIBLE_THREADS_MAX_PAGE_SIZE = 100
+VISIBLE_THREADS_DEFAULT_PAGE_SIZE = 20
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,43 @@ def resolve_operator(
     change, and it is where the BL-1 no-materialized-list rule lives.
     """
     return OperatorScope(kind=operator_kind, value=operator_value)
+
+
+# ---------------------------------------------------------------------------
+# Write-authz predicates (Phase 4c item 4) -- role IN the thread, not
+# identity (identity is the product proxy's concern, arch decision 14).
+# These catch the role violations comms can see from thread state. v1
+# section membership is TRIVIAL (OperatorScope): any agent serves any
+# section, so a section thread's operator verbs are open to any actor
+# the proxy vouches for; a user thread is served ONLY by its master
+# (assignee), so a foreign actor is rejected. Rich (starred) membership
+# tightens the section case in Phase 7.
+# ---------------------------------------------------------------------------
+def can_post_message(thread: Thread, actor: UUID) -> bool:
+    """A message may be posted by the PARTICIPANT (client) or the
+    SERVING operator (assignee)."""
+    return actor == thread.client or actor == thread.assignee
+
+
+def can_claim(thread: Thread) -> bool:
+    """Only a SECTION thread is claimable; a user thread's operator is
+    fixed by the form and is never claimed."""
+    scope = resolve_operator(
+        OperatorKind(thread.operator_kind), thread.operator_value
+    )
+    return scope.is_claimable
+
+
+def can_operate(thread: Thread, actor: UUID) -> bool:
+    """status / retag: the SERVING operator (assignee), OR any agent on a
+    SECTION thread (v1 trivial membership). A user thread is served only
+    by its master (its assignee)."""
+    if actor == thread.assignee:
+        return True
+    scope = resolve_operator(
+        OperatorKind(thread.operator_kind), thread.operator_value
+    )
+    return scope.kind is OperatorKind.SECTION
 
 
 async def claim_thread(
@@ -123,7 +165,9 @@ async def list_visible_threads(
     *,
     operator: UUID,
     is_supervisor: bool = False,
-) -> Sequence[Thread]:
+    limit: int = VISIBLE_THREADS_DEFAULT_PAGE_SIZE,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> tuple[Sequence[Thread], tuple[datetime, UUID] | None]:
     """Threads an operator may SEE, most-recently-active first.
 
     The set-level form of the OperatorScope rule (resolve_operator):
@@ -142,7 +186,21 @@ async def list_visible_threads(
     only WIDENS the read. The write-ban (a supervisor must not mutate)
     rides with write-authz in Phase 4c (§6d), the same seam as the
     sender write-authz assumption; 4b never gates writes.
+
+    Keyset pagination (Phase 4c item 5): ordered by
+    COALESCE(last_message_at, created_at) DESC, id DESC -- the EXACT
+    ix_threads_activity order (EXPLAIN-confirmed Index Scan) and the
+    same keyset shape as the inbox. `limit` clamps to 1..100 (default
+    20, never rejected); `cursor` is the (activity, id) of the last row
+    already seen and the next page is WHERE (activity, id) < cursor.
+    The id tiebreak is DESC (was id ASC in 4b) to line up with the
+    index and the cursor codec. Returns (threads, next_cursor);
+    next_cursor is None on the final page. The opaque base64 wire form
+    of the cursor lives at the API edge (parallel to the inbox codec).
     """
+    limit = max(1, min(limit, VISIBLE_THREADS_MAX_PAGE_SIZE))
+    activity = func.coalesce(Thread.last_message_at, Thread.created_at)
+
     stmt = select(Thread)
     if not is_supervisor:
         stmt = stmt.where(
@@ -154,12 +212,22 @@ async def list_visible_threads(
                 ),
             )
         )
-    stmt = stmt.order_by(
-        func.coalesce(Thread.last_message_at, Thread.created_at).desc(),
-        Thread.id,
-    )
-    result = await session.scalars(stmt)
-    return result.all()
+    if cursor is not None:
+        # Row-value comparison against the (activity, id) cursor: the
+        # next page is strictly "older" in the DESC order. The
+        # expression index carries this as an Index Cond, not a filter.
+        stmt = stmt.where(tuple_(activity, Thread.id) < cursor)
+
+    stmt = stmt.order_by(activity.desc(), Thread.id.desc()).limit(limit + 1)
+    rows = list(await session.scalars(stmt))
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor: tuple[datetime, UUID] | None = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = (last.last_message_at or last.created_at, last.id)
+    return page, next_cursor
 
 
 async def retag_thread(

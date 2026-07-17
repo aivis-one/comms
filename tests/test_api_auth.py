@@ -80,6 +80,14 @@ class TestAuthRequired:
         )
         assert response.status_code == 401
 
+    async def test_messaging_router_also_guarded(
+        self, client: AsyncClient, auth_enabled: None,
+    ) -> None:
+        response = await client.get(
+            f"/api/v1/threads/{uuid4()}/messages",
+        )
+        assert response.status_code == 401
+
 
 class TestAuthDisabledInStub:
     async def test_empty_token_disables_auth(

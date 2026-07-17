@@ -22,6 +22,16 @@ class NotFoundError(CommsError):
     """Requested entity does not exist (or belongs to someone else)."""
 
 
+class AuthorizationError(CommsError):
+    """Actor is not permitted to perform this write on this thread.
+
+    Phase 4c write-authz (item 4): the check is by ROLE IN THE THREAD
+    (participant / serving operator / pool agent), NOT by identity --
+    identity is the product proxy's concern (arch decision 14). Mapped
+    to HTTP 403 by the API error handler.
+    """
+
+
 class ProfileError(CommsError):
     """Product profile failed to load or validate.
 

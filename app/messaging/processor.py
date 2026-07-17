@@ -54,28 +54,19 @@ async def auto_close_idle_threads(
     empty thread ages from created_at. Every pass logs its duration --
     the observable promotion trigger.
 
-    KNOWN CEILING (acknowledged by design -- messaging-side idle scan,
-    the BL-3 family):
-      1. Mechanics: the batch select filters on COALESCE(
-         last_message_at, created_at) with no matching index -> each
-         pass seq-scans the threads table as it grows. COALESCE over
-         two columns makes it doubly unindexed by a plain column index.
-      2. Status: acknowledged by design.
-      3. Backlog ref: BL-3 family (dispatch plan §6a) -- the messaging
-         idle scan alongside the notification retention scan.
-      4. Promotion trigger (observable, via the thread_auto_close_pass
-         log): a pass stably longer than ~1 second OR threads on the
-         order of ~100k+.
-      5. Agreed fix: ONE migration -- an expression / partial index on
-         COALESCE(last_message_at, created_at) with a predicate
-         excluding closed threads, OR a maintained last_activity_at
-         column carrying that value with its own index.
-      6. Rejected: an index NOW (write amplification on thread activity
-         for a query cheap at current scale and rare by cadence); an
-         unbounded UPDATE (one long transaction); DB coordination of
-         the cadence gate -- it is PER-PROCESS on purpose (two workers
-         -> two cheap idempotent scans per interval), no distributed
-         lock.
+    Idle-scan index (Phase 4c -- resolved, was a KNOWN CEILING): the
+    batch select filters and orders on COALESCE(last_message_at,
+    created_at); migration 0008 adds the expression index
+    ix_threads_activity over exactly that value. EXPLAIN (ANALYZE) on 5k
+    threads confirms the planner uses it here -- "Index Scan Backward
+    using ix_threads_activity" with the cutoff carried as an Index Cond
+    (not a post-scan filter) -- so a pass is no longer a seq-scan that
+    grows with the table. The SAME index backs the list_visible_threads
+    keyset (one index, two readers; both plans in the Phase 4c report).
+    Two design choices are deliberately KEPT: the cadence gate stays
+    PER-PROCESS (two workers -> two cheap idempotent scans per interval,
+    no distributed lock), and batches stay bounded (no unbounded UPDATE,
+    one commit per batch).
 
     Returns:
         Total number of threads closed this pass.

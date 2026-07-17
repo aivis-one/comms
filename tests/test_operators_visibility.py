@@ -28,7 +28,7 @@ async def _rid(session: AsyncSession) -> UUID:
 async def _visible_ids(
     session: AsyncSession, operator: UUID, *, is_supervisor: bool = False
 ) -> set[UUID]:
-    threads = await list_visible_threads(
+    threads, _ = await list_visible_threads(
         session, operator=operator, is_supervisor=is_supervisor
     )
     return {t.id for t in threads}

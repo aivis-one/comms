@@ -243,7 +243,7 @@ class TestWorkerMaintenanceCadence:
         delivery batch is stubbed as one unit."""
         reset_retention_gate()
         reset_auto_close_gate()
-        calls = {"batch": 0, "retention": 0, "auto_close": 0}
+        calls = {"batch": 0, "retention": 0, "auto_close": 0, "close_notify": 0}
         order: list[str] = []
 
         async def _batch() -> int:
@@ -261,12 +261,20 @@ class TestWorkerMaintenanceCadence:
             order.append("auto_close")
             return 0
 
+        async def _close_notify() -> int:
+            calls["close_notify"] += 1
+            order.append("close_notify")
+            return 0
+
         monkeypatch.setattr(worker_module, "run_notification_batch", _batch)
         monkeypatch.setattr(
             worker_module, "cleanup_terminal_notifications", _retention,
         )
         monkeypatch.setattr(
             worker_module, "auto_close_idle_threads", _auto_close,
+        )
+        monkeypatch.setattr(
+            worker_module, "consume_close_notifications", _close_notify,
         )
         self.calls = calls
         self.order = order
@@ -281,16 +289,20 @@ class TestWorkerMaintenanceCadence:
         assert self.calls["auto_close"] == 1
 
     async def test_tick_order_is_batch_then_maintenance(self) -> None:
-        """Deliveries first -- maintenance never delays them."""
+        """Deliveries first -- maintenance never delays them. Close-
+        notify runs every tick right after; the two gated scans last."""
         await run_worker_batch()
-        assert self.order == ["batch", "retention", "auto_close"]
+        assert self.order == [
+            "batch", "close_notify", "retention", "auto_close",
+        ]
 
     async def test_within_interval_gates_both(self) -> None:
-        """Second tick inside the intervals: the delivery batch runs
-        every tick, both maintenance passes stay gated."""
+        """Second tick inside the intervals: the delivery batch AND the
+        close-notify pass run every tick; both gated scans stay gated."""
         await run_worker_batch()
         await run_worker_batch()
         assert self.calls["batch"] == 2
+        assert self.calls["close_notify"] == 2
         assert self.calls["retention"] == 1
         assert self.calls["auto_close"] == 1
 

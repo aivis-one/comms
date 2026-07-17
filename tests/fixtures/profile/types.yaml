@@ -36,3 +36,16 @@ unit_plain: {}
 # this type carries button_text / disable_preview / silent -- see
 # templates/en.yaml for the reference shape.
 unit_presented: {}
+
+# -----------------------------------------------------------------------------
+# Messaging chat types (Phase 4c). comms emits these abstract keys; the
+# product profile maps them to the locked msg_* categories. A thread-
+# closed notice goes to the client -> the participant category.
+# (The real VELO dictionary supplies these in Phase 6.)
+# -----------------------------------------------------------------------------
+msg.participant_message:
+  category: msg_participants
+msg.support_message:
+  category: msg_support
+msg.thread_closed:
+  category: msg_participants
