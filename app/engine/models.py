@@ -133,7 +133,7 @@ class Notification(UUIDMixin, Base):
     )
 
     # Deep-link intent + template variables + internal keys ("_channels").
-    # {"action": "open_practice", "params": {"practice_id": "uuid"}, ...}
+    # {"action": "open_thread", "params": {"thread_id": "uuid"}, ...}
     action_data: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB,
         nullable=True,

@@ -91,7 +91,7 @@ async def user_upserted(
 
     recipient_id is the PRODUCT user id (shared id-space, Model B).
     Writes only the sync-owned identity fields (incl. timezone, which
-    the product owns -- e.g. VELO users.timezone); the comms-owned
+    the product owns); the comms-owned
     quiet_* preference fields survive re-syncs untouched. `timezone`
     is a required parameter on purpose: the transport must map "field
     absent in payload" to None explicitly (snapshot discipline), not

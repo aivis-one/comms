@@ -60,5 +60,8 @@ jobs:
       - name: Domain-literal fence (arch doc §2.6 / decision 13)
         run: python scripts/check_domain_literals.py
 
+      - name: Product-literal fence (arch doc #15, Release-Hardening)
+        run: python scripts/check_product_literals.py
+
       - name: Type check (mypy)
         run: mypy app

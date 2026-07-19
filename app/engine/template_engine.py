@@ -66,7 +66,7 @@ def render(
     startup, this guard covers templates registered past it.
 
     Args:
-        notification_type: Registered type key (e.g. "booking_confirmed").
+        notification_type: Registered type key (e.g. "unit_event").
         channel: DeliveryChannel value (e.g. "telegram", "email").
         field: Template field (e.g. "body", "title", "subject").
         locale: Recipient locale; None means deploy default.

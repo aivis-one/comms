@@ -26,6 +26,7 @@ from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import settings
+from app.core.constants import MSG_TYPE_KEYS
 from app.core.exceptions import ProfileError
 from app.engine.constants import TargetType
 from app.engine.formatters import TelegramFormatter
@@ -45,13 +46,35 @@ from tests.helpers import next_phase2_telegram_id
 BOT_URL = "https://t.me/comms_testbot"
 
 
+# Chat-baseline declarations (arch doc #15): every valid profile must
+# carry the three msg.* types with categories, so the throwaway
+# profiles append them by default -- tests exercising OTHER validation
+# stay green under the Release-Hardening strictness.
+_MSG_TYPES_YAML = (
+    "msg.participant_message:\n  category: msg_participants\n"
+    "msg.support_message:\n  category: msg_support\n"
+    "msg.thread_closed:\n  category: msg_participants\n"
+)
+
+
 def _write_profile(
     root: Path,
     types_yaml: str,
     templates: dict[str, str] | None = None,
+    *,
+    msg_types: bool = True,
 ) -> Path:
-    """Materialize a throwaway profile directory under tmp_path."""
+    """Materialize a throwaway profile directory under tmp_path.
+
+    msg_types=False skips the appended chat-baseline block -- for
+    tests that need a NON-mapping types document or that exercise the
+    chat-baseline validation itself.
+    """
     root.mkdir(parents=True, exist_ok=True)
+    if msg_types:
+        if types_yaml and not types_yaml.endswith("\n"):
+            types_yaml += "\n"
+        types_yaml += _MSG_TYPES_YAML
     (root / "types.yaml").write_text(types_yaml, encoding="utf-8")
     templates_dir = root / "templates"
     templates_dir.mkdir(exist_ok=True)
@@ -167,7 +190,9 @@ class TestValidator:
 
     def test_types_as_list_rejected_with_hint(self, tmp_path: Path) -> None:
         """The type dictionary must be a mapping, not a list."""
-        root = _write_profile(tmp_path, "- unit_event\n- unit_plain\n")
+        root = _write_profile(
+            tmp_path, "- unit_event\n- unit_plain\n", msg_types=False,
+        )
         with pytest.raises(ProfileError, match="not a list"):
             load_profile(FileProfileSource(root))
 
@@ -255,12 +280,18 @@ class TestValidator:
         # The template is still carried (the type may be enabled later).
         assert "ghost_type" in profile.templates["en"]
 
-    def test_empty_types_document_warns(self, tmp_path: Path) -> None:
-        """An empty types.yaml loads as zero types, with a warning."""
-        root = _write_profile(tmp_path, "# nothing yet\n")
-        with capture_logs() as logs:
-            profile = load_profile(FileProfileSource(root))
-        assert profile.types == {}
+    def test_empty_types_document_fails_chat_baseline(
+        self, tmp_path: Path,
+    ) -> None:
+        """An empty types.yaml no longer loads: the chat-baseline
+        contract (Release-Hardening item 3a) demands the three msg.*
+        declarations, so zero types is a startup error. The emptiness
+        warning still fires first (diagnostic breadcrumb)."""
+        root = _write_profile(tmp_path, "# nothing yet\n", msg_types=False)
+        with capture_logs() as logs, pytest.raises(
+            ProfileError, match=r"msg\.participant_message",
+        ):
+            load_profile(FileProfileSource(root))
         assert any(log["event"] == "profile_types_empty" for log in logs)
 
     def test_unknown_spec_keys_tolerated(self, tmp_path: Path) -> None:
@@ -571,3 +602,124 @@ class TestKeyLengthValidation:
         assert isinstance(category_col, String)
         assert type_col.length == MAX_TYPE_KEY_LEN
         assert category_col.length == MAX_CATEGORY_LEN
+
+
+class TestChatBaselineValidation:
+    """Release-Hardening item 3a: every profile must declare the three
+    comms-native msg.* types, each with a non-empty category --
+    otherwise chat notifications bypass the mute gate (§2.5) and
+    cannot be muted. Enforced at startup."""
+
+    def test_good_profile_with_all_three_loads(self, tmp_path: Path) -> None:
+        """A profile declaring all three msg.* types (helper default)
+        passes the chat-baseline check."""
+        root = _write_profile(tmp_path, "unit_event: {}\n")
+        profile = load_profile(FileProfileSource(root))
+        for key in MSG_TYPE_KEYS:
+            assert profile.types[key]["category"]
+
+    def test_missing_msg_type_key_fails(self, tmp_path: Path) -> None:
+        """Dropping any one of the three keys is a startup error that
+        names the missing type."""
+        partial = (
+            "unit_event: {}\n"
+            "msg.participant_message:\n  category: msg_participants\n"
+            "msg.thread_closed:\n  category: msg_participants\n"
+        )
+        root = _write_profile(tmp_path, partial, msg_types=False)
+        with pytest.raises(
+            ProfileError,
+            match=r"'msg\.support_message' is not declared",
+        ):
+            load_profile(FileProfileSource(root))
+
+    def test_msg_type_without_category_fails(self, tmp_path: Path) -> None:
+        """A declared msg.* type with an EMPTY spec (no category) is a
+        startup error naming the uncategorized type."""
+        uncategorized = (
+            "msg.participant_message: {}\n"
+            "msg.support_message:\n  category: msg_support\n"
+            "msg.thread_closed:\n  category: msg_participants\n"
+        )
+        root = _write_profile(tmp_path, uncategorized, msg_types=False)
+        with pytest.raises(
+            ProfileError,
+            match=r"'msg\.participant_message' has no category",
+        ):
+            load_profile(FileProfileSource(root))
+
+    def test_error_lists_every_offender_at_once(
+        self, tmp_path: Path,
+    ) -> None:
+        """All problems surface in ONE error -- not one restart at a
+        time."""
+        root = _write_profile(
+            tmp_path,
+            "msg.participant_message: {}\n",
+            msg_types=False,
+        )
+        with pytest.raises(ProfileError) as excinfo:
+            load_profile(FileProfileSource(root))
+        message = str(excinfo.value)
+        assert "'msg.participant_message' has no category" in message
+        assert "'msg.support_message' is not declared" in message
+        assert "'msg.thread_closed' is not declared" in message
+
+
+class TestProfileDomainFence:
+    """Release-Hardening item 3b: decision 13 extended from code to
+    DATA -- an external domain literal in profile YAML fails startup
+    with a message naming the offending key."""
+
+    def test_domain_in_template_fails(self, tmp_path: Path) -> None:
+        """A scheme URL baked into a template body dies at startup."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": 'unit_event:\n  telegram:\n    body: "Go https://example.com/{id}"\n'},
+        )
+        with pytest.raises(
+            ProfileError,
+            match=r"unit_event\.telegram\.body contains an external domain",
+        ):
+            load_profile(FileProfileSource(root))
+
+    def test_bare_telegram_host_in_template_fails(
+        self, tmp_path: Path,
+    ) -> None:
+        """The incident class: a scheme-less t.me in message text is
+        caught too."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {"en": 'unit_event:\n  telegram:\n    body: "Open t.me/somebot now"\n'},
+        )
+        with pytest.raises(ProfileError, match="external domain"):
+            load_profile(FileProfileSource(root))
+
+    def test_domain_in_types_spec_fails(self, tmp_path: Path) -> None:
+        """A domain smuggled into a types.yaml spec value (even an
+        unknown, tolerated field) dies at startup, named by key path."""
+        root = _write_profile(
+            tmp_path,
+            'unit_event:\n  category: cat_a\n  landing: "https://example.com/x"\n',
+        )
+        with pytest.raises(
+            ProfileError,
+            match=r"type 'unit_event'\.landing contains an external domain",
+        ):
+            load_profile(FileProfileSource(root))
+
+    def test_clean_profile_passes_the_fence(self, tmp_path: Path) -> None:
+        """Placeholders and plain text sail through -- the fence
+        triggers on domains, not on braces or slashes."""
+        root = _write_profile(
+            tmp_path,
+            "unit_event: {}\n",
+            {
+                "en": "unit_event:\n  telegram:\n"
+                '    body: "Hi {name}, see item {item[id]}/details"\n',
+            },
+        )
+        profile = load_profile(FileProfileSource(root))
+        assert "unit_event" in profile.templates["en"]

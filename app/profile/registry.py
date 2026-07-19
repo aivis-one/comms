@@ -16,7 +16,7 @@
 #
 # TEMPLATE STRUCTURE (same shape as cbshome YAML, held in memory):
 #   {locale: {type: {channel: {field: leaf}}}}
-#   e.g. templates["en"]["booking_confirmed"]["telegram"]["body"]
+#   e.g. templates["en"]["unit_event"]["telegram"]["body"]
 #
 #   Since Phase 3a (item 1) the sheet owns PRESENTATION, not only
 #   text: a leaf is either a template STRING (title / body / subject /

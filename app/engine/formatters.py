@@ -182,7 +182,7 @@ class TelegramFormatter:
 
         Args:
             bot: Aiogram Bot instance (already configured with token).
-            bot_url: Base URL for deep links (e.g. "https://t.me/velo_testbot").
+            bot_url: Base URL for deep links (e.g. "https://t.me/<product_bot>").
         """
         self._bot = bot
         self._bot_url = bot_url.rstrip("/")
@@ -214,8 +214,8 @@ class TelegramFormatter:
         decision 13).
 
         Args:
-            action_data: {"action": "open_practice",
-                          "params": {"practice_id": "<uuid>"}}
+            action_data: {"action": "open_thread",
+                          "params": {"thread_id": "<uuid>"}}
 
         Returns:
             Deep link URL, or None when there is nothing to link

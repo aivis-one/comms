@@ -21,8 +21,9 @@
 # keys below; the product PROFILE maps them to the locked msg_*
 # categories (§2.5). In tests the fixture profile does it; the concrete
 # VELO dictionary is a Phase 6 input. A type with NO category bypasses
-# the mute gate (§2.5) -- so the profile MUST map these three; Phase 6
-# adds a load-time validation for it.
+# the mute gate (§2.5) -- so the profile MUST map these three; the
+# profile loader enforces it at startup (Release-Hardening item 3a,
+# keys shared via app/core/constants.py).
 # =============================================================================
 
 from datetime import datetime
@@ -33,6 +34,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.constants import (
+    MSG_TYPE_PARTICIPANT_MESSAGE,
+    MSG_TYPE_SUPPORT_MESSAGE,
+    MSG_TYPE_THREAD_CLOSED,
+)
 from app.core.database import get_session_factory
 from app.engine.constants import TargetType
 from app.engine.models import Notification
@@ -64,10 +70,13 @@ CATEGORY_SUPPORT = "msg_support"
 # -- Abstract chat notification TYPE keys comms emits. The profile maps
 # each to a category above (participant side -> participants, support
 # side -> support; a thread-closed notice goes to the client, i.e. the
-# participant side -> participants). --
-TYPE_PARTICIPANT_MESSAGE = "msg.participant_message"
-TYPE_SUPPORT_MESSAGE = "msg.support_message"
-TYPE_THREAD_CLOSED = "msg.thread_closed"
+# participant side -> participants). Canonical home is
+# app/core/constants.py (Release-Hardening: the profile loader
+# validates the same three keys at startup and must not import this
+# module); the legacy TYPE_* names stay as the stable notifier API. --
+TYPE_PARTICIPANT_MESSAGE = MSG_TYPE_PARTICIPANT_MESSAGE
+TYPE_SUPPORT_MESSAGE = MSG_TYPE_SUPPORT_MESSAGE
+TYPE_THREAD_CLOSED = MSG_TYPE_THREAD_CLOSED
 
 # Navigational action for the inbox deep-link (comms-defined name; the
 # product proxy interprets it). Phase 3a deep-link encoding carries AT

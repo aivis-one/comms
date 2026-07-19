@@ -33,24 +33,29 @@
 from __future__ import annotations
 
 import ast
-import re
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = REPO_ROOT / "app"
 
+# The patterns are SHARED with the profile loader's data fence
+# (Release-Hardening item 3b) and live in app/core/constants.py -- the
+# Docker image ships app/ but not scripts/, so the import must point
+# this way. The bootstrap makes `app` importable when the script is
+# run as `python scripts/check_domain_literals.py` from the repo root.
+sys.path.insert(0, str(REPO_ROOT))
+
+from app.core.constants import DOMAIN_LITERAL_PATTERNS  # noqa: E402
+
 # Files under app/ exempt from the fence (posix paths relative to
 # app/). config.py is the ONE place a domain may live: env defaults
 # and their documentation.
 DEFAULT_WHITELIST = frozenset({"core/config.py"})
 
-_PATTERNS = (
-    # A real scheme is required on purpose: the secret sanitizer's
-    # "://"-only regex must not trip the fence.
-    re.compile(r"https?://", re.IGNORECASE),
-    re.compile(r"\b(?:t\.me|telegram\.(?:org|me))\b", re.IGNORECASE),
-)
+# Local alias -- scan_source below and the unit test address the
+# patterns through this historical name.
+_PATTERNS = DOMAIN_LITERAL_PATTERNS
 
 
 def _docstring_ids(tree: ast.AST) -> set[int]:

@@ -46,7 +46,18 @@
 #     the constants honest instead);
 #   - templates for types missing from the dictionary -> loud warning
 #     (not fatal: additive contract, profile may ship templates ahead
-#     of enabling a type).
+#     of enabling a type);
+#   - the CHAT-BASELINE contract (arch doc #15, Release-Hardening
+#     item 3a): comms emits the built-in msg.* types unconditionally,
+#     so every profile must declare all of MSG_TYPE_KEYS with a
+#     non-empty category -- a type without a category bypasses the
+#     mute gate (§2.5) and chat notifications would be unmutable;
+#   - the DOMAIN fence over profile DATA (decision 13 extended from
+#     code to data, Release-Hardening item 3b): an external domain
+#     literal anywhere in types.yaml or a template string fails the
+#     startup -- domains live in env, URLs are assembled at the edge.
+#     Patterns are shared with scripts/check_domain_literals.py via
+#     app/core/constants.py (the image ships app/, not scripts/).
 #
 # A broken profile raises ProfileError -> the service does not start.
 # The runtime fallback chain in template_engine stays as the second
@@ -61,7 +72,12 @@ import structlog
 import yaml
 
 from app.core.config import settings
-from app.core.constants import MAX_CATEGORY_LEN, MAX_TYPE_KEY_LEN
+from app.core.constants import (
+    DOMAIN_LITERAL_PATTERNS,
+    MAX_CATEGORY_LEN,
+    MAX_TYPE_KEY_LEN,
+    MSG_TYPE_KEYS,
+)
 from app.core.exceptions import ProfileError
 from app.profile.registry import ProfileRegistry, TemplateTree, registry
 
@@ -186,12 +202,77 @@ def parse_profile(raw: RawProfile) -> Profile:
     problem; templates for unregistered types only log a warning.
     """
     types = _parse_types(raw.types)
+    _require_msg_type_categories(types)
 
     templates: dict[str, TemplateTree] = {}
     for locale, doc in raw.templates_by_locale.items():
         templates[locale] = _parse_template_tree(locale, doc, types)
 
     return Profile(types=types, templates=templates)
+
+
+def _require_msg_type_categories(types: dict[str, dict[str, Any]]) -> None:
+    """Enforce the chat-baseline contract (arch doc #15).
+
+    comms emits the MSG_TYPE_KEYS unconditionally (chat is a core
+    capability), and a type without a category bypasses the mute gate
+    (§2.5) -- chat notifications would be unmutable. So EVERY profile
+    must register all three keys, each with a non-empty category. All
+    offenders are reported in one error, not one restart at a time.
+    """
+    problems: list[str] = []
+    for key in MSG_TYPE_KEYS:
+        if key not in types:
+            problems.append(f"type {key!r} is not declared")
+        elif not types[key].get("category"):
+            problems.append(f"type {key!r} has no category")
+    if problems:
+        raise ProfileError(
+            "types.yaml: comms emits the built-in chat types "
+            "unconditionally, so the profile must declare every one "
+            "of them with a non-empty preference category -- otherwise "
+            "chat notifications bypass the mute gate and cannot be "
+            "muted. Problems: " + "; ".join(problems) + ". Declare "
+            "each as e.g. `msg.support_message: {category: "
+            "msg_support}`."
+        )
+
+
+def _reject_domain_literals(where: str, value: str) -> None:
+    """Startup fence over profile DATA (decision 13 extended to data).
+
+    External domains must not live in profile YAML (types or template
+    strings): links are assembled at the edge from env-held domains,
+    so a domain baked into a template dies with the domain (the t.me
+    incident class). Raises ProfileError naming the offending key.
+    """
+    for pattern in DOMAIN_LITERAL_PATTERNS:
+        match = pattern.search(value)
+        if match:
+            raise ProfileError(
+                f"{where} contains an external domain literal "
+                f"({match.group(0)!r}). Domains live in env and URLs "
+                f"are assembled at send time (arch doc §2.6, decision "
+                f"13) -- put a deep-link intent into action_data "
+                f"instead of a URL into the profile."
+            )
+
+
+def _reject_domain_literals_in(where: str, value: Any) -> None:
+    """Recursive walk over a YAML fragment: fence every string value.
+
+    Covers today's spec fields and tomorrow's (unknown spec keys are
+    tolerated by the additive contract -- they still must not smuggle
+    a domain). YAML comments never reach here: safe_load drops them.
+    """
+    if isinstance(value, str):
+        _reject_domain_literals(where, value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_domain_literals_in(f"{where}.{key}", item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_domain_literals_in(f"{where}[{index}]", item)
 
 
 def _parse_types(doc: Any) -> dict[str, dict[str, Any]]:
@@ -253,6 +334,7 @@ def _parse_types(doc: Any) -> dict[str, dict[str, Any]]:
                 f"{_CATEGORY_MAX_LENGTH} (width of the "
                 f"category_mutes.category column)."
             )
+        _reject_domain_literals_in(f"types.yaml: type {key!r}", spec)
         types[key] = spec
     return types
 
@@ -322,6 +404,12 @@ def _parse_template_tree(
                         f"string, got {fname!r}"
                     )
                 _validate_leaf(locale, type_key, channel, fname, template)
+                if isinstance(template, str):
+                    _reject_domain_literals(
+                        f"templates/{locale}.yaml: "
+                        f"{type_key}.{channel}.{fname}",
+                        template,
+                    )
                 tree_fields[fname] = template
             tree_channels[channel] = tree_fields
         tree[type_key] = tree_channels

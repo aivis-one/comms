@@ -94,7 +94,7 @@ class Settings(BaseSettings):
 
     # -- Telegram (shared bot with the product, see arch doc §7) --
     telegram_bot_token: str = ""
-    # Base URL for deep-link buttons, e.g. "https://t.me/velo_testbot".
+    # Base URL for deep-link buttons, e.g. "https://t.me/<product_bot>".
     # Consumed by TelegramFormatter.format_deep_link (ported from VELO).
     telegram_bot_url: str = ""
 

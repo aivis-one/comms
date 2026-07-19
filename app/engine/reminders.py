@@ -42,10 +42,11 @@ from app.engine.service import create_notification
 
 logger = structlog.get_logger()
 
-# Buffer: don't schedule a reminder if it's less than 5 minutes away (velo).
+# Buffer: don't schedule a reminder if it's less than 5 minutes away
+# (donor default).
 DEFAULT_MIN_LEAD = timedelta(minutes=5)
 
-# Priority for reminders (velo: higher than default 5, lower than urgent 1).
+# Priority for reminders (higher than the default 5, lower than urgent 1).
 DEFAULT_REMINDER_PRIORITY = 2
 
 
@@ -53,9 +54,9 @@ DEFAULT_REMINDER_PRIORITY = 2
 class ReminderSpec:
     """One reminder in a series: which type key, how long before anchor.
 
-    The type key must be registered by the product profile (e.g. the
-    velo profile registers reminder_24h / reminder_1h / reminder_10min
-    with leads of 24h / 1h / 10min).
+    The type key must be registered by the product profile (e.g. a
+    profile registers rem_24h / rem_1h / rem_10m with leads of
+    24h / 1h / 10min).
     """
 
     type: str
@@ -84,7 +85,7 @@ async def schedule_reminders(
     For each spec, creates a Notification with
     scheduled_at = anchor_at - spec.lead, skipping any send time that
     is less than min_lead away. expiry_at defaults to the anchor
-    (velo: no point sending after the event starts).
+    (no point sending after the event starts).
 
     Args:
         session: Database session (caller manages commit).
@@ -96,12 +97,12 @@ async def schedule_reminders(
         body: Stored fallback body.
         action_data: Deep-link intent + template variables.
         correlation_key: action_data key used to find these reminders
-            later (velo: "practice_id"). Stored automatically when
+            later (e.g. "<entity>_id"). Stored automatically when
             provided together with correlation_value.
         correlation_value: Value for the correlation key.
         channels: Delivery channels (defaults handled by
             create_notification).
-        priority: Queue priority (velo reminders used 2).
+        priority: Queue priority (defaults to DEFAULT_REMINDER_PRIORITY).
         min_lead: Skip reminders due sooner than this from now.
         expiry_at: TTL override; defaults to anchor_at.
 
@@ -161,7 +162,7 @@ async def cancel_reminders(
     target_type: str | None = None,
     target_value: str | None = None,
 ) -> int:
-    """Cancel pending reminders matched by correlation (velo mechanism).
+    """Cancel pending reminders matched by correlation.
 
     Marks PENDING notifications as EXPIRED where:
       - type is in the given set,
@@ -172,7 +173,7 @@ async def cancel_reminders(
     Args:
         session: Database session (caller manages commit).
         types: Reminder type keys to cancel.
-        correlation_key: action_data key (velo: "practice_id").
+        correlation_key: action_data key (e.g. "<entity>_id").
         correlation_value: Value to match.
         target_type: Optional target_type filter.
         target_value: Optional target_value filter.
