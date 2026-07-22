@@ -52,6 +52,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = REPO_ROOT / "app"
+DEPLOY_DIR = REPO_ROOT / "deploy"
+
+# Marker for the ONE legitimate product mention in deploy/ behavior:
+# the DD-6 token hand-over knob (VELO_ENV_PATH -- where `install`
+# writes the COMMS_* variables on the shared VPS). A pragma line
+# exempts itself and the line right below it -- an explicit,
+# diff-visible act, not a silent whitelist. Do not reuse it outside
+# the hand-over seam.
+_SEAM_PRAGMA = "fence: product-seam"
 
 # Product vocabulary (see header for what is deliberately absent).
 PRODUCT_TOKENS = frozenset(
@@ -130,19 +139,73 @@ def scan_tree(app_dir: Path = APP_DIR) -> list[str]:
     return findings
 
 
+def scan_deploy_text(source: str) -> list[tuple[int, str]]:
+    """Scan one deploy/ text file; return (lineno, snippet) violations.
+
+    deploy/ is yaml/sh/env -- no Python AST -- so the fence works on
+    lines, mirroring the AST scan's scope rules:
+      - FULL-LINE comments (first non-space char is '#') are free,
+        exactly as comments are invisible to the AST scan: heritage
+        notes and pattern references stay legal;
+      - a _SEAM_PRAGMA line exempts itself and the following line
+        (the DD-6 hand-over knob -- the one product mention deploy
+        behavior legitimately carries);
+      - every other line is BEHAVIOR and is segment-matched against
+        the token set.
+    """
+    violations: list[tuple[int, str]] = []
+    exempt_next = False
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        stripped = line.strip()
+        if _SEAM_PRAGMA in stripped:
+            exempt_next = True
+            continue
+        if exempt_next:
+            exempt_next = False
+            continue
+        if stripped.startswith("#"):
+            continue
+        if _hits(line):
+            violations.append((lineno, f"line {stripped[:60]!r}"))
+    return violations
+
+
+def scan_deploy_tree(deploy_dir: Path = DEPLOY_DIR) -> list[str]:
+    """Scan the deploy/ tree; return human-readable violation lines.
+
+    Markdown is DOCUMENTATION and is skipped wholesale -- the exact
+    analogue of the docstring whitelist in the AST scan (deploy/
+    INTEGRATION.md documents the product-side steps and legitimately
+    names the product). The cost is the same and equally honest:
+    flavor drifting into docs is caught by release audits, not here.
+    """
+    findings: list[str] = []
+    if not deploy_dir.is_dir():
+        return findings
+    for path in sorted(deploy_dir.rglob("*")):
+        if not path.is_file() or path.suffix == ".md":
+            continue
+        rel = path.relative_to(deploy_dir).as_posix()
+        source = path.read_text(encoding="utf-8")
+        for lineno, snippet in scan_deploy_text(source):
+            findings.append(f"{deploy_dir.name}/{rel}:{lineno}: {snippet}")
+    return findings
+
+
 def main() -> int:
     """CI entry point."""
-    findings = scan_tree()
+    findings = scan_tree() + scan_deploy_tree()
     if findings:
         print(
-            "Product literals in app/ behavior (arch doc #15: "
-            "capability -> comms, fact -> profile; product "
-            "dictionaries in comms code are forbidden):"
+            "Product literals in app/ behavior or deploy/ (arch doc "
+            "#15: capability -> comms, fact -> profile; product "
+            "dictionaries in comms code and deploy tooling are "
+            "forbidden):"
         )
         for finding in findings:
             print(f"  {finding}")
         return 1
-    print("product-literal fence: clean")
+    print("product-literal fence: clean (app/ + deploy/)")
     return 0
 
 

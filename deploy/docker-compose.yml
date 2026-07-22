@@ -1,0 +1,181 @@
+# =============================================================================
+# COMMS -- Docker Compose (deploy/, Phase 5)
+# =============================================================================
+#
+# The comms stack as its OWN compose project, sitting NEXT TO the
+# product stack on one VPS (DD-1/DD-3, variant A): dedicated
+# containers, nothing shared with the product except the external
+# docker network "aivis-shared".
+#
+# FIVE services, THREE of them from the ONE root Dockerfile
+# (same image, different commands):
+#   comms-app      -- uvicorn API; the ONLY migrator (alembic runs
+#                     before uvicorn, so "app is healthy" implies
+#                     "schema is migrated");
+#   comms-worker   -- delivery loop (python -m app.worker);
+#   comms-consumer -- product event stream reader (python -m
+#                     app.consumer), the integration backbone;
+#   comms-postgres -- dedicated database (never the product's);
+#   comms-redis    -- DURABLE stream backbone (DD-4): AOF +
+#                     noeviction + requirepass. NOT a cache.
+#
+# INTERNAL SERVICE (DD-5): comms-app publishes NO host port and gets
+# no nginx route. The only way in is over "aivis-shared" from the
+# product backend, presenting the shared service token.
+#
+# The network is EXTERNAL: created once, idempotently, by
+# `comms-deploy.sh install` (docker network create aivis-shared);
+# the product stack joins the same network on its side.
+#
+# Environment comes from ./.env (written by `install`, never
+# committed). PROFILE_DIR points at the per-instance profile
+# directory OUTSIDE the checkout (survives `update`); it is
+# bind-mounted read-only and exposed to the service as
+# TEMPLATES_DIR=/profile.
+#
+# Usage (via the CLI next to this file):
+#   comms-deploy.sh install | update | logs | db | status
+# =============================================================================
+
+services:
+  comms-app:
+    build:
+      context: ..
+    container_name: comms-app
+    env_file:
+      - ./.env
+    environment:
+      # The in-container profile mount point; the host side is
+      # PROFILE_DIR from .env (see volumes below).
+      TEMPLATES_DIR: /profile
+    # The ONLY migrator: schema first, then the server. `exec` hands
+    # PID 1 to uvicorn (clean signal handling). Worker/consumer gate
+    # on this container's health, so they never race the migration.
+    command: >
+      sh -c "alembic upgrade head
+      && exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+      --workers 2 --proxy-headers"
+    # NO ports: section -- internal by design (DD-5). Port 8000 is
+    # reachable only inside "aivis-shared" as http://comms-app:8000.
+    volumes:
+      - ${PROFILE_DIR}:/profile:ro
+    depends_on:
+      comms-postgres: { condition: service_healthy }
+      comms-redis: { condition: service_healthy }
+    healthcheck:
+      # /ready answers 503 while the database is unreachable; the
+      # probe runs in-container (no published port needed).
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - aivis-shared
+
+  comms-worker:
+    build:
+      context: ..
+    container_name: comms-worker
+    env_file:
+      - ./.env
+    environment:
+      TEMPLATES_DIR: /profile
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - ${PROFILE_DIR}:/profile:ro
+    depends_on:
+      # Healthy app == migration done; the worker never touches an
+      # unmigrated schema and never runs alembic itself.
+      comms-app: { condition: service_healthy }
+    healthcheck:
+      # Single-process container: the meaningful liveness signal is
+      # "PID 1 is the worker". No pgrep in the slim image, so read
+      # procfs directly.
+      test: ["CMD-SHELL", "grep -q app.worker /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - aivis-shared
+
+  comms-consumer:
+    build:
+      context: ..
+    container_name: comms-consumer
+    env_file:
+      - ./.env
+    environment:
+      TEMPLATES_DIR: /profile
+    command: ["python", "-m", "app.consumer"]
+    volumes:
+      - ${PROFILE_DIR}:/profile:ro
+    depends_on:
+      comms-app: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q app.consumer /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - aivis-shared
+
+  comms-postgres:
+    image: postgres:16
+    container_name: comms-postgres
+    env_file:
+      - ./.env
+    # NO published port (unlike the product's postgres): nothing on
+    # the host needs it; the CLI's `db` subcommand goes through
+    # `docker compose exec`.
+    volumes:
+      - comms_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aivis-shared
+
+  comms-redis:
+    image: redis:7-alpine
+    container_name: comms-redis
+    env_file:
+      - ./.env
+    # DD-4 (extended): durable AND protected. AOF + noeviction --
+    # the stream carries notification_request, eviction would mean
+    # silently dropped notifications; requirepass -- the container
+    # sits on a network shared with the product stack. The password
+    # is mandatory here (no passwordless fallback): this compose is
+    # deploy-only, and .env is generated by `install`.
+    command: >
+      sh -c 'exec redis-server
+      --requirepass "$$REDIS_PASSWORD"
+      --appendonly yes
+      --maxmemory-policy noeviction'
+    volumes:
+      - comms_redis_data:/data
+    healthcheck:
+      # REDISCLI_AUTH keeps the password out of CLI args.
+      test: ["CMD-SHELL", "export REDISCLI_AUTH=$$REDIS_PASSWORD; redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - aivis-shared
+
+networks:
+  aivis-shared:
+    external: true
+
+volumes:
+  comms_postgres_data:
+  comms_redis_data:

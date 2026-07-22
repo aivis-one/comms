@@ -1,0 +1,4 @@
+# The real env (a symlink to /opt/comms/.env on the VPS) carries
+# secrets and must never land in the repo; .env.example is the
+# committed reference.
+.env
