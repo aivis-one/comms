@@ -92,3 +92,30 @@ class TestTreeScan:
         """The check CI runs: app/ behavior carries no product
         vocabulary (invariant #15, confirmed by the release audit)."""
         assert fence.scan_tree() == []
+
+
+class TestDeployScan:
+    """The deploy/ text pass (Phase 5) -- same discipline, no AST."""
+
+    def test_behavior_line_is_flagged(self) -> None:
+        """The injection this pass exists for: a product literal in
+        deploy behavior (compose/env/shell)."""
+        assert len(fence.scan_deploy_text("STREAM=booking_confirmed\n")) == 1
+
+    def test_full_line_comment_is_free(self) -> None:
+        """Heritage notes mirror the AST scan's comment invisibility."""
+        assert fence.scan_deploy_text("# velo pattern note\nKEY=value\n") == []
+
+    def test_tree_skips_markdown_and_formats_findings(self, tmp_path: Path) -> None:
+        """.md is documentation (the docstring-whitelist analogue);
+        everything else is behavior and carries file:line."""
+        (tmp_path / "doc.md").write_text("velo is named here\n", encoding="utf-8")
+        (tmp_path / "bad.env").write_text("STREAM=booking_confirmed\n", encoding="utf-8")
+        findings = fence.scan_deploy_tree(tmp_path)
+        assert len(findings) == 1
+        assert "bad.env:1" in findings[0]
+
+    def test_real_deploy_tree_is_clean(self) -> None:
+        """The check CI runs: deploy/ behavior is product-agnostic
+        (DD §7) -- no whitelists, no pragmas."""
+        assert fence.scan_deploy_tree() == []

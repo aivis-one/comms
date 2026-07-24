@@ -142,8 +142,11 @@ DEFAULT_TIMEZONE=UTC
 
 PROFILE_DIR=$PROFILE_DIR_DEFAULT
 
-# fence: product-seam
-VELO_ENV_PATH=/opt/velo/repo/backend/.env
+# Token hand-over target: ABSOLUTE path of the PRODUCT backend's .env
+# on this VPS (per-product CONFIG, DD-8 -- the value for a concrete
+# product is documented in deploy/INTEGRATION.md). Empty = install
+# prints the COMMS_* block for manual paste instead of writing it.
+PRODUCT_ENV_PATH=
 EOF
     echo -e "${GREEN}✓ $ENV_FILE generated (postgres/redis/service-token minted)${NC}"
     echo -e "${YELLOW}  TELEGRAM_BOT_TOKEN is a placeholder; replace it before CHANNELS_MODE=real${NC}"
@@ -201,14 +204,15 @@ upsert_env_var() {
 }
 
 # Step 5: the trust seam (DD-6). The three COMMS_* variables the
-# product backend needs, delivered from the SINGLE source (our env):
-# written straight into the product's .env when it is where the
-# product's installer puts it, printed for manual paste otherwise.
+# product backend needs, delivered from the SINGLE source (our env).
+# The target is pure CONFIG (PRODUCT_ENV_PATH, DD-8): set -> written
+# straight into the product's .env, idempotently; empty (the shipped
+# default) -> the block is printed for manual paste. No product path
+# lives in this code -- per-product values belong to INTEGRATION.md.
 handover_token() {
     load_env
     local api_url="http://comms-app:${APP_PORT}"
-    # fence: product-seam
-    local target="${VELO_ENV_PATH:-}"
+    local target="${PRODUCT_ENV_PATH:-}"
 
     if [ -n "$target" ] && [ -f "$target" ]; then
         local ok=0
@@ -221,8 +225,10 @@ handover_token() {
             return 0
         fi
         echo -e "${RED}✗ Could not write all variables into $target -- paste the block below manually${NC}"
+    elif [ -n "$target" ]; then
+        echo -e "${YELLOW}PRODUCT_ENV_PATH is set but '$target' does not exist -- paste this block into the product's .env manually:${NC}"
     else
-        echo -e "${YELLOW}Product .env not found at '${target:-<unset>}' -- paste this block into it manually:${NC}"
+        echo -e "${YELLOW}PRODUCT_ENV_PATH is empty (see deploy/INTEGRATION.md for the product's value) -- paste this block into the product's .env manually:${NC}"
     fi
     echo
     echo "COMMS_SERVICE_TOKEN=$COMMS_SERVICE_TOKEN"

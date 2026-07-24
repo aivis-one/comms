@@ -9,11 +9,13 @@
 # Dev dependencies (pytest, ruff, mypy, httpx) are ALWAYS installed
 # because tests run inside this container on the VPS.
 #
-# ONE IMAGE, TWO PROCESSES (handoff item 1):
-#   API:    default CMD (uvicorn on :8000)
-#   Worker: same image, different command:
-#             python -m app.worker
-#           (set via docker-compose `command:` for the worker service)
+# ONE IMAGE, THREE PROCESSES (handoff item 1; deploy/ Phase 5):
+#   API:      default CMD (uvicorn on :8000)
+#   Worker:   same image, different command:
+#               python -m app.worker
+#   Consumer: same image, different command:
+#               python -m app.consumer
+#           (both set via docker-compose `command:` in deploy/)
 #
 # PYTHONPATH=/app ensures `from app.core.config import settings` works
 # everywhere: uvicorn, alembic, pytest -- without `pip install -e .`.

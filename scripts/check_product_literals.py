@@ -54,14 +54,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = REPO_ROOT / "app"
 DEPLOY_DIR = REPO_ROOT / "deploy"
 
-# Marker for the ONE legitimate product mention in deploy/ behavior:
-# the DD-6 token hand-over knob (VELO_ENV_PATH -- where `install`
-# writes the COMMS_* variables on the shared VPS). A pragma line
-# exempts itself and the line right below it -- an explicit,
-# diff-visible act, not a silent whitelist. Do not reuse it outside
-# the hand-over seam.
-_SEAM_PRAGMA = "fence: product-seam"
-
 # Product vocabulary (see header for what is deliberately absent).
 PRODUCT_TOKENS = frozenset(
     {"velo", "cbshome", "booking", "practice", "checkin", "waitlist"}
@@ -147,22 +139,16 @@ def scan_deploy_text(source: str) -> list[tuple[int, str]]:
       - FULL-LINE comments (first non-space char is '#') are free,
         exactly as comments are invisible to the AST scan: heritage
         notes and pattern references stay legal;
-      - a _SEAM_PRAGMA line exempts itself and the following line
-        (the DD-6 hand-over knob -- the one product mention deploy
-        behavior legitimately carries);
       - every other line is BEHAVIOR and is segment-matched against
-        the token set.
+        the token set. NO whitelists and NO pragmas -- same discipline
+        as the AST scan: deploy behavior legitimately carries ZERO
+        product vocabulary. Per-product values (e.g. the token
+        hand-over target path) are CONFIG (DD-8): they live in the
+        generated .env and in INTEGRATION.md, never in this tree.
     """
     violations: list[tuple[int, str]] = []
-    exempt_next = False
     for lineno, line in enumerate(source.splitlines(), start=1):
         stripped = line.strip()
-        if _SEAM_PRAGMA in stripped:
-            exempt_next = True
-            continue
-        if exempt_next:
-            exempt_next = False
-            continue
         if stripped.startswith("#"):
             continue
         if _hits(line):
