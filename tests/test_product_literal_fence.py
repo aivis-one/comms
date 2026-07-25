@@ -109,8 +109,10 @@ class TestDeployScan:
     def test_tree_skips_markdown_and_formats_findings(self, tmp_path: Path) -> None:
         """.md is documentation (the docstring-whitelist analogue);
         everything else is behavior and carries file:line."""
-        (tmp_path / "doc.md").write_text("velo is named here\n", encoding="utf-8")
-        (tmp_path / "bad.env").write_text("STREAM=booking_confirmed\n", encoding="utf-8")
+        doc = tmp_path / "doc.md"
+        doc.write_text("velo is named here\n", encoding="utf-8")
+        bad = tmp_path / "bad.env"
+        bad.write_text("STREAM=booking_confirmed\n", encoding="utf-8")
         findings = fence.scan_deploy_tree(tmp_path)
         assert len(findings) == 1
         assert "bad.env:1" in findings[0]
