@@ -17,6 +17,7 @@ from app.core.exceptions import ValidationError
 from app.transport.events import (
     GroupChanged,
     NotificationRequest,
+    ReminderCancel,
     UserUpserted,
     parse_event,
     validate_action_data,
@@ -280,3 +281,94 @@ class TestSyncSchemas:
                 "v": 1, "group_key": "g",
                 "recipient_id": str(uuid4()), "member": "yes",
             }))
+
+
+class TestReminderCancelSchema:
+    """Phase 6/T1 additive event (Master-chat approved 2026-07-28):
+    the wire mirror of engine/reminders.cancel_reminders."""
+
+    @staticmethod
+    def _cancel_data(**overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "v": 1,
+            "types": ["rem_24h", "rem_1h"],
+            "correlation_key": "booking_id",
+            "correlation_value": str(uuid4()),
+        }
+        base.update(overrides)
+        return base
+
+    def test_happy_path_without_target(self) -> None:
+        data = self._cancel_data()
+        event = parse_event(_envelope("reminder_cancel", data))
+        assert isinstance(event, ReminderCancel)
+        assert event.types == ["rem_24h", "rem_1h"]
+        assert event.correlation_key == "booking_id"
+        assert event.target_type is None
+        assert event.target_value is None
+
+    def test_happy_path_with_user_target(self) -> None:
+        uid = str(uuid4())
+        event = parse_event(_envelope("reminder_cancel", self._cancel_data(
+            target_type="user", target_value=uid,
+        )))
+        assert isinstance(event, ReminderCancel)
+        assert event.target_type == "user"
+        assert event.target_value == uid
+
+    def test_required_fields(self) -> None:
+        for field in ("types", "correlation_key", "correlation_value"):
+            data = self._cancel_data()
+            del data[field]
+            with pytest.raises(ValidationError, match="missing"):
+                parse_event(_envelope("reminder_cancel", data))
+
+    def test_types_must_be_nonempty_list(self) -> None:
+        with pytest.raises(ValidationError, match="non-empty list"):
+            parse_event(_envelope(
+                "reminder_cancel", self._cancel_data(types=[]),
+            ))
+        with pytest.raises(ValidationError, match="non-empty list"):
+            parse_event(_envelope(
+                "reminder_cancel", self._cancel_data(types="rem_1h"),
+            ))
+
+    def test_types_entries_must_be_strings(self) -> None:
+        with pytest.raises(ValidationError, match="types"):
+            parse_event(_envelope(
+                "reminder_cancel", self._cancel_data(types=["ok", 5]),
+            ))
+
+    def test_underscore_correlation_key_rejected(self) -> None:
+        """An underscore key cannot exist in action_data (reserved),
+        so the cancel could never match -- loud producer bug."""
+        with pytest.raises(ValidationError, match="reserved"):
+            parse_event(_envelope(
+                "reminder_cancel",
+                self._cancel_data(correlation_key="_channels"),
+            ))
+
+    def test_half_target_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="both target"):
+            parse_event(_envelope(
+                "reminder_cancel",
+                self._cancel_data(target_value=str(uuid4())),
+            ))
+        with pytest.raises(ValidationError, match="both target"):
+            parse_event(_envelope(
+                "reminder_cancel", self._cancel_data(target_type="user"),
+            ))
+
+    def test_target_form_checked_per_type(self) -> None:
+        with pytest.raises(ValidationError, match="uuid"):
+            parse_event(_envelope("reminder_cancel", self._cancel_data(
+                target_type="user", target_value="not-a-uuid",
+            )))
+
+    def test_version_barrier_applies(self) -> None:
+        """The new event sits behind the same v-gate as the frozen
+        three -- an unsupported version dead-letters, never parses."""
+        with pytest.raises(ValidationError, match="unsupported schema"):
+            parse_event(_envelope(
+                "reminder_cancel", self._cancel_data(v=2),
+            ))

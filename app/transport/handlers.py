@@ -9,6 +9,10 @@
 #                          idempotency_key unique index, item 2/3)
 #   UserUpserted        -> audience.sync.user_upserted   (item 4)
 #   GroupChanged        -> audience.sync.group_changed   (item 4)
+#   ReminderCancel      -> engine.reminders.cancel_reminders
+#                          (Phase 6/T1 additive event; naturally
+#                          idempotent -- a replay or a no-match set is
+#                          a zero-row update, never an error)
 #
 # The Phase 2 sync functions are called AS-IS (the handoff's explicit
 # rule: wire them, do not rewrite them).
@@ -34,10 +38,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience import sync
+from app.engine.reminders import cancel_reminders
 from app.engine.service import create_notification
 from app.transport.events import (
+    GroupChanged,
     NotificationRequest,
     ParsedEvent,
+    ReminderCancel,
     UserUpserted,
 )
 
@@ -71,14 +78,35 @@ async def handle_event(
             active=event.active,
         )
         return HandleResult.PROCESSED
-    # GroupChanged. May raise NotFoundError when the recipient has not
-    # been synced yet (user_upserted lagging) -- classified RETRYABLE
-    # by the consumer.
-    await sync.group_changed(
+    if isinstance(event, GroupChanged):
+        # May raise NotFoundError when the recipient has not been
+        # synced yet (user_upserted lagging) -- classified RETRYABLE
+        # by the consumer.
+        await sync.group_changed(
+            session,
+            group_key=event.group_key,
+            recipient_id=event.recipient_id,
+            member=event.member,
+        )
+        return HandleResult.PROCESSED
+    # ReminderCancel (Phase 6/T1). cancel_reminders expires PENDING
+    # matches only -- replays and no-match sets are zero-row updates,
+    # so at-least-once delivery needs no dedup here.
+    assert isinstance(event, ReminderCancel)
+    cancelled = await cancel_reminders(
         session,
-        group_key=event.group_key,
-        recipient_id=event.recipient_id,
-        member=event.member,
+        types=set(event.types),
+        correlation_key=event.correlation_key,
+        correlation_value=event.correlation_value,
+        target_type=event.target_type,
+        target_value=event.target_value,
+    )
+    logger.info(
+        "reminder_cancel_handled",
+        correlation=(
+            f"{event.correlation_key}={event.correlation_value}"
+        ),
+        expired_count=cancelled,
     )
     return HandleResult.PROCESSED
 
