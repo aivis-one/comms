@@ -207,7 +207,8 @@ class Message(UUIDMixin, Base):
 
     Immutable once written (append-only history) -- created_at only, no
     updated_at, mirroring the notification rows. The "message sent"
-    event / notification / callback is NOT here; it is Phase 4c.
+    notification is NOT emitted from the data layer by design: that
+    path lives in app/notifier.py (notify_new_message).
     """
 
     __tablename__ = "messages"

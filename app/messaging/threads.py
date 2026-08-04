@@ -23,8 +23,11 @@
 # already guards via its FK.
 #
 # NOT here: resolving operator_target into recipients, claim,
-# visibility, status transitions (Phase 4b); the message -> notification
-# path (Phase 4c). Callers commit.
+# visibility, status transitions (Phase 4b). The message ->
+# notification path is deliberately NOT in the data layer either: it
+# lives one layer up, in the neutral app/notifier.py (engine and
+# messaging never import each other -- the 4b DAG invariant).
+# Callers commit.
 # =============================================================================
 
 from collections.abc import Sequence
@@ -164,7 +167,7 @@ def _is_dedup_violation(exc: IntegrityError) -> bool:
     return any(name in message for name in _DEDUP_INDEX_NAMES)
 
 
-async def create_or_get_thread(
+async def create_or_get_thread_detailed(
     session: AsyncSession,
     *,
     client: UUID,
@@ -175,8 +178,16 @@ async def create_or_get_thread(
     subject_id: str | None = None,
     title: str | None = None,
     priority: int | None = None,
-) -> Thread:
+) -> tuple[Thread, bool]:
     """Create a thread, or return the existing one per the dedup key.
+
+    Returns (thread, created). `created` is True ONLY for the caller
+    that actually inserted the row -- False on a dedup hit AND on a
+    lost insert race (that row is somebody else's creation). So the
+    flag is True exactly once in a thread's life, which is what lets a
+    caller treat "a conversation started" as its own event without
+    asking anybody: create-or-get hides the difference, and outside
+    this function it cannot be re-derived without racing.
 
     Dedup is applied ONLY here (the thread_id invariant). Raises
     ValidationError on a half-populated subject_ref and NotFoundError
@@ -220,7 +231,7 @@ async def create_or_get_thread(
             kind=str(kind),
             deduped=False,
         )
-        return thread
+        return thread, True
 
     existing = await _select_by_dedup_key(
         session,
@@ -231,7 +242,7 @@ async def create_or_get_thread(
         subject_id=subject_id,
     )
     if existing is not None:
-        return existing
+        return existing, False
 
     thread = _build_thread(
         client=client,
@@ -261,14 +272,58 @@ async def create_or_get_thread(
         )
         if existing is None:
             raise
+        # A concurrent creator inserted first: THEIR call is the
+        # creation event, ours is a plain get. Reporting True here
+        # would let two parallel callers both treat the same thread as
+        # newly started.
         logger.info("thread_create_lost_race", thread_id=str(existing.id))
-        return existing
+        return existing, False
 
     logger.info(
         "thread_created",
         thread_id=str(thread.id),
         kind=str(kind),
         deduped=True,
+    )
+    return thread, True
+
+
+async def create_or_get_thread(
+    session: AsyncSession,
+    *,
+    client: UUID,
+    operator_kind: OperatorKind,
+    operator_value: UUID,
+    kind: ThreadKind,
+    subject_type: str | None = None,
+    subject_id: str | None = None,
+    title: str | None = None,
+    priority: int | None = None,
+) -> Thread:
+    """Thin test-compat wrapper over create_or_get_thread_detailed.
+
+    The CORE is create_or_get_thread_detailed, which the application
+    calls (app/api/messaging.py -- the only app-side caller); this name
+    survives for the callers that do not need the flag, i.e. the 47
+    call sites across 12 test files of the closed messaging phases.
+
+    WHY two names rather than one tuple-returning function: the flag
+    was added by a micro-delivery (H-T2-C1-rev, 2026-08-04) whose whole
+    point was a small diff; changing the return type would have edited
+    47 lines in phases 4a/4b/4c for one useful line here. Not a second
+    implementation -- one core, one alias. Collapse them the next time
+    the messaging tests are touched wholesale.
+    """
+    thread, _created = await create_or_get_thread_detailed(
+        session,
+        client=client,
+        operator_kind=operator_kind,
+        operator_value=operator_value,
+        kind=kind,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        title=title,
+        priority=priority,
     )
     return thread
 
@@ -284,10 +339,12 @@ async def post_message(
     """Append a message to an existing thread and bump its activity.
 
     Sets Thread.last_message_at to the message time (the 4b auto-close
-    socket). Raises NotFoundError if the thread does not exist. Does
-    NOT emit any "message sent" event / notification / callback -- that
-    is Phase 4c. `created_at` is accepted for deterministic ordering;
-    it defaults to now (UTC).
+    socket). Raises NotFoundError if the thread does not exist. Emits
+    nothing BY DESIGN -- the data layer never notifies: the message ->
+    notification path lives in app/notifier.py (notify_new_message),
+    called by the POST handler in the SAME session, so the message and
+    its ping commit together. `created_at` is accepted for
+    deterministic ordering; it defaults to now (UTC).
     """
     thread = await session.get(Thread, thread_id)
     if thread is None:
