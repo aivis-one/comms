@@ -160,6 +160,26 @@ def next_phase4c_telegram_id() -> int:
     return tid
 
 
+SEAM_T2_TELEGRAM_ID_BAND_START = 92100
+SEAM_T2_TELEGRAM_ID_BAND_END = 92139
+
+_seam_t2_telegram_id_counter = itertools.count(SEAM_T2_TELEGRAM_ID_BAND_START)
+
+
+def next_seam_t2_telegram_id() -> int:
+    """Next telegram_id from the comms seam-T2 band (92100-92139).
+
+    A NARROW band, unlike the per-phase thousands above: the seam adds
+    a handful of actors, not a module.
+    """
+    tid = next(_seam_t2_telegram_id_counter)
+    if tid > SEAM_T2_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 92100-92139 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,

@@ -15,7 +15,7 @@
 #
 # CONTRACT (Phase 6 product proxy consumes as-is):
 #
-#   POST /api/v1/threads                      -> 200 <thread>
+#   POST /api/v1/threads                      -> 200 <thread> + created
 #   GET  /api/v1/threads?operator=&is_supervisor=&limit=&cursor=
 #                                             -> 200 {threads, next_cursor}
 #   POST /api/v1/threads/{tid}/messages       -> 200 <message>  (+ notify)
@@ -28,6 +28,11 @@
 #   POST /api/v1/threads/{tid}/status         -> 200 <thread>
 #   POST /api/v1/threads/{tid}/retag          -> 200 <thread>
 #
+#   - `created` (bool) rides ONLY on the create response: True for the
+#     call that inserted the row, False on a dedup hit or a lost insert
+#     race. ADDITIVE to the frozen 3b shape (seam T2 / ID-10, precedent
+#     reminder_cancel) -- every pre-existing field is unchanged, and no
+#     OTHER endpoint gained the key;
 #   - limit: 1..100, default 20 (clamped, not rejected); cursor is the
 #     previous page's opaque next_cursor, malformed -> 422;
 #   - a bad status transition / half subject_ref -> 422; an absent
@@ -75,7 +80,7 @@ from app.messaging.operators import (
 from app.messaging.read_state import count_unread, mark_read
 from app.messaging.status import set_status
 from app.messaging.threads import (
-    create_or_get_thread,
+    create_or_get_thread_detailed,
     list_thread_messages,
     post_message,
 )
@@ -202,8 +207,21 @@ async def create_thread(
     payload: ThreadCreateIn = Body(...),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Create a thread, or return the existing one per the dedup key."""
-    thread = await create_or_get_thread(
+    """Create a thread, or return the existing one per the dedup key.
+
+    ADDITIVE `created` (seam T2 / ID-10): create-or-get hides whether
+    this call inserted the row or found it, so the product could not
+    tell "a conversation just started" from "the same conversation
+    again" -- and it cannot re-derive it without racing. The flag is
+    True exactly once per thread, for the caller that inserted it, so
+    the product can act on its OWN request (write its diary entry)
+    without comms pushing anything back.
+
+    The key is attached HERE, not inside _thread_out: that serializer
+    is shared with the list / claim / status / retag responses, whose
+    shapes are frozen (3b) and must stay byte-for-byte.
+    """
+    thread, created = await create_or_get_thread_detailed(
         session,
         client=payload.client,
         operator_kind=payload.operator_kind,
@@ -214,7 +232,7 @@ async def create_thread(
         title=payload.title,
         priority=payload.priority,
     )
-    return _thread_out(thread)
+    return {**_thread_out(thread), "created": created}
 
 
 @router.get("")

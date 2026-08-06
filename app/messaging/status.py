@@ -24,8 +24,9 @@
 # mark (the close was voided before 4c sent).
 #
 # AUTHZ: set_status validates the TRANSITION only, never WHO may make
-# it -- write-authz is Phase 4c (the same seam as the sender write-authz
-# and the supervisor read-only marker). Callers commit.
+# it -- write-authz lives one layer up, in app/api/messaging.py (4c),
+# the same seam as the sender write-authz and the supervisor read-only
+# rule. Callers commit.
 # =============================================================================
 
 from datetime import UTC, datetime

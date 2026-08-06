@@ -7,6 +7,7 @@
 # ENVELOPE (one Redis Stream entry, XADD <stream> * ...):
 #
 #   event: "notification_request" | "user_upserted" | "group_changed"
+#          | "reminder_cancel"
 #   data:  <UTF-8 JSON document>
 #
 # VERSIONING (frozen decision, review 3c part B): the ENVELOPE
@@ -58,6 +59,31 @@
 #     recipient_id "<uuid>"    -- required
 #     member       bool        -- required (true=ensure, false=remove)
 #
+#   reminder_cancel (ADDITIVE extension, Phase 6/T1, Master-chat
+#   approved 2026-07-28; the envelope is untouched and old producers
+#   are unaffected -- arch doc §4.3. Naturally idempotent: it expires
+#   PENDING reminders matched by correlation, and an already-expired
+#   or never-scheduled match set is simply a zero-row update. The wire
+#   form mirrors engine/reminders.cancel_reminders, which scheduling
+#   already reaches through notification_request's scheduled_at --
+#   "a reminder is just a Notification with a FUTURE scheduled_at"):
+#     v                 1          -- required
+#     types             [str]      -- required, non-empty list of
+#                                     reminder type keys to cancel
+#     correlation_key   str 1..200 -- required; the action_data key the
+#                                     reminders were scheduled with. An
+#                                     underscore prefix is rejected: such
+#                                     keys cannot exist in action_data
+#                                     (reserved) so the cancel could
+#                                     never match -- a producer bug.
+#     correlation_value str 1..500 -- required; value to match
+#     target_type       str | null -- optional filter; both target
+#     target_value      str | null    fields together or neither
+#                                     (a bare target_value is
+#                                     ambiguous); form checked per
+#                                     target_type as in
+#                                     notification_request
+#
 # action_data rules (Phase 3c item 5, early line of defense; the
 # per-channel checks at delivery -- deep-link charset/64 from 3a --
 # remain the second line):
@@ -106,11 +132,13 @@ ENVELOPE_DATA_FIELD = "data"
 EVENT_NOTIFICATION_REQUEST = "notification_request"
 EVENT_USER_UPSERTED = "user_upserted"
 EVENT_GROUP_CHANGED = "group_changed"
+EVENT_REMINDER_CANCEL = "reminder_cancel"
 
 KNOWN_EVENTS = frozenset({
     EVENT_NOTIFICATION_REQUEST,
     EVENT_USER_UPSERTED,
     EVENT_GROUP_CHANGED,
+    EVENT_REMINDER_CANCEL,
 })
 
 _SCALAR_TYPES = (str, int, float, bool, type(None))
@@ -156,7 +184,18 @@ class GroupChanged:
     member: bool
 
 
-ParsedEvent = NotificationRequest | UserUpserted | GroupChanged
+@dataclass(frozen=True)
+class ReminderCancel:
+    types: list[str]
+    correlation_key: str
+    correlation_value: str
+    target_type: str | None
+    target_value: str | None
+
+
+ParsedEvent = (
+    NotificationRequest | UserUpserted | GroupChanged | ReminderCancel
+)
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +449,9 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
         return _parse_notification_request(data)
     if event == EVENT_USER_UPSERTED:
         return _parse_user_upserted(data)
-    return _parse_group_changed(data)
+    if event == EVENT_GROUP_CHANGED:
+        return _parse_group_changed(data)
+    return _parse_reminder_cancel(data)
 
 
 def _parse_notification_request(data: dict[str, Any]) -> NotificationRequest:
@@ -536,4 +577,72 @@ def _parse_group_changed(data: dict[str, Any]) -> GroupChanged:
         group_key=group_key,
         recipient_id=recipient_id,
         member=member,
+    )
+
+
+# Mirrors the length caps of the values being matched: a type key is
+# capped at 200 in _parse_notification_request; a correlation value is
+# an action_data scalar rendered to text -- 500 is a generous ceiling
+# for what is in practice an entity id.
+_MAX_CORRELATION_VALUE_LEN = 500
+
+
+def _parse_reminder_cancel(data: dict[str, Any]) -> ReminderCancel:
+    event = EVENT_REMINDER_CANCEL
+
+    raw_types = _require(data, "types", event)
+    if not isinstance(raw_types, list) or not raw_types:
+        raise ValidationError(
+            f"{event}: types must be a non-empty list of reminder "
+            f"type keys"
+        )
+    types = [
+        _string(t, "types[]", event, max_len=200) for t in raw_types
+    ]
+
+    correlation_key = _string(
+        _require(data, "correlation_key", event),
+        "correlation_key", event, max_len=200,
+    )
+    if correlation_key.startswith("_"):
+        # Underscore keys are rejected by validate_action_data at
+        # schedule time (reserved for the pipeline, e.g. _channels),
+        # so a cancel correlated on one could never match anything --
+        # loud producer bug, not a silent zero-row update.
+        raise ValidationError(
+            f"{event}: correlation_key {correlation_key!r} is "
+            f"reserved (underscore prefix cannot exist in "
+            f"action_data)"
+        )
+    correlation_value = _string(
+        _require(data, "correlation_value", event),
+        "correlation_value", event,
+        max_len=_MAX_CORRELATION_VALUE_LEN,
+    )
+
+    target_type_raw = data.get("target_type")
+    target_value_raw = data.get("target_value")
+    target_type: str | None = None
+    target_value: str | None = None
+    if target_type_raw is None and target_value_raw is not None:
+        raise ValidationError(
+            f"{event}: target_value without target_type is ambiguous "
+            f"-- send both target fields or neither"
+        )
+    if target_type_raw is not None and target_value_raw is None:
+        raise ValidationError(
+            f"{event}: target_type without target_value is ambiguous "
+            f"-- send both target fields or neither"
+        )
+    if target_type_raw is not None:
+        target_type, target_value = _validate_target(
+            target_type_raw, target_value_raw, event,
+        )
+
+    return ReminderCancel(
+        types=types,
+        correlation_key=correlation_key,
+        correlation_value=correlation_value,
+        target_type=target_type,
+        target_value=target_value,
     )

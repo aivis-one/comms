@@ -445,3 +445,100 @@ class TestEntrypoint:
         monkeypatch.setattr(settings, "redis_url", "")
         with pytest.raises(RuntimeError, match="REDIS_URL"):
             entrypoint.main()
+
+
+class TestReminderCancel:
+    """Phase 6/T1 additive event, e2e over the stream: a reminder is
+    a notification_request with a FUTURE scheduled_at; reminder_cancel
+    expires the PENDING matches by correlation. Recipients are not
+    needed on either path (resolve happens at due time), so the issued
+    T1 band 92000-92099 stays untouched here."""
+
+    @staticmethod
+    def _reminder_request(
+        correlation_value: str, type_: str = "unit_rem_1h",
+    ) -> dict[str, Any]:
+        from datetime import UTC, datetime, timedelta
+
+        anchor = datetime.now(UTC) + timedelta(hours=2)
+        return _request_data(
+            type=type_,
+            scheduled_at=(anchor - timedelta(hours=1)).isoformat(),
+            expiry_at=anchor.isoformat(),
+            action_data={"booking_id": correlation_value},
+        )
+
+    async def test_cancel_expires_pending_reminders(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+    ) -> None:
+        from app.engine.constants import NotificationStatus
+
+        booking_id = str(uuid4())
+        first = self._reminder_request(booking_id, "unit_rem_1h")
+        second = self._reminder_request(booking_id, "unit_rem_10m")
+        bystander = self._reminder_request(str(uuid4()), "unit_rem_1h")
+        await _xadd(redis, stream, "notification_request", first)
+        await _xadd(redis, stream, "notification_request", second)
+        await _xadd(redis, stream, "notification_request", bystander)
+        await _xadd(redis, stream, "reminder_cancel", {
+            "v": 1,
+            "types": ["unit_rem_24h", "unit_rem_1h", "unit_rem_10m"],
+            "correlation_key": "booking_id",
+            "correlation_value": booking_id,
+        })
+
+        async def all_acked() -> bool:
+            length: int = await redis.xlen(stream)
+            return length == 4 and await _no_pending(redis, stream)
+
+        await _run_until(StreamConsumer(redis), all_acked)
+
+        db_session.expire_all()
+        by_key = {}
+        for data in (first, second, bystander):
+            row = (await db_session.execute(
+                select(Notification).where(
+                    Notification.idempotency_key
+                    == data["idempotency_key"],
+                )
+            )).scalar_one()
+            by_key[data["idempotency_key"]] = row
+        assert (
+            by_key[first["idempotency_key"]].status
+            == NotificationStatus.EXPIRED
+        )
+        assert (
+            by_key[second["idempotency_key"]].status
+            == NotificationStatus.EXPIRED
+        )
+        # A different correlation value stays scheduled.
+        assert (
+            by_key[bystander["idempotency_key"]].status
+            == NotificationStatus.PENDING
+        )
+        assert await redis.exists(settings.dlq_stream) == 0
+
+    async def test_no_match_cancel_is_acked_not_dead_lettered(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+    ) -> None:
+        """A cancel that matches nothing (already expired / never
+        scheduled / replay) is the idempotency contract working --
+        acked, zero rows, no DLQ."""
+        await _xadd(redis, stream, "reminder_cancel", {
+            "v": 1,
+            "types": ["unit_rem_1h"],
+            "correlation_key": "booking_id",
+            "correlation_value": str(uuid4()),
+        })
+
+        async def acked() -> bool:
+            length: int = await redis.xlen(stream)
+            return length == 1 and await _no_pending(redis, stream)
+
+        await _run_until(StreamConsumer(redis), acked)
+        assert await redis.exists(settings.dlq_stream) == 0

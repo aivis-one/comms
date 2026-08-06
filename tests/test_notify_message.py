@@ -32,6 +32,7 @@ from tests.helpers import (
     create_recipient,
     create_section,
     next_phase4c_telegram_id,
+    next_seam_t2_telegram_id,
 )
 
 
@@ -180,6 +181,29 @@ class TestUnclaimedSection:
         assert len(notifs) == 1
         assert notifs[0].type == TYPE_SUPPORT_MESSAGE
         assert notifs[0].target_value == str(agent)
+
+
+class TestSectionOperatorSide:
+    """Coverage symmetry (seam T2, band 92100-92139): the operator ->
+    client direction was only exercised on the user form. The mapping
+    axis is the RECIPIENT'S SIDE, not the thread's operator form, so an
+    agent writing from a section thread must reach the client with the
+    SAME participant type a user-form operator does."""
+
+    async def test_section_operator_message_pings_client_participant(
+        self, db_session: AsyncSession
+    ) -> None:
+        thread, client = await _section(db_session)
+        agent = await create_recipient(
+            db_session, telegram_id=next_seam_t2_telegram_id()
+        )
+        await claim_thread(db_session, thread_id=thread.id, operator=agent.id)
+        await db_session.refresh(thread)
+        msg = await _post(db_session, thread, agent.id)
+        notifs = await notify_new_message(db_session, thread=thread, message=msg)
+        assert len(notifs) == 1
+        assert notifs[0].type == TYPE_PARTICIPANT_MESSAGE
+        assert notifs[0].target_value == str(client)
 
 
 class TestIdempotencyGuard:

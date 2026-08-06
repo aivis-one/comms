@@ -17,8 +17,12 @@
 #   imports app.audience models -- so it does not sit below audience.
 #
 # FENCE (Phase 4a): fields, not behavior. Operator resolution, claim,
-# visibility, supervisor, retag and STATUS TRANSITIONS are Phase 4b;
-# the message -> notification path, the msg_* gate, the callback client
-# and the messaging HTTP-API are Phase 4c. Every seam left for them is
+# visibility, supervisor, retag and STATUS TRANSITIONS landed in 4b;
+# the message -> notification path, the msg_* gate and the messaging
+# HTTP-API landed in 4c and live OUTSIDE this package (app/notifier.py,
+# app/api/messaging.py) -- this package stays data-only. An outgoing
+# product callback was considered for the same seam and REJECTED (the
+# product learns "a thread started" from the `created` flag on its own
+# create call -- ID-10, 2026-08-04). Deferred seams that remain are
 # marked in-code (KNOWN CEILING convention).
 # =============================================================================
