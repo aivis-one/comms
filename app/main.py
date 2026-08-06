@@ -10,7 +10,7 @@
 #
 # The notification worker does NOT run inside this process (unlike the
 # donors, which ticked daemons in the API lifespan). It is a separate
-# process from the same image: `python -m app.worker`
+# process from the same image: `python -m app.worker`.
 #
 # HEALTH vs READY:
 #   /health -- always 200; reports dependency status.
