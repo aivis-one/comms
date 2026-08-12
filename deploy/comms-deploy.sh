@@ -31,11 +31,15 @@ set -uo pipefail
 #                              reads ./.env for env_file AND for
 #                              ${PROFILE_DIR} interpolation)
 #
-# Subcommands (v1, DD §6): install | update | logs | db | status.
+# Subcommands: install | update | restart | logs | db | status.
+# `restart` is a plain lifecycle verb (bounce the three app containers,
+# wait for health) -- the one a product needs after changing data the
+# service only reads at startup, and the one a registry-driven product
+# CLI will reach for.
 # Operational tails (dlq, lag) are deliberately ABSENT -- deferred
 # with a trigger (DD §0), do not add them here ahead of it.
 #
-# Usage: comms-deploy.sh {install|update|logs|db|status} [args]
+# Usage: comms-deploy.sh {install|update|restart|logs|db|status} [args]
 # ==============================================================================
 
 INSTALL_BASE="/opt/comms"
@@ -135,7 +139,6 @@ COMMS_SERVICE_TOKEN=$service_token
 CHANNELS_MODE=stub
 TELEGRAM_BOT_TOKEN=$tg_placeholder
 TELEGRAM_BOT_URL=
-TELEGRAM_API_BASE=
 
 DEFAULT_LOCALE=en
 DEFAULT_TIMEZONE=UTC
@@ -149,7 +152,9 @@ PROFILE_DIR=$PROFILE_DIR_DEFAULT
 PRODUCT_ENV_PATH=
 EOF
     echo -e "${GREEN}✓ $ENV_FILE generated (postgres/redis/service-token minted)${NC}"
-    echo -e "${YELLOW}  TELEGRAM_BOT_TOKEN is a placeholder; replace it before CHANNELS_MODE=real${NC}"
+    echo -e "${YELLOW}  Channels start in stub mode: the token above is a placeholder.${NC}"
+    echo -e "${YELLOW}  Real credentials come from the PRODUCT installer, which owns${NC}"
+    echo -e "${YELLOW}  the bot and writes them into this file before the stack starts.${NC}"
 }
 
 # Step 3: compose reads ./.env next to docker-compose.yml -- link it
@@ -164,10 +169,13 @@ ensure_env_link() {
     fi
 }
 
-# Step 4: the profile. Seeded with the generic smoke profile ONLY when
-# the directory is empty -- a real product profile already dropped in
-# by the operator is never overwritten (and survives update: it lives
-# outside the checkout).
+# Step 4: the profile. The generic smoke profile is a FLOOR, not a
+# default: it is copied in ONLY when PROFILE_DIR is empty, which is the
+# standalone case (this CLI run on its own, before any product is
+# wired). A product installer points PROFILE_DIR at the profile it
+# ships and this step then finds a populated directory and keeps its
+# hands off it. Either way the profile survives `update`: it lives
+# outside the checkout, or outside this repo entirely.
 seed_profile() {
     local profile_dir="${PROFILE_DIR:-$PROFILE_DIR_DEFAULT}"
     mkdir -p "$profile_dir"
@@ -177,7 +185,8 @@ seed_profile() {
     fi
     if cp -r "$COMPOSE_DIR/smoke-profile/." "$profile_dir/"; then
         echo -e "${GREEN}✓ Generic smoke profile seeded into $profile_dir${NC}"
-        echo -e "${YELLOW}  Drop the real product profile on top when it is ready${NC}"
+        echo -e "${YELLOW}  Standalone bring-up: three chat types only. A product${NC}"
+        echo -e "${YELLOW}  installer supplies PROFILE_DIR and this step is skipped.${NC}"
     else
         echo -e "${RED}✗ Failed to seed the smoke profile${NC}"
         exit 1
@@ -310,6 +319,34 @@ cmd_update() {
     echo -e "${GREEN}✓ comms updated (pulled, rebuilt, migrated)${NC}"
 }
 
+# Restart the three application containers -- API, worker, consumer --
+# and wait for the API to be healthy again.
+#
+# NOT a hot reload. The name says restart because that is all it is:
+# the processes read their profile once, at startup, so a profile that
+# changed on the bind-mounted path reaches them by being restarted.
+# Naming it after the profile would promise a reload endpoint that is
+# deliberately not built.
+#
+# postgres and redis are left alone on purpose: they hold the data, and
+# bouncing them for an application-level change is gratuitous risk.
+cmd_restart() {
+    echo -e "${CYAN}== comms restart ==${NC}"
+    cd_compose
+    if ! $COMPOSE_CMD restart comms-app comms-worker comms-consumer; then
+        echo -e "${RED}✗ restart failed${NC}"
+        exit 1
+    fi
+    # `compose restart` returns as soon as it has signalled the
+    # containers -- it says nothing about what happened next. comms-app
+    # validates its profile during startup and dies on a bad one, which
+    # is a health failure a few seconds later, not a non-zero exit here.
+    if ! wait_for_app; then
+        exit 1
+    fi
+    echo -e "${GREEN}✓ comms-app / comms-worker / comms-consumer restarted${NC}"
+}
+
 cmd_logs() {
     cd_compose
     $COMPOSE_CMD logs -f --tail=200 "$@"
@@ -380,11 +417,12 @@ cmd_status() {
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;
     update)  shift; cmd_update "$@" ;;
+    restart) shift; cmd_restart "$@" ;;
     logs)    shift; cmd_logs "$@" ;;
     db)      shift; cmd_db "$@" ;;
     status)  shift; cmd_status "$@" ;;
     *)
-        echo "Usage: $0 {install|update|logs [service]|db {dump|restore <file>|migrate}|status}"
+        echo "Usage: $0 {install|update|restart|logs [service]|db {dump|restore <file>|migrate}|status}"
         exit 1
         ;;
 esac
