@@ -31,11 +31,24 @@ set -uo pipefail
 #                              reads ./.env for env_file AND for
 #                              ${PROFILE_DIR} interpolation)
 #
-# Subcommands: install | update | restart | logs | db | status.
-# `restart` is a plain lifecycle verb (bounce the three app containers,
-# wait for health) -- the one a product needs after changing data the
-# service only reads at startup, and the one a registry-driven product
-# CLI will reach for.
+# Subcommands: install | update | start | stop | restart | logs | db |
+# status.
+#
+# THREE LIFECYCLE VERBS, THREE DIFFERENT WIDTHS -- the difference is
+# deliberate and easy to erase by "unifying" them later:
+#   restart  bounces the THREE app containers only, and waits for
+#            health. Narrow because its job is re-reading data the
+#            service only loads at startup (the profile); the
+#            datastores hold state and bouncing them for an
+#            application-level change is gratuitous risk.
+#   stop     takes the WHOLE stack down, postgres and redis included.
+#            It is the switch you throw when the machine goes off, not
+#            an application-level operation.
+#   start    brings the whole stack back up and waits for health.
+# A product CLI driving this registry-style reaches for start/stop to
+# cover a whole box, and for restart to reload data. Collapsing
+# restart into stop+start would make a template edit cost a database
+# bounce.
 # Operational tails (dlq, lag) are deliberately ABSENT -- deferred
 # with a trigger (DD §0), do not add them here ahead of it.
 #
@@ -347,6 +360,65 @@ cmd_restart() {
     echo -e "${GREEN}✓ comms-app / comms-worker / comms-consumer restarted${NC}"
 }
 
+# Bring the whole stack up and wait until it is actually serving.
+#
+# ORDER IS NOT WRITTEN HERE ON PURPOSE. deploy/docker-compose.yml
+# already declares it -- comms-app depends_on comms-postgres and
+# comms-redis with `condition: service_healthy` -- so `up -d` starts
+# things in dependency order by itself. Spelling the sequence out again
+# in this script would be a second copy of that graph, and the two
+# would drift the first time the compose changed.
+#
+# Idempotent: `up -d` on an already-running stack is a no-op, and
+# wait_for_app returns on its first check when the container is
+# already healthy. Safe to call from product automation that does not
+# know the current state.
+#
+# `install` is NOT implied. A box that never ran install has no
+# compose and no env, and cd_compose / load_env already say so in
+# their own words -- adding a third phrasing of the same state would
+# just be one more sentence to keep in step.
+cmd_start() {
+    echo -e "${CYAN}== comms start ==${NC}"
+    load_env
+    cd_compose
+    # The shared network is EXTERNAL: compose will refuse to start if
+    # nobody has created it. Either side may have created it (see
+    # ensure_network) -- but on a machine that came up from cold, the
+    # product's installer is not necessarily the one that ran first.
+    ensure_network
+    if ! $COMPOSE_CMD up -d; then
+        echo -e "${RED}✗ start failed${NC}"
+        exit 1
+    fi
+    if ! wait_for_app; then
+        exit 1
+    fi
+    echo -e "${GREEN}✓ comms stack is up${NC}"
+}
+
+# Take the WHOLE stack down -- app, worker, consumer AND the datastores.
+#
+# Wider than restart by design (see the header): this is called when a
+# box is being shut down, and leaving a database running behind a
+# `stop` would be a lie the operator only discovers in `docker ps`.
+#
+# Data survives: `down` removes containers and the compose-managed
+# network, NOT the named volumes. The shared external network is not
+# ours to remove and compose leaves it alone.
+#
+# Idempotent: `down` on an already-stopped stack removes nothing and
+# exits 0.
+cmd_stop() {
+    echo -e "${CYAN}== comms stop ==${NC}"
+    cd_compose
+    if ! $COMPOSE_CMD down; then
+        echo -e "${RED}✗ stop failed${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ comms stack is down (volumes kept)${NC}"
+}
+
 cmd_logs() {
     cd_compose
     $COMPOSE_CMD logs -f --tail=200 "$@"
@@ -414,15 +486,24 @@ cmd_status() {
 # Dispatch
 # ------------------------------------------------------------------------------
 
+# A driving product CLI discovers what this service implements by
+# reading the labels of THIS case -- the one at column zero. Labels of
+# the nested case inside cmd_db (dump/restore/migrate) are arguments to
+# `db`, not verbs of the service, and are correctly not seen. Keep new
+# lifecycle verbs here, in this block: a verb added anywhere else is
+# invisible to the product, and the product will keep reporting that
+# this service cannot do it.
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;
     update)  shift; cmd_update "$@" ;;
+    start)   shift; cmd_start "$@" ;;
+    stop)    shift; cmd_stop "$@" ;;
     restart) shift; cmd_restart "$@" ;;
     logs)    shift; cmd_logs "$@" ;;
     db)      shift; cmd_db "$@" ;;
     status)  shift; cmd_status "$@" ;;
     *)
-        echo "Usage: $0 {install|update|restart|logs [service]|db {dump|restore <file>|migrate}|status}"
+        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|status}"
         exit 1
         ;;
 esac
