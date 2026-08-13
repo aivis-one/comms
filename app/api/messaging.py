@@ -28,6 +28,24 @@
 #   POST /api/v1/threads/{tid}/status         -> 200 <thread>
 #   POST /api/v1/threads/{tid}/retag          -> 200 <thread>
 #
+#   POST /api/v1/sections                     -> 200 <section>
+#
+#   - sections live on their OWN router (prefix /api/v1/sections) in
+#     this module: they are part of messaging, but a section is not a
+#     thread and must not hide under the threads prefix;
+#   - CREATE-OR-FIND, not upsert. Posting a key that already exists
+#     returns the EXISTING section with 200 and does NOT touch its
+#     label. Sending the same key with a different label is therefore
+#     a successful no-op that returns the OLD label -- it is not a
+#     rename and not a 409. Said here because the opposite is the
+#     natural assumption, and a consumer who assumes it will spend an
+#     afternoon debugging a rename that was never implemented;
+#   - 200 rather than 201 for the same reason the thread endpoint uses
+#     it: the call is idempotent, and "created" is not a property of
+#     the response. Unlike POST /threads there is NO `created` flag --
+#     see the endpoint docstring for why it cannot be derived here
+#     honestly.
+#
 #   - `created` (bool) rides ONLY on the create response: True for the
 #     call that inserted the row, False on a dedup hit or a lost insert
 #     race. ADDITIVE to the frozen 3b shape (seam T2 / ID-10, precedent
@@ -57,7 +75,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_service_auth
@@ -67,8 +85,14 @@ from app.core.exceptions import (
     NotFoundError,
     ValidationError,
 )
-from app.messaging.constants import OperatorKind, ThreadKind, ThreadStatus
-from app.messaging.models import Message, Thread
+from app.messaging.constants import (
+    MAX_SECTION_KEY_LEN,
+    MAX_SECTION_LABEL_LEN,
+    OperatorKind,
+    ThreadKind,
+    ThreadStatus,
+)
+from app.messaging.models import Message, Section, Thread
 from app.messaging.operators import (
     can_claim,
     can_operate,
@@ -78,6 +102,7 @@ from app.messaging.operators import (
     retag_thread,
 )
 from app.messaging.read_state import count_unread, mark_read
+from app.messaging.sections import get_or_create_section
 from app.messaging.status import set_status
 from app.messaging.threads import (
     create_or_get_thread_detailed,
@@ -88,6 +113,19 @@ from app.notifier import notify_new_message
 
 router = APIRouter(
     prefix="/api/v1/threads",
+    tags=["messaging"],
+    dependencies=[Depends(require_service_auth)],
+)
+
+# Sections get their OWN router rather than a path under /threads: a
+# section is not a thread, and a route that says otherwise sends the
+# next reader looking for it in the wrong place. Same module, because
+# sections are part of messaging and this codebase does not add files
+# for one endpoint. Same auth as every neighbour -- the shared service
+# token authenticates the PRODUCT (arch decision 14); nothing new is
+# invented here.
+sections_router = APIRouter(
+    prefix="/api/v1/sections",
     tags=["messaging"],
     dependencies=[Depends(require_service_auth)],
 )
@@ -140,6 +178,15 @@ def _thread_out(thread: Thread) -> dict[str, Any]:
     }
 
 
+def _section_out(section: Section) -> dict[str, Any]:
+    return {
+        "id": str(section.id),
+        "key": section.key,
+        "label": section.label,
+        "created_at": _iso(section.created_at),
+    }
+
+
 def _message_out(message: Message) -> dict[str, Any]:
     return {
         "id": str(message.id),
@@ -162,6 +209,16 @@ class ThreadCreateIn(BaseModel):
     subject_id: str | None = None
     title: str | None = None
     priority: int | None = None
+
+
+class SectionIn(BaseModel):
+    # Widths mirror the column definitions (MAX_SECTION_KEY_LEN /
+    # MAX_SECTION_LABEL_LEN) so an over-long value is a 422 at the
+    # edge, not a database error mid-transaction. min_length=1 makes
+    # an empty string a rejection rather than a section nobody can
+    # name -- the column is NOT NULL but "" would satisfy it.
+    key: str = Field(min_length=1, max_length=MAX_SECTION_KEY_LEN)
+    label: str = Field(min_length=1, max_length=MAX_SECTION_LABEL_LEN)
 
 
 class MessageIn(BaseModel):
@@ -233,6 +290,48 @@ async def create_thread(
         priority=payload.priority,
     )
     return {**_thread_out(thread), "created": created}
+
+
+@sections_router.post("")
+async def create_section(
+    payload: SectionIn = Body(...),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Create a section for this key, or return the existing one.
+
+    CREATE-OR-FIND, not upsert. An existing section comes back exactly
+    as it is: `label` is NOT updated. Posting a known key with a new
+    label is a successful no-op returning the OLD label -- not a
+    rename, not a conflict. That is the domain function's documented
+    behaviour and it is repeated here because the opposite is what a
+    consumer will assume, and the assumption fails silently: the call
+    succeeds, the name does not change, and there is nothing to debug
+    because nothing is broken.
+
+    Concurrency is the DATABASE's business, not this handler's: the
+    unique index on key turns a losing race into an IntegrityError that
+    the domain function catches and resolves to the winner's row,
+    inside a SAVEPOINT so this request's transaction stays usable.
+
+    NO `created` FLAG, unlike POST /threads -- deliberately, because
+    here it could not be honest. The thread endpoint gets its flag from
+    create_or_get_thread_detailed, which knows which branch it took;
+    the section function returns only the row. Deriving the flag out
+    here would mean probing for the key first and reporting "created"
+    when the probe found nothing -- and under a race BOTH callers probe
+    nothing, so BOTH would report created=True for a single row. A flag
+    that can be true twice is worse than no flag: the thread flag's
+    entire value is that it is true exactly once. The honest way to add
+    it is a `_detailed` variant in app/messaging/sections.py returning
+    (section, created), mirroring the thread function -- out of scope
+    here, named in the report as a candidate.
+    """
+    section = await get_or_create_section(
+        session,
+        key=payload.key,
+        label=payload.label,
+    )
+    return _section_out(section)
 
 
 @router.get("")
