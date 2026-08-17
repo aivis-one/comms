@@ -23,7 +23,15 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, func, or_, select, tuple_, update
+from sqlalchemy import (
+    ColumnElement,
+    and_,
+    func,
+    or_,
+    select,
+    tuple_,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -166,6 +174,65 @@ async def claim_thread(
     if thread is None:
         raise NotFoundError(f"thread {thread_id} does not exist")
     return False
+
+
+def participation_clause(participant: UUID) -> ColumnElement[bool]:
+    """Threads `participant` TAKES PART IN -- all three participant roles.
+
+        participates(me) = client == me
+                           OR assignee == me
+                           OR (user thread AND operator_value == me)
+
+    NOT THE SAME PREDICATE AS list_visible_threads, and the difference
+    is the point of this docstring. Visibility answers "may I read
+    it"; participation answers "is this conversation mine". They part
+    company on the UNCLAIMED SECTION THREAD: it is in every agent's
+    POOL (visible, assignee IS NULL), but nobody takes part in it yet
+    -- client is the customer, assignee is empty, and operator_value is
+    a SECTION id, not a recipient. So a pool row is visible-not-
+    participating, and every T-51 aggregate treats it as "not mine":
+    absent from the summary, absent from the batch counts, no `unread`
+    key on the list row. That is a real production state, not a corner
+    case -- the product's operator list is read with
+    is_supervisor=False, so pool rows are what an operator normally
+    sees. Supervisor widening produces the same state by a second
+    route (foreign threads), not the only one.
+
+    A DESCRIPTOR-FREE predicate (BL-1 discipline): a clause, never a
+    materialized set of threads or of agents.
+
+    # KNOWN CEILING (third OR branch is currently redundant;
+    # acknowledged by design):
+    #   1. Mechanics: `operator_kind == user AND operator_value == me`
+    #      adds no row that `assignee == me` would not already add,
+    #      because a user thread is PRE-ASSIGNED assignee =
+    #      operator_value at creation (D1(i), threads.py) and nothing
+    #      can part them: retag rejects the user form outright and
+    #      claim requires assignee IS NULL, which a user thread never
+    #      has.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: none -- this is a property of the thread
+    #      constructor, not a deferred item.
+    #   4. Promotion trigger: a path appears that sets assignee and
+    #      operator_value to different recipients on a user thread (a
+    #      master hand-off / re-assignment being the obvious one).
+    #   5. Agreed fix: none needed -- the branch already covers it; the
+    #      trigger only means the branch stops being redundant.
+    #   6. Rejected: dropping the branch as dead code. The invariant
+    #      that makes it redundant lives in a CONSTRUCTOR, not in the
+    #      schema, so nothing would fail loudly when it stops holding
+    #      -- the DM operator's badge would simply go dark. It also
+    #      keeps ix_threads_operator_user in play: the planner does not
+    #      know the invariant and prices the OR branch on its own.
+    """
+    return or_(
+        Thread.client == participant,
+        Thread.assignee == participant,
+        and_(
+            Thread.operator_kind == OperatorKind.USER,
+            Thread.operator_value == participant,
+        ),
+    )
 
 
 async def list_visible_threads(
