@@ -27,8 +27,14 @@
 #   POST /api/v1/threads/{tid}/claim          -> 200 {claimed, thread}
 #   POST /api/v1/threads/{tid}/status         -> 200 <thread>
 #   POST /api/v1/threads/{tid}/retag          -> 200 <thread>
+#   POST /api/v1/threads/unread-counts        -> 200 {counts}
 #
 #   POST /api/v1/sections                     -> 200 <section>
+#
+#   GET  /api/v1/participants/{pid}/unread-summary
+#                                             -> 200 {has_unread,
+#                                                     threads_with_unread,
+#                                                     unread_messages}
 #
 #   - sections live on their OWN router (prefix /api/v1/sections) in
 #     this module: they are part of messaging, but a section is not a
@@ -46,6 +52,19 @@
 #     see the endpoint docstring for why it cannot be derived here
 #     honestly.
 #
+#   - THE THREE UNREAD AGGREGATES (T-51) SHARE ONE ABSENCE RULE:
+#     ABSENCE MEANS "NOT A PARTICIPANT". The summary aggregates only
+#     the caller's own threads; the batch OMITS a thread the caller
+#     does not take part in (and, by the same single rule, a thread id
+#     that does not exist at all); the list omits the `unread` KEY on
+#     such a row. Never a silent zero -- a zero would read as "nothing
+#     unread here" and hide an integration mistake (wrong participant,
+#     stale thread id) behind a plausible number. Never a whole-batch
+#     error either: one bad id must not cost the caller the other 99.
+#     Participation is the three-role clause in
+#     messaging/operators.participation_clause -- NOT thread
+#     visibility: an unclaimed section thread is visible to every
+#     operator and belongs to none of them, so it has no unread key;
 #   - `created` (bool) rides ONLY on the create response: True for the
 #     call that inserted the row, False on a dedup hit or a lost insert
 #     race. ADDITIVE to the frozen 3b shape (seam T2 / ID-10, precedent
@@ -101,7 +120,12 @@ from app.messaging.operators import (
     list_visible_threads,
     retag_thread,
 )
-from app.messaging.read_state import count_unread, mark_read
+from app.messaging.read_state import (
+    count_unread,
+    mark_read,
+    participant_unread_summary,
+    unread_counts_for_participant,
+)
 from app.messaging.sections import get_or_create_section
 from app.messaging.status import set_status
 from app.messaging.threads import (
@@ -129,6 +153,23 @@ sections_router = APIRouter(
     tags=["messaging"],
     dependencies=[Depends(require_service_auth)],
 )
+
+# Participants get their own router for the same reason sections do: a
+# participant is not a thread, and the summary is an aggregate ACROSS
+# threads -- hiding it under /threads would say the opposite. Same
+# module (this codebase does not add a file for one endpoint), same
+# service-token dependency as every neighbour.
+participants_router = APIRouter(
+    prefix="/api/v1/participants",
+    tags=["messaging"],
+    dependencies=[Depends(require_service_auth)],
+)
+
+
+# One page of a chat list, matched to the list endpoint's own page
+# ceiling (VISIBLE_THREADS_MAX_PAGE_SIZE): the batch exists to serve a
+# rendered list, so it takes exactly as many ids as a list can show.
+UNREAD_COUNTS_MAX_THREAD_IDS = 100
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +288,16 @@ class ReadIn(BaseModel):
     last_read_at: datetime | None = None
 
 
+class UnreadCountsIn(BaseModel):
+    participant: UUID
+    # max_length is measured on the RAW list, BEFORE the handler
+    # de-duplicates it: 120 ids of which 80 are distinct is a 422, not
+    # a 200. A limit applied after dedup would depend on the CONTENT of
+    # the request rather than its shape, and a caller could not predict
+    # from the contract whether their list is acceptable.
+    thread_ids: list[UUID] = Field(max_length=UNREAD_COUNTS_MAX_THREAD_IDS)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints -- threads
 # ---------------------------------------------------------------------------
@@ -338,6 +389,7 @@ async def create_section(
 async def list_threads(
     operator: UUID = Query(...),
     is_supervisor: bool = Query(default=False),
+    with_unread: bool = Query(default=False),
     limit: int = Query(default=20),
     cursor: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_reader),
@@ -352,6 +404,25 @@ async def list_threads(
     authenticated session and MUST NEVER let a client set is_supervisor
     -- forwarding a client-supplied value here is a full read-authz
     bypass. Same for the thread_id-only read endpoints (feed / unread).
+
+    ADDITIVE `unread`, STRICTLY OPT-IN (T-51). Without with_unread the
+    response is unchanged BYTE FOR BYTE -- the 3b shape is frozen and
+    the product proxy mirrors it. With it, each row the `operator`
+    takes part in gains "unread": n, counted FOR THAT OPERATOR, so a
+    chat list needs one call instead of one per row.
+
+    The key is attached HERE, not inside _thread_out, for the same
+    reason `created` is (see create_thread): that serializer is shared
+    with claim / status / retag, whose shapes are frozen.
+
+    NO KEY ON A ROW THE OPERATOR DOES NOT TAKE PART IN. Visibility is
+    wider than participation, so this is a normal row, not an oddity:
+    an UNCLAIMED SECTION THREAD sits in every operator's pool and
+    belongs to none of them (assignee empty, operator_value is a
+    section id) -- and with is_supervisor=true every foreign thread
+    arrives as well. An absent key says "not yours"; a zero would say
+    "nothing unread here" and be indistinguishable from a thread the
+    operator has fully read.
     """
     decoded = _decode_cursor(cursor) if cursor is not None else None
     threads, next_cursor = await list_visible_threads(
@@ -361,12 +432,86 @@ async def list_threads(
         limit=limit,
         cursor=decoded,
     )
+    rows = [_thread_out(t) for t in threads]
+    if with_unread:
+        counts = await unread_counts_for_participant(
+            session,
+            participant=operator,
+            thread_ids=[t.id for t in threads],
+        )
+        rows = [
+            ({**row, "unread": counts[thread.id]} if thread.id in counts
+             else row)
+            for row, thread in zip(rows, threads, strict=True)
+        ]
     return {
-        "threads": [_thread_out(t) for t in threads],
+        "threads": rows,
         "next_cursor": (
             _encode_cursor(next_cursor) if next_cursor is not None else None
         ),
     }
+
+
+# Declared ABOVE every /{thread_id} route: a literal path segment must
+# not be reachable as a thread_id. There is no bare POST /{thread_id}
+# today, so nothing shadows it either way -- the ordering is what keeps
+# that true when one is added.
+@router.post("/unread-counts")
+async def unread_counts(
+    payload: UnreadCountsIn = Body(...),
+    session: AsyncSession = Depends(get_db_reader),
+) -> dict[str, dict[str, int]]:
+    """Unread counts for a list of threads, for one participant.
+
+    READ-SCOPING IS THE PROXY'S JOB (frozen trust model). `participant`
+    is a TRUSTED body field: comms does not verify that the caller is
+    that participant -- the shared service token authenticates the
+    PRODUCT (arch decision 14). Phase 6 MUST substitute it server-side
+    from its own authenticated session and MUST NEVER accept it from
+    the client; forwarding a client-supplied participant here lets one
+    user read another's unread state.
+
+    POST because the input is a list -- semantically this is a READ and
+    it is idempotent: the same body returns the same counts and changes
+    nothing. A repeated thread_id collapses to one entry (the response
+    is keyed by thread id), it does not double a count.
+
+    A THREAD THE PARTICIPANT DOES NOT TAKE PART IN IS ABSENT from
+    `counts` -- not zero, and not an error for the whole batch. So is
+    an id that matches no thread: one rule, not two. See the module
+    header for why absence rather than zero.
+
+    # KNOWN CEILING (this contract disagrees with
+    # GET /threads/{id}/unread-count; acknowledged by design):
+    #   1. Mechanics: the per-thread endpoint does NOT check
+    #      participation -- it answers "what is the count for this
+    #      (thread, participant) pair" and returns a real number to a
+    #      non-participant. This batch endpoint, and the summary,
+    #      answer "which of these threads are yours, and what is
+    #      unread in them", so they omit the row instead. Same input,
+    #      two different numbers, on purpose.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: none -- the divergence is the contract, not a
+    #      deferred fix.
+    #   4. Promotion trigger: a consumer needs one endpoint to answer
+    #      the other's question -- concretely, a product that renders a
+    #      badge from the per-thread endpoint on threads the reader
+    #      does not take part in.
+    #   5. Agreed fix: a new, explicitly-named contract for whichever
+    #      question is missing; never a silent change of an existing
+    #      one.
+    #   6. Rejected: "aligning" the per-thread endpoint to this rule.
+    #      Its shape is frozen (3b) and the product proxy consumes it
+    #      as-is, so turning its answer into a zero would make an
+    #      additive release a breaking one -- and would break it
+    #      silently, since the response shape would not change at all.
+    """
+    counts = await unread_counts_for_participant(
+        session,
+        participant=payload.participant,
+        thread_ids=payload.thread_ids,
+    )
+    return {"counts": {str(tid): n for tid, n in counts.items()}}
 
 
 # ---------------------------------------------------------------------------
@@ -522,3 +667,77 @@ async def retag(
         subject_id=payload.subject_id,
     )
     return _thread_out(thread)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints -- participant aggregates (across threads)
+# ---------------------------------------------------------------------------
+@participants_router.get("/{participant_id}/unread-summary")
+async def participant_unread_summary_endpoint(
+    participant_id: UUID,
+    session: AsyncSession = Depends(get_db_reader),
+) -> dict[str, Any]:
+    """One participant's unread state across ALL their threads.
+
+    READ-SCOPING IS THE PROXY'S JOB (frozen trust model).
+    `participant_id` is a TRUSTED path parameter: comms does not verify
+    that the caller is that participant -- the shared service token
+    authenticates the PRODUCT (arch decision 14). Phase 6 MUST derive
+    it server-side from its own authenticated session and MUST NEVER
+    take it from the client; forwarding a client-supplied id here hands
+    any user another user's unread state.
+
+    Answers the bell in one call: has_unread for the dot,
+    threads_with_unread and unread_messages for a number. has_unread is
+    sugar over threads_with_unread > 0 and is kept ON PURPOSE -- a
+    consumer that only draws a dot should not have to know that the
+    contract has counts in it, nor decide for itself what "> 0" means.
+
+    Threads counted are the ones the participant TAKES PART IN, by all
+    three roles: client, assignee, and DM operator (operator_value on a
+    user thread). Unknown participant id, or one with no threads at
+    all -> zeros, not a 404: there is no foreign key on the way in and
+    "you have nothing unread" is the true answer to the question asked.
+
+    # KNOWN CEILING (an unclaimed section thread is in nobody's
+    # summary; acknowledged by design):
+    #   1. Mechanics: an UNCLAIMED section thread has an empty assignee
+    #      and an operator_value that is a SECTION id rather than a
+    #      recipient, so no participant role matches and the thread
+    #      enters no one's summary. The visible consequence: a support
+    #      agent's bell stays dark over an unhandled queue, which reads
+    #      as "comms is broken" while it is in fact the same deferral
+    #      as the push side.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: the pool-push deferral already marked in
+    #      app/notifier.py (KNOWN CEILING, pool-push deferred) and its
+    #      backlog reference there -- BL-1 plus starred section <->
+    #      operator membership. SAME ROOT, DIFFERENT SURFACE, and the
+    #      distinction matters: that marker is about PUSHING to a pool
+    #      with no materialized agent list, this one is about READ
+    #      aggregation over a thread with no participant. Neither is a
+    #      duplicate of the other; fixing one leaves the other standing.
+    #      No new identifier is minted here.
+    #   4. Promotion trigger: the pool gains a push mechanism -- i.e.
+    #      section membership arrives and agents can be resolved for a
+    #      section.
+    #   5. Agreed fix: whatever resolves an agent set for a section
+    #      feeds both surfaces -- the pool push and this aggregate --
+    #      from the same membership.
+    #   6. Rejected: counting unclaimed section threads for every agent
+    #      here, ahead of membership. Without membership "every agent"
+    #      means every recipient, so the query would materialize a
+    #      broadcast audience (BL-1 territory) to answer a bell, and it
+    #      would light up the bell of people who do not serve that
+    #      section. Also rejected: a stored counter -- unmaintainable
+    #      for exactly this class of thread, which is why on-read
+    #      counting was chosen in the first place.
+    """
+    threads_with_unread, unread_messages = await participant_unread_summary(
+        session, participant=participant_id
+    )
+    return {
+        "has_unread": threads_with_unread > 0,
+        "threads_with_unread": threads_with_unread,
+        "unread_messages": unread_messages,
+    }

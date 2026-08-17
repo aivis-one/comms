@@ -180,6 +180,27 @@ def next_seam_t2_telegram_id() -> int:
     return tid
 
 
+T51_TELEGRAM_ID_BAND_START = 92140
+T51_TELEGRAM_ID_BAND_END = 92179
+
+_t51_telegram_id_counter = itertools.count(T51_TELEGRAM_ID_BAND_START)
+
+
+def next_t51_telegram_id() -> int:
+    """Next telegram_id from the T-51 unread-aggregates band.
+
+    Narrow, like the seam-T2 band above: the unread contracts add a
+    handful of actors (a client, a master, an agent, a supervisor),
+    not a module.
+    """
+    tid = next(_t51_telegram_id_counter)
+    if tid > T51_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 92140-92179 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,
