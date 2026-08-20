@@ -201,6 +201,30 @@ def next_t51_telegram_id() -> int:
     return tid
 
 
+T64_TELEGRAM_ID_BAND_START = 92180
+T64_TELEGRAM_ID_BAND_END = 92199
+
+_t64_telegram_id_counter = itertools.count(T64_TELEGRAM_ID_BAND_START)
+
+
+def next_t64_telegram_id() -> int:
+    """Next telegram_id from the T-64 recipient-upsert band.
+
+    NARROWER THAN THE BAND THE HANDOFF ASSIGNED, on purpose. T-64 was
+    issued 92140-92199, but 92140-92179 is already held by the T-51
+    allocator right above -- the registry double-booked the lower half.
+    Rather than hand out ids a sibling suite also hands out, this
+    allocator takes only the free remainder. Twenty ids is ample: these
+    tests need a handful of recipients, not a module.
+    """
+    tid = next(_t64_telegram_id_counter)
+    if tid > T64_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 92180-92199 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,
