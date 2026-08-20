@@ -33,6 +33,7 @@ from app.api.inbox import router as inbox_router
 from app.api.messaging import participants_router, sections_router
 from app.api.messaging import router as messaging_router
 from app.api.prefs import router as prefs_router
+from app.api.recipients import router as recipients_router
 from app.core.config import APP_VERSION, settings
 from app.core.database import dispose_engine, get_engine
 from app.core.logging import setup_logging
@@ -85,6 +86,7 @@ app.include_router(prefs_router)
 app.include_router(messaging_router)
 app.include_router(sections_router)
 app.include_router(participants_router)
+app.include_router(recipients_router)
 
 
 async def _db_ok() -> bool:
