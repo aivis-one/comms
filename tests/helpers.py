@@ -225,6 +225,29 @@ def next_t64_telegram_id() -> int:
     return tid
 
 
+T67_TELEGRAM_ID_BAND_START = 92200
+T67_TELEGRAM_ID_BAND_END = 92259
+
+_t67_telegram_id_counter = itertools.count(T67_TELEGRAM_ID_BAND_START)
+
+
+def next_t67_telegram_id() -> int:
+    """Next telegram_id from the T-67 section-membership band.
+
+    92200-92259, checked against every allocator above before being
+    taken: the highest previously held id is 92199 (T-64), so this band
+    starts one past the end of the occupied space rather than where a
+    document says it should. The registry has double-booked before --
+    see the T-64 allocator's own note.
+    """
+    tid = next(_t67_telegram_id_counter)
+    if tid > T67_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 92200-92259 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,

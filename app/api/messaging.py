@@ -618,7 +618,7 @@ async def claim(
 ) -> dict[str, Any]:
     """Claim an unassigned thread; report whether THIS call won it."""
     thread = await _require_thread(session, thread_id)
-    if not can_claim(thread):
+    if not await can_claim(session, thread, payload.operator):
         raise AuthorizationError(
             "thread is not claimable (only section threads are claimed)"
         )
@@ -637,7 +637,7 @@ async def change_status(
 ) -> dict[str, Any]:
     """Apply a manual status transition (D5 matrix)."""
     thread = await _require_thread(session, thread_id)
-    if not can_operate(thread, payload.operator):
+    if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
             "actor is not the serving operator of this thread"
         )
@@ -655,7 +655,7 @@ async def retag(
 ) -> dict[str, Any]:
     """Retag a section thread to a new section / subject_ref."""
     thread = await _require_thread(session, thread_id)
-    if not can_operate(thread, payload.operator):
+    if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
             "actor is not the serving operator of this thread"
         )
@@ -709,29 +709,37 @@ async def participant_unread_summary_endpoint(
     #      as "comms is broken" while it is in fact the same deferral
     #      as the push side.
     #   2. Status: acknowledged by design.
-    #   3. Backlog ref: the pool-push deferral already marked in
-    #      app/notifier.py (KNOWN CEILING, pool-push deferred) and its
-    #      backlog reference there -- BL-1 plus starred section <->
-    #      operator membership. SAME ROOT, DIFFERENT SURFACE, and the
-    #      distinction matters: that marker is about PUSHING to a pool
-    #      with no materialized agent list, this one is about READ
-    #      aggregation over a thread with no participant. Neither is a
-    #      duplicate of the other; fixing one leaves the other standing.
-    #      No new identifier is minted here.
-    #   4. Promotion trigger: the pool gains a push mechanism -- i.e.
-    #      section membership arrives and agents can be resolved for a
-    #      section.
-    #   5. Agreed fix: whatever resolves an agent set for a section
-    #      feeds both surfaces -- the pool push and this aggregate --
-    #      from the same membership.
+    #   3. Backlog ref: none yet -- registered by the owner at the T-67
+    #      delivery. THE SIBLING MARKER THIS ONE USED TO POINT AT IS
+    #      GONE: the pool-push deferral in app/notifier.py was resolved
+    #      by T-67 (section membership + a push over the declared
+    #      roster), so the reference was removed rather than left
+    #      pointing at nothing. What that proves is exactly the
+    #      distinction the old text drew -- same root, different
+    #      surface: fixing the PUSH left this READ aggregate standing,
+    #      because an unclaimed section thread still has no participant
+    #      to aggregate for, roster or no roster.
+    #   4. Promotion trigger: FIRED, and only half-consumed. Section
+    #      membership now exists (messaging/membership.py), so agents
+    #      CAN be resolved for a section -- the missing ingredient
+    #      arrived. This aggregate was deliberately not rewritten in
+    #      the same pass; the remaining trigger is a consumer that
+    #      needs an unclaimed queue to raise a bell, rather than the
+    #      pull list it raises today.
+    #   5. Agreed fix: unchanged, and now concrete -- this aggregate
+    #      counts a section thread for the operators in
+    #      messaging.membership.member_ids, the SAME roster the pool
+    #      push fans out over. One membership, two surfaces, as the
+    #      original text required.
     #   6. Rejected: counting unclaimed section threads for every agent
-    #      here, ahead of membership. Without membership "every agent"
-    #      means every recipient, so the query would materialize a
-    #      broadcast audience (BL-1 territory) to answer a bell, and it
-    #      would light up the bell of people who do not serve that
-    #      section. Also rejected: a stored counter -- unmaintainable
-    #      for exactly this class of thread, which is why on-read
-    #      counting was chosen in the first place.
+    #      here. Before membership that meant materializing a broadcast
+    #      audience (BL-1 territory) to answer a bell; with a roster it
+    #      is no longer impossible, but it is still not free -- and it
+    #      remains rejected until asked for, because an aggregate that
+    #      silently changes what a badge counts is a breaking change
+    #      wearing a compatible shape. Also rejected, unchanged: a
+    #      stored counter -- unmaintainable for exactly this class of
+    #      thread, which is why on-read counting was chosen at all.
     """
     threads_with_unread, unread_messages = await participant_unread_summary(
         session, participant=participant_id

@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind
+from app.messaging.membership import section_serves_clause, serves_section
 from app.messaging.models import Section, Thread
 from app.messaging.threads import _is_dedup_violation, _recipient_exists
 
@@ -105,25 +106,53 @@ def can_post_message(thread: Thread, actor: UUID) -> bool:
     return actor == thread.client or actor == thread.assignee
 
 
-def can_claim(thread: Thread) -> bool:
-    """Only a SECTION thread is claimable; a user thread's operator is
-    fixed by the form and is never claimed."""
+async def can_claim(
+    session: AsyncSession, thread: Thread, actor: UUID
+) -> bool:
+    """A SECTION thread claimed by an operator who SERVES that section.
+
+    Two conditions, and the second is T-67. A user thread's operator is
+    fixed by the form and is never claimed, as before. What changed is
+    that "section" stopped meaning "anybody": claiming is the act that
+    makes the claimer the assignee, and an assignee passes both
+    can_operate and can_post_message -- so leaving claim open while
+    narrowing the other two would have been a closed window beside an
+    open door, not a restriction.
+
+    An undeclared section is served by any operator (membership.py), so
+    a product with no roster sees no change at all.
+    """
     scope = resolve_operator(
         OperatorKind(thread.operator_kind), thread.operator_value
     )
-    return scope.is_claimable
+    if not scope.is_claimable:
+        return False
+    return await serves_section(session, scope.value, actor)
 
 
-def can_operate(thread: Thread, actor: UUID) -> bool:
-    """status / retag: the SERVING operator (assignee), OR any agent on a
-    SECTION thread (v1 trivial membership). A user thread is served only
-    by its master (its assignee)."""
+async def can_operate(
+    session: AsyncSession, thread: Thread, actor: UUID
+) -> bool:
+    """status / retag: the SERVING operator (assignee), or an operator
+    who SERVES the section (T-67, was: any operator at all).
+
+    The assignee branch is unconditional and stays first: whoever took
+    the conversation finishes it, even if their section membership is
+    revoked mid-conversation. Losing a roster seat should not strand a
+    thread somebody is already answering.
+
+    A user thread is served only by its master (its assignee). An
+    undeclared section is served by anybody, so a product without a
+    roster keeps today's behaviour exactly.
+    """
     if actor == thread.assignee:
         return True
     scope = resolve_operator(
         OperatorKind(thread.operator_kind), thread.operator_value
     )
-    return scope.kind is OperatorKind.SECTION
+    if scope.kind is not OperatorKind.SECTION:
+        return False
+    return await serves_section(session, scope.value, actor)
 
 
 async def claim_thread(
@@ -284,6 +313,10 @@ async def list_visible_threads(
                 and_(
                     Thread.operator_kind == OperatorKind.SECTION,
                     Thread.assignee.is_(None),
+                    # T-67: ... AND I serve that section. An undeclared
+                    # section satisfies this for everyone, so a product
+                    # with no roster sees the same pool it saw before.
+                    section_serves_clause(Thread.operator_value, operator),
                 ),
             )
         )

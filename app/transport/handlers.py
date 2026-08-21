@@ -40,11 +40,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience import sync
 from app.engine.reminders import cancel_reminders
 from app.engine.service import create_notification
+from app.messaging.membership import set_membership
 from app.transport.events import (
     GroupChanged,
     NotificationRequest,
     ParsedEvent,
     ReminderCancel,
+    SectionMembershipChanged,
     UserUpserted,
 )
 
@@ -86,6 +88,19 @@ async def handle_event(
             session,
             group_key=event.group_key,
             recipient_id=event.recipient_id,
+            member=event.member,
+        )
+        return HandleResult.PROCESSED
+    if isinstance(event, SectionMembershipChanged):
+        # The section is created if absent (a roster may be declared
+        # before anyone writes in); an operator comms has not been told
+        # about yet fails the recipient FK, which the consumer
+        # classifies RETRYABLE -- the same lag group_changed has.
+        await set_membership(
+            session,
+            section_key=event.section_key,
+            section_label=event.section_label,
+            operator_id=event.operator_id,
             member=event.member,
         )
         return HandleResult.PROCESSED

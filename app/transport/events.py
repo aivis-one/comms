@@ -122,6 +122,7 @@ from app.core.constants import (
 )
 from app.core.exceptions import ValidationError
 from app.engine.constants import TargetType
+from app.messaging.constants import MAX_SECTION_KEY_LEN, MAX_SECTION_LABEL_LEN
 
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
 
@@ -133,18 +134,26 @@ EVENT_NOTIFICATION_REQUEST = "notification_request"
 EVENT_USER_UPSERTED = "user_upserted"
 EVENT_GROUP_CHANGED = "group_changed"
 EVENT_REMINDER_CANCEL = "reminder_cancel"
+EVENT_SECTION_MEMBERSHIP_CHANGED = "section_membership_changed"
 
 KNOWN_EVENTS = frozenset({
     EVENT_NOTIFICATION_REQUEST,
     EVENT_USER_UPSERTED,
     EVENT_GROUP_CHANGED,
     EVENT_REMINDER_CANCEL,
+    EVENT_SECTION_MEMBERSHIP_CHANGED,
 })
 
 _SCALAR_TYPES = (str, int, float, bool, type(None))
 
 # group_memberships.group_key is String(200); mirror at the boundary.
 _MAX_GROUP_KEY_LEN = 200
+
+# sections.key is String(MAX_SECTION_KEY_LEN); mirror at the boundary so
+# an over-long key is a terminal validation error here rather than a
+# database error mid-transaction.
+_MAX_SECTION_KEY_LEN = MAX_SECTION_KEY_LEN
+_MAX_SECTION_LABEL_LEN = MAX_SECTION_LABEL_LEN
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +194,22 @@ class GroupChanged:
 
 
 @dataclass(frozen=True)
+class SectionMembershipChanged:
+    """One operator declared (or undeclared) as serving one section.
+
+    The section travels as a KEY, never as an id. Section ids live in
+    this service's database and do not survive its teardown, so a
+    product that stored one would be pointing at nothing after a
+    rebuild -- the key is the only stable name the two sides share.
+    """
+
+    section_key: str
+    section_label: str
+    operator_id: UUID
+    member: bool
+
+
+@dataclass(frozen=True)
 class ReminderCancel:
     types: list[str]
     correlation_key: str
@@ -194,7 +219,11 @@ class ReminderCancel:
 
 
 ParsedEvent = (
-    NotificationRequest | UserUpserted | GroupChanged | ReminderCancel
+    NotificationRequest
+    | UserUpserted
+    | GroupChanged
+    | SectionMembershipChanged
+    | ReminderCancel
 )
 
 
@@ -451,6 +480,8 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
         return _parse_user_upserted(data)
     if event == EVENT_GROUP_CHANGED:
         return _parse_group_changed(data)
+    if event == EVENT_SECTION_MEMBERSHIP_CHANGED:
+        return _parse_section_membership_changed(data)
     return _parse_reminder_cancel(data)
 
 
@@ -576,6 +607,37 @@ def _parse_group_changed(data: dict[str, Any]) -> GroupChanged:
     return GroupChanged(
         group_key=group_key,
         recipient_id=recipient_id,
+        member=member,
+    )
+
+
+def _parse_section_membership_changed(
+    data: dict[str, Any],
+) -> SectionMembershipChanged:
+    event = EVENT_SECTION_MEMBERSHIP_CHANGED
+
+    section_key = _string(
+        _require(data, "section_key", event), "section_key", event,
+        max_len=_MAX_SECTION_KEY_LEN,
+    )
+    # The label is carried because this event may be the FIRST mention
+    # of a section: operators are hired before anybody writes in. The
+    # handler create-or-finds by key, and an existing section keeps the
+    # label it already has (create-or-find, not upsert), so a label sent
+    # later never renames anything.
+    section_label = _string(
+        _require(data, "section_label", event), "section_label", event,
+        max_len=_MAX_SECTION_LABEL_LEN,
+    )
+    operator_id = _uuid(
+        _require(data, "operator_id", event), "operator_id", event,
+    )
+    member = _bool(_require(data, "member", event), "member", event)
+
+    return SectionMembershipChanged(
+        section_key=section_key,
+        section_label=section_label,
+        operator_id=operator_id,
         member=member,
     )
 

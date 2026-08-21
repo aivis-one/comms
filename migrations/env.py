@@ -36,6 +36,7 @@ from app.engine.models import Notification, NotificationDelivery  # noqa: F401
 from app.messaging.models import (  # noqa: F401
     Message,
     Section,
+    SectionMember,
     Thread,
     ThreadReadState,
 )
