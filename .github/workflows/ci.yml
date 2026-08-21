@@ -22,18 +22,22 @@ jobs:
         env:
           POSTGRES_USER: comms
           POSTGRES_PASSWORD: comms
-          POSTGRES_DB: comms
+          # T-78: the suite refuses to run against a database whose
+          # name does not end in _test, because it deletes every row
+          # before each test. The rule has no exceptions, so CI obeys it
+          # like every other caller rather than being one.
+          POSTGRES_DB: comms_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U comms"
+          --health-cmd "pg_isready -U comms -d comms_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
 
     env:
       APP_ENV: ci
-      DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms
+      DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
       CHANNELS_MODE: stub
 
     steps:

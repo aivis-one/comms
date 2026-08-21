@@ -477,6 +477,74 @@ cmd_db() {
     esac
 }
 
+# Run the suite on THIS box, against an isolated database.
+#
+# WHY A BOX RUN EXISTS AT ALL, next to a CI that already runs the same
+# suite: CI checks what does not depend on the machine -- lint, types,
+# fences -- on every push, and it does it on a runner that is not this
+# server. This checks the other half: the real Postgres, the image that
+# was actually built here, the environment as it is actually projected.
+# Neither replaces the other.
+#
+# THE ONE PROGRAM, RUN TWICE. The environment below mirrors the CI
+# workflow exactly -- same APP_ENV, same CHANNELS_MODE, same shape of
+# DATABASE_URL -- so that a difference in the result means a difference
+# in the MACHINE and nothing else. APP_ENV=ci on a server reads oddly,
+# and it is deliberate: the alternative (development) would make the two
+# runs two different programs, which is the one thing this must not be.
+#
+# CHANNELS_MODE=stub is a fence, not a convenience: the container's own
+# value is `real`, and running the suite under it would hand tests a
+# live Telegram token.
+#
+# NO MIGRATIONS HERE. The suite brings the schema up itself
+# (tests/conftest.py shells `alembic upgrade head` in a session
+# fixture), so running it here too would be a second copy of a step that
+# already has an owner.
+#
+# NO REDIS EITHER, and this was checked rather than assumed: every test
+# that speaks to a stream does it over fakeredis, in-process. The suite
+# never opens a connection to comms-redis.
+cmd_test() {
+    echo -e "${CYAN}== comms test ==${NC}"
+    cd_compose
+    load_env
+
+    # The app's own URL is the source of truth for credentials and host;
+    # only the database NAME is swapped. `%` strips the SHORTEST
+    # matching suffix, so a password containing "comms" survives intact.
+    local app_db_url test_db_url
+    app_db_url=$($COMPOSE_CMD exec -T comms-app printenv DATABASE_URL | tr -d '\r\n')
+    if [ -z "$app_db_url" ]; then
+        echo -e "${RED}✗ Could not read DATABASE_URL from comms-app (is the stack up? try '$0 start')${NC}"
+        exit 1
+    fi
+    test_db_url="${app_db_url%/${POSTGRES_DB}}/${POSTGRES_DB}_test"
+
+    echo "Provisioning isolated test database (${POSTGRES_DB}_test)..."
+    # FORCE terminates connections left by a previous run (PG13+), so a
+    # second run in a row does not depend on the first having exited
+    # cleanly.
+    if ! $COMPOSE_CMD exec -T comms-postgres psql -U "$POSTGRES_USER" -d postgres \
+        -c "DROP DATABASE IF EXISTS ${POSTGRES_DB}_test WITH (FORCE);" \
+        -c "CREATE DATABASE ${POSTGRES_DB}_test OWNER $POSTGRES_USER;" >/dev/null; then
+        echo -e "${RED}✗ Could not (re)create ${POSTGRES_DB}_test${NC}"
+        exit 1
+    fi
+
+    echo "Running the suite inside comms-app..."
+    if ! $COMPOSE_CMD exec -T \
+        -e DATABASE_URL="$test_db_url" \
+        -e APP_ENV=ci \
+        -e CHANNELS_MODE=stub \
+        comms-app python -m pytest -q; then
+        echo -e "${RED}✗ tests failed${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ suite passed against ${POSTGRES_DB}_test${NC}"
+}
+
 cmd_status() {
     cd_compose
     $COMPOSE_CMD ps
@@ -501,9 +569,10 @@ case "${1:-}" in
     restart) shift; cmd_restart "$@" ;;
     logs)    shift; cmd_logs "$@" ;;
     db)      shift; cmd_db "$@" ;;
+    test)    shift; cmd_test "$@" ;;
     status)  shift; cmd_status "$@" ;;
     *)
-        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|status}"
+        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|test|status}"
         exit 1
         ;;
 esac
