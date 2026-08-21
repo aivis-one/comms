@@ -40,12 +40,12 @@ from app.messaging.membership import (
     set_membership,
 )
 from app.messaging.models import SectionMember
-from app.messaging.sections import get_or_create_section
 from app.messaging.operators import (
     can_claim,
     can_operate,
     list_visible_threads,
 )
+from app.messaging.sections import get_or_create_section
 from app.messaging.threads import create_or_get_thread, post_message
 from app.notifier import notify_new_message
 from tests.helpers import (

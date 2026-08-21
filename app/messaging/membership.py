@@ -37,6 +37,7 @@ import structlog
 from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
 from app.core.exceptions import NotFoundError
 from app.messaging.models import SectionMember
@@ -47,7 +48,8 @@ logger = structlog.get_logger()
 
 
 def section_serves_clause(
-    section_column: ColumnElement[UUID], operator: UUID
+    section_column: ColumnElement[UUID] | InstrumentedAttribute[UUID],
+    operator: UUID,
 ) -> ColumnElement[bool]:
     """The rule as a SQL predicate over a query's section column.
 
@@ -58,6 +60,10 @@ def section_serves_clause(
 
     `section_column` is the column carrying the section id in the outer
     query (threads.operator_value), so the EXISTS correlates with it.
+    The union in the signature is not decoration: a mapped attribute
+    (Thread.operator_value) is an InstrumentedAttribute, not a plain
+    ColumnElement, and strict typing rejects the narrower annotation --
+    which is exactly how this was found.
     """
     roster = select(SectionMember.section_id).where(
         SectionMember.section_id == section_column
