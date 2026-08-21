@@ -43,6 +43,8 @@ from app.core.database import get_session_factory
 from app.engine.constants import TargetType
 from app.engine.models import Notification
 from app.engine.service import create_notification
+from app.messaging.constants import OperatorKind
+from app.messaging.membership import member_ids
 from app.messaging.models import Message, Thread
 
 logger = structlog.get_logger()
@@ -197,11 +199,19 @@ async def notify_new_message(
       - the client, category participant, iff the sender is NOT the
         client (the operator side wrote);
       - the assigned operator (thread.assignee), category support, iff
-        assignee is set AND is NOT the sender.
-    The sender never pings itself; a message yields 0..2 notifications
-    (independent categories, independent mute). Each is created with a
-    per-recipient idempotency key, so a recipient on both sides (or a
-    replay) is pinged at most once.
+        assignee is set AND is NOT the sender;
+      - T-67: when there is NO assignee and the thread is a section
+        thread, the operators DECLARED as serving that section, category
+        support -- the pool push. An undeclared section has an empty
+        roster and yields nothing, which is the behaviour this branch
+        replaced.
+    The sender never pings itself; a message yields 0..N notifications
+    (independent categories, independent mute) -- at most one client
+    ping plus the operator side, which is one assignee OR the section
+    roster, never both. Each is created with a per-recipient idempotency
+    key, so a recipient on both sides (or a replay) is pinged at most
+    once; that key is what makes a fan-out over a roster safe without a
+    second dedup mechanism.
 
     Creation is atomic with the message (same session -- fork 3); the
     engine delivers on the worker tick and applies the SAME Phase 2
@@ -233,27 +243,42 @@ async def notify_new_message(
         if support is not None:
             created.append(support)
 
-    # KNOWN CEILING (pool-push deferred -- acknowledged by design):
-    # when thread.assignee is None (an UNCLAIMED section thread) there
-    # is no operator to push to, and we deliberately do NOT fan out to
-    # "the section pool".
-    #   1. Mechanics: pool-push = pinging every agent serving the
-    #      section -> needs a MATERIALIZED agent list, which BL-1 (no
-    #      set materialization) + trivial/starred section membership do
-    #      not provide; it is also a broadcast -- exactly the BL-1
-    #      territory deferred in 4a/4b.
-    #   2. Status: acknowledged by design.
-    #   3. Backlog ref: BL-1 + starred section<->operator membership.
-    #   4. Promotion trigger: section operators gain a real consumer
-    #      (cbshome / TP onboards, Phase 7) AND section membership is
-    #      introduced -- the two arrive together.
-    #   5. Agreed fix: pool-push via membership + broadcast-hardening.
-    #   6. Rejected: materializing the agent list on the push path
-    #      (breaks BL-1); pushing to ALL recipients without membership.
-    # NOT a hole: an unclaimed thread is visible to the pool through
-    # list_visible_threads (pull / inbox badge), and the push arrives
-    # once it is claimed. For the v1 consumer (VELO is user-form)
-    # assignee is ALWAYS set, so every client message pushes the master.
+    elif thread.assignee is None and (
+        OperatorKind(thread.operator_kind) is OperatorKind.SECTION
+    ):
+        # THE POOL PUSH (T-67). An unclaimed section thread has no
+        # assignee to ping, so the ping goes to the operators DECLARED
+        # as serving that section -- the roster the product synced, in
+        # membership.member_ids.
+        #
+        # This is the fix the deferred marker that used to stand here
+        # named as agreed, arriving on its own trigger: section
+        # membership exists now. What that marker REJECTED stays
+        # rejected and is not what happens below -- there is no
+        # materialized audience here, no "every agent", no broadcast to
+        # all recipients. An undeclared section yields an EMPTY roster
+        # and therefore ZERO notifications, which is precisely the
+        # behaviour of this branch before it existed: a product that
+        # declares nobody is pinged for nobody, and its pool is still
+        # served (and seen) by everyone through list_visible_threads.
+        #
+        # The sender is skipped by the same rule as the assignee branch
+        # above: an operator who is also a member of the section they
+        # wrote into does not ping themselves. It is reachable -- staff
+        # opening a request of their own are the client AND on the
+        # roster.
+        for operator in await member_ids(session, thread.operator_value):
+            if operator == sender:
+                continue
+            pooled = await _emit_message_notification(
+                session,
+                thread=thread,
+                message=message,
+                recipient=operator,
+                type_key=TYPE_SUPPORT_MESSAGE,
+            )
+            if pooled is not None:
+                created.append(pooled)
 
     return created
 

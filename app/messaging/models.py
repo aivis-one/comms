@@ -285,3 +285,56 @@ class ThreadReadState(Base):
             f"<ThreadReadState thread={self.thread_id} "
             f"participant={self.participant} last_read_at={self.last_read_at}>"
         )
+
+
+class SectionMember(Base):
+    """An operator declared as serving a section (T-67).
+
+    THE SHAPE IS GroupMembership's, deliberately: a composite primary
+    key over the pair, no surrogate id, no timestamps, an index on the
+    second column so the reverse lookup ("which sections does this
+    operator serve") is answerable. comms already has one membership
+    table and this is the second one of the same kind, not a second
+    convention.
+
+    WHY NOT group_memberships ITSELF, since it exists: a group key is
+    an opaque product string for ADDRESSING a broadcast, while this pair
+    answers "who serves this section" and is read three times inside
+    messaging (visibility, operate-authz, the pool push). Riding on the
+    string table would mean a cross-repository key convention with no
+    foreign key, where a renamed section key orphans its roster in
+    silence. Here the section is referenced, not spelled.
+
+    ondelete DIVERGES BETWEEN THE TWO COLUMNS, on purpose:
+      - section CASCADE: a deleted section has no roster to keep;
+      - operator CASCADE: a deleted recipient serves nothing.
+    Both differ from the RESTRICT that guards thread references, and the
+    reason is that a thread is IMMORTAL and must never lose the identity
+    it names, whereas a membership row is a current fact with no
+    history to protect.
+
+    EMPTY IS NOT UNCONFIGURED. A section with no rows here is served by
+    ANY operator -- that is the definition, not a migration window (see
+    messaging/membership.py).
+    """
+
+    __tablename__ = "section_members"
+
+    section_id: Mapped[UUID] = mapped_column(
+        ForeignKey("sections.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    # The serving operator, a recipient (referenced BY NAME -- messaging
+    # does not import app.audience).
+    operator_id: Mapped[UUID] = mapped_column(
+        ForeignKey("recipients.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SectionMember section={self.section_id} "
+            f"operator={self.operator_id}>"
+        )
