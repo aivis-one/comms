@@ -18,12 +18,19 @@
 #     emits the "conversation closed" notification and clears the flag.
 #
 # TYPE / CATEGORY SOURCE (fork 2a): comms owns the ABSTRACT chat type
-# keys below; the product PROFILE maps them to the locked msg_*
-# categories (§2.5). In tests the fixture profile does it; the concrete
-# VELO dictionary is a Phase 6 input. A type with NO category bypasses
-# the mute gate (§2.5) -- so the profile MUST map these three; the
-# profile loader enforces it at startup (Release-Hardening item 3a,
-# keys shared via app/core/constants.py).
+# keys below; the product PROFILE gives each of them a preference
+# category. WHICH categories those are is the product's business and
+# not this service's: the loader requires every chat type to declare a
+# NON-EMPTY category and checks nothing else, so two products can and do
+# use different names. A type with NO category bypasses the mute gate
+# (§2.5), which is the whole reason the loader enforces presence at
+# startup (Release-Hardening item 3a, keys shared via
+# app/core/constants.py).
+#
+# This paragraph used to say the profile must map the types onto a
+# "locked" pair of msg_* names, and two constants below spelled them
+# out. Neither was true: no code ever read the constants, and no check
+# ever compared a profile against them.
 # =============================================================================
 
 from datetime import datetime
@@ -63,19 +70,13 @@ def _is_idempotency_violation(exc: IntegrityError) -> bool:
     unique firing (a benign dedup), not some other constraint."""
     return _IDEMPOTENCY_INDEX_NAME in str(exc.orig)
 
-# -- Locked preference categories (§2.5, E8-canon). The gate reads a
-# type's category from the profile registry; these are the values the
-# profile must map the chat types to. --
-CATEGORY_PARTICIPANTS = "msg_participants"
-CATEGORY_SUPPORT = "msg_support"
-
-# -- Abstract chat notification TYPE keys comms emits. The profile maps
-# each to a category above (participant side -> participants, support
-# side -> support; a thread-closed notice goes to the client, i.e. the
-# participant side -> participants). Canonical home is
-# app/core/constants.py (Release-Hardening: the profile loader
-# validates the same three keys at startup and must not import this
-# module); the legacy TYPE_* names stay as the stable notifier API. --
+# -- Abstract chat notification TYPE keys comms emits. The profile
+# attaches a preference category to each; this service reads that
+# category out of the registry at gate time and never compares it to a
+# name of its own. Canonical home is app/core/constants.py
+# (Release-Hardening: the profile loader validates the same three keys
+# at startup and must not import this module); the legacy TYPE_* names
+# stay as the stable notifier API. --
 TYPE_PARTICIPANT_MESSAGE = MSG_TYPE_PARTICIPANT_MESSAGE
 TYPE_SUPPORT_MESSAGE = MSG_TYPE_SUPPORT_MESSAGE
 TYPE_THREAD_CLOSED = MSG_TYPE_THREAD_CLOSED
