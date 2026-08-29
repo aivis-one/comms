@@ -147,3 +147,18 @@ velo repo:
 None of that is wired here; this file only accounts for the network
 path, the credentials and the profile being in place before that code
 runs.
+
+## Compose project name
+
+This stack declares its compose project name in `deploy/docker-compose.yml`:
+`name: comms`, first line. Its volume names are pinned there too.
+
+Both matter to whoever runs it next to another stack. Compose infers the project
+from the directory holding the file when it is not declared, so two services
+whose files both live in `deploy/` become **one project**: `docker compose ps`
+from either directory lists the other's containers, `up -d` reports the other's
+as orphans, and `down --remove-orphans` from either destroys the other. The
+inferred name is also the prefix of every volume, so it decides where the data
+lands.
+
+A stack added beside this one is expected to do the same.
