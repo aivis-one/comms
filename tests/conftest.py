@@ -59,8 +59,11 @@
 #   spec, so a channel added later is fenced without anyone remembering.
 #   A test that needs a LIVE channel builds one explicitly
 #   (formatters.build_formatters with full settings and a fake Bot).
-#   Second line: the network tripwire fixture below makes any real
-#   Telegram API request fail the test.
+#   Second line: the network tripwire fixtures below make any real
+#   outbound request fail the test -- ONE PER CLIENT LIBRARY. The
+#   telegram tripwire patches aiogram's transport, which says nothing
+#   about plain HTTP: an email double that forgot to inject a fake
+#   client would have walked straight out to the provider.
 #
 #   COMMS_SERVICE_TOKEN is required outside development, and the suite
 #   runs with APP_ENV=ci -- so the fence also supplies a suite token,
@@ -251,6 +254,26 @@ def network_tripwire() -> Generator[None, None, None]:
 
     patcher = pytest.MonkeyPatch()
     patcher.setattr(AiohttpSession, "make_request", _refuse)
+    yield
+    patcher.undo()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def http_network_tripwire() -> Generator[None, None, None]:
+    """Any real HTTP request fails the test that made it.
+
+    Patched at httpx's transport, below every client: a client built on
+    a MockTransport never reaches it, a real one always would.
+    """
+    from httpx import AsyncHTTPTransport
+
+    async def _refuse(*args: object, **kwargs: object) -> object:
+        raise RuntimeError(
+            "network tripwire: a test reached the real network over HTTP"
+        )
+
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(AsyncHTTPTransport, "handle_async_request", _refuse)
     yield
     patcher.undo()
 

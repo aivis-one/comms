@@ -11,6 +11,8 @@
 #                        raise ordinary exceptions (service retries).
 #   InAppFormatter    -- in_app delivery: the delivery row IS the
 #                        inbox entry, nothing leaves the process.
+#   EmailFormatter    -- plain-text email through the provider's HTTP
+#                        API (one path, no SMTP fallback).
 #   UnavailableChannelFormatter
 #                     -- a channel this deploy does not have; every
 #                        delivery fails PERMANENTLY and loudly.
@@ -49,14 +51,14 @@
 #   failure to build kills the worker before its loop, never on the
 #   first delivery.
 #
-# EMAIL / PUSH:
+# PUSH:
 #   Not implemented -> absent on every deploy (not_implemented in the
 #   startup channel map).
 # =============================================================================
 
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from html import escape
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -97,6 +99,16 @@ class RateLimitedError(Exception):
             f"rate limited by channel: retry after {retry_after}s"
         )
         self.retry_after = retry_after
+
+
+class EmailTransientError(Exception):
+    """The email provider failed in a way a retry can fix.
+
+    A named type rather than a bare Exception: the service layer treats
+    any unexpected exception as transient too, but that path logs
+    delivery_error with a traceback. A provider 500 is expected weather,
+    not a bug in this service.
+    """
 
 
 class ChannelFormatter(Protocol):
@@ -476,9 +488,393 @@ class TelegramFormatter:
             raise
 
 
+# ===================================================================
+# EmailFormatter
+# ===================================================================
+
+# Response statuses that mean the provider ACCEPTED the message. Accepted
+# is not delivered: what happens after -- the provider's own queue, the
+# receiving MX, greylisting -- is outside this service and, without
+# inbound status webhooks, not measurable here. The provider's message
+# id is logged for exactly that reason (see below).
+_EMAIL_ACCEPTED_STATUSES = frozenset({200, 202})
+
+# Statuses that mean the CHANNEL is wrong, not the message: a bad API
+# key, an account out of credit, a forbidden operation. Every message
+# will die the same way until a human changes the configuration.
+_EMAIL_CONFIG_STATUSES = frozenset({401, 402, 403})
+
+# Substrings in the provider's own error text that place a 400 on the
+# SENDER rather than on the recipient -- an unverified domain or a from
+# address outside it kills the channel, not one message, and the status
+# code alone cannot tell the two apart. Lower-cased before matching.
+_EMAIL_SENDER_FAULT_MARKERS = (
+    "domain not found",
+    "domain is not verified",
+    "not allowed to send",
+    "sandbox",
+    "free accounts are for test purposes",
+    "from address",
+    "invalid domain",
+)
+
+
+class EmailFormatter:
+    """Deliver notifications as plain-text email through the provider.
+
+    ONE PATH, on purpose: an SMTP fallback would be code no deploy
+    executes and only a mock ever exercises. Delivery is retried, and
+    the products that send codes re-send them on request.
+
+    TEXT ONLY: an HTML body carrying a link, with no text alternative,
+    is a classic reason to be filed as spam -- and deliverability is the
+    single reason this provider is used at all.
+
+    SUBJECT AND BODY come from the profile like every other channel:
+    {type: {channel: {field}}}, so email reads its OWN `subject` and
+    `body` fields. Nothing new enters the profile contract.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: Any,
+        api_base_url: str,
+        api_key: str,
+        domain: str,
+        from_address: str,
+    ) -> None:
+        """Hold the HTTP client and this deploy's provider settings."""
+        self._client = client
+        self._url = f"{api_base_url.rstrip('/')}/v3/{domain}/messages"
+        self._api_key = api_key
+        self._from_address = from_address
+        # LOUDNESS IS PER STATE, NOT PER MESSAGE (see _fail_configured):
+        # a dead channel during a thousand registrations is a thousand
+        # identical lines, which is noise, not a signal. This flag ONLY
+        # controls log volume -- it never gates a delivery and never
+        # marks the channel as broken.
+        self._configuration_reported = False
+
+    async def deliver(
+        self,
+        notification: Notification,
+        delivery: NotificationDelivery,
+        recipient: Recipient,
+    ) -> bool:
+        """Send one email; True when the provider accepted it."""
+        address = _usable_email_address(recipient.email)
+        if address is None:
+            # The recipient snapshot arrives over the bus and an address
+            # MAY appear between attempts -- retrying is still wrong: the
+            # notification would live to its attempt budget, eating the
+            # delivery-time budget of the recipients who do have one. An
+            # address that appears later is a reason for a NEW
+            # notification from the product, not for reviving this one.
+            raise PermanentDeliveryError(
+                "recipient has no usable email address "
+                f"({_address_defect(recipient.email)})"
+            )
+
+        subject, body = self._compose(notification, recipient)
+
+        try:
+            response = await self._client.post(
+                self._url,
+                auth=("api", self._api_key),
+                data={
+                    "from": self._from_address,
+                    "to": [address],
+                    "subject": subject,
+                    "text": body,
+                },
+            )
+        except Exception as exc:
+            # Transient by construction: connect failures and read
+            # timeouts alike. The two are logged apart because only one
+            # of them can have produced a message on the provider's side
+            # -- see the duplicate note in the phase report.
+            logger.warning(
+                "email_request_failed",
+                notification_id=str(notification.id),
+                delivery_id=str(delivery.id),
+                recipient_id=str(delivery.recipient_id),
+                sent_unknown=_request_may_have_arrived(exc),
+                error=sanitize_error(exc),
+            )
+            raise
+
+        return self._interpret(response, notification, delivery)
+
+    # -- composition --------------------------------------------------
+
+    def _compose(
+        self, notification: Notification, recipient: Recipient,
+    ) -> tuple[str, str]:
+        """Subject and body for this notification, in the recipient's
+        locale, with the fallbacks the channel needs."""
+        variables = build_variables(notification)
+        locale = recipient.locale or settings.default_locale
+
+        rendered_subject = render(
+            notification_type=notification.type,
+            channel=DeliveryChannel.EMAIL,
+            field="subject",
+            locale=locale,
+            variables=variables,
+        )
+        # SUBJECT FALLBACK, three steps, and each step is load-bearing:
+        #   1. the channel's own subject template;
+        #   2. the stored title -- NOT anything derived from the body:
+        #      a confirmation body opens with the code, and the subject
+        #      shows up in the lock-screen preview;
+        #   3. the type key, when the title is blank. A blank title IS
+        #      reachable (the ingest validator rejects "" but accepts
+        #      whitespace), and an empty subject both looks like spam
+        #      and hurts the deliverability this channel exists for.
+        #      The type key is ugly and honest: never blank, never
+        #      derived from the body, not invented copy in one language
+        #      on a multi-locale service, and traceable to the producer.
+        subject = _clean_subject(rendered_subject or notification.title)
+        if not subject:
+            subject = notification.type
+
+        rendered_body = render(
+            notification_type=notification.type,
+            channel=DeliveryChannel.EMAIL,
+            field="body",
+            locale=locale,
+            variables=variables,
+        )
+        # BODY FALLBACK goes to the STORED body and never to another
+        # channel's template: the telegram body carries HTML markup,
+        # which would arrive as raw characters in a text email.
+        body = rendered_body if rendered_body is not None else notification.body
+        return subject, body
+
+    # -- response handling --------------------------------------------
+
+    def _interpret(
+        self,
+        response: Any,
+        notification: Notification,
+        delivery: NotificationDelivery,
+    ) -> bool:
+        """Turn the provider's response into a delivery outcome.
+
+        Three classes, decided here and NOT in the service layer (which
+        owns the shared retry policy and is not touched by this change):
+          transient  -> raise, the attempts budget retries;
+          permanent, one message -> PermanentDeliveryError;
+          permanent, the channel -> PermanentDeliveryError, and the
+          FIRST one says so in its own line.
+        """
+        status = int(response.status_code)
+        payload = _response_payload(response)
+
+        if status in _EMAIL_ACCEPTED_STATUSES:
+            # THE FORENSIC HANDLE. A message accepted here and never
+            # seen in a mailbox is invisible in every log we own; the
+            # provider's id is the only thing that can be looked up in
+            # its dashboard afterwards. Logged on BOTH paths -- an id
+            # that only appears on success is missing exactly when
+            # something went wrong. The recipient address is
+            # deliberately absent: recipient_id already leads to it
+            # through the database, and comms logs carry no personal
+            # data today.
+            logger.info(
+                "email_accepted",
+                notification_id=str(notification.id),
+                delivery_id=str(delivery.id),
+                recipient_id=str(delivery.recipient_id),
+                provider_message_id=payload.get("id"),
+            )
+            return True
+
+        message = str(payload.get("message") or payload.get("text") or "")
+
+        if status == 429:
+            # The provider's own wait, honored through the existing
+            # deferral mechanism (a second cap of our own would be a
+            # second way to express one thing). Without a named wait it
+            # degrades to an ordinary transient failure.
+            retry_after = _retry_after_seconds(response)
+            if retry_after is not None:
+                raise RateLimitedError(retry_after)
+            raise EmailTransientError(
+                f"provider rate limit (429): {message[:200]}"
+            )
+
+        if status in _EMAIL_CONFIG_STATUSES or (
+            status == 400 and _looks_like_sender_fault(message)
+        ):
+            self._fail_configured(status, message, notification, delivery)
+
+        if status >= 500:
+            raise EmailTransientError(
+                f"provider error ({status}): {message[:200]}"
+            )
+
+        # Everything else -- a 400 on the recipient, and any 4xx whose
+        # body did not name the sender -- is ONE message failing.
+        # Deliberately conservative: mistaking a channel fault for a
+        # single message costs one email, the opposite declares a live
+        # channel dead on an unparsed reply. The body is logged so the
+        # case stays visible.
+        logger.warning(
+            "email_rejected",
+            notification_id=str(notification.id),
+            delivery_id=str(delivery.id),
+            recipient_id=str(delivery.recipient_id),
+            status=status,
+            provider_message_id=payload.get("id"),
+            provider_message=message[:300],
+        )
+        raise PermanentDeliveryError(
+            f"provider rejected the message ({status}): {message[:200]}"
+        )
+
+    def _fail_configured(
+        self,
+        status: int,
+        message: str,
+        notification: Notification,
+        delivery: NotificationDelivery,
+    ) -> None:
+        """Raise the channel-fault class, loud once and then plain."""
+        if not self._configuration_reported:
+            self._configuration_reported = True
+            logger.error(
+                "email_channel_not_viable",
+                channel=DeliveryChannel.EMAIL,
+                status=status,
+                provider_message=message[:300],
+                detail=(
+                    "the provider refused on configuration, not on this "
+                    "message: every email will fail the same way until "
+                    "the deploy's email settings are corrected"
+                ),
+            )
+        logger.warning(
+            "email_rejected",
+            notification_id=str(notification.id),
+            delivery_id=str(delivery.id),
+            recipient_id=str(delivery.recipient_id),
+            status=status,
+            provider_message=message[:300],
+        )
+        raise PermanentDeliveryError(
+            f"provider refused on configuration ({status}): {message[:200]}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# -- email helpers ----------------------------------------------------------
+
+
+def _usable_email_address(value: str | None) -> str | None:
+    """The recipient's address, or None when it cannot be used.
+
+    Three shapes, all reachable: null (the snapshot contract carries an
+    explicit null for "no value"), the empty string (the ingest
+    validator lets it through untrimmed), and a syntactically broken
+    address. The first two are caught here; a broken one that passes
+    this check is caught by the provider and lands in the 400 class.
+    """
+    if value is None:
+        return None
+    address = value.strip()
+    if not address:
+        return None
+    if "@" not in address or address.startswith("@") or address.endswith("@"):
+        return None
+    if any(ch in address for ch in ("\r", "\n")) or " " in address:
+        return None
+    return address
+
+
+def _address_defect(value: str | None) -> str:
+    """Name the defect WITHOUT echoing the address (no PII in logs)."""
+    if value is None:
+        return "no address in the recipient snapshot"
+    if not value.strip():
+        return "the address is blank"
+    return "the address is not a usable mailbox"
+
+
+def _clean_subject(value: str) -> str:
+    """Collapse whitespace and drop line breaks from a subject line.
+
+    The subject is rendered from a template whose variables come from
+    the producer -- the same trust boundary that HTML escaping guards on
+    the telegram side. A line break in a subject is a header-injection
+    shape wherever headers are built from it, and a folded subject is
+    wrong even where they are not.
+    """
+    return " ".join(value.split())
+
+
+def _response_payload(response: Any) -> dict[str, Any]:
+    """The provider's JSON body, or an empty mapping.
+
+    A non-JSON body is normal on an infrastructure error page in front
+    of the API -- it must not turn a classifiable failure into a
+    traceback.
+    """
+    try:
+        payload = response.json()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    """The wait the provider named, in seconds, if it named one."""
+    raw = None
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        raw = headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        # An HTTP-date form is legal here; we do not parse it. Treating
+        # it as "no named wait" degrades to the ordinary transient path,
+        # which is finite -- guessing a duration would not be.
+        return None
+    return seconds if seconds > 0 else None
+
+
+def _looks_like_sender_fault(message: str) -> bool:
+    """Whether a 400 blames the SENDER (the channel), not the recipient.
+
+    Read from the provider's own text, which says what it objects to.
+    A "several 400s in a row" counter was deliberately not built: it is
+    state, a threshold and a flaky test for a signal the reply already
+    carries.
+    """
+    lowered = message.lower()
+    return any(marker in lowered for marker in _EMAIL_SENDER_FAULT_MARKERS)
+
+
+def _request_may_have_arrived(exc: Exception) -> bool:
+    """True when the request could already be at the provider.
+
+    A connect failure never produced a message; a read timeout may
+    have. The provider offers no idempotency on this endpoint, so the
+    distinction cannot PREVENT a duplicate -- it only makes it
+    attributable afterwards. Named by class rather than by an httpx
+    import: this module must stay importable on a deploy without email.
+    """
+    name = type(exc).__name__
+    return "Read" in name or "Pool" in name or "Remote" in name
+
+
+
 
 
 # Secret-redaction patterns (review 1.1). The Phase 1 version truncated
@@ -549,17 +945,29 @@ def build_variables(notification: Notification) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+# What a channel hands back for shutdown: an awaitable close with no
+# arguments (aiogram's session.close, httpx's aclose).
+Closer = Callable[[], Awaitable[None]]
+
+
 @dataclass
 class ChannelRegistry:
-    """One formatter per DeliveryChannel, plus the Bot to close."""
+    """One formatter per DeliveryChannel, plus what must be closed.
+
+    R-1: this used to hold a single `bot`, because telegram was the only
+    channel owning a network resource. Email owns a second one (an HTTP
+    client whose connection is REUSED across sends -- a fresh TLS
+    handshake per message would eat the delivery-time budget), so the
+    field became a list of closers. Each entry names what it closes, so
+    a failure to close one is attributable in the log.
+    """
 
     formatters: dict[str, ChannelFormatter]
-    # Real aiogram Bot, kept so its aiohttp session can be closed on
-    # shutdown (review 1.1: unclosed session).
-    bot: "Bot | None" = None
+    closers: list[tuple[str, Closer]] = field(default_factory=list)
 
 
 BotFactory = Callable[..., "Bot"]
+HttpClientFactory = Callable[..., Any]
 
 
 def channel_map(source: Settings) -> dict[str, str]:
@@ -580,30 +988,67 @@ def channel_map(source: Settings) -> dict[str, str]:
     }
 
 
-def _build_in_app(
-    source: Settings, bot_factory: BotFactory,
-) -> tuple[ChannelFormatter, "Bot | None"]:
-    return InAppFormatter(), None
+@dataclass
+class _Built:
+    """A live channel: its formatter and anything it must close."""
+
+    formatter: ChannelFormatter
+    closers: list[tuple[str, Closer]] = field(default_factory=list)
 
 
-def _build_telegram(
-    source: Settings, bot_factory: BotFactory,
-) -> tuple[ChannelFormatter, "Bot | None"]:
-    bot = bot_factory(token=source.telegram_bot_token)
-    return (
-        TelegramFormatter(bot=bot, bot_url=source.telegram_bot_url),
-        bot,
+def _build_in_app(source: Settings, factories: "_Factories") -> _Built:
+    return _Built(formatter=InAppFormatter())
+
+
+def _build_telegram(source: Settings, factories: "_Factories") -> _Built:
+    bot = factories.bot(token=source.telegram_bot_token)
+
+    async def _close_bot() -> None:
+        # Resolved at CLOSE time, not at build time: aiogram creates the
+        # aiohttp session lazily, and reaching for it here would open one
+        # at worker startup on a deploy that never sends a message.
+        await bot.session.close()
+
+    return _Built(
+        formatter=TelegramFormatter(
+            bot=bot, bot_url=source.telegram_bot_url,
+        ),
+        closers=[("telegram_bot_session", _close_bot)],
     )
+
+
+def _build_email(source: Settings, factories: "_Factories") -> _Built:
+    client = factories.http_client()
+
+    async def _close_client() -> None:
+        await client.aclose()
+
+    return _Built(
+        formatter=EmailFormatter(
+            client=client,
+            api_base_url=source.email_api_base_url,
+            api_key=source.email_mailgun_api_key,
+            domain=source.email_mailgun_domain,
+            from_address=source.email_from_address,
+        ),
+        closers=[("email_http_client", _close_client)],
+    )
+
+
+@dataclass
+class _Factories:
+    """Network objects a live channel needs, injectable for tests."""
+
+    bot: BotFactory
+    http_client: HttpClientFactory
 
 
 # One builder per implemented channel (app/core/channels.py
 # CHANNEL_SPECS) -- pinned by a test in both directions.
-_BUILDERS: dict[
-    str,
-    Callable[[Settings, BotFactory], tuple[ChannelFormatter, "Bot | None"]],
-] = {
+_BUILDERS: dict[str, Callable[[Settings, _Factories], _Built]] = {
     DeliveryChannel.IN_APP: _build_in_app,
     DeliveryChannel.TELEGRAM: _build_telegram,
+    DeliveryChannel.EMAIL: _build_email,
 }
 
 _UNAVAILABLE_REASONS = {
@@ -615,26 +1060,32 @@ _UNAVAILABLE_REASONS = {
 
 
 def build_formatters(
-    source: Settings, bot_factory: BotFactory,
+    source: Settings,
+    bot_factory: BotFactory,
+    http_client_factory: HttpClientFactory | None = None,
 ) -> ChannelRegistry:
     """Build the formatter of every channel from validated settings.
 
-    Pure apart from constructing the Bot: no logging, no globals. Tests
-    pass a full key set and a fake bot factory to get a live channel
-    without the network.
+    Pure apart from constructing the network objects: no logging, no
+    globals. Tests pass a full key set plus fake factories to get a live
+    channel without the network.
     """
+    factories = _Factories(
+        bot=bot_factory,
+        http_client=http_client_factory or _real_http_client_factory,
+    )
     formatters: dict[str, ChannelFormatter] = {}
-    bot: Bot | None = None
+    closers: list[tuple[str, Closer]] = []
     for channel, state in channel_map(source).items():
         if state == ChannelState.LIVE:
-            formatter, built_bot = _BUILDERS[channel](source, bot_factory)
-            formatters[channel] = formatter
-            bot = built_bot or bot
+            built = _BUILDERS[channel](source, factories)
+            formatters[channel] = built.formatter
+            closers.extend(built.closers)
         else:
             formatters[channel] = UnavailableChannelFormatter(
                 channel, _UNAVAILABLE_REASONS[state],
             )
-    return ChannelRegistry(formatters=formatters, bot=bot)
+    return ChannelRegistry(formatters=formatters, closers=closers)
 
 
 _registry: ChannelRegistry | None = None
@@ -644,6 +1095,26 @@ def _real_bot_factory(**kwargs: Any) -> "Bot":
     from aiogram import Bot
 
     return Bot(**kwargs)
+
+
+def _real_http_client_factory() -> Any:
+    """The email channel's HTTP client, one per process.
+
+    Lazy import, same hygiene as the Bot above: one image serves every
+    product, and a deploy without email must not pay for the client.
+
+    TIMEOUTS ARE EXPLICIT AND BELOW the service-layer deliver timeout
+    (30s, app/engine/service.py): a timeout that surfaces INSIDE the
+    formatter can still be told apart -- connect failed (nothing was
+    sent) versus read timed out (the message may be on its way). A
+    timeout swallowed by the outer wait_for arrives as a bare
+    TimeoutError with that distinction lost.
+    """
+    import httpx
+
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
+    )
 
 
 def init_formatters() -> ChannelRegistry:
@@ -673,8 +1144,8 @@ def get_formatter(channel: str) -> ChannelFormatter:
 def reset_formatters() -> None:
     """Forget the built registry (tests); the next use rebuilds it.
 
-    Does NOT close a live Bot session -- use close_formatters() on a
-    real shutdown path.
+    Does NOT close anything the registry holds -- use
+    close_formatters() on a real shutdown path.
     """
     global _registry
     _registry = None
@@ -683,13 +1154,18 @@ def reset_formatters() -> None:
 async def close_formatters() -> None:
     """Close network resources held by the registry, then forget it.
 
-    Called on worker/API shutdown. Safe when nothing was built, or when
-    no channel holds a Bot: no-op apart from the reset.
+    Called on worker/API shutdown. Every closer is attempted even when
+    an earlier one fails -- one stuck resource must not strand the
+    others. Safe when nothing was built, and safe when the registry has
+    no closers at all (a deploy with in_app only): the loop is empty.
     """
-    if _registry is not None and _registry.bot is not None:
-        try:
-            await _registry.bot.session.close()
-            logger.info("telegram_bot_session_closed")
-        except Exception:
-            logger.exception("telegram_bot_session_close_failed")
+    if _registry is not None:
+        for name, close in _registry.closers:
+            try:
+                await close()
+                logger.info("channel_resource_closed", resource=name)
+            except Exception:
+                logger.exception(
+                    "channel_resource_close_failed", resource=name,
+                )
     reset_formatters()

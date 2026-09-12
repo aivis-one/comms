@@ -374,7 +374,14 @@ class TestFormatterChoice:
 
         registry = build_formatters(_settings(), _factory)
         assert built == [{"token": _GOOD_TOKEN}]
-        assert registry.bot is not None
+        # R-1: this asserted `registry.bot is not None` -- the registry
+        # held one network object because telegram was the only channel
+        # that owned one. Email owns a second, so the field became a
+        # list of named closers. The property is the same: a live
+        # channel leaves the registry knowing what to close.
+        assert [name for name, _ in registry.closers] == [
+            "telegram_bot_session",
+        ]
 
     def test_in_app_is_live_even_with_nothing_configured(self) -> None:
         registry = build_formatters(
@@ -672,9 +679,14 @@ class TestGeneratedEnv:
         # Absence.
         assert "replace-with-real" not in body
         assert "tg_placeholder" not in body
-        # Its pair: both keys present, and present EMPTY.
-        assert "\nTELEGRAM_BOT_TOKEN=\n" in body
-        assert "\nTELEGRAM_BOT_URL=\n" in body
+        # Its pair: every channel key present, and present EMPTY.
+        # R-1: email joined the list -- an installer that mints a
+        # PARTIAL set of any channel writes a state the service itself
+        # refuses, and the fresh install of a product dies on it.
+        from app.core.channels import channel_env_keys
+
+        for key in channel_env_keys():
+            assert f"\n{key}=\n" in body, key
 
     def test_service_token_is_present_and_not_empty(self) -> None:
         """The generated env declares APP_ENV=production, where the

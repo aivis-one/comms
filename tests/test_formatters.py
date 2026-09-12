@@ -455,34 +455,75 @@ class TestRenderErrorFallback:
 class TestCloseFormatters:
     """Review 1.1: the aiogram session is closed on shutdown."""
 
-    async def test_closes_tracked_bot_session(self) -> None:
+    async def test_closes_every_registered_resource(self) -> None:
+        """R-0 put the Bot in the registry instead of a module global;
+        R-1 replaced the single `bot` field with a list of named
+        closers, because email owns a second network object. What holds
+        across all three: whatever the registry knows about gets closed
+        on shutdown, and the registry is forgotten afterwards."""
         from app.engine import formatters as formatters_module
 
-        class _FakeSession:
-            def __init__(self) -> None:
-                self.closed = False
+        closed: list[str] = []
 
-            async def close(self) -> None:
-                self.closed = True
+        def _closer(name: str) -> Any:
+            async def _close() -> None:
+                closed.append(name)
 
-        # R-0: the Bot used to live in a module-level _bot; it now lives
-        # in the built registry. Same property, new home.
-        fake_bot = SimpleNamespace(session=_FakeSession())
+            return _close
+
         formatters_module._registry = ChannelRegistry(
-            formatters={}, bot=fake_bot,  # type: ignore[arg-type]
+            formatters={},
+            closers=[
+                ("telegram_bot_session", _closer("telegram")),
+                ("email_http_client", _closer("email")),
+            ],
         )
         try:
             await close_formatters()
         finally:
             formatters_module._registry = None
 
-        assert fake_bot.session.closed is True
+        assert closed == ["telegram", "email"]
         assert formatters_module._registry is None
 
+    async def test_one_failing_closer_does_not_strand_the_others(
+        self,
+    ) -> None:
+        """A stuck resource must not keep the rest open."""
+        from app.engine import formatters as formatters_module
+
+        closed: list[str] = []
+
+        async def _boom() -> None:
+            raise RuntimeError("session already gone")
+
+        async def _ok() -> None:
+            closed.append("second")
+
+        formatters_module._registry = ChannelRegistry(
+            formatters={},
+            closers=[("first", _boom), ("second", _ok)],
+        )
+        try:
+            await close_formatters()
+        finally:
+            formatters_module._registry = None
+
+        assert closed == ["second"]
+
     async def test_noop_when_nothing_initialized(self) -> None:
-        """Nothing built (no registry, or no channel holding a Bot):
-        close is a harmless reset."""
+        """Nothing built at all: close is a harmless reset."""
         await close_formatters()
+
+    async def test_registry_without_closers_closes_cleanly(self) -> None:
+        """The pair to the assertions above: a deploy whose only channel
+        is in_app has NOTHING to close, and shutdown must not trip over
+        the empty list."""
+        from app.engine import formatters as formatters_module
+
+        formatters_module._registry = ChannelRegistry(formatters={})
+        await close_formatters()
+        assert formatters_module._registry is None
 
 
 class TestSanitizeError:

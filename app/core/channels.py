@@ -61,8 +61,17 @@ class ChannelSpec:
     """An implemented channel and the keys that make it live."""
 
     name: str
+    # The keys that decide the channel: all empty = absent, all set =
+    # live, some set = refusal.
     keys: tuple[str, ...]
     validators: Mapping[str, Validator] = field(default_factory=dict)
+    # Keys that carry a DEFAULT and therefore do not decide anything --
+    # "unset" and "set to the default" cannot be told apart. Their form
+    # is still checked whenever the deploy spells them out, so a typo in
+    # a defaulted value refuses startup like any other.
+    optional_validators: Mapping[str, Validator] = field(
+        default_factory=dict,
+    )
 
 
 class ChannelState(StrEnum):
@@ -106,6 +115,88 @@ def _telegram_url(value: str) -> str | None:
     return None
 
 
+# -- email ------------------------------------------------------------------
+#
+# ONE PREFIX PER CHANNEL (EMAIL_), including the provider-named keys:
+# the agreed fix of the KNOWN CEILING below scans the environment for a
+# channel's prefix, and a channel spread over two prefixes would make it
+# unperformable. The provider IS in the key names on purpose -- "domain"
+# and "region" are its concepts, and a neutral name over a single
+# provider would mislead the next integrator.
+
+# The provider serves two regions from two different base addresses. A
+# CLOSED SET, so an unknown region refuses startup instead of failing
+# every send: "eu-west" or "europe" are the shapes an integrator
+# actually writes, and they must not reach the delivery path. The
+# addresses themselves live in app/core/config.py -- the one file the
+# domain-literal fence allows (arch doc 2.6 / decision 13).
+EMAIL_REGIONS: tuple[str, ...] = ("eu", "us")
+
+_CRLF = ("\r", "\n")
+
+
+def _email_region(value: str) -> str | None:
+    """One of the known regions, spelled exactly."""
+    if value not in EMAIL_REGIONS:
+        return (
+            f"expected one of {', '.join(EMAIL_REGIONS)} "
+            f"(got {value!r})"
+        )
+    return None
+
+
+def _address_shape(value: str) -> str | None:
+    """A bare addr-spec: one @, non-empty both sides, no spaces."""
+    local, sep, domain = value.partition("@")
+    if not sep or not local or not domain:
+        return "an address needs one @ with text on both sides"
+    if "@" in domain:
+        return "an address must not carry more than one @"
+    if any(ch.isspace() for ch in value):
+        return "an address must not contain spaces"
+    if "." not in domain:
+        return "the domain part needs a dot"
+    return None
+
+
+def _email_sender(value: str) -> str | None:
+    """Either a bare address or a display-name form.
+
+    CR/LF is checked over the WHOLE value BEFORE any parsing: a header
+    injection must not depend on how the angle brackets happened to
+    split. The display-name form is allowed on purpose -- a signed
+    sender is materially better for deliverability, which is the whole
+    reason a provider is used at all.
+    """
+    if any(ch in value for ch in _CRLF):
+        return (
+            "expected an address, or the form 'Name <address>'; the "
+            "value carries a line break"
+        )
+    if value.endswith(">"):
+        name, _, rest = value.partition("<")
+        if not name.strip() or ">" in rest[:-1]:
+            return (
+                "expected an address, or the form 'Name <address>' with "
+                "a non-empty name and one pair of angle brackets"
+            )
+        complaint = _address_shape(rest[:-1])
+        return None if complaint is None else f"inside <>: {complaint}"
+    if "<" in value or ">" in value:
+        return (
+            "expected an address, or the form 'Name <address>' -- angle "
+            "brackets must wrap the address and close at the end"
+        )
+    complaint = _address_shape(value)
+    if complaint is None:
+        return None
+    # The expected form belongs in EVERY complaint, not only in the ones
+    # about brackets: this is a startup refusal on a value the provider
+    # itself might have accepted, and "wrong shape" without the shape
+    # leaves the integrator guessing.
+    return f"expected an address, or the form 'Name <address>' -- {complaint}"
+
+
 CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
     ChannelSpec(name="in_app", keys=()),
     ChannelSpec(
@@ -116,12 +207,83 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
             "TELEGRAM_BOT_URL": _telegram_url,
         },
     ),
+    ChannelSpec(
+        name="email",
+        keys=(
+            "EMAIL_MAILGUN_API_KEY",
+            "EMAIL_MAILGUN_DOMAIN",
+            "EMAIL_FROM_ADDRESS",
+        ),
+        validators={
+            "EMAIL_FROM_ADDRESS": _email_sender,
+        },
+        # NOT a declared key: it has a default, so "unset" and "set to
+        # the default" are indistinguishable, and counting it would make
+        # an EMPTY set look PARTIAL -- refusing startup on every deploy
+        # that has no email at all. Its FORM is still checked, but only
+        # when the deploy spells it out.
+        optional_validators={
+            "EMAIL_MAILGUN_REGION": _email_region,
+        },
+    ),
 )
 
 
 def channel_env_keys() -> tuple[str, ...]:
-    """Every declared key of every channel, in declaration order."""
+    """Every DECIDING key of every channel, in declaration order.
+
+    Defaulted keys are not here: blanking them (tests/conftest.py) would
+    replace a working default with an invalid empty value, and they
+    cannot make a channel live or absent anyway.
+    """
     return tuple(key for spec in CHANNEL_SPECS for key in spec.keys)
+
+
+def channel_optional_keys() -> tuple[str, ...]:
+    """Every DEFAULTED key of every channel, in declaration order."""
+    return tuple(
+        key for spec in CHANNEL_SPECS for key in spec.optional_validators
+    )
+
+
+def _malformed_optionals(
+    spec: ChannelSpec, values: Mapping[str, str],
+) -> list[str]:
+    """Complaints about spelled-out defaulted values, if any."""
+    complaints: list[str] = []
+    for key, validator in spec.optional_validators.items():
+        value = values.get(key, "")
+        if value == "":
+            continue
+        if value.strip() == "":
+            complaints.append(f"{key} consists only of whitespace")
+            continue
+        complaint = validator(value)
+        if complaint is not None:
+            complaints.append(f"{key} is malformed: {complaint}")
+    return complaints
+
+
+def _problem(
+    spec: ChannelSpec,
+    missing: list[str],
+    present: list[str],
+    malformed: list[str],
+) -> str:
+    """One channel's refusal text, naming keys and the expected shape."""
+    lines = [f"channel '{spec.name}' is misconfigured:"]
+    if missing:
+        lines.append(
+            f"  missing: {', '.join(missing)} "
+            f"(set: {', '.join(present) or 'none'})"
+        )
+    lines.extend(f"  {m}" for m in malformed)
+    lines.append(
+        f"  Set every key of '{spec.name}', or leave all of "
+        f"{', '.join(spec.keys)} empty if this deploy has no "
+        f"{spec.name}."
+    )
+    return "\n".join(lines)
 
 
 def evaluate_channels(
@@ -145,6 +307,14 @@ def evaluate_channels(
     for spec in CHANNEL_SPECS:
         present = [k for k in spec.keys if values.get(k, "") != ""]
         if spec.keys and not present:
+            # A defaulted value of the wrong shape on an ABSENT channel
+            # is still a refusal: it is a typo in this deploy's env, and
+            # silently ignoring it would teach the integrator that the
+            # key does not exist.
+            stray = _malformed_optionals(spec, values)
+            if stray:
+                problems.append(_problem(spec, [], present, stray))
+                continue
             # KNOWN CEILING -- a typo in EVERY key name of a channel
             # reads as "no such channel" (consequence of extra="ignore"
             # on Settings, app/core/config.py -- a decision, described
@@ -181,12 +351,19 @@ def evaluate_channels(
 
         missing = [k for k in spec.keys if k not in present]
         malformed: list[str] = []
-        for key in present:
+        # Defaulted keys never make a set partial, but a spelled-out
+        # value of the wrong shape is still a refusal.
+        checked = present + [
+            k for k in spec.optional_validators if values.get(k, "") != ""
+        ]
+        for key in checked:
             value = values[key]
             if value.strip() == "":
                 malformed.append(f"{key} consists only of whitespace")
                 continue
-            validator = spec.validators.get(key)
+            validator = spec.validators.get(key) or (
+                spec.optional_validators.get(key)
+            )
             complaint = validator(value) if validator else None
             if complaint is not None:
                 malformed.append(f"{key} is malformed: {complaint}")
@@ -195,17 +372,5 @@ def evaluate_channels(
             states[spec.name] = ChannelState.LIVE
             continue
 
-        lines = [f"channel '{spec.name}' is misconfigured:"]
-        if missing:
-            lines.append(
-                f"  missing: {', '.join(missing)} "
-                f"(set: {', '.join(present)})"
-            )
-        lines.extend(f"  {m}" for m in malformed)
-        lines.append(
-            f"  Set every key of '{spec.name}', or leave all of "
-            f"{', '.join(spec.keys)} empty if this deploy has no "
-            f"{spec.name}."
-        )
-        problems.append("\n".join(lines))
+        problems.append(_problem(spec, missing, present, malformed))
     return states, problems

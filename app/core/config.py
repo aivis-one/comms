@@ -27,7 +27,11 @@ from zoneinfo import ZoneInfo
 from pydantic import ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.core.channels import channel_env_keys, evaluate_channels
+from app.core.channels import (
+    channel_env_keys,
+    channel_optional_keys,
+    evaluate_channels,
+)
 
 # Single source of truth for API version.
 # Import as: from app.core.config import APP_VERSION, settings
@@ -35,6 +39,15 @@ APP_VERSION = "0.1.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+# Provider base addresses per region. Here and nowhere else: this file
+# is the single exemption of the domain-literal fence. Keys are the
+# closed set validated in app/core/channels.py (EMAIL_REGIONS) -- a test
+# pins the two sides together.
+_EMAIL_API_BASE_URLS = {
+    "eu": "https://api.eu.mailgun.net",
+    "us": "https://api.mailgun.net",
+}
 
 
 class Settings(BaseSettings):
@@ -95,6 +108,34 @@ class Settings(BaseSettings):
     # Base URL for deep-link buttons, e.g. "https://t.me/<product_bot>".
     # Consumed by TelegramFormatter.format_deep_link (ported from VELO).
     telegram_bot_url: str = ""
+
+    # -- Email (a channel key set, app/core/channels.py) --
+    # All three empty = this deploy has no email; all three set = live;
+    # anything else refuses startup. The sender has NO default on
+    # purpose: it is a product fact, and a default would make a partial
+    # set look complete.
+    email_mailgun_api_key: str = ""
+    email_mailgun_domain: str = ""
+    # A bare address, or the display form "Name <address>" -- a signed
+    # sender is materially better for deliverability, which is the
+    # reason a provider is used at all.
+    email_from_address: str = ""
+    # NOT part of the key set (it has a default), but its shape IS
+    # checked when spelled out: a closed set of two, so "eu-west" or
+    # "europe" refuses startup instead of failing every send.
+    email_mailgun_region: str = "eu"
+
+    @property
+    def email_api_base_url(self) -> str:
+        """Provider base address for this deploy's region.
+
+        THE ONE PLACE these live: the domain-literal fence (arch doc
+        §2.6 / decision 13) whitelists this file and nothing else --
+        external addresses belong to configuration, never to logic. The
+        region is validated as a closed set before this is read, so the
+        lookup cannot miss.
+        """
+        return _EMAIL_API_BASE_URLS[self.email_mailgun_region]
 
     # -- Localization --
     # Per-deploy default locale; template fallback language.
@@ -239,7 +280,8 @@ class Settings(BaseSettings):
         # Every declared key is a field of this class under its
         # lower-case name (pinned by a test).
         _, channel_problems = evaluate_channels({
-            key: getattr(self, key.lower()) for key in channel_env_keys()
+            key: getattr(self, key.lower())
+            for key in channel_env_keys() + channel_optional_keys()
         })
         problems.extend(channel_problems)
 

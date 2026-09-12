@@ -148,10 +148,15 @@ REDIS_URL=redis://:$redis_pass@comms-redis:6379/0
 
 COMMS_SERVICE_TOKEN=$service_token
 
-# A channel is decided by its key set: both empty = no telegram on this
-# deploy (legal); both set = live; one set = comms refuses to start.
+# A channel is decided by its key set: all keys empty = the deploy does
+# not have that channel (legal); all set = live; some set = comms
+# refuses to start. The PRODUCT installer, which owns these
+# credentials, writes them here.
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_BOT_URL=
+EMAIL_MAILGUN_API_KEY=
+EMAIL_MAILGUN_DOMAIN=
+EMAIL_FROM_ADDRESS=
 
 DEFAULT_LOCALE=en
 DEFAULT_TIMEZONE=UTC

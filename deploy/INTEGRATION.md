@@ -186,6 +186,58 @@ such channel". The map shows `not_configured` where the installer
 expected `live`; the in-code marker (`KNOWN CEILING` in
 `app/core/channels.py`) records the case and its agreed fix.
 
+**Email, concretely.** The channel is decided by its key set like any
+other, and its keys are declared in `app/core/channels.py`. Three of
+them decide it -- the provider API key, the provider domain, and the
+sender address -- and all three must be set together or left empty
+together. The sender has no default because it is a product fact; a
+default would make an incomplete set look complete. It accepts either a
+bare address or the display form `Name <address>`, since a signed
+sender delivers better, and a value carrying a line break is refused at
+startup.
+
+The provider region is different in kind: it has a default, so
+"unset" and "set to the default" cannot be told apart, and it therefore
+does NOT take part in deciding whether the channel exists -- a deploy
+with no email at all is not made incomplete by it. Its VALUE is still
+checked whenever it is spelled out, against a closed set of the
+provider's regions: a plausible-looking `eu-west` refuses startup
+instead of failing every send later.
+
+**What the key set cannot check.** A syntactically perfect set with a
+wrong API key, or with a domain that is not verified with the provider,
+starts cleanly and fails on every message. That is by construction: a
+network check at startup would make the service's boot depend on the
+provider being reachable. The loudness therefore sits at send time --
+the first refusal the provider attributes to configuration rather than
+to the message is logged as `email_channel_not_viable`, once, naming
+the channel; the messages after it are ordinary per-message lines, so a
+dead channel is a signal instead of a thousand identical entries.
+
+**What email reads from the profile.** Its own fields under its own
+channel: `{type: {email: {subject, body}}}`. Nothing new enters the
+profile contract, and a profile that declares neither field stays
+valid -- the subject falls back to the notification title, and, when
+that is blank, to the type key, because an empty subject is filed as
+spam. The body falls back to the stored body and never to another
+channel's template, whose markup would arrive as raw characters.
+Declaring email templates does not make a notification use the channel:
+the channel list comes from the request that created it, and from
+nowhere else.
+
+**One delivery path.** There is no SMTP fallback, deliberately: a
+second path no deploy exercises rots from the first day. The
+consequence is worth stating -- while the provider is unreachable, mail
+does not go out at all. Delivery is retried, and products that send
+codes re-send them on request.
+
+**Time.** A product that mails short-lived codes should set `expiry_at`
+on the notification to the life of the code. Delivery is retried on
+transient failures, and when the provider asks to be retried later the
+service honours the wait it names -- which can exceed the life of a
+code by a wide margin. `expiry_at` is what stops a delivery that has
+outlived its point; without it the service has no way to know.
+
 **Scope of this rule: sending channels only.** A future inbound side
 (receiving bot updates) is a separate capability with its own keys and
 its own switch, and is not a channel of this registry. One bot has
