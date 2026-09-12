@@ -17,11 +17,11 @@
 #   - an auth failure is logged WITHOUT the presented value.
 #
 # EMPTY TOKEN:
-#   - real mode  -> unreachable here: startup validation in
+#   - outside development -> unreachable here: startup validation in
 #     app/core/config.py refuses to boot without the token;
-#   - stub mode  -> auth is DISABLED (local dev / tests without the
-#     bearer ceremony); app/main.py logs a loud warning at startup so
-#     a misconfigured deployment is visible, not silent.
+#   - development -> auth is DISABLED (local dev without the bearer
+#     ceremony); app/main.py logs a loud warning at startup so an open
+#     API is visible, not silent.
 # =============================================================================
 
 import secrets
@@ -50,12 +50,12 @@ async def require_service_auth(
 
     Raises HTTP 401 when the Authorization header is missing, is not
     a Bearer scheme, or carries a token that does not match
-    COMMS_SERVICE_TOKEN. No-op when the token is unset (stub mode --
-    real mode refuses to start without it).
+    COMMS_SERVICE_TOKEN. No-op when the token is unset (development
+    only -- any other APP_ENV refuses to start without it).
     """
     expected = settings.comms_service_token
     if not expected:
-        # Stub mode with auth disabled (warned at startup).
+        # Development with auth disabled (warned at startup).
         return
 
     if authorization is None or not authorization.startswith(_BEARER_PREFIX):

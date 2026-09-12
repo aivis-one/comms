@@ -10,12 +10,12 @@
 #   database + role inside the PRODUCT's Postgres. Channel credentials
 #   (bot token) are shared with the product and injected via env.
 #
-# CHANNELS_MODE:
-#   "stub" (default) -- every channel resolves to StubFormatter; nothing
-#                       leaves the process. Used by tests and CI.
-#   "real"           -- channels with configured credentials use real
-#                       formatters (Phase 1: telegram only; email/push/
-#                       in_app remain stubs until later phases).
+# CHANNELS:
+#   A channel is decided by its own key set and by nothing else -- see
+#   app/core/channels.py for the rule. Empty set: the deploy has no
+#   such channel. Full set: the channel is live. Partial set or a
+#   malformed value: startup is refused with a message naming the
+#   channel and the keys (load_settings below).
 #
 # DEFAULT_LOCALE:
 #   Per-deploy default used as the template-rendering fallback language
@@ -24,8 +24,10 @@
 
 from zoneinfo import ZoneInfo
 
-from pydantic import model_validator
+from pydantic import ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.channels import channel_env_keys, evaluate_channels
 
 # Single source of truth for API version.
 # Import as: from app.core.config import APP_VERSION, settings
@@ -33,9 +35,6 @@ APP_VERSION = "0.1.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-
-# Valid channel modes.
-_VALID_CHANNELS_MODES = {"stub", "real"}
 
 
 class Settings(BaseSettings):
@@ -48,17 +47,12 @@ class Settings(BaseSettings):
     # -- Database (dedicated comms database inside the product Postgres) --
     database_url: str = ""
 
-    # -- Channels --
-    # "stub" keeps every channel local (tests/CI); "real" enables
-    # configured channels (Phase 1: telegram).
-    channels_mode: str = "stub"
-
     # -- Event transport, push side (Phase 3c) --
     # The consumer process (`python -m app.consumer`) reads the
     # product's event stream via a Redis consumer group. Nobody else
     # needs Redis (API/worker are DB-only), so an empty redis_url is
     # validated at CONSUMER startup (app/consumer.py), not here --
-    # deliberately not coupled to channels_mode.
+    # deliberately not coupled to any delivery channel.
     # Names below are FROZEN CONTRACT surface (Phase 3c item 7): the
     # product's outbox relay XADDs into comms_events_stream; the DLQ
     # is derived as f"{comms_events_stream}:dlq" (see dlq_stream).
@@ -87,12 +81,16 @@ class Settings(BaseSettings):
     # shared secret as "Authorization: Bearer <token>". Verified by the
     # FastAPI dependency in app/api/deps.py. NEVER logged (same
     # principle as the formatter's secret sanitizer).
-    # Empty token: startup ERROR in real mode (an unauthenticated
-    # "internal" API is effectively open), loud warning + auth disabled
-    # in stub mode (local dev / tests).
+    # Empty token: startup ERROR outside development (an
+    # unauthenticated "internal" API is effectively open) -- the same
+    # axis as DATABASE_URL. In development an empty token disables auth
+    # with a loud startup warning (app/main.py).
     comms_service_token: str = ""
 
     # -- Telegram (shared bot with the product, see arch doc §7) --
+    # A channel key set (app/core/channels.py): both empty = this
+    # deploy has no telegram; both set = live; anything else refuses
+    # startup.
     telegram_bot_token: str = ""
     # Base URL for deep-link buttons, e.g. "https://t.me/<product_bot>".
     # Consumed by TelegramFormatter.format_deep_link (ported from VELO).
@@ -229,44 +227,34 @@ class Settings(BaseSettings):
                 f"Valid: {', '.join(sorted(_VALID_LOG_LEVELS))}"
             )
 
-        if self.channels_mode not in _VALID_CHANNELS_MODES:
-            raise ValueError(
-                f"Invalid CHANNELS_MODE: {self.channels_mode}. "
-                f"Valid: {', '.join(sorted(_VALID_CHANNELS_MODES))}"
+        # Credentials: every problem is collected before raising, so an
+        # integrator fixes all of them in one pass, not one per restart.
+        problems: list[str] = []
+
+        # Phase 3b item 4 (3a flag 7.3), generalized: a channel with a
+        # PARTIAL key set must die AT STARTUP, not on the delivery path
+        # -- an empty bot URL next to a real token turns every deep-link
+        # button into a BUTTON_URL_INVALID storm of permanent FAILED
+        # deliveries. An EMPTY set is legal: the deploy has no channel.
+        # Every declared key is a field of this class under its
+        # lower-case name (pinned by a test).
+        _, channel_problems = evaluate_channels({
+            key: getattr(self, key.lower()) for key in channel_env_keys()
+        })
+        problems.extend(channel_problems)
+
+        # Phase 3b item 1: an "internal" API without its shared secret
+        # is effectively open -- required outside development, the same
+        # axis as DATABASE_URL above.
+        if not self.is_dev and not self.comms_service_token:
+            problems.append(
+                "COMMS_SERVICE_TOKEN is required outside development: "
+                "the comms API is internal (arch decision 14) and must "
+                "not run open."
             )
 
-        # Phase 3b item 4 (3a flag 7.3): real mode with missing telegram
-        # credentials must die AT STARTUP, not on the delivery path --
-        # an empty bot URL turns every deep-link button into a
-        # BUTTON_URL_INVALID storm of permanent FAILED deliveries, and
-        # an empty token fails every send. Stub mode stays exempt
-        # (tests/CI run without credentials by design).
-        if self.channels_mode == "real":
-            if not self.telegram_bot_token:
-                raise ValueError(
-                    "TELEGRAM_BOT_TOKEN is required when "
-                    "CHANNELS_MODE=real: without it every telegram "
-                    "send fails. Set it in the .env file."
-                )
-            if not self.telegram_bot_url:
-                raise ValueError(
-                    "TELEGRAM_BOT_URL is required when "
-                    "CHANNELS_MODE=real: deep-link buttons would be "
-                    "built from an empty base and every buttoned "
-                    "delivery would permanently fail with "
-                    "BUTTON_URL_INVALID. Set it in the .env file."
-                )
-            # Phase 3b item 1: an "internal" API without its shared
-            # secret is effectively open -- same fail-at-startup
-            # philosophy. In stub mode an empty token merely disables
-            # auth (loud warning at startup, see app/main.py).
-            if not self.comms_service_token:
-                raise ValueError(
-                    "COMMS_SERVICE_TOKEN is required when "
-                    "CHANNELS_MODE=real: the comms API is internal "
-                    "(arch decision 14) and must not run open. Set "
-                    "it in the .env file."
-                )
+        if problems:
+            raise ValueError("\n".join(problems))
 
         try:
             ZoneInfo(self.default_timezone)
@@ -310,6 +298,11 @@ class Settings(BaseSettings):
 
         return self
 
+    # extra="ignore" is a DECISION, not an oversight: a deploy's env is
+    # shared with installers that write keys this service does not read
+    # (including keys it used to read), and an unknown key must not
+    # refuse startup. Its consequence for channel keys is marked as a
+    # KNOWN CEILING in app/core/channels.py (evaluate_channels).
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -317,4 +310,42 @@ class Settings(BaseSettings):
     )
 
 
-settings = Settings()
+def format_startup_error(exc: ValidationError) -> str:
+    """Render a settings ValidationError as a message for a human.
+
+    Our own validator raises ValueError with ready-made text; pydantic
+    wraps it ("Value error, ...") and adds a location. Unwrap ours,
+    keep pydantic's own wording (with the field name) for type errors.
+    """
+    lines: list[str] = []
+    for error in exc.errors():
+        ctx_error = (error.get("ctx") or {}).get("error")
+        if error["type"] == "value_error" and ctx_error is not None:
+            lines.append(str(ctx_error))
+        else:
+            loc = ".".join(str(part) for part in error["loc"]).upper()
+            lines.append(f"{loc}: {error['msg']}")
+    body = "\n".join(lines)
+    return (
+        "comms: startup refused -- the configuration is invalid.\n"
+        f"{body}\n"
+        "Fix the .env of this deploy and start again."
+    )
+
+
+def load_settings() -> Settings:
+    """Build the settings, or exit with a readable message.
+
+    Settings are built at import -- before logging is configured -- so
+    a raw pydantic traceback would be the only output. SystemExit with a
+    string prints exactly that string to stderr and exits with status 1,
+    without a traceback. Every entrypoint (API, worker, consumer,
+    migrations) imports this module, so all of them refuse alike.
+    """
+    try:
+        return Settings()
+    except ValidationError as exc:
+        raise SystemExit(format_startup_error(exc)) from None
+
+
+settings = load_settings()

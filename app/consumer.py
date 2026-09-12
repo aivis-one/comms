@@ -60,9 +60,9 @@ def main() -> None:
     """Console entrypoint: `python -m app.consumer`."""
     setup_logging()
     if not settings.redis_url:
-        # Fail-at-startup, same philosophy as the real-mode config
-        # validation: a consumer without Redis is a no-op pretending
-        # to be a process.
+        # Fail-at-startup, same philosophy as the startup config
+        # validation (app/core/config.py): a consumer without Redis is
+        # a no-op pretending to be a process.
         raise RuntimeError(
             "REDIS_URL is required to run the consumer: it reads the "
             "product's event stream. Set it in the .env file."

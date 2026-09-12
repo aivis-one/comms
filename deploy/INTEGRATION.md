@@ -130,6 +130,69 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+## 3a. How a product declares its channels
+
+Every product has a different set of delivery channels, and a channel
+it does not have is not a failure -- it is a design decision. One rule
+expresses that, and it is the only mechanism:
+
+**A channel is decided by its own set of settings keys, and by nothing
+else.** A channel exists on a deploy when it has an implementation in
+this service and every key it declares is set:
+
+| the channel's key set | what it means | what happens |
+|---|---|---|
+| **every key empty** | this product has no such channel, by design | the service starts; the channel is absent |
+| **every key set** | the product has the channel | the channel is live |
+| **some keys set** | an integrator typo | **the service refuses to start**, naming the channel and every missing key |
+| **a malformed value** | an integrator typo | same refusal, naming the key and the shape expected |
+
+There is no mode, no global switch and no special case per channel. A
+channel that declares no keys at all is live by definition, because the
+empty set is trivially complete: that is how in-app delivery works --
+its delivery is the row the inbox reads, nothing leaves the process,
+and there is nothing to configure. A channel with no implementation in
+this service is absent on every deploy, whatever the environment says.
+
+The declared keys of every implemented channel live in one place,
+`app/core/channels.py`. That file is the answer to "which keys does
+this channel need"; this document does not duplicate the list.
+
+**A requested channel that the product does not have is a LOUD
+failure.** Asking for a channel whose key set is empty produces a
+delivery with status `failed`, immediately and without retries: the
+channel will not become configured between attempts. It is never
+reported as a success. The two situations that used to look identical
+are now distinguishable: a channel nobody requests is simply absent and
+costs nothing, while a channel that is requested but not configured is
+a lost notification and says so in the log
+(`delivery_channel_unavailable`) and in the delivery row.
+
+**Startup refusals are readable.** The configuration is built before
+logging is set up, so a refusal prints a message -- naming the channel
+and the keys -- and exits, rather than a traceback. When the refusal
+happens during an install, `comms-deploy.sh` prints the last lines of
+the application log where the installer output is, so the typo is
+visible without going looking for it.
+
+**What the first start tells you.** The `comms_started` log line
+carries a channel map: every channel with `live`, `not_configured` or
+`not_implemented`. That map is the way to confirm that a deploy sees
+the channels its installer meant to give it. One case needs it: a typo
+in *every* key name of a channel (unknown keys are ignored on purpose,
+so that a leftover variable in a shared env file cannot refuse a
+working deploy) leaves the key set empty and therefore reads as "no
+such channel". The map shows `not_configured` where the installer
+expected `live`; the in-code marker (`KNOWN CEILING` in
+`app/core/channels.py`) records the case and its agreed fix.
+
+**Scope of this rule: sending channels only.** A future inbound side
+(receiving bot updates) is a separate capability with its own keys and
+its own switch, and is not a channel of this registry. One bot has
+exactly one update receiver, so a receiver switched on by the mere
+presence of a sending token would start at a deploy that only asked to
+send.
+
 ## 4. What the integration code does with all this
 
 Consumers of the variables above are the integration track in the

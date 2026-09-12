@@ -122,11 +122,10 @@ generate_env() {
         return 0
     fi
 
-    local pg_pass redis_pass service_token tg_placeholder
+    local pg_pass redis_pass service_token
     pg_pass=$(openssl rand -hex 24) || { echo -e "${RED}✗ openssl failed${NC}"; exit 1; }
     redis_pass=$(openssl rand -hex 24) || { echo -e "${RED}✗ openssl failed${NC}"; exit 1; }
     service_token=$(openssl rand -hex 32) || { echo -e "${RED}✗ openssl failed${NC}"; exit 1; }
-    tg_placeholder="replace-with-real-bot-token-$(openssl rand -hex 8)"
 
     mkdir -p "$INSTALL_BASE"
     # Written with a heredoc in one shot; 600 before secrets land.
@@ -149,8 +148,9 @@ REDIS_URL=redis://:$redis_pass@comms-redis:6379/0
 
 COMMS_SERVICE_TOKEN=$service_token
 
-CHANNELS_MODE=stub
-TELEGRAM_BOT_TOKEN=$tg_placeholder
+# A channel is decided by its key set: both empty = no telegram on this
+# deploy (legal); both set = live; one set = comms refuses to start.
+TELEGRAM_BOT_TOKEN=
 TELEGRAM_BOT_URL=
 
 DEFAULT_LOCALE=en
@@ -165,9 +165,8 @@ PROFILE_DIR=$PROFILE_DIR_DEFAULT
 PRODUCT_ENV_PATH=
 EOF
     echo -e "${GREEN}✓ $ENV_FILE generated (postgres/redis/service-token minted)${NC}"
-    echo -e "${YELLOW}  Channels start in stub mode: the token above is a placeholder.${NC}"
-    echo -e "${YELLOW}  Real credentials come from the PRODUCT installer, which owns${NC}"
-    echo -e "${YELLOW}  the bot and writes them into this file before the stack starts.${NC}"
+    echo -e "${YELLOW}  Telegram keys are EMPTY: this deploy has no telegram until the${NC}"
+    echo -e "${YELLOW}  PRODUCT installer, which owns the bot, writes BOTH of them here.${NC}"
 }
 
 # Step 3: compose reads ./.env next to docker-compose.yml -- link it
@@ -274,7 +273,12 @@ wait_for_app() {
         sleep 2
     done
     echo -e "${RED}✗ comms-app did not become healthy${NC}"
-    echo "Check logs: $0 logs comms-app"
+    # The reason is in the container log -- a refused start prints a
+    # readable message naming the broken keys. Show it here, where the
+    # person running the install is looking, instead of pointing away.
+    echo "Last lines of comms-app:"
+    $COMPOSE_CMD logs --no-color --tail=20 comms-app 2>&1 | sed 's/^/  /'
+    echo "Full logs: $0 logs comms-app"
     return 1
 }
 
@@ -487,15 +491,17 @@ cmd_db() {
 # Neither replaces the other.
 #
 # THE ONE PROGRAM, RUN TWICE. The environment below mirrors the CI
-# workflow exactly -- same APP_ENV, same CHANNELS_MODE, same shape of
-# DATABASE_URL -- so that a difference in the result means a difference
-# in the MACHINE and nothing else. APP_ENV=ci on a server reads oddly,
+# workflow exactly -- same APP_ENV, same shape of DATABASE_URL -- so
+# that a difference in the result means a difference in the MACHINE and
+# nothing else. APP_ENV=ci on a server reads oddly,
 # and it is deliberate: the alternative (development) would make the two
 # runs two different programs, which is the one thing this must not be.
 #
-# CHANNELS_MODE=stub is a fence, not a convenience: the container's own
-# value is `real`, and running the suite under it would hand tests a
-# live Telegram token.
+# NO CHANNEL FENCE HERE, on purpose: the container's own env carries
+# the live bot token, and the fence against it lives in the suite
+# itself (tests/conftest.py blanks every channel key before settings
+# are built, and a tripwire fails any real Telegram request) -- so it
+# holds wherever pytest runs, not only where someone remembered a flag.
 #
 # NO MIGRATIONS HERE. The suite brings the schema up itself
 # (tests/conftest.py shells `alembic upgrade head` in a session
@@ -536,7 +542,6 @@ cmd_test() {
     if ! $COMPOSE_CMD exec -T \
         -e DATABASE_URL="$test_db_url" \
         -e APP_ENV=ci \
-        -e CHANNELS_MODE=stub \
         comms-app python -m pytest -q; then
         echo -e "${RED}✗ tests failed${NC}"
         exit 1

@@ -2,7 +2,8 @@
 # COMMS Service -- Formatter tests
 # =============================================================================
 # Handoff item 4:
-#   - CHANNELS_MODE=stub keeps every channel local
+#   - an empty channel key set keeps every channel local (the refusal,
+#     not a quiet success -- R-0; was the global switch's stub mode)
 #   - format_deep_link ported as-is from velo (same three cases as
 #     velo's TestTelegramFormatter)
 #   - telegram deliver: HTML message, deep-link button, permanent
@@ -21,18 +22,21 @@
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from app.audience.models import Recipient
+from app.core.config import Settings
 from app.engine.constants import DeliveryChannel
 from app.engine.formatters import (
+    ChannelRegistry,
+    InAppFormatter,
     PermanentDeliveryError,
     RateLimitedError,
-    StubFormatter,
     TelegramFormatter,
+    UnavailableChannelFormatter,
+    build_formatters,
     close_formatters,
     get_formatter,
     sanitize_error,
@@ -90,24 +94,50 @@ def _recipient(**overrides: Any) -> Recipient:
     return Recipient(**defaults)
 
 
-class TestChannelsMode:
-    """CHANNELS_MODE=stub keeps everything local (handoff item 4)."""
+class TestLocalByDefault:
+    """Nothing leaves the process unless a channel's key set is full.
 
-    def test_stub_mode_returns_stub_for_all_channels(self) -> None:
-        """Default test mode: every channel is the stub."""
+    R-0: these two tests asserted the global switch's stub mode --
+    "every channel is the stub" and "even a configured token stays
+    local". Both were right for a switch that no longer exists. What
+    replaced them: the key set decides per channel (app/core/
+    channels.py), and an absent channel REFUSES instead of succeeding.
+    """
+
+    def test_empty_key_sets_keep_every_channel_local(self) -> None:
+        """The suite's own configuration (conftest channel fence): only
+        in_app -- zero declared keys, live by definition -- succeeds;
+        every other channel resolves to the refusal, never a stub."""
+        assert isinstance(get_formatter(DeliveryChannel.IN_APP), InAppFormatter)
         for channel in DeliveryChannel:
-            assert isinstance(get_formatter(channel), StubFormatter)
-
-    def test_stub_mode_ignores_real_credentials(self) -> None:
-        """Even with a token configured, stub mode stays local."""
-        with patch(
-            "app.engine.formatters.settings"
-        ) as mock_settings:
-            mock_settings.channels_mode = "stub"
-            mock_settings.telegram_bot_token = "123456:real-looking-token"
+            if channel is DeliveryChannel.IN_APP:
+                continue
             assert isinstance(
-                get_formatter(DeliveryChannel.TELEGRAM), StubFormatter,
+                get_formatter(channel), UnavailableChannelFormatter,
             )
+
+    def test_full_key_set_makes_telegram_live_through_the_factory(
+        self,
+    ) -> None:
+        """The successor of "stub mode ignores real credentials": a full
+        key set DOES make the channel live -- and the Bot comes from the
+        injected factory, so a test never builds a real one."""
+        built: list[dict[str, Any]] = []
+
+        def _factory(**kwargs: Any) -> _FakeBot:
+            built.append(kwargs)
+            return _FakeBot()
+
+        full = Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            telegram_bot_token="123456:unit-test-token",
+            telegram_bot_url=BOT_URL,
+        )
+        registry_ = build_formatters(full, _factory)
+        assert isinstance(
+            registry_.formatters[DeliveryChannel.TELEGRAM], TelegramFormatter,
+        )
+        assert built == [{"token": "123456:unit-test-token"}]
 
 
 class TestFormatDeepLink:
@@ -435,18 +465,23 @@ class TestCloseFormatters:
             async def close(self) -> None:
                 self.closed = True
 
+        # R-0: the Bot used to live in a module-level _bot; it now lives
+        # in the built registry. Same property, new home.
         fake_bot = SimpleNamespace(session=_FakeSession())
-        formatters_module._bot = fake_bot  # simulate real-mode init
+        formatters_module._registry = ChannelRegistry(
+            formatters={}, bot=fake_bot,  # type: ignore[arg-type]
+        )
         try:
             await close_formatters()
         finally:
-            formatters_module._bot = None
+            formatters_module._registry = None
 
         assert fake_bot.session.closed is True
-        assert formatters_module._bot is None
+        assert formatters_module._registry is None
 
     async def test_noop_when_nothing_initialized(self) -> None:
-        """Stub mode: close is a harmless reset."""
+        """Nothing built (no registry, or no channel holding a Bot):
+        close is a harmless reset."""
         await close_formatters()
 
 

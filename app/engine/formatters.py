@@ -9,8 +9,11 @@
 #                        recipient) -> bool; raises PermanentDeliveryError
 #                        for non-retryable failures; transient failures
 #                        raise ordinary exceptions (service retries).
-#   StubFormatter     -- logs and succeeds; used for unconfigured
-#                        channels and in CHANNELS_MODE=stub.
+#   InAppFormatter    -- in_app delivery: the delivery row IS the
+#                        inbox entry, nothing leaves the process.
+#   UnavailableChannelFormatter
+#                     -- a channel this deploy does not have; every
+#                        delivery fails PERMANENTLY and loudly.
 #   TelegramFormatter -- aiogram Bot.send_message.
 #
 # TELEGRAM (merged):
@@ -32,25 +35,36 @@
 #   - Credentials come from recipient columns (telegram_id, locale),
 #     not from a product User (de-domainization).
 #
-# CHANNELS_MODE:
-#   settings.channels_mode == "stub" -> get_formatter returns the stub
-#   for EVERY channel regardless of configured credentials. Tests and
-#   CI run in this mode; nothing leaves the process.
+# REGISTRY (app/core/channels.py holds the rule):
+#   build_formatters() maps EVERY DeliveryChannel to a formatter: live
+#   channels to their implementation, every other channel to
+#   UnavailableChannelFormatter. There is no fallback to a succeeding
+#   stub anywhere: a requested channel that the deploy does not have is
+#   a lost notification, and it must be a FAILED delivery, not a quiet
+#   success. The refusal is raised by the formatter's deliver() -- the
+#   service catches PermanentDeliveryError per delivery, so neighbours
+#   in the same pass are unaffected (get_formatter itself never raises
+#   for a known channel).
+#   The worker builds the registry AT STARTUP (init_formatters), so a
+#   failure to build kills the worker before its loop, never on the
+#   first delivery.
 #
-# EMAIL / PUSH / IN_APP:
-#   Stubs in Phase 1. cbshome's EmailFormatter (SMTP+Mailgun) was NOT
-#   ported -- it drags core/email.py and per-product mail config; it
-#   returns with the profile work in later phases.
+# EMAIL / PUSH:
+#   Not implemented -> absent on every deploy (not_implemented in the
+#   startup channel map).
 # =============================================================================
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from html import escape
 from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
 
 from app.audience.models import Recipient
-from app.core.config import settings
+from app.core.channels import ChannelState, channel_env_keys, evaluate_channels
+from app.core.config import Settings, settings
 from app.engine.constants import DeliveryChannel
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.template_engine import render, resolve_flag
@@ -110,11 +124,13 @@ class ChannelFormatter(Protocol):
         ...
 
 
-class StubFormatter:
-    """Stub formatter -- logs delivery and always succeeds.
+class InAppFormatter:
+    """in_app delivery -- the delivery row IS the inbox entry.
 
-    Used in CHANNELS_MODE=stub and for channels without real
-    implementations or credentials.
+    The inbox reads in_app deliveries with status sent (app/api/
+    inbox.py), so succeeding here is the whole delivery: nothing leaves
+    the process and there is nothing to configure (in_app declares no
+    keys, app/core/channels.py).
     """
 
     async def deliver(
@@ -123,9 +139,9 @@ class StubFormatter:
         delivery: NotificationDelivery,
         recipient: Recipient,
     ) -> bool:
-        """Log the delivery attempt and return True."""
+        """Log the delivery and return True -- the row is the inbox."""
         logger.info(
-            "stub_delivery",
+            "in_app_delivery",
             notification_id=str(notification.id),
             delivery_id=str(delivery.id),
             channel=delivery.channel,
@@ -133,6 +149,40 @@ class StubFormatter:
             title=notification.title,
         )
         return True
+
+
+class UnavailableChannelFormatter:
+    """A channel this deploy does not have -- every delivery FAILS.
+
+    Not configured (its key set is empty) or not implemented: either
+    way the channel will not appear between attempts, so the failure is
+    permanent (PermanentDeliveryError -> immediate FAILED, no attempt
+    increment, no retry).
+    """
+
+    def __init__(self, channel: str, reason: str) -> None:
+        """Remember which channel and why it is unavailable."""
+        self._channel = channel
+        self._reason = reason
+
+    async def deliver(
+        self,
+        notification: Notification,
+        delivery: NotificationDelivery,
+        recipient: Recipient,
+    ) -> bool:
+        """Refuse loudly: log at error level, raise permanent failure."""
+        logger.error(
+            "delivery_channel_unavailable",
+            notification_id=str(notification.id),
+            delivery_id=str(delivery.id),
+            channel=self._channel,
+            reason=self._reason,
+        )
+        raise PermanentDeliveryError(
+            f"channel '{self._channel}' is not available on this "
+            f"deploy: {self._reason}"
+        )
 
 
 # ===================================================================
@@ -495,95 +545,151 @@ def build_variables(notification: Notification) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Formatter registry + lazy init (cbshome pattern + CHANNELS_MODE gate)
+# Formatter registry (app/core/channels.py decides; built at startup)
 # ---------------------------------------------------------------------------
 
-_stub = StubFormatter()
-_initialized = False
 
-# Real aiogram Bot created by _init_formatters -- kept so its aiohttp
-# session can be closed on shutdown (review 1.1: unclosed session).
-_bot: "Bot | None" = None
+@dataclass
+class ChannelRegistry:
+    """One formatter per DeliveryChannel, plus the Bot to close."""
 
-_FORMATTERS: dict[str, ChannelFormatter] = {
-    DeliveryChannel.TELEGRAM: _stub,
-    DeliveryChannel.EMAIL: _stub,
-    DeliveryChannel.PUSH: _stub,
-    DeliveryChannel.IN_APP: _stub,
+    formatters: dict[str, ChannelFormatter]
+    # Real aiogram Bot, kept so its aiohttp session can be closed on
+    # shutdown (review 1.1: unclosed session).
+    bot: "Bot | None" = None
+
+
+BotFactory = Callable[..., "Bot"]
+
+
+def channel_map(source: Settings) -> dict[str, str]:
+    """State of EVERY DeliveryChannel on this deploy (the startup log).
+
+    live / not_configured (implemented, key set empty) /
+    not_implemented. Only ever called on validated settings, so a
+    broken key set cannot reach here -- startup was refused before.
+    """
+    states, _ = evaluate_channels({
+        key: getattr(source, key.lower()) for key in channel_env_keys()
+    })
+    return {
+        channel.value: states.get(
+            channel.value, ChannelState.NOT_IMPLEMENTED,
+        ).value
+        for channel in DeliveryChannel
+    }
+
+
+def _build_in_app(
+    source: Settings, bot_factory: BotFactory,
+) -> tuple[ChannelFormatter, "Bot | None"]:
+    return InAppFormatter(), None
+
+
+def _build_telegram(
+    source: Settings, bot_factory: BotFactory,
+) -> tuple[ChannelFormatter, "Bot | None"]:
+    bot = bot_factory(token=source.telegram_bot_token)
+    return (
+        TelegramFormatter(bot=bot, bot_url=source.telegram_bot_url),
+        bot,
+    )
+
+
+# One builder per implemented channel (app/core/channels.py
+# CHANNEL_SPECS) -- pinned by a test in both directions.
+_BUILDERS: dict[
+    str,
+    Callable[[Settings, BotFactory], tuple[ChannelFormatter, "Bot | None"]],
+] = {
+    DeliveryChannel.IN_APP: _build_in_app,
+    DeliveryChannel.TELEGRAM: _build_telegram,
+}
+
+_UNAVAILABLE_REASONS = {
+    ChannelState.NOT_CONFIGURED.value: (
+        "not configured (every key of the channel is empty)"
+    ),
+    ChannelState.NOT_IMPLEMENTED.value: "not implemented in this service",
 }
 
 
-def _init_formatters() -> None:
-    """Initialize real formatters based on config values.
+def build_formatters(
+    source: Settings, bot_factory: BotFactory,
+) -> ChannelRegistry:
+    """Build the formatter of every channel from validated settings.
 
-    Called once on first get_formatter() call in CHANNELS_MODE=real.
-    Uses StubFormatter when credentials are not configured.
+    Pure apart from constructing the Bot: no logging, no globals. Tests
+    pass a full key set and a fake bot factory to get a live channel
+    without the network.
     """
-    global _bot, _initialized
-
-    # -- Telegram --
-    token = settings.telegram_bot_token
-    if token:
-        try:
-            from aiogram import Bot
-
-            bot = Bot(token=token)
-            _bot = bot
-            _FORMATTERS[DeliveryChannel.TELEGRAM] = TelegramFormatter(
-                bot=bot,
-                bot_url=settings.telegram_bot_url,
+    formatters: dict[str, ChannelFormatter] = {}
+    bot: Bot | None = None
+    for channel, state in channel_map(source).items():
+        if state == ChannelState.LIVE:
+            formatter, built_bot = _BUILDERS[channel](source, bot_factory)
+            formatters[channel] = formatter
+            bot = built_bot or bot
+        else:
+            formatters[channel] = UnavailableChannelFormatter(
+                channel, _UNAVAILABLE_REASONS[state],
             )
-            logger.info("telegram_formatter_initialized")
-        except Exception:
-            logger.exception("telegram_formatter_init_failed")
-    else:
-        logger.info("telegram_formatter_stub", reason="no bot token")
+    return ChannelRegistry(formatters=formatters, bot=bot)
 
-    # -- Email / Push / In-app: stubs in Phase 1 --
 
-    _initialized = True
+_registry: ChannelRegistry | None = None
+
+
+def _real_bot_factory(**kwargs: Any) -> "Bot":
+    from aiogram import Bot
+
+    return Bot(**kwargs)
+
+
+def init_formatters() -> ChannelRegistry:
+    """Build this process's registry once (worker startup).
+
+    Idempotent: a second call returns the registry already built. No
+    exception is caught here -- a registry that cannot be built must
+    stop the process that needs it, never degrade a channel.
+    """
+    global _registry
+    if _registry is None:
+        _registry = build_formatters(settings, _real_bot_factory)
+        logger.info("channel_formatters_built", channels=channel_map(settings))
+    return _registry
 
 
 def get_formatter(channel: str) -> ChannelFormatter:
     """Get the formatter for a delivery channel.
 
-    In CHANNELS_MODE=stub every channel resolves to the stub -- nothing
-    is ever sent (tests / CI). In "real" mode, formatters are lazily
-    initialized on first call; unknown channels fall back to the stub.
+    Builds the registry on first use when the process has not built it
+    yet (the worker builds it at startup). Every DeliveryChannel has an
+    entry -- live or unavailable; there is no fallback.
     """
-    if settings.channels_mode == "stub":
-        return _stub
-
-    global _initialized
-    if not _initialized:
-        _init_formatters()
-    return _FORMATTERS.get(channel, _stub)
+    return init_formatters().formatters[channel]
 
 
 def reset_formatters() -> None:
-    """Reset lazy-initialized formatters to stubs (tests).
+    """Forget the built registry (tests); the next use rebuilds it.
 
     Does NOT close a live Bot session -- use close_formatters() on a
     real shutdown path.
     """
-    global _initialized
-    _initialized = False
-    for channel in _FORMATTERS:
-        _FORMATTERS[channel] = _stub
+    global _registry
+    _registry = None
 
 
 async def close_formatters() -> None:
-    """Close network resources held by real formatters, then reset.
+    """Close network resources held by the registry, then forget it.
 
-    Called on worker/API shutdown. Safe to call when nothing was
-    initialized (stub mode): no-op apart from the reset.
+    Called on worker/API shutdown. Safe when nothing was built, or when
+    no channel holds a Bot: no-op apart from the reset.
     """
-    global _bot
-    if _bot is not None:
+    if _registry is not None and _registry.bot is not None:
         try:
-            await _bot.session.close()
+            await _registry.bot.session.close()
             logger.info("telegram_bot_session_closed")
         except Exception:
             logger.exception("telegram_bot_session_close_failed")
-        _bot = None
     reset_formatters()

@@ -37,7 +37,7 @@ from app.api.recipients import router as recipients_router
 from app.core.config import APP_VERSION, settings
 from app.core.database import dispose_engine, get_engine
 from app.core.logging import setup_logging
-from app.engine.formatters import close_formatters
+from app.engine.formatters import channel_map, close_formatters
 from app.profile.loader import install_profile_from_settings
 
 logger = structlog.get_logger()
@@ -54,20 +54,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logging()
     install_profile_from_settings()
     if not settings.comms_service_token:
-        # Only reachable in stub mode: real mode refuses to start
-        # without the token (app/core/config.py). Loud on purpose --
-        # an open "internal" API must be a visible choice, not a
+        # Only reachable in development: any other APP_ENV refuses to
+        # start without the token (app/core/config.py). Loud on purpose
+        # -- an open "internal" API must be a visible choice, not a
         # silent default.
         logger.warning(
             "service_auth_disabled",
             reason="COMMS_SERVICE_TOKEN is empty",
-            channels_mode=settings.channels_mode,
+            env=settings.app_env,
         )
+    # The channel map is the operator's view of the channel rule
+    # (app/core/channels.py): live / not_configured / not_implemented.
     logger.info(
         "comms_started",
         version=APP_VERSION,
         env=settings.app_env,
-        channels_mode=settings.channels_mode,
+        channels=channel_map(settings),
     )
     yield
     await close_formatters()

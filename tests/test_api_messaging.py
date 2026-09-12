@@ -1,7 +1,8 @@
 # =============================================================================
 # COMMS Service -- messaging API tests (Phase 4c item 3)
 # =============================================================================
-# End-to-end through the ASGI transport (auth is no-op in stub mode).
+# End-to-end through the ASGI transport (auth is off in the suite --
+# the autouse api_auth_disabled fixture in conftest).
 # Actor ids (client/sender/operator/participant) are seeded recipients
 # because the domain FKs are real; the API itself trusts them.
 # =============================================================================
