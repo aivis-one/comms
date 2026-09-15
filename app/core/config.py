@@ -22,6 +22,7 @@
 #   (recipient locale -> default_locale -> stored title/body).
 # =============================================================================
 
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError, model_validator
@@ -242,6 +243,50 @@ class Settings(BaseSettings):
         return self.app_env == "development"
 
     # -- Validation --
+
+    @model_validator(mode="before")
+    @classmethod
+    def _empty_defaulted_key_means_unwritten(cls, values: Any) -> Any:
+        """An empty DEFAULTED channel key reads as a key nobody wrote.
+
+        THE RULE, stated once for every defaulted key there will ever
+        be: such a key has no empty state. "Unset" and "set to the
+        default" are indistinguishable by construction -- which is
+        exactly why these keys are kept out of the set that decides a
+        channel (app/core/channels.py) -- so an empty value cannot mean
+        anything other than "not written". The keys come from that same
+        registry, so a defaulted key added later obeys the rule without
+        anyone remembering to; each is a field of this class under its
+        lower-case name (pinned by a test).
+
+        WHY HERE AND NOT IN evaluate_channels: that function already
+        treats an empty defaulted value as absent and passes it without
+        a complaint. Its verdict was never the problem -- the VALUE
+        was. `EMAIL_MAILGUN_REGION=` in a deploy's env makes
+        pydantic-settings store "" (the key even lands in
+        model_fields_set), startup is allowed, and the empty string
+        then reaches the region -> base-address lookup below as a bare
+        KeyError inside the WORKER, while the API -- which never reads
+        the region -- keeps reporting the channel live. Dropping the
+        key here instead lets pydantic apply the declared default
+        through its own machinery, so model_fields_set stays truthful
+        for whoever later builds logic on "was this spelled out".
+
+        WHITESPACE IS NOT EMPTY: "   " was written, and it still
+        refuses startup naming the key (app/core/channels.py). And only
+        the keys of channel_optional_keys() are normalized: other
+        defaulted fields of this class mean something else when emptied
+        (an empty LOG_LEVEL is a refusal today), and turning an
+        existing refusal into an acceptance is a different question
+        from this one.
+        """
+        if not isinstance(values, dict):
+            return values
+        normalized = dict(values)
+        for key in channel_optional_keys():
+            if normalized.get(key.lower()) == "":
+                del normalized[key.lower()]
+        return normalized
 
     @model_validator(mode="after")
     def _apply_env_defaults_and_validate(self) -> "Settings":

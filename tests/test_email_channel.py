@@ -35,7 +35,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
-from app.core.channels import EMAIL_REGIONS, ChannelState, evaluate_channels
+from app.core.channels import (
+    EMAIL_REGIONS,
+    ChannelState,
+    channel_optional_keys,
+    evaluate_channels,
+)
 from app.core.config import _EMAIL_API_BASE_URLS, Settings
 from app.engine.constants import (
     DeliveryChannel,
@@ -277,6 +282,70 @@ class TestRegionIsDefaultedNotDeciding:
     def test_unknown_region_refuses_startup(self, region: str) -> None:
         with pytest.raises(ValueError, match="EMAIL_MAILGUN_REGION"):
             _settings(email_mailgun_region=region)
+
+    def test_an_empty_region_means_the_default(self) -> None:
+        """A defaulted key has no empty state, so an empty value is a
+        key nobody wrote -- not a value and not a typo.
+
+        This is why the empty string is NOT in the refusal list above
+        (it was the one shape that list never carried): after the rule
+        it is a default, and a test that expected a refusal would pin
+        the opposite of the intended behaviour.
+        """
+        source = _settings(email_mailgun_region="")
+        assert source.email_mailgun_region == _settings().email_mailgun_region
+        # The pair to "startup was not refused": the value that came
+        # out is a real region and it resolves. Without it this test
+        # would also pass on a field that stayed empty.
+        assert source.email_mailgun_region in EMAIL_REGIONS
+        assert source.email_api_base_url == _EMAIL_API_BASE_URLS[
+            source.email_mailgun_region
+        ]
+
+    def test_an_empty_region_in_the_environment_means_the_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The shape the defect actually had: the key spelled out in
+        the env with nothing after the '='. pydantic-settings stores
+        that as "" instead of falling back to the default -- a
+        constructor argument travels the same path afterwards, but only
+        this test reproduces what an integrator writes when they
+        uncomment a line and clear its value.
+
+        Before the rule, the empty value survived into the field and
+        the region -> base-address lookup raised a bare KeyError in the
+        WORKER, while the API -- which never reads the region -- kept
+        reporting the channel live.
+        """
+        monkeypatch.setenv("EMAIL_MAILGUN_REGION", "")
+        source = _settings()
+        assert source.email_mailgun_region in EMAIL_REGIONS
+        assert source.email_api_base_url == _EMAIL_API_BASE_URLS[
+            source.email_mailgun_region
+        ]
+
+    def test_a_whitespace_region_still_refuses_startup(self) -> None:
+        """"Empty means unwritten" is about what was NOT written. A
+        space WAS written, and reading it as the default would swallow
+        an integrator's typo instead of naming it.
+        """
+        with pytest.raises(ValueError, match="EMAIL_MAILGUN_REGION"):
+            _settings(email_mailgun_region="   ")
+
+    @pytest.mark.parametrize("key", channel_optional_keys())
+    def test_every_defaulted_key_reads_empty_as_unwritten(
+        self, key: str,
+    ) -> None:
+        """One rule, not a patch for the region: whichever defaulted
+        key a channel declares next is carried by the same
+        normalization, because the list it walks IS this registry.
+        """
+        name = key.lower()
+        assert getattr(_settings(**{name: ""}), name) == getattr(
+            _settings(), name,
+        )
+        # The pair: "the two agree" says nothing if both are "".
+        assert getattr(_settings(), name) != ""
 
     def test_unknown_region_refuses_even_without_the_channel(self) -> None:
         """A typo in a defaulted value on a deploy that has NO email is
@@ -777,13 +846,59 @@ class TestRecipientAddress:
 
     @pytest.mark.parametrize(
         "value",
-        ["not-an-address", "@example.test", "user@", "a b@example.test"],
+        [
+            "not-an-address",
+            "@example.test",
+            "user@",
+            "a b@example.test",
+            # LIST SEPARATORS. These four are not broken addresses at
+            # all -- the provider parses `to` as a list, so one value
+            # from one product's snapshot becomes TWO addressees, and
+            # the body of a confirmation message opens with a one-time
+            # code. Three shapes of the same defect: a plain pair, the
+            # same address twice (a repeat is still two recipients),
+            # and a separator with nothing on one side of it.
+            "victim@example.test,attacker@evil.test",
+            "victim@example.test;attacker@evil.test",
+            "victim@example.test,victim@example.test",
+            "victim@example.test,",
+            ",attacker@evil.test",
+            "victim@example.test;",
+        ],
     )
     async def test_broken_address_is_terminal(self, value: str) -> None:
+        """Nothing this gate rejects is ever retried, and nothing it
+        rejects reaches the provider.
+
+        The separator values were added with the rule that rejects
+        them: before it they passed this gate and the message went to
+        both addressees.
+        """
         provider = _Provider()
         with pytest.raises(PermanentDeliveryError):
             await _send(provider, recipient=_recipient(email=value))
         assert provider.requests == []
+
+    @pytest.mark.parametrize("value", ["a@b@c", "nodot@localhost"])
+    async def test_a_merely_malformed_address_still_reaches_the_provider(
+        self, value: str,
+    ) -> None:
+        """THE PAIR to the separator cases above, and the reason both
+        halves live in one test.
+
+        The tidy-looking fix for separators is to reuse _address_shape
+        (app/core/channels.py) -- it would pass every separator case
+        while quietly taking two AGREED behaviours with it, because it
+        also demands exactly one @ and a dot in the domain. Each half
+        here catches one of those two extra rules: a double @ is the
+        provider's judgement (it lands in the 400 class, costing one
+        message and nobody's privacy), and a dotless domain is legal in
+        a private deploy. Apart, each half lets half of the wrong fix
+        through.
+        """
+        provider = _Provider()
+        assert await _send(provider, recipient=_recipient(email=value))
+        assert provider.fields()["to"] == value
 
     async def test_the_refusal_does_not_echo_the_address(self) -> None:
         """An address is personal data even when it is unusable: the

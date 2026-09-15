@@ -104,7 +104,21 @@ async def _db_ok() -> bool:
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """Health check -- always returns 200, reports DB status."""
+    """Health check -- always returns 200, reports DB and channels.
+
+    THE CHANNEL MAP IS HERE AS WELL AS IN THE STARTUP LOG, and it is
+    the same map (channel_map): deploy/INTEGRATION.md asks the operator
+    to compare what the deploy has against what the installer meant to
+    give it, and a detector reachable only by grepping a container's
+    log is half a detector. One map in two places, never a second
+    vocabulary for the same three states.
+
+    STATES ONLY, NEVER A KEY VALUE: this endpoint carries no
+    authentication on purpose (installer and docker healthchecks hold
+    no secret), so what it may say about a channel is that the deploy
+    has it, lacks it, or has no implementation of it -- and nothing
+    about what was configured.
+    """
     db_ok = await _db_ok()
     return JSONResponse(
         status_code=200,
@@ -112,6 +126,7 @@ async def health() -> JSONResponse:
             "status": "ok" if db_ok else "degraded",
             "db": "ok" if db_ok else "error",
             "version": APP_VERSION,
+            "channels": channel_map(settings),
         },
     )
 

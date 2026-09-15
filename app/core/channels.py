@@ -330,9 +330,10 @@ def evaluate_channels(
             #   3. Backlog ref: none -- the case became visible in the
             #      same change that introduced its detector (item 4),
             #      and no automatic detection has been requested.
-            #   4. Promotion trigger (observable): the startup channel
-            #      map (`channels` field of the comms_started and
-            #      channel_formatters_built logs) shows a channel as
+            #   4. Promotion trigger (observable): the channel map
+            #      (`channels` field of the comms_started and
+            #      channel_formatters_built logs, and of the GET
+            #      /health body -- app/main.py) shows a channel as
             #      not_configured although its keys were written into
             #      the env. That map IS the detector: the ceiling is
             #      "caught by eye from the first start", not "not

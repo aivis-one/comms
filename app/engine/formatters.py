@@ -60,7 +60,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html import escape
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 
 import structlog
 
@@ -508,6 +508,14 @@ _EMAIL_CONFIG_STATUSES = frozenset({401, 402, 403})
 # SENDER rather than on the recipient -- an unverified domain or a from
 # address outside it kills the channel, not one message, and the status
 # code alone cannot tell the two apart. Lower-cased before matching.
+# The characters a provider splits a RECIPIENT LIST on. The `to` field
+# below carries one address, and the provider parses that field as a
+# list -- so a separator inside a single snapshot value does not make
+# the address invalid, it makes the message go to somebody else as
+# well. See _usable_email_address for why this, and only this, is ours
+# to judge rather than the provider's.
+_EMAIL_LIST_SEPARATORS = (",", ";")
+
 _EMAIL_SENDER_FAULT_MARKERS = (
     "domain not found",
     "domain is not verified",
@@ -740,8 +748,13 @@ class EmailFormatter:
         message: str,
         notification: Notification,
         delivery: NotificationDelivery,
-    ) -> None:
-        """Raise the channel-fault class, loud once and then plain."""
+    ) -> NoReturn:
+        """Raise the channel-fault class, loud once and then plain.
+
+        NoReturn, not None: this never gives control back, and a reader
+        of the caller must not have to walk the body to learn that the
+        branch below it is the not-a-configuration-fault branch.
+        """
         if not self._configuration_reported:
             self._configuration_reported = True
             logger.error(
@@ -778,11 +791,32 @@ class EmailFormatter:
 def _usable_email_address(value: str | None) -> str | None:
     """The recipient's address, or None when it cannot be used.
 
-    Three shapes, all reachable: null (the snapshot contract carries an
-    explicit null for "no value"), the empty string (the ingest
-    validator lets it through untrimmed), and a syntactically broken
-    address. The first two are caught here; a broken one that passes
-    this check is caught by the provider and lands in the 400 class.
+    THE TWO GATES ANSWER DIFFERENT QUESTIONS, and the asymmetry with
+    _address_shape (app/core/channels.py) is deliberate -- a review
+    read the two as copies of one question. The SENDER is ours: we know
+    it completely, it is one value per deploy, and its full form is
+    judged at startup. The RECIPIENT arrives inside a product's
+    snapshot over the bus, and its SYNTAX is the provider's judgement,
+    not ours: reusing _address_shape here would demand a dot in the
+    domain and refuse nodot@localhost -- legal in a private deploy --
+    and would take from the provider what it judges better than we do.
+
+    So this gate keeps exactly what the provider cannot judge for us:
+
+      - no address at all: null (the snapshot contract carries an
+        explicit null for "no value") or blank (the ingest validator
+        lets an untrimmed empty value through);
+      - CR/LF or an inner space: header-injection shapes;
+      - a LIST SEPARATOR (_EMAIL_LIST_SEPARATORS): the provider parses
+        the `to` field as a list, so one snapshot value carrying a
+        comma becomes TWO addressees -- and the body of a confirmation
+        message opens with a one-time code. These change the NUMBER of
+        recipients, not the validity of an address, which is why they
+        are ours and not the provider's.
+
+    A merely MALFORMED address passes on purpose and is judged where it
+    should be: a double @ or a dotless domain reaches the provider and
+    lands in its 400 class, costing one message and nobody's privacy.
     """
     if value is None:
         return None
@@ -792,6 +826,8 @@ def _usable_email_address(value: str | None) -> str | None:
     if "@" not in address or address.startswith("@") or address.endswith("@"):
         return None
     if any(ch in address for ch in ("\r", "\n")) or " " in address:
+        return None
+    if any(ch in address for ch in _EMAIL_LIST_SEPARATORS):
         return None
     return address
 
