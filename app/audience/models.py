@@ -42,7 +42,13 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.constants import MAX_CATEGORY_LEN
+from app.core.constants import (
+    MAX_CATEGORY_LEN,
+    MAX_EMAIL_LEN,
+    MAX_GROUP_KEY_LEN,
+    MAX_LOCALE_LEN,
+    MAX_TIMEZONE_LEN,
+)
 from app.core.database import Base
 from app.core.mixins import TimestampMixin
 
@@ -68,12 +74,12 @@ class Recipient(TimestampMixin, Base):
     )
 
     email: Mapped[str | None] = mapped_column(
-        String(320),
+        String(MAX_EMAIL_LEN),
         nullable=True,
     )
 
     locale: Mapped[str] = mapped_column(
-        String(8),
+        String(MAX_LOCALE_LEN),
         nullable=False,
         default="en",
         server_default="en",
@@ -93,7 +99,7 @@ class Recipient(TimestampMixin, Base):
     # locale. Nullable: falls back to settings.default_timezone when
     # the product does not track it.
     timezone: Mapped[str | None] = mapped_column(
-        String(64),
+        String(MAX_TIMEZONE_LEN),
         nullable=True,
     )
 
@@ -139,7 +145,7 @@ class GroupMembership(Base):
     __tablename__ = "group_memberships"
 
     group_key: Mapped[str] = mapped_column(
-        String(100),
+        String(MAX_GROUP_KEY_LEN),
         primary_key=True,
     )
 

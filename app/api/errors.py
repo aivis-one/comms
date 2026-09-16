@@ -14,19 +14,36 @@
 #                            status, so the client sees ONE status for
 #                            "your input is wrong" regardless of which
 #                            layer caught it)
+#   DBAPIError      -> 500  (the safety net, R-2 item 5 -- see below)
 #
 # Exception messages are written by our own service layer and carry no
 # secrets (credentials are sanitized at the formatter boundary), so
-# they are safe to return verbatim in `detail`.
+# they are safe to return verbatim in `detail`. The database's are NOT,
+# which is exactly why the last handler does not pass its own through.
 # =============================================================================
 
+import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
 
 from app.core.exceptions import (
     AuthorizationError,
     NotFoundError,
     ValidationError,
+)
+
+logger = structlog.get_logger()
+
+# What the caller is told when a database error reaches this level.
+# FIXED TEXT, carrying nothing from the exception: a DBAPIError's
+# string is the failed SQL plus its bound parameters -- table and
+# column names, and whatever the caller sent us. /api is internal, but
+# "internal" is a network fact, not a reason to hand a product our
+# schema and its own payload back in an error body.
+_DB_FAILURE_DETAIL = (
+    "The service could not complete the request. "
+    "The failure has been logged."
 )
 
 
@@ -62,4 +79,37 @@ def register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=422,
             content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(DBAPIError)
+    async def _database_failure(
+        request: Request, exc: DBAPIError
+    ) -> JSONResponse:
+        """A database error that reached the edge: 500, and loud.
+
+        A SAFETY NET, NOT A SUBSTITUTE FOR BOUNDS. Every input this
+        release could name is bounded in its model, where an oversized
+        value is a 422 the caller can act on. Whatever still arrives
+        here is by definition something we did not foresee, so it is
+        OUR defect, not the caller's -- which is why it is a 500 and
+        not a 422: a 422 would send a product to fix input that may be
+        perfectly correct.
+
+        AND IT IS LOGGED WITH THE TRACEBACK. A net that swallows
+        quietly is worse than no net: the response would be clean, the
+        service would look healthy, and the defect would be invisible
+        until someone happened to reproduce it. exc_info carries the
+        original error -- SQL, parameters and all -- to the one place
+        that is ours, while the body carries none of it.
+        """
+        logger.error(
+            "database_error_at_api_edge",
+            path=request.url.path,
+            method=request.method,
+            error_type=type(exc).__name__,
+            exc_info=exc,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": _DB_FAILURE_DETAIL},
         )

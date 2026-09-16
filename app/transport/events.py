@@ -117,8 +117,14 @@ from uuid import UUID
 
 from app.core.constants import (
     MAX_BODY_LEN,
+    MAX_EMAIL_LEN,
+    MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_LOCALE_LEN,
+    MAX_TELEGRAM_ID,
+    MAX_TIMEZONE_LEN,
     MAX_TITLE_LEN,
+    MIN_TELEGRAM_ID,
 )
 from app.core.exceptions import ValidationError
 from app.engine.constants import TargetType
@@ -146,8 +152,15 @@ KNOWN_EVENTS = frozenset({
 
 _SCALAR_TYPES = (str, int, float, bool, type(None))
 
-# group_memberships.group_key is String(200); mirror at the boundary.
-_MAX_GROUP_KEY_LEN = 200
+# The boundary mirrors the COLUMN, and does so by reading the column's
+# own constant rather than by repeating its number (R-2 item 1). The
+# previous local constant here said 200 and its comment claimed the
+# column was String(200); the column is MAX_GROUP_KEY_LEN, and a key
+# between the two passed this parser and died on the INSERT -- six
+# retries and a DLQ entry for what is a naming error in one field. A
+# number copied by hand is a number that drifts; the comment that
+# justified the copy outlived the value it justified.
+_MAX_GROUP_KEY_LEN = MAX_GROUP_KEY_LEN
 
 # sections.key is String(MAX_SECTION_KEY_LEN); mirror at the boundary so
 # an over-long key is a terminal validation error here rather than a
@@ -254,12 +267,26 @@ def _string(value: Any, field: str, event: str, *, max_len: int) -> str:
     return value
 
 
-def _optional_string(value: Any, field: str, event: str) -> str | None:
+def _optional_string(
+    value: Any, field: str, event: str, *, max_len: int,
+) -> str | None:
+    """A nullable string, bounded like its column.
+
+    max_len is REQUIRED, not defaulted: a nullable field is still a
+    field with a column behind it, and the two values that used to
+    arrive here unbounded (email, timezone) reached the INSERT and came
+    back as a database error. An optional value is optional, not
+    unmeasured.
+    """
     if value is None:
         return None
     if not isinstance(value, str):
         raise ValidationError(
             f"{event}: field {field!r} must be a string or null"
+        )
+    if len(value) > max_len:
+        raise ValidationError(
+            f"{event}: field {field!r} exceeds {max_len} characters"
         )
     return value
 
@@ -272,12 +299,30 @@ def _bool(value: Any, field: str, event: str) -> bool:
     return value
 
 
-def _int(value: Any, field: str, event: str) -> int:
+def _int(
+    value: Any,
+    field: str,
+    event: str,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
     # bool is an int subclass -- reject it explicitly: "priority":
     # true is a producer bug, not priority 1.
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValidationError(
             f"{event}: field {field!r} must be an integer"
+        )
+    # The range, where given, is the COLUMN's range: an integer outside
+    # it is not a large value, it is a broken one, and unbounded it
+    # reaches the INSERT.
+    if minimum is not None and value < minimum:
+        raise ValidationError(
+            f"{event}: field {field!r} is below {minimum}"
+        )
+    if maximum is not None and value > maximum:
+        raise ValidationError(
+            f"{event}: field {field!r} exceeds {maximum}"
         )
     return value
 
@@ -569,16 +614,27 @@ def _parse_user_upserted(data: dict[str, Any]) -> UserUpserted:
     telegram_id = (
         None
         if telegram_id_raw is None
-        else _int(telegram_id_raw, "telegram_id", event)
+        else _int(
+            telegram_id_raw, "telegram_id", event,
+            minimum=MIN_TELEGRAM_ID, maximum=MAX_TELEGRAM_ID,
+        )
     )
     email = _optional_string(
         _require(data, "email", event), "email", event,
+        max_len=MAX_EMAIL_LEN,
     )
+    # Every width here is the column's own constant. locale used to say
+    # 20 against a column of MAX_LOCALE_LEN: values in between were
+    # accepted by this parser and refused by the database. Nothing that
+    # WORKED stops working -- only the FORM of the refusal changes,
+    # from a retried database error to a terminal, named one.
     locale = _string(
-        _require(data, "locale", event), "locale", event, max_len=20,
+        _require(data, "locale", event), "locale", event,
+        max_len=MAX_LOCALE_LEN,
     )
     timezone = _optional_string(
         _require(data, "timezone", event), "timezone", event,
+        max_len=MAX_TIMEZONE_LEN,
     )
     active = _bool(_require(data, "active", event), "active", event)
 

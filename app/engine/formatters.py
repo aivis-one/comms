@@ -508,14 +508,6 @@ _EMAIL_CONFIG_STATUSES = frozenset({401, 402, 403})
 # SENDER rather than on the recipient -- an unverified domain or a from
 # address outside it kills the channel, not one message, and the status
 # code alone cannot tell the two apart. Lower-cased before matching.
-# The characters a provider splits a RECIPIENT LIST on. The `to` field
-# below carries one address, and the provider parses that field as a
-# list -- so a separator inside a single snapshot value does not make
-# the address invalid, it makes the message go to somebody else as
-# well. See _usable_email_address for why this, and only this, is ours
-# to judge rather than the provider's.
-_EMAIL_LIST_SEPARATORS = (",", ";")
-
 _EMAIL_SENDER_FAULT_MARKERS = (
     "domain not found",
     "domain is not verified",
@@ -525,6 +517,14 @@ _EMAIL_SENDER_FAULT_MARKERS = (
     "from address",
     "invalid domain",
 )
+
+# The characters a provider splits a RECIPIENT LIST on. The `to` field
+# below carries one address, and the provider parses that field as a
+# list -- so a separator inside a single snapshot value does not make
+# the address invalid, it makes the message go to somebody else as
+# well. See _usable_email_address for why this, and only this, is ours
+# to judge rather than the provider's.
+_EMAIL_LIST_SEPARATORS = (",", ";")
 
 
 class EmailFormatter:

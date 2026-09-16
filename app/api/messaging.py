@@ -94,7 +94,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_service_auth
@@ -105,8 +105,14 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.messaging.constants import (
+    MAX_MESSAGE_BODY_LEN,
     MAX_SECTION_KEY_LEN,
     MAX_SECTION_LABEL_LEN,
+    MAX_SUBJECT_ID_LEN,
+    MAX_SUBJECT_TYPE_LEN,
+    MAX_THREAD_PRIORITY,
+    MAX_THREAD_TITLE_LEN,
+    MIN_THREAD_PRIORITY,
     OperatorKind,
     ThreadKind,
     ThreadStatus,
@@ -241,15 +247,40 @@ def _message_out(message: Message) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Request bodies
 # ---------------------------------------------------------------------------
+# THE RULE FOR EVERY BODY BELOW (R-2 items 2, 3, 6), generalized from
+# SectionIn, which carried it alone:
+#
+#   1. Every field with a column behind it is bounded by that COLUMN's
+#      constant, so an over-long value is a 422 AT THE EDGE rather
+#      than a database error mid-transaction. Before this, a 5001-
+#      character message body, a 600-character title or a priority
+#      past the Integer range all passed the model and came back to
+#      the caller as a 500 -- which tells an integrator the service
+#      broke, on input only they can fix.
+#   2. extra="forbid" everywhere. A misspelled field used to be
+#      accepted and dropped: the product got a 200 for a value that
+#      went nowhere. Silence is the worse failure -- the same reason
+#      already written into RecipientSnapshot and PreferencesPatch.
+#   3. min_length is for fields whose emptiness is meaningless, NOT
+#      for every string: a section nobody can name, a message nobody
+#      can read. An empty title is simply a thread without a title.
 class ThreadCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     client: UUID
     operator_kind: OperatorKind
     operator_value: UUID
     kind: ThreadKind
-    subject_type: str | None = None
-    subject_id: str | None = None
-    title: str | None = None
-    priority: int | None = None
+    subject_type: str | None = Field(
+        default=None, max_length=MAX_SUBJECT_TYPE_LEN,
+    )
+    subject_id: str | None = Field(
+        default=None, max_length=MAX_SUBJECT_ID_LEN,
+    )
+    title: str | None = Field(default=None, max_length=MAX_THREAD_TITLE_LEN)
+    priority: int | None = Field(
+        default=None, ge=MIN_THREAD_PRIORITY, le=MAX_THREAD_PRIORITY,
+    )
 
 
 class SectionIn(BaseModel):
@@ -258,37 +289,73 @@ class SectionIn(BaseModel):
     # edge, not a database error mid-transaction. min_length=1 makes
     # an empty string a rejection rather than a section nobody can
     # name -- the column is NOT NULL but "" would satisfy it.
+    model_config = ConfigDict(extra="forbid")
+
     key: str = Field(min_length=1, max_length=MAX_SECTION_KEY_LEN)
     label: str = Field(min_length=1, max_length=MAX_SECTION_LABEL_LEN)
 
 
 class MessageIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     sender: UUID
-    body: str
+    body: str = Field(min_length=1, max_length=MAX_MESSAGE_BODY_LEN)
+
+    @field_validator("body")
+    @classmethod
+    def _not_only_whitespace(cls, value: str) -> str:
+        """A body of spaces is a message nobody can read.
+
+        min_length=1 alone would let "   " through, and it lands as a
+        real row in a real feed: the other side is notified, the thread
+        is bumped to the top, and there is nothing to see. Rejected,
+        not trimmed -- silently editing a person's message is a
+        separate decision, and leading whitespace can be meant (an
+        indented snippet).
+        """
+        if not value.strip():
+            raise ValueError(
+                "body must contain at least one non-whitespace character"
+            )
+        return value
 
 
 class ClaimIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     operator: UUID
 
 
 class StatusIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     operator: UUID
     status: ThreadStatus
 
 
 class RetagIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     operator: UUID
     section: UUID
-    subject_type: str | None = None
-    subject_id: str | None = None
+    subject_type: str | None = Field(
+        default=None, max_length=MAX_SUBJECT_TYPE_LEN,
+    )
+    subject_id: str | None = Field(
+        default=None, max_length=MAX_SUBJECT_ID_LEN,
+    )
 
 
 class ReadIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     participant: UUID
     last_read_at: datetime | None = None
 
 
 class UnreadCountsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     participant: UUID
     # max_length is measured on the RAW list, BEFORE the handler
     # de-duplicates it: 120 ids of which 80 are distinct is a 422, not
@@ -576,7 +643,16 @@ async def mark_thread_read(
     monotonic (a past value is a no-op), and a FUTURE value would
     otherwise pre-clear the participant's own badge for messages not
     yet read. Only the caller's own badge is affected either way.
+
+    THE THREAD IS REQUIRED FIRST (R-2 item 4), exactly as it is for
+    posting a message two handlers above: without it a pointer into a
+    thread that does not exist reached the read-state INSERT and came
+    back as a foreign-key violation -- a 500 that tells the product
+    comms is broken when the truth is "no such thread". The other half
+    of the same endpoint -- a participant who is not a recipient -- is
+    checked in mark_read, where that foreign key lives.
     """
+    await _require_thread(session, thread_id)
     now = datetime.now(UTC)
     requested = payload.last_read_at
     if requested is not None and requested.tzinfo is None:

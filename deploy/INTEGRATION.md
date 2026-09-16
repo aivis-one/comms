@@ -177,11 +177,13 @@ visible without going looking for it.
 
 **What the first start tells you.** The `comms_started` log line
 carries a channel map: every channel with `live`, `not_configured` or
-`not_implemented`. That map is the way to confirm that a deploy sees
-the channels its installer meant to give it. One case needs it: a typo
-in *every* key name of a channel (unknown keys are ignored on purpose,
-so that a leftover variable in a shared env file cannot refuse a
-working deploy) leaves the key set empty and therefore reads as "no
+`not_implemented`. The same map is served by `GET /health` under
+`channels`, so confirming it later needs a request rather than a grep
+through a container's log. That map is the way to confirm that a deploy
+sees the channels its installer meant to give it. One case needs it: a
+typo in *every* key name of a channel (unknown keys are ignored on
+purpose, so that a leftover variable in a shared env file cannot refuse
+a working deploy) leaves the key set empty and therefore reads as "no
 such channel". The map shows `not_configured` where the installer
 expected `live`; the in-code marker (`KNOWN CEILING` in
 `app/core/channels.py`) records the case and its agreed fix.

@@ -96,3 +96,12 @@ MAX_THREAD_TITLE_LEN = 500
 # (MAX_BODY_LEN) but kept separate on purpose: coupling messaging's
 # limit to the notification-body limit would be accidental.
 MAX_MESSAGE_BODY_LEN = 5000
+
+# threads.priority -- an opaque product number, Integer column. The
+# bound IS the column's range and nothing narrower: comms does not own
+# the meaning of a product's priority, so a scale of its own (1..10,
+# say) would be a policy invented in passing. Out of range the value is
+# not a big priority, it is a broken one -- and unbounded it reaches
+# the INSERT and returns as a database error.
+MIN_THREAD_PRIORITY = -(2**31)
+MAX_THREAD_PRIORITY = 2**31 - 1

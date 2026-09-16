@@ -48,8 +48,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import LateralFromClause
 
+from app.core.exceptions import NotFoundError
 from app.messaging.models import Message, Thread, ThreadReadState
 from app.messaging.operators import participation_clause
+from app.messaging.threads import _recipient_exists
 
 logger = structlog.get_logger()
 
@@ -64,9 +66,28 @@ async def mark_read(
     """Advance a participant's read pointer to `last_read_at`.
 
     Race-safe and monotonic: the pointer only ever moves forward. See
-    the module header. (thread_id / participant referents are guarded
-    by the table's FKs -- a bad id surfaces as an IntegrityError.)
+    the module header.
+
+    THE PARTICIPANT REFERENT IS CHECKED IN CODE (R-2 item 4). This
+    docstring used to say that both referents were "guarded by the
+    table's FKs -- a bad id surfaces as an IntegrityError", and that
+    was true as a description of the mechanism; what it left out is
+    what an IntegrityError becomes by the time it reaches a product: a
+    500 on ordinary input. The state is ordinary, not exotic -- a
+    product whose synchronous recipient upsert failed and fell back to
+    its outbox has users that exist for it and not yet for comms, and
+    a read pointer for one of them is a plain request. So: a missing
+    recipient is a clean 404, symmetric with how operators.claim
+    validates the assignee referent and how create_or_get_thread
+    validates client / operator. The thread referent is checked by the
+    caller (app/api/messaging.py), with the same helper every other
+    thread write uses.
     """
+    if not await _recipient_exists(session, participant):
+        raise NotFoundError(
+            f"participant recipient {participant} does not exist"
+        )
+
     insert_stmt = pg_insert(ThreadReadState).values(
         thread_id=thread_id,
         participant=participant,

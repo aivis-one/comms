@@ -13,6 +13,11 @@ from uuid import uuid4
 
 import pytest
 
+from app.core.constants import (
+    MAX_GROUP_KEY_LEN,
+    MAX_TELEGRAM_ID,
+    MIN_TELEGRAM_ID,
+)
 from app.core.exceptions import ValidationError
 from app.transport.events import (
     GroupChanged,
@@ -281,6 +286,59 @@ class TestSyncSchemas:
                 "v": 1, "group_key": "g",
                 "recipient_id": str(uuid4()), "member": "yes",
             }))
+
+    @pytest.mark.parametrize("length", [MAX_GROUP_KEY_LEN, 1])
+    def test_group_key_up_to_the_column_width_parses(
+        self, length: int,
+    ) -> None:
+        """The pair to the refusal below: the boundary sits where the
+        column sits, not wherever is convenient."""
+        event = parse_event(_envelope("group_changed", {
+            "v": 1, "group_key": "g" * length,
+            "recipient_id": str(uuid4()), "member": True,
+        }))
+        assert isinstance(event, GroupChanged)
+        assert len(event.group_key) == length
+
+    def test_group_key_past_the_column_width_is_terminal(self) -> None:
+        """This parser used to accept 200 characters against a column
+        of MAX_GROUP_KEY_LEN, with a comment asserting the column was
+        String(200). Anything in between passed here and died on the
+        INSERT -- which the consumer treats as a possibly-transient
+        failure, so it retried six times before the DLQ. Nothing that
+        WORKED changed; the shape of the refusal did.
+        """
+        with pytest.raises(ValidationError, match="group_key"):
+            parse_event(_envelope("group_changed", {
+                "v": 1, "group_key": "g" * (MAX_GROUP_KEY_LEN + 1),
+                "recipient_id": str(uuid4()), "member": True,
+            }))
+
+    @pytest.mark.parametrize(
+        "telegram_id", [MAX_TELEGRAM_ID + 1, MIN_TELEGRAM_ID - 1],
+    )
+    def test_telegram_id_outside_the_column_range_is_terminal(
+        self, telegram_id: int,
+    ) -> None:
+        """Out of the BigInteger range the value is not a large id, it
+        is a broken one -- and unbounded it reached the INSERT."""
+        with pytest.raises(ValidationError, match="telegram_id"):
+            parse_event(_envelope("user_upserted", {
+                "v": 1, "recipient_id": str(uuid4()),
+                "telegram_id": telegram_id, "email": None,
+                "locale": "en", "timezone": None, "active": True,
+            }))
+
+    def test_telegram_id_at_the_edge_of_the_range_parses(self) -> None:
+        """The pair. Parsing only -- nothing is stored, so this costs
+        the shared id band nothing (tests/helpers.py)."""
+        event = parse_event(_envelope("user_upserted", {
+            "v": 1, "recipient_id": str(uuid4()),
+            "telegram_id": MAX_TELEGRAM_ID, "email": None,
+            "locale": "en", "timezone": None, "active": True,
+        }))
+        assert isinstance(event, UserUpserted)
+        assert event.telegram_id == MAX_TELEGRAM_ID
 
 
 class TestReminderCancelSchema:

@@ -23,6 +23,14 @@
 #                        (app/engine/models.py) + ingest validation of
 #                        the notification_request event
 #                        (app/transport/events.py)
+#   MAX_EMAIL_LEN / MAX_LOCALE_LEN / MAX_TIMEZONE_LEN /
+#   MIN_TELEGRAM_ID / MAX_TELEGRAM_ID -- the recipient snapshot
+#                        (app/audience/models.py) + the synchronous
+#                        upsert (app/api/recipients.py) + the
+#                        user_upserted envelope (app/transport/events.py)
+#   MAX_GROUP_KEY_LEN -- group_memberships.group_key
+#                        (app/audience/models.py) + the group_changed
+#                        envelope (app/transport/events.py)
 #
 # WHY HERE (and not introspected from the models, as in Phase 2):
 #   The profile validator used to read these widths off the mapped
@@ -62,6 +70,43 @@ MAX_BODY_LEN = 5000
 # 200 fits any sane producer key (outbox row uuid, composite string);
 # part of the FROZEN event contract: 1..200 chars.
 MAX_IDEMPOTENCY_KEY_LEN = 200
+
+# -----------------------------------------------------------------------------
+# Recipient snapshot widths (R-2 item 1)
+# -----------------------------------------------------------------------------
+# THREE consumers each, which is why they live here and not next to
+# the columns: the column itself (app/audience/models.py), the
+# synchronous HTTP surface (app/api/recipients.py) and the event
+# envelope (app/transport/events.py). Before this, each of the three
+# carried its own number, and two of them disagreed with the column --
+# an over-long locale passed the envelope and died on the INSERT, which
+# is the defect class this release closes. A width that only one place
+# knows is a width the other places will get wrong.
+#
+# CHANGING ONE: widen the constant AND ship the alembic migration in
+# the same change -- the consistency test pins constant == column.
+
+# recipients.email -- the RFC 5321 maximum for a whole address
+# (64 local + @ + 255 domain).
+MAX_EMAIL_LEN = 320
+
+# recipients.locale -- a language tag, "en" / "pt-BR" class of value.
+MAX_LOCALE_LEN = 8
+
+# recipients.timezone -- an IANA zone name ("Europe/Berlin").
+MAX_TIMEZONE_LEN = 64
+
+# group_memberships.group_key -- opaque product-facing audience key
+# ("masters", "admins"). Same width class as sections.key.
+MAX_GROUP_KEY_LEN = 100
+
+# recipients.telegram_id is a BigInteger, and the bound IS the column's
+# range: comms does not own the id space (the platform does), so any
+# narrower window would be a policy invented here. Out of range the
+# value is not a large id, it is a broken one -- and without this bound
+# it reaches the INSERT and comes back as a database error.
+MIN_TELEGRAM_ID = -(2**63)
+MAX_TELEGRAM_ID = 2**63 - 1
 
 
 # -----------------------------------------------------------------------------
