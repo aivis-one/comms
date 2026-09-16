@@ -121,9 +121,12 @@ from app.core.constants import (
     MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_LOCALE_LEN,
+    MAX_NOTIFICATION_PRIORITY,
     MAX_TELEGRAM_ID,
     MAX_TIMEZONE_LEN,
     MAX_TITLE_LEN,
+    MAX_TYPE_KEY_LEN,
+    MIN_NOTIFICATION_PRIORITY,
     MIN_TELEGRAM_ID,
 )
 from app.core.exceptions import ValidationError
@@ -540,7 +543,16 @@ def _parse_notification_request(data: dict[str, Any]) -> NotificationRequest:
     # Type registration is checked in the handler against the live
     # registry (create_notification); here only the string form.
     type_ = _string(
-        _require(data, "type", event), "type", event, max_len=200,
+        # MAX_TYPE_KEY_LEN, not the 200 that stood here: the number
+        # was copied by hand against a column of 50. NO DEFECT HID
+        # BEHIND IT -- a type longer than 50 cannot be registered (the
+        # profile loader caps keys at the same constant), so the
+        # registry refused it before any INSERT. What changes is the
+        # WORDING for types of 51..200 characters: the field is named
+        # here instead of the profile's whole declared list being
+        # printed. Both refusals are terminal.
+        _require(data, "type", event), "type", event,
+        max_len=MAX_TYPE_KEY_LEN,
     )
     target_type, target_value = _validate_target(
         _require(data, "target_type", event),
@@ -578,7 +590,11 @@ def _parse_notification_request(data: dict[str, Any]) -> NotificationRequest:
 
     priority = 5
     if data.get("priority") is not None:
-        priority = _int(data["priority"], "priority", event)
+        priority = _int(
+            data["priority"], "priority", event,
+            minimum=MIN_NOTIFICATION_PRIORITY,
+            maximum=MAX_NOTIFICATION_PRIORITY,
+        )
 
     scheduled_at: datetime | None = None
     if data.get("scheduled_at") is not None:

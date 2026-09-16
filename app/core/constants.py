@@ -13,6 +13,14 @@
 # Column widths:
 #
 #   MAX_TYPE_KEY_LEN  -- notifications.type        (app/engine/models.py)
+#                        + the profile loader's key check
+#                        (app/profile/loader.py) + ingest validation of
+#                        the notification_request event
+#                        (app/transport/events.py)
+#   MIN_NOTIFICATION_PRIORITY / MAX_NOTIFICATION_PRIORITY --
+#                        notifications.priority (app/engine/models.py)
+#                        + the notification_request envelope
+#                        (app/transport/events.py)
 #                        + profile type-key check  (app/profile/loader.py)
 #   MAX_CATEGORY_LEN  -- category_mutes.category   (app/audience/models.py)
 #                        + profile category check  (app/profile/loader.py)
@@ -99,6 +107,18 @@ MAX_TIMEZONE_LEN = 64
 # group_memberships.group_key -- opaque product-facing audience key
 # ("masters", "admins"). Same width class as sections.key.
 MAX_GROUP_KEY_LEN = 100
+
+# notifications.priority -- an opaque product number behind an Integer
+# column, and the LAST field of the class R-2 closed. The bound is the
+# column's range and nothing narrower, for the reason already written
+# at threads.priority: comms does not own what a product means by
+# priority, so a scale of its own (1..10, say) would be a policy
+# invented in passing. Out of range the value is not a high priority,
+# it is a broken one -- and unbounded it passed the envelope parser and
+# died on the INSERT, where the producer's mistake is diagnosed as our
+# internal fault and retried before reaching the DLQ.
+MIN_NOTIFICATION_PRIORITY = -(2**31)
+MAX_NOTIFICATION_PRIORITY = 2**31 - 1
 
 # recipients.telegram_id is a BigInteger, and the bound IS the column's
 # range: comms does not own the id space (the platform does), so any

@@ -58,6 +58,14 @@ jobs:
       - name: Apply migrations (alembic upgrade head)
         run: alembic upgrade head
 
+      # Turns the autogenerate filter from a patch into a detector
+      # (R-3). Red when a model changed without a migration, and red
+      # when a migration-only object was added without being listed in
+      # app/core/schema_objects.py. It says nothing about the objects
+      # already listed there -- the suite asserts those exist.
+      - name: Schema matches the models (alembic check)
+        run: alembic check
+
       - name: Run tests
         run: pytest -q
 
