@@ -36,7 +36,15 @@ from app.core.channels import (
 
 # Single source of truth for API version.
 # Import as: from app.core.config import APP_VERSION, settings
-APP_VERSION = "0.1.0"
+#
+# IT IS THE NUMBER THE DEPLOY REPORTS. /health and the startup log both
+# carry it, and the first question when an incident is opened in
+# someone else's stack is which version of comms is running there. It
+# stood at 0.1.0 through every release up to v1.3.0, which made that
+# question unanswerable from the outside. Raise it with the tag, in the
+# same commit; pyproject carries the same number and a test pins the
+# two together, so neither can move alone.
+APP_VERSION = "1.4.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

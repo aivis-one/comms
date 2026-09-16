@@ -99,6 +99,17 @@ Semantics:
   here. Treat this file with the same care as the rest of your
   secrets: the URL carries the redis password.
 
+**The stream and group names are half of an agreement, so they are
+written down on both sides.** The relay XADDs into the stream
+`comms:events`; comms reads it as the consumer group `comms`. Both are
+the defaults on the comms side (`COMMS_EVENTS_STREAM`,
+`COMMS_CONSUMER_GROUP` in `deploy/.env.example`), so a deploy that
+names neither works -- but a relay pointing at a different stream is
+not an error anywhere: it writes where nobody reads, and the
+notifications simply never arrive, with no failure to see on either
+side. If a deploy overrides either name, every product writing to it
+must be changed in the same step.
+
 The installer places all of this BEFORE it starts the product stack,
 so the backend comes up with the variables already in its env file and
 no restart is needed.

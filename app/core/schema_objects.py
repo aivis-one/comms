@@ -26,6 +26,24 @@
 #   It is consumed by the suite, which asks the database directly, and
 #   it covers one object more -- see the CHECK note below.
 #
+# A NAME IS NOT AN INVARIANT -- ITS DEFINITION IS. The existence list
+# pins each index's definition, not just its name, because the two come
+# apart: an index recreated under the same name WITHOUT `UNIQUE` passes
+# a by-name check, passes `alembic check`, and lets two eternal DMs
+# exist for one pair. That was measured, not imagined -- the invariant
+# was dead and both detectors were green. Two facts are pinned per
+# index: the catalog's `indisunique` flag, which is what died in that
+# experiment and which Postgres reports identically across versions,
+# and the rendered definition, which is what catches a changed
+# predicate or column list. A major Postgres upgrade may reformat the
+# rendered text: then the definition half goes red, the uniqueness half
+# stays green, and a person looks at the diff -- which is the intended
+# outcome, not a malfunction.
+#
+# A LEGITIMATE CHANGE updates the line here in the same commit as the
+# migration, exactly as a column width is updated together with its
+# constant.
+#
 # THE LISTS ARE NAMED, NOT A BLANKET. "Skip every index the metadata
 # does not reference" would also silence a genuinely stray index, and a
 # stray index IS drift worth reporting. An object absent from the list
@@ -40,31 +58,118 @@
 # schema instead of trusting the comparison.
 # =============================================================================
 
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.schema import SchemaItem
 
+
+@dataclass(frozen=True)
+class IndexShape:
+    """What an index must BE, beyond being present under its name.
+
+    unique:     pg_index.indisunique. Stable wording across Postgres
+                versions, and the property that silently died when the
+                index was recreated without UNIQUE.
+    definition: pg_indexes.indexdef, as Postgres renders it. Catches a
+                changed predicate, column list or order -- the ways an
+                index stays unique and stops meaning what it meant.
+    """
+
+    unique: bool
+    definition: str
+
 # Declared in migrations, absent from Base.metadata, and compared by
 # autogenerate -- which is why each one needs muting by name.
-MIGRATION_OWNED_INDEXES = frozenset({
+MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
     # -- Uniqueness that is an invariant, not an optimization --
     # Replay of a stream event collapses onto one notification.
-    "uq_notifications_idempotency_key",
+    "uq_notifications_idempotency_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_notifications_idempotency_key "
+            "ON public.notifications USING btree (idempotency_key) "
+            "WHERE (idempotency_key IS NOT NULL)"
+        ),
+    ),
     # "One eternal DM per pair" -- partial unique index.
-    "uq_threads_dedup_dm",
+    "uq_threads_dedup_dm": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_threads_dedup_dm ON public.threads "
+            "USING btree (client, operator_kind, operator_value) "
+            "WHERE (((kind)::text = 'dm'::text) "
+            "AND (subject_type IS NULL))"
+        ),
+    ),
     # "One thread per subject" -- partial unique index.
-    "uq_threads_dedup_subject",
+    "uq_threads_dedup_subject": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_threads_dedup_subject "
+            "ON public.threads USING btree "
+            "(client, operator_kind, operator_value, subject_type, "
+            "subject_id) WHERE (subject_type IS NOT NULL)"
+        ),
+    ),
     # Arbitrates the race when two callers create the same section;
     # the service catches the IntegrityError BY THIS NAME.
-    "uq_sections_key",
+    "uq_sections_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_sections_key ON public.sections "
+            "USING btree (key)"
+        ),
+    ),
     # -- Read-path indexes --
-    "ix_messages_thread_created",
-    "ix_notification_deliveries_inbox",
-    "ix_notifications_status_scheduled_priority",
-    "ix_threads_activity",
-    "ix_threads_close_notify_pending",
-    "ix_threads_operator_user",
-})
+    "ix_messages_thread_created": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_messages_thread_created "
+            "ON public.messages USING btree (thread_id, created_at)"
+        ),
+    ),
+    "ix_notification_deliveries_inbox": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notification_deliveries_inbox "
+            "ON public.notification_deliveries USING btree "
+            "(recipient_id, status, read_at)"
+        ),
+    ),
+    "ix_notifications_status_scheduled_priority": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notifications_status_scheduled_priority "
+            "ON public.notifications USING btree "
+            "(status, scheduled_at, priority)"
+        ),
+    ),
+    "ix_threads_activity": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_threads_activity ON public.threads "
+            "USING btree (COALESCE(last_message_at, created_at) DESC, "
+            "id DESC)"
+        ),
+    ),
+    "ix_threads_close_notify_pending": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_threads_close_notify_pending "
+            "ON public.threads USING btree (close_notify_pending_at) "
+            "WHERE (close_notify_pending_at IS NOT NULL)"
+        ),
+    ),
+    "ix_threads_operator_user": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_threads_operator_user ON public.threads "
+            "USING btree (operator_value) "
+            "WHERE ((operator_kind)::text = 'user'::text)"
+        ),
+    ),
+}
 
 # Migration-owned CHECK constraints. NOT in the filter list above, and
 # the absence is deliberate: alembic does not compare CHECK constraints
@@ -85,7 +190,9 @@ MIGRATION_OWNED_CHECKS = frozenset({
 
 # Everything the schema must carry although the metadata never mentions
 # it. The suite walks this set against the live catalogs.
-MIGRATION_OWNED_INVARIANTS = MIGRATION_OWNED_INDEXES | MIGRATION_OWNED_CHECKS
+MIGRATION_OWNED_INVARIANTS = (
+    frozenset(MIGRATION_OWNED_INDEXES) | MIGRATION_OWNED_CHECKS
+)
 
 
 def include_object(

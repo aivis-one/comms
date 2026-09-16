@@ -74,16 +74,54 @@ class TestMigrationOwnedInvariantsExist:
     """
 
     @pytest.mark.parametrize("name", sorted(MIGRATION_OWNED_INDEXES))
-    async def test_the_index_is_in_the_schema(self, name: str) -> None:
+    async def test_the_index_is_in_the_schema_as_declared(
+        self, name: str
+    ) -> None:
+        """A NAME IS NOT AN INVARIANT -- the definition is.
+
+        This test used to ask only whether an index of that name
+        existed, and it was right about the half it checked: an index
+        that is gone cannot hold anything. What it missed is that an
+        index can be present and hollow. Recreated under the same name
+        without UNIQUE it passes a by-name check, passes `alembic
+        check`, and lets two eternal DMs exist for one pair -- measured,
+        not supposed. So both facts are asserted: the catalog flag that
+        died in that experiment, and the rendered definition that
+        carries the predicate and the column list.
+        """
+        expected = MIGRATION_OWNED_INDEXES[name]
         async with get_engine().connect() as connection:
-            found = await connection.scalar(
-                text(
-                    "SELECT indexname FROM pg_indexes "
-                    "WHERE schemaname = 'public' AND indexname = :name"
-                ),
-                {"name": name},
-            )
-        assert found == name
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT x.indisunique, i.indexdef "
+                        "FROM pg_indexes i "
+                        "JOIN pg_class c ON c.relname = i.indexname "
+                        "JOIN pg_index x ON x.indexrelid = c.oid "
+                        "WHERE i.schemaname = 'public' "
+                        "AND i.indexname = :name"
+                    ),
+                    {"name": name},
+                )
+            ).first()
+
+        assert row is not None, (
+            f"{name} is missing from the schema -- an invariant declared "
+            f"in a migration is gone"
+        )
+        unique, definition = row
+        assert unique == expected.unique, (
+            f"{name} exists but its uniqueness changed: the schema says "
+            f"unique={unique}, the invariant says {expected.unique}"
+        )
+        assert definition == expected.definition, (
+            f"{name} exists but is defined differently:\n"
+            f"  schema:    {definition}\n"
+            f"  invariant: {expected.definition}\n"
+            f"A legitimate change updates app/core/schema_objects.py in "
+            f"the same commit as the migration. A Postgres major upgrade "
+            f"can also reword this text -- then compare by eye and repin."
+        )
 
     @pytest.mark.parametrize("name", sorted(MIGRATION_OWNED_CHECKS))
     async def test_the_check_constraint_is_in_the_schema(
@@ -133,12 +171,34 @@ class TestTheListsDescribeReality:
         """The two lists differ by exactly the objects autogenerate
         does not compare -- today, the CHECK. Stated as a relation
         rather than as a count, so the assertion survives the next
-        invariant being added to both."""
-        assert MIGRATION_OWNED_INVARIANTS == (
-            MIGRATION_OWNED_INDEXES | MIGRATION_OWNED_CHECKS
-        )
-        assert not (MIGRATION_OWNED_INDEXES & MIGRATION_OWNED_CHECKS)
+        invariant being added to both.
+
+        The index list is a mapping now (name -> definition), so the
+        relation is over its KEYS; the old form compared two sets and
+        was right while both were sets.
+        """
+        both_lists = frozenset(MIGRATION_OWNED_INDEXES) | MIGRATION_OWNED_CHECKS
+        assert both_lists == MIGRATION_OWNED_INVARIANTS
+        assert not (frozenset(MIGRATION_OWNED_INDEXES) & MIGRATION_OWNED_CHECKS)
         assert MIGRATION_OWNED_CHECKS
+
+    @pytest.mark.parametrize("name", sorted(MIGRATION_OWNED_INDEXES))
+    def test_the_two_pinned_facts_agree(self, name: str) -> None:
+        """POVTOR: one fact written twice.
+
+        `unique` and the first words of `definition` say the same
+        thing, and a pin edited in one place only would claim an index
+        is unique while pinning a definition that does not create it
+        that way. The redundancy is deliberate -- the flag survives a
+        Postgres rewording, the text catches a changed predicate -- but
+        redundancy that is allowed to disagree is worse than either
+        half alone.
+        """
+        shape = MIGRATION_OWNED_INDEXES[name]
+        assert shape.definition.startswith(
+            "CREATE UNIQUE INDEX " if shape.unique else "CREATE INDEX "
+        )
+        assert f" {name} " in shape.definition
 
 
 class TestAutogenerateAgainstHead:

@@ -11,11 +11,13 @@
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from httpx import AsyncClient
 
 from app.core.channels import ChannelState
-from app.core.config import Settings
+from app.core.config import Settings, settings
 from app.engine.constants import DeliveryChannel
+from app.main import docs_urls
 
 # A deploy with both external channels fully configured. Every value is
 # a SENTINEL, and every one of them is non-empty on purpose: the suite
@@ -134,3 +136,51 @@ async def test_health_reports_the_same_map_on_every_call(
         first = (await client.get("/health")).json()["channels"]
         second = (await client.get("/health")).json()["channels"]
     assert first == second
+
+
+class TestTheSchemaIsNotPublic:
+    """The interactive schema is a development tool (R-4).
+
+    FastAPI serves /docs, /redoc and /openapi.json with no
+    authentication of their own -- require_service_auth guards the
+    routers, not these -- and what they publish is every route's
+    docstring. Ours are written for us: KNOWN CEILING blocks, release
+    markers, and on one route the sentence describing a read-authz
+    bypass. Five of twenty-one operations carried such text.
+    """
+
+    @pytest.mark.parametrize(
+        "path", ["/openapi.json", "/docs", "/redoc"],
+    )
+    async def test_the_schema_endpoints_do_not_exist_here(
+        self, client: AsyncClient, path: str
+    ) -> None:
+        """The suite runs outside development (APP_ENV=ci), which is
+        the state every deploy is in except a developer's laptop."""
+        assert not settings.is_dev
+        response = await client.get(path)
+        assert response.status_code == 404, response.text
+
+    def test_development_still_gets_them(self) -> None:
+        """THE PAIR, and the reason the decision is a function rather
+        than three inline conditionals: closing the schema everywhere
+        would also satisfy the test above, and a developer would find
+        out by losing a tool with no explanation."""
+        assert docs_urls(is_dev=True) == {
+            "openapi_url": "/openapi.json",
+            "docs_url": "/docs",
+            "redoc_url": "/redoc",
+        }
+        assert docs_urls(is_dev=False) == {
+            "openapi_url": None,
+            "docs_url": None,
+            "redoc_url": None,
+        }
+
+    async def test_the_service_still_answers_where_it_should(
+        self, client: AsyncClient
+    ) -> None:
+        """A closed schema is not a closed service: the endpoints an
+        installer and a product actually call are untouched."""
+        assert (await client.get("/health")).status_code == 200
+        assert (await client.get("/ready")).status_code in (200, 503)

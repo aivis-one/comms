@@ -52,8 +52,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      # From the lock, so CI tests the package set the image ships --
+      # the project itself without deps, since the lock already has
+      # them and re-resolving would defeat the pin.
+      - name: Install dependencies (pinned)
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
 
       - name: Apply migrations (alembic upgrade head)
         run: alembic upgrade head

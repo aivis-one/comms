@@ -77,10 +77,43 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("comms_stopped")
 
 
+# THE INTERACTIVE SCHEMA IS A DEVELOPMENT TOOL, NOT A PRODUCT SURFACE.
+# FastAPI serves /docs, /redoc and /openapi.json with no authentication
+# of their own -- require_service_auth guards the routers, not these --
+# and what they publish is every route's docstring. Those docstrings
+# are written for us: they carry KNOWN CEILING blocks, release markers
+# and, on one route, the sentence describing a read-authz bypass. Five
+# of the twenty-one operations carry such text today.
+#
+# An integrator does not need them: deploy/INTEGRATION.md is the
+# contract, and it is written for that reader. So outside development
+# the three endpoints do not exist at all -- openapi_url=None also
+# removes /docs and /redoc, and the explicit Nones say so to the next
+# reader rather than leaving it to be discovered.
+def docs_urls(is_dev: bool) -> dict[str, str | None]:
+    """The schema endpoints FastAPI should mount, or None for each.
+
+    A function rather than three inline conditionals so that both
+    branches can be asserted without re-importing this module under
+    patched settings: the closed case is checked against the running
+    app, the open one against this.
+    """
+    return {
+        "openapi_url": "/openapi.json" if is_dev else None,
+        "docs_url": "/docs" if is_dev else None,
+        "redoc_url": "/redoc" if is_dev else None,
+    }
+
+
+_DOCS = docs_urls(settings.is_dev)
+
 app = FastAPI(
     title="COMMS Service",
     version=APP_VERSION,
     lifespan=lifespan,
+    openapi_url=_DOCS["openapi_url"],
+    docs_url=_DOCS["docs_url"],
+    redoc_url=_DOCS["redoc_url"],
 )
 register_error_handlers(app)
 app.include_router(inbox_router)
