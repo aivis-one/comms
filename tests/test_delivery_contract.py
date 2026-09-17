@@ -83,6 +83,40 @@ class TestTheLockCoversWhatIsDeclared:
             f"(the command is in the lock's own header)"
         )
 
+    @pytest.mark.parametrize("name", sorted(_declared_dependencies()))
+    def test_every_pinned_line_carries_a_hash(self, name: str) -> None:
+        """A version pin says WHICH release; a hash says which ARTIFACT.
+
+        The guard exists because losing the hashes costs nothing
+        visible: regenerate without --generate-hashes and the file
+        still installs, still pins every version, and quietly stops
+        checking what was downloaded. Nothing fails, so nothing tells
+        anyone -- the same shape as a comment that points at a file
+        that no longer exists.
+        """
+        lines = _LOCK.splitlines()
+        for position, line in enumerate(lines):
+            head = line.split("==")[0].strip().lower().replace("_", "-")
+            if "==" in line and not line.startswith("#") and head == name:
+                rest = "\n".join(lines[position:position + 40])
+                assert "--hash=sha256:" in rest.split("\n")[1], (
+                    f"{name} is pinned without a hash -- the lock was "
+                    f"regenerated without --generate-hashes (the command "
+                    f"is in the lock's own header)"
+                )
+                return
+        pytest.fail(f"{name} is not in the lock at all")
+
+    def test_the_hashes_cover_more_than_one_artifact(self) -> None:
+        """THE PAIR to the line-by-line check: a file where every
+        package carries exactly one hash would satisfy it and would
+        pin comms to one platform's wheel -- an image built on another
+        architecture could then not be installed at all. Packages with
+        compiled wheels carry a hash per artifact.
+        """
+        hashes = _LOCK.count("--hash=sha256:")
+        assert hashes > len(_locked_distributions()) * 2
+
     def test_everything_in_the_lock_is_pinned_exactly(self) -> None:
         """A lock with a range in it is not a lock. The pair to the
         coverage test above: coverage is satisfied by a file that
@@ -93,6 +127,7 @@ class TestTheLockCoversWhatIsDeclared:
             if line.strip()
             and not line.startswith("#")
             and not line.startswith(" ")
+            and not line.strip().startswith("--hash")
             and "==" not in line
         ]
         assert loose == []

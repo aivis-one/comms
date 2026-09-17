@@ -276,6 +276,26 @@ None of that is wired here; this file only accounts for the network
 path, the credentials and the profile being in place before that code
 runs.
 
+## How long comms keeps things
+
+Two questions every product asks once, answered here so the answer is
+not a trip through our source. Both are deploy-side settings with
+defaults; both are days-granular, and both treat a value of zero or
+less as "never".
+
+- **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
+  **90**. A notification in a terminal state (and its deliveries) is
+  removed by the worker's retention pass after that many days. Nothing
+  is removed while a delivery is still pending.
+- **Threads closing themselves**: `THREAD_AUTO_CLOSE_DAYS`, default
+  **30**. A thread with no activity for that long is closed by the
+  same worker. Closing is a status change -- the thread, its messages
+  and the participants' read pointers stay.
+
+A deploy that wants either behaviour off sets the value to 0. A
+product that needs history kept longer than comms keeps it should
+retain its own copy: comms is the delivery service, not the archive.
+
 ## Compose project name
 
 This stack declares its compose project name in `deploy/docker-compose.yml`:
