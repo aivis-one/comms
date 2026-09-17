@@ -26,7 +26,7 @@
 #   Presence of a row = muted. See app/audience/prefs.py.
 # =============================================================================
 
-from datetime import datetime, time
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
@@ -34,12 +34,10 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
-    SmallInteger,
     String,
-    Time,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.constants import (
@@ -103,28 +101,39 @@ class Recipient(TimestampMixin, Base):
         nullable=True,
     )
 
-    # -- Quiet-hours preferences (Phase 2) --
-    # Comms-owned: the recipient sets these through the prefs API, the
-    # product does not know them, so user_upserted must never touch
-    # them.
-
-    # Quiet window: local wall-clock start/end. quiet_from >= quiet_to
-    # means the window crosses midnight (e.g. 22:00 -> 08:00).
-    quiet_from: Mapped[time | None] = mapped_column(
-        Time,
-        nullable=True,
-    )
-
-    quiet_to: Mapped[time | None] = mapped_column(
-        Time,
-        nullable=True,
-    )
-
-    # ISO weekdays (1=Mon .. 7=Sun) on which the window STARTS. An
-    # overnight window starting Friday 22:00 belongs to day 5 even
-    # though it ends on Saturday. Stored sorted and de-duplicated.
-    quiet_days: Mapped[list[int] | None] = mapped_column(
-        ARRAY(SmallInteger),
+    # -- Delivery schedule (R-5) --
+    # Comms-owned: the recipient sets it through the prefs API, the
+    # product does not know it, so user_upserted must never touch it.
+    #
+    # THE PERIODS DURING WHICH DELIVERY IS ALLOWED -- not the periods
+    # of silence. The polarity matters: the old three columns held one
+    # quiet window whose day set meant "days the window STARTS on",
+    # and a product whose screen says "when you may reach me" had to
+    # invert times, after which the start day landed on the evening
+    # before the morning it covered. Every period here belongs to the
+    # day it falls in, and none crosses midnight -- a night allowance
+    # is written as two periods, one per day -- so the start-day
+    # notion does not exist to be got wrong.
+    #
+    # SHAPE: a list of {"day": 1..7 (ISO), "from": minutes, "to":
+    # minutes}, minutes counted from local midnight, sorted by (day,
+    # from), never overlapping or touching within a day. `to` may be
+    # 1440 (exactly midnight) so that a whole allowed day is exact;
+    # the old model's closest form, 00:00 -> 23:59, left a one-minute
+    # hole that delivered.
+    #
+    # NULL means NO RESTRICTION -- deliver at any time. An EMPTY LIST
+    # is rejected at write time: it would mean "never", which is not a
+    # schedule but a black hole (the deliveries defer until they
+    # expire). Muting exists for "do not send me this".
+    #
+    # JSONB and not a table: the delivery gate already holds the
+    # Recipient row (engine/service.deliver_notification), and a table
+    # would add a query per delivery. The write path
+    # (audience/prefs.set_schedule) is the only door, so the shape is
+    # validated there.
+    allowed_windows: Mapped[list[dict[str, int]] | None] = mapped_column(
+        JSONB,
         nullable=True,
     )
 

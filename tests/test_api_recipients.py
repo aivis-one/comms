@@ -26,7 +26,6 @@
 # =============================================================================
 
 import json
-from datetime import time
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -128,10 +127,11 @@ class TestUpsert:
         """Repeat axis, and the ownership boundary in one test.
 
         The second call must find the existing row rather than add a
-        second one -- and must not touch quiet_*, which the recipient
-        owns through the preferences API and the product knows nothing
-        about. A re-sync that wiped someone's quiet hours would be
-        invisible until the notification that woke them at 3am.
+        second one -- and must not touch allowed_windows, which the
+        recipient owns through the preferences API and the product
+        knows nothing about. A re-sync that wiped someone's schedule
+        would be invisible until the notification that woke them at
+        3am.
         """
         factory = get_session_factory()
         async with factory() as session:
@@ -139,9 +139,10 @@ class TestUpsert:
                 session, telegram_id=next_t64_telegram_id(), locale="de"
             )
             recipient_id = seeded.id
-            seeded.quiet_from = time(22, 0)
-            seeded.quiet_to = time(8, 0)
-            seeded.quiet_days = [1, 5]
+            seeded.allowed_windows = [
+                {"day": 1, "from": 540, "to": 1260},
+                {"day": 5, "from": 540, "to": 1260},
+            ]
             await session.commit()
 
         body = _snapshot(locale="fr")
@@ -155,9 +156,13 @@ class TestUpsert:
         stored = await _load(recipient_id)
         assert stored is not None
         assert stored.locale == "fr"
-        assert stored.quiet_from is not None, "comms-owned field survived"
-        assert stored.quiet_to is not None
-        assert stored.quiet_days == [1, 5]
+        assert stored.allowed_windows is not None, (
+            "comms-owned field survived"
+        )
+        assert stored.allowed_windows == [
+            {"day": 1, "from": 540, "to": 1260},
+            {"day": 5, "from": 540, "to": 1260},
+        ]
 
         async with factory() as session:
             count = await session.scalar(
@@ -216,7 +221,7 @@ class TestSnapshotDiscipline:
     ) -> None:
         """A typo must not be silently dropped."""
         response = await client.put(
-            _url(uuid4()), json=_snapshot(quiet_from="22:00")
+            _url(uuid4()), json=_snapshot(allowed_windows=[])
         )
         assert response.status_code == 422
 
@@ -226,7 +231,7 @@ class TestSnapshotDiscipline:
         """Poison-pill rule: a bad value never jams the sync.
 
         The zone is kept as sent (with a warning at intake) and degrades
-        to the service default when quiet hours are computed. Rejecting
+        to the service default when the schedule is computed. Rejecting
         it here would block a product's whole identity sync on one row.
         """
         recipient_id = uuid4()

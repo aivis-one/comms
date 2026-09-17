@@ -91,7 +91,7 @@ class RateLimitedError(Exception):
     Not a message failure: the channel is healthy, it just asks to
     slow down -- and tells exactly when to retry. The service layer
     defers via next_retry_at WITHOUT burning an attempt (same pattern
-    as quiet hours), up to a deferral budget (Phase 2.2).
+    as the delivery schedule), up to a deferral budget (Phase 2.2).
     """
 
     def __init__(self, retry_after: float) -> None:
