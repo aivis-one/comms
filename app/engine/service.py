@@ -43,7 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import Recipient
 from app.audience.prefs import muted_recipient_ids
-from app.audience.quiet_hours import recipient_quiet_until
+from app.audience.schedule import recipient_deferred_until
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.engine.constants import (
@@ -312,28 +312,32 @@ async def deliver_notification(
 
     - Batch-loads Recipient objects for credentials and locale.
     - LATE-MUTE RE-CHECK (Phase 2.1): the resolve-time mute gate is
-      the first line, but a delivery can sit gated for HOURS (quiet
-      hours stretched the window far past the old 30-60s backoff). So
+      the first line, but a delivery can sit gated for HOURS (the
+      schedule gate stretched the wait far past the old 30-60s
+      backoff). So
       right before sending, recipients who muted the notification's
       category since resolve are closed out terminally with
       DeliveryStatus.SKIPPED -- not FAILED (nothing broke), mirroring
       the notification-level SKIPPED. One batched lookup per pass;
-      checked BEFORE the quiet gate (no point deferring a muted
+      checked BEFORE the schedule gate (no point deferring a muted
       delivery). Attempts and error_message stay untouched (a skip is
       not an attempt; prior transient history is kept).
-    - QUIET HOURS (Phase 2): a delivery whose recipient is inside
-      their quiet window is DEFERRED, not sent -- next_retry_at is set
-      to the window's end (recipient's timezone) and the existing
-      retry gate keeps it invisible to the poll until then. Attempts
-      and error_message stay untouched: deferral is not a failure.
-      Checked per attempt, so backoff retries landing in a quiet
-      window are deferred too.
-      TIGHT EXPIRY INSIDE A QUIET WINDOW: when the window end lands
+    - DELIVERY SCHEDULE (Phase 2; polarity flipped in R-5): a
+      delivery whose recipient is OUTSIDE their allowed periods is
+      DEFERRED, not sent -- next_retry_at is set to the next period's
+      start (recipient's timezone) and the existing retry gate keeps
+      it invisible to the poll until then. Attempts and error_message
+      stay untouched: deferral is not a failure. Checked per attempt,
+      so backoff retries landing outside the periods are deferred too
+      -- which is one of the two reasons this gate cannot live in the
+      product (the other: comms creates message pings and close
+      notices itself, for which no product ever computed a time).
+      TIGHT EXPIRY OUTSIDE THE PERIODS: when the next opening lands
       past the notification's expiry_at, the step-0 expire sweep will
       mark it EXPIRED before the gate reopens -- a deliberate expiry,
       not a late send (a "1 hour before" reminder deferred past its
       anchor must die quietly, not arrive mid-session). The
-      delivery_quiet_deferred log carries beyond_expiry=true for
+      delivery_schedule_deferred log carries beyond_expiry=true for
       causality.
     - CHANNEL RATE LIMIT (Phase 2.2): a 429 is "come back later", not
       a message failure -- the delivery is deferred via next_retry_at
@@ -421,8 +425,11 @@ async def deliver_notification(
             )
             continue
 
-        # -- Quiet-hours gate: defer, never suppress --
-        quiet_until = recipient_quiet_until(recipient, now)
+        # -- Schedule gate: defer, never suppress --
+        # The recipient's allowed periods (app/audience/schedule.py).
+        # None means "now is fine" -- both when a period covers now
+        # and when there is no schedule at all.
+        quiet_until = recipient_deferred_until(recipient, now)
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
             # Causality flag: the deferral pushes the delivery past
@@ -435,7 +442,7 @@ async def deliver_notification(
                 and quiet_until > notification.expiry_at
             )
             logger.info(
-                "delivery_quiet_deferred",
+                "delivery_schedule_deferred",
                 delivery_id=str(delivery.id),
                 recipient_id=str(recipient.id),
                 until=quiet_until.isoformat(),

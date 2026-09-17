@@ -2,24 +2,24 @@
 # COMMS Service -- Preferences + gating tests (Phase 2 items 5-7)
 # =============================================================================
 # Item 5: preference API -- category mutes (idempotent, validated
-#   against the profile), quiet-hours window (all-or-nothing, day
+#   against the profile), the delivery schedule (allowed periods,
 #   normalization). Timezone is NOT settable here since Phase 2.1
 #   (sync-owned; read-only in RecipientPreferences).
 # Item 6: gating -- a muted recipient gets NO deliveries (gated at
-#   resolve, family granularity via the type dictionary); quiet hours
+#   resolve, family granularity via the type dictionary); the schedule
 #   DEFER delivery via next_retry_at (never suppress), including
 #   backoff retries that land inside a window.
 # Item 7: SKIPPED -- empty-after-mute audiences end SKIPPED; the
 #   status is terminal (invisible to the poll, immune to rollup).
 # Phase 2.1 item 3: LATE MUTES -- a mute set while a delivery sits
-#   gated (backoff / quiet hours) closes it out with
+#   gated (backoff / schedule) closes it out with
 #   DeliveryStatus.SKIPPED at deliver time; rollup treats skips as
 #   non-events (matrix covered below).
 #
 # Recipients here draw telegram_ids from the Phase 2 band 81000-81999.
 # =============================================================================
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -34,9 +34,9 @@ from app.audience.prefs import (
     get_preferences,
     muted_recipient_ids,
     set_category_muted,
-    set_quiet_hours,
+    set_schedule,
 )
-from app.audience.quiet_hours import recipient_quiet_until
+from app.audience.schedule import recipient_deferred_until
 from app.core.database import get_session_factory
 from app.core.exceptions import NotFoundError, ValidationError
 from app.engine.constants import (
@@ -117,35 +117,59 @@ class _FailingFormatter:
         raise RuntimeError("boom transient")
 
 
-def _window_around_now() -> tuple[time, time, list[int]]:
-    """A quiet window straddling the current UTC moment (+-2h).
+def _allowed_now() -> list[dict[str, int]]:
+    """A schedule whose allowed period straddles the current moment.
 
-    Day = ISO weekday of the window START; the overnight from>=to
-    convention makes this correct at any hour, including just after
-    midnight (start lands on yesterday, from > to).
+    Periods never cross midnight now, so a stretch around "now" may
+    fall in two days -- near midnight this yields one period ending at
+    24:00 and another starting at 00:00 the next day. That IS the
+    replacement for the old overnight window, expressed rather than
+    implied.
     """
     start = datetime.now(UTC) - timedelta(hours=2)
     end = datetime.now(UTC) + timedelta(hours=2)
-    return (
-        start.time().replace(second=0, microsecond=0),
-        end.time().replace(second=0, microsecond=0),
-        [start.date().isoweekday()],
-    )
+    return _periods_between(start, end)
 
 
-def _window_missing_now() -> tuple[time, time, list[int]]:
-    """A quiet window strictly in the future (now+3h .. now+4h)."""
+def _allowed_later() -> list[dict[str, int]]:
+    """A schedule allowing delivery only in 3..4 hours from now."""
     start = datetime.now(UTC) + timedelta(hours=3)
     end = datetime.now(UTC) + timedelta(hours=4)
-    return (
-        start.time().replace(second=0, microsecond=0),
-        end.time().replace(second=0, microsecond=0),
-        [start.date().isoweekday()],
-    )
+    return _periods_between(start, end)
+
+
+def _periods_between(
+    start: datetime, end: datetime
+) -> list[dict[str, int]]:
+    """Stored periods covering [start, end), split at local midnight."""
+
+    def minutes(moment: datetime) -> int:
+        return moment.hour * 60 + moment.minute
+
+    if start.date() == end.date():
+        return [
+            {
+                "day": start.date().isoweekday(),
+                "from": minutes(start),
+                "to": max(minutes(end), minutes(start) + 1),
+            }
+        ]
+    return [
+        {
+            "day": start.date().isoweekday(),
+            "from": minutes(start),
+            "to": 1440,
+        },
+        {
+            "day": end.date().isoweekday(),
+            "from": 0,
+            "to": max(minutes(end), 1),
+        },
+    ]
 
 
 class TestPreferenceApi:
-    """Item 5: mutes, quiet hours and timezone read/write."""
+    """Item 5: mutes, the delivery schedule and timezone."""
 
     async def test_mute_roundtrip_is_idempotent(
         self, db_session: AsyncSession,
@@ -185,56 +209,85 @@ class TestPreferenceApi:
                 db_session, uuid4(), "unit_updates", True,
             )
 
-    async def test_quiet_hours_roundtrip_and_clear(
+    async def test_schedule_roundtrip_and_clear(
         self, db_session: AsyncSession,
     ) -> None:
-        """Set normalizes days (dedupe + sort); all-None clears."""
+        """Set normalizes (sorted by day then start); None clears.
+
+        The old form of this test asserted that the DAY LIST was
+        deduplicated and sorted, and it was right about the model it
+        tested: one window with a set of start days. There is no set
+        of days any more -- each period carries its own day -- so what
+        is left to pin is the ordering of the periods themselves.
+        """
         recipient = await _phase2_recipient(db_session)
-        await set_quiet_hours(
+        await set_schedule(
             db_session,
             recipient.id,
-            quiet_from=time(22, 0),
-            quiet_to=time(8, 0),
-            days=[7, 1, 1, 5],
+            windows=[
+                {"day": 5, "from": 540, "to": 720},
+                {"day": 1, "from": 1320, "to": 1440},
+                {"day": 1, "from": 540, "to": 720},
+            ],
         )
         prefs = await get_preferences(db_session, recipient.id)
-        assert prefs.quiet_from == time(22, 0)
-        assert prefs.quiet_to == time(8, 0)
-        assert prefs.quiet_days == (1, 5, 7)
-
-        await set_quiet_hours(
-            db_session, recipient.id,
-            quiet_from=None, quiet_to=None, days=None,
+        assert prefs.allowed_windows == (
+            {"day": 1, "from": 540, "to": 720},
+            {"day": 1, "from": 1320, "to": 1440},
+            {"day": 5, "from": 540, "to": 720},
         )
-        prefs = await get_preferences(db_session, recipient.id)
-        assert prefs.quiet_from is None
-        assert prefs.quiet_to is None
-        assert prefs.quiet_days is None
 
-    async def test_quiet_hours_invalid_inputs_rejected(
+        await set_schedule(db_session, recipient.id, windows=None)
+        prefs = await get_preferences(db_session, recipient.id)
+        assert prefs.allowed_windows is None
+
+    async def test_schedule_invalid_inputs_rejected(
         self, db_session: AsyncSession,
     ) -> None:
-        """Partial config, zero-length window and bad days bounce."""
+        """Every state from the release's own table that must bounce.
+
+        The old test covered a partial window, a zero-length one and
+        bad days. Partial state is gone with the three columns; the
+        rest carried over, and two refusals are NEW because the model
+        is: an empty list (which would mean "never deliver", a black
+        hole rather than a schedule) and periods that overlap or touch
+        (one stretch, one spelling -- accepting both would let two
+        stored values mean one thing, which is the defect class this
+        release removes).
+        """
         recipient = await _phase2_recipient(db_session)
-        with pytest.raises(ValidationError, match="all-or-nothing"):
-            await set_quiet_hours(
+        with pytest.raises(ValidationError, match="at least one period"):
+            await set_schedule(db_session, recipient.id, windows=[])
+        with pytest.raises(ValidationError, match="end after it starts"):
+            await set_schedule(
                 db_session, recipient.id,
-                quiet_from=time(22, 0), quiet_to=None, days=None,
+                windows=[{"day": 1, "from": 540, "to": 540}],
             )
-        with pytest.raises(ValidationError, match="must differ"):
-            await set_quiet_hours(
+        with pytest.raises(ValidationError, match="ISO weekday"):
+            await set_schedule(
                 db_session, recipient.id,
-                quiet_from=time(8, 0), quiet_to=time(8, 0), days=[1],
+                windows=[{"day": 8, "from": 540, "to": 600}],
             )
-        with pytest.raises(ValidationError, match="non-empty"):
-            await set_quiet_hours(
+        with pytest.raises(ValidationError, match="minutes"):
+            await set_schedule(
                 db_session, recipient.id,
-                quiet_from=time(22, 0), quiet_to=time(8, 0), days=[],
+                windows=[{"day": 1, "from": 540, "to": 1441}],
             )
-        with pytest.raises(ValidationError, match="ISO weekdays"):
-            await set_quiet_hours(
+        with pytest.raises(ValidationError, match="overlap or touch"):
+            await set_schedule(
                 db_session, recipient.id,
-                quiet_from=time(22, 0), quiet_to=time(8, 0), days=[0, 8],
+                windows=[
+                    {"day": 1, "from": 540, "to": 720},
+                    {"day": 1, "from": 700, "to": 780},
+                ],
+            )
+        with pytest.raises(ValidationError, match="overlap or touch"):
+            await set_schedule(
+                db_session, recipient.id,
+                windows=[
+                    {"day": 1, "from": 540, "to": 720},
+                    {"day": 1, "from": 720, "to": 780},
+                ],
             )
 
     async def test_preferences_expose_synced_timezone_readonly(
@@ -404,16 +457,21 @@ class TestMuteGating:
 class TestQuietHoursGating:
     """Item 6 (quiet hours): defer via next_retry_at, never suppress."""
 
-    async def test_delivery_deferred_inside_window(
+    async def test_delivery_deferred_outside_the_allowed_periods(
         self, db_session: AsyncSession,
     ) -> None:
-        """Inside the window: no send, no attempt burned, gate set to
-        the window end; the gated row hides from the next poll."""
+        """Outside the allowed periods: no send, no attempt burned,
+        gate set to the next opening; the gated row hides from the
+        next poll.
+
+        THE POLARITY FLIPPED, the assertion did not. This test used to
+        put the recipient INSIDE a quiet window to get the same
+        deferral, and it was right about that model. What it pins is
+        unchanged: a deferral is not a failure and not an attempt.
+        """
         recipient = await _phase2_recipient(db_session)
-        quiet_from, quiet_to, days = _window_around_now()
-        await set_quiet_hours(
-            db_session, recipient.id,
-            quiet_from=quiet_from, quiet_to=quiet_to, days=days,
+        await set_schedule(
+            db_session, recipient.id, windows=_allowed_later(),
         )
         notification = await create_notification(
             db_session,
@@ -435,7 +493,7 @@ class TestQuietHoursGating:
         assert delivery.attempts == 0
         assert delivery.error_message is None
 
-        expected = recipient_quiet_until(
+        expected = recipient_deferred_until(
             await _fetch_recipient(recipient.id), datetime.now(UTC),
         )
         assert expected is not None
@@ -444,7 +502,7 @@ class TestQuietHoursGating:
         # Fully gated -> the notification is invisible to the poll.
         assert await process_pending_notifications() == 0
 
-    async def test_delivery_sends_outside_window(
+    async def test_delivery_sends_inside_an_allowed_period(
         self, db_session: AsyncSession,
     ) -> None:
         """A window elsewhere in the day does not block delivery.
@@ -458,10 +516,8 @@ class TestQuietHoursGating:
         live on every deploy by definition (zero declared keys).
         """
         recipient = await _phase2_recipient(db_session)
-        quiet_from, quiet_to, days = _window_missing_now()
-        await set_quiet_hours(
-            db_session, recipient.id,
-            quiet_from=quiet_from, quiet_to=quiet_to, days=days,
+        await set_schedule(
+            db_session, recipient.id, windows=_allowed_now(),
         )
         notification = await create_notification(
             db_session,
@@ -478,7 +534,7 @@ class TestQuietHoursGating:
         fresh = await _fetch_notification(notification.id)
         assert fresh.status == NotificationStatus.SENT
 
-    async def test_transient_retry_landing_in_window_is_deferred(
+    async def test_transient_retry_landing_outside_the_periods_is_deferred(
         self, db_session: AsyncSession,
     ) -> None:
         """A backoff retry due inside a quiet window is re-deferred to
@@ -506,10 +562,8 @@ class TestQuietHoursGating:
         assert delivery.status == DeliveryStatus.PENDING
 
         # The recipient's quiet window opens before the retry runs.
-        quiet_from, quiet_to, days = _window_around_now()
-        await set_quiet_hours(
-            db_session, recipient.id,
-            quiet_from=quiet_from, quiet_to=quiet_to, days=days,
+        await set_schedule(
+            db_session, recipient.id, windows=_allowed_later(),
         )
         await db_session.commit()
         await _force_retry_due(delivery.id)
@@ -520,7 +574,7 @@ class TestQuietHoursGating:
         (delivery,) = await _fetch_deliveries(notification.id)
         assert delivery.status == DeliveryStatus.PENDING
         assert delivery.attempts == 1  # deferral is not an attempt
-        expected = recipient_quiet_until(
+        expected = recipient_deferred_until(
             await _fetch_recipient(recipient.id), datetime.now(UTC),
         )
         assert expected is not None
@@ -537,10 +591,8 @@ class TestLateMuteAtDeliver:
         """Done-when scenario: delivery created -> mute -> gate opens
         -> NO send; delivery and notification end SKIPPED."""
         recipient = await _phase2_recipient(db_session)
-        quiet_from, quiet_to, days = _window_around_now()
-        await set_quiet_hours(
-            db_session, recipient.id,
-            quiet_from=quiet_from, quiet_to=quiet_to, days=days,
+        await set_schedule(
+            db_session, recipient.id, windows=_allowed_later(),
         )
         notification = await create_notification(
             db_session,
@@ -712,24 +764,23 @@ async def _force_expiry(notification_id: UUID) -> None:
         await session.commit()
 
 
-class TestQuietDeferralVsExpiry:
-    """Phase 2.2 items 3+5: a quiet deferral that pushes past
+class TestScheduleDeferralVsExpiry:
+    """Phase 2.2 items 3+5: a schedule deferral that pushes past
     expiry_at is a DELIBERATE expiry, not a late send -- and the
-    quiet-defer log names the causality (beyond_expiry=true)."""
+    deferral log names the causality (beyond_expiry=true)."""
 
-    async def test_expiry_inside_quiet_window_expires(
+    async def test_expiry_outside_the_periods_expires(
         self, db_session: AsyncSession,
     ) -> None:
         """Deferred past the deadline -> step-0 EXPIRED, nothing sent;
         the deferral log flags beyond_expiry."""
         recipient = await _phase2_recipient(db_session)
-        quiet_from, quiet_to, days = _window_around_now()
-        await set_quiet_hours(
-            db_session, recipient.id,
-            quiet_from=quiet_from, quiet_to=quiet_to, days=days,
+        await set_schedule(
+            db_session, recipient.id, windows=_allowed_later(),
         )
-        # Expiry INSIDE the quiet window: the window opens ~now+2h,
-        # the notification dies at now+1h.
+        # The deadline falls before the gate reopens: the next
+        # allowed period starts ~now+3h, the notification dies at
+        # now+1h.
         notification = await create_notification(
             db_session,
             type="unit_event",
@@ -746,7 +797,7 @@ class TestQuietDeferralVsExpiry:
             assert await process_pending_notifications() == 1
         deferred = [
             log for log in logs
-            if log["event"] == "delivery_quiet_deferred"
+            if log["event"] == "delivery_schedule_deferred"
         ]
         assert len(deferred) == 1
         assert deferred[0]["beyond_expiry"] is True

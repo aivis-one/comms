@@ -3,8 +3,8 @@
 # =============================================================================
 #
 # Phase 3b item 3. Preferences live in TWO homes (arch §2.5): category
-# mutes in the category_mutes table, the quiet-hours schedule in
-# quiet_* columns on the recipient. This facade hides both behind ONE
+# mutes in the category_mutes table, the delivery schedule in the
+# allowed_windows column on the recipient. This facade hides both behind ONE
 # object shaped for the product's settings screen (VELO E8:
 # master_notifications) -- the Phase 6 proxy passes it through without
 # re-assembly or re-conversion.
@@ -73,7 +73,7 @@
 # from the client.
 # =============================================================================
 
-from datetime import time
+import re
 from typing import Any
 from uuid import UUID
 
@@ -86,7 +86,7 @@ from app.audience.prefs import (
     RecipientPreferences,
     get_preferences,
     set_category_muted,
-    set_quiet_hours,
+    set_schedule,
 )
 from app.core.database import get_db_reader, get_db_session
 from app.core.exceptions import ValidationError
@@ -133,32 +133,81 @@ def _codes_to_iso_days(codes: list[str]) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-class ScheduleIn(BaseModel):
-    """The quiet-hours window as the wire sees it (full replace)."""
+_TIME_RE = re.compile(r"^([01]\d|2[0-4]):([0-5]\d)$")
+
+
+def _minutes(value: str, field: str) -> int:
+    """"HH:MM" -> minutes from midnight; 24:00 is valid as an END.
+
+    Minute granularity is the contract's: a boundary of 22:00:30 would
+    survive a write and come back as "22:00" -- a silently unstable
+    round-trip. So the wire form is exactly HH:MM and nothing finer.
+
+    24:00 exists for one reason: a period running to the end of the
+    day. The old model's closest form was 23:59, which left a
+    one-minute hole delivering on a day the user had marked silent.
+    24:xx is not a time, and a period is rejected later if it starts
+    at 24:00 (a start has nothing after it).
+    """
+    match = _TIME_RE.match(value)
+    if match is None:
+        raise ValueError(
+            f"{field} must be HH:MM between 00:00 and 24:00, got {value!r}"
+        )
+    hours, minutes = int(match.group(1)), int(match.group(2))
+    if hours == 24 and minutes != 0:
+        raise ValueError(f"{field}: 24:00 is the only hour-24 value")
+    return hours * 60 + minutes
+
+
+def _hhmm(minutes: int) -> str:
+    """Minutes from midnight -> "HH:MM"; 1440 -> "24:00"."""
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+class PeriodIn(BaseModel):
+    """One period during which delivery is ALLOWED.
+
+    THE POLARITY IS THE POINT (R-5). This used to be one quiet window
+    -- when NOT to deliver -- whose day set meant "the days the window
+    STARTS on". A product whose screen says "when you may reach me"
+    had to invert it; the inverted window became nocturnal, its start
+    day landed on the evening before the morning it covered, and the
+    deploy delivered at hours nobody asked for. A period now says when
+    delivery IS allowed, belongs to the day it falls in, and never
+    crosses midnight -- a night allowance is two periods, one per day.
+    """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
+    day: str
     # "from" is a Python keyword -> alias.
-    from_: time = Field(alias="from")
-    to: time
-    days: list[str]
+    from_: str = Field(alias="from")
+    to: str
+
+    @field_validator("day")
+    @classmethod
+    def _known_day(cls, value: str) -> str:
+        if value not in _CODE_TO_ISO:
+            raise ValueError(
+                f"Unknown day code: {value!r}. "
+                f"Valid: {', '.join(_DAY_CODES)}"
+            )
+        return value
 
     @field_validator("from_", "to")
     @classmethod
-    def _minute_granularity(cls, value: time) -> time:
-        """Reject sub-minute precision.
-
-        The wire form is HH:MM; a window boundary of 22:00:30 would
-        survive the write but come back as "22:00" -- a silently
-        unstable round-trip on a frozen contract. Minutes are the
-        contract's granularity, so anything finer is a client error.
-        """
-        if value.second or value.microsecond:
-            raise ValueError(
-                "schedule times use minute granularity (HH:MM); "
-                "seconds are not allowed"
-            )
+    def _wire_time(cls, value: str) -> str:
+        _minutes(value, "time")
         return value
+
+    def stored(self) -> dict[str, int]:
+        """The shape the store and the gate speak: ISO day and minutes."""
+        return {
+            "day": _CODE_TO_ISO[self.day],
+            "from": _minutes(self.from_, "from"),
+            "to": _minutes(self.to, "to"),
+        }
 
 
 class PreferencesPatch(BaseModel):
@@ -171,9 +220,12 @@ class PreferencesPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     categories: dict[str, bool] | None = None
-    # None is meaningful (clear the window) -- presence is checked via
-    # model_fields_set, not via the value.
-    schedule: ScheduleIn | None = None
+    # None is meaningful (clear the schedule) -- presence is checked
+    # via model_fields_set, not via the value. A LIST, not an object:
+    # a recipient has as many allowed periods as their week needs, and
+    # the single-window shape is exactly what made "Mon-Fri 09-21 plus
+    # silent weekends" inexpressible.
+    schedule: list[PeriodIn] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -188,28 +240,21 @@ def _facade_form(prefs: RecipientPreferences) -> dict[str, Any]:
         for category in sorted(registry.registered_categories())
     }
 
-    schedule: dict[str, Any] | None = None
-    if prefs.quiet_from is not None:
-        # set_quiet_hours is all-or-nothing: quiet_from set implies
-        # quiet_to and quiet_days set. An explicit check, not an
-        # assert (Phase 2.3 precedent): asserts vanish under
-        # `python -O`, and a half-window (only reachable by manual DB
-        # surgery) would then surface as an opaque strftime(None)
-        # traceback. RuntimeError, NOT ValidationError: this is store
-        # corruption, not client input -- the caller must see a 500,
-        # not be told its request was wrong.
-        if prefs.quiet_to is None or prefs.quiet_days is None:
-            raise RuntimeError(
-                f"Recipient {prefs.recipient_id} has a partial "
-                f"quiet-hours window (quiet_from set, quiet_to/days "
-                f"missing) -- the store violates the all-or-nothing "
-                f"invariant; fix the row"
-            )
-        schedule = {
-            "from": prefs.quiet_from.strftime("%H:%M"),
-            "to": prefs.quiet_to.strftime("%H:%M"),
-            "days": _iso_days_to_codes(prefs.quiet_days),
-        }
+    schedule: list[dict[str, str]] | None = None
+    if prefs.allowed_windows is not None:
+        # No partial-state guard like the old window needed: a
+        # schedule is ONE column now, so "half a schedule" is not a
+        # state the store can be in. The invariant that had to be
+        # checked there -- three columns that must agree -- stopped
+        # existing together with the three columns.
+        schedule = [
+            {
+                "day": _DAY_CODES[window["day"] - 1],
+                "from": _hhmm(window["from"]),
+                "to": _hhmm(window["to"]),
+            }
+            for window in prefs.allowed_windows
+        ]
 
     return {
         "categories": categories,
@@ -256,22 +301,15 @@ async def patch_preferences_form(
             )
 
     if "schedule" in patch.model_fields_set:
-        if patch.schedule is None:
-            await set_quiet_hours(
-                session,
-                recipient_id,
-                quiet_from=None,
-                quiet_to=None,
-                days=None,
-            )
-        else:
-            await set_quiet_hours(
-                session,
-                recipient_id,
-                quiet_from=patch.schedule.from_,
-                quiet_to=patch.schedule.to,
-                days=_codes_to_iso_days(patch.schedule.days),
-            )
+        await set_schedule(
+            session,
+            recipient_id,
+            windows=(
+                None
+                if patch.schedule is None
+                else [period.stored() for period in patch.schedule]
+            ),
+        )
 
     prefs = await get_preferences(session, recipient_id)
     return _facade_form(prefs)

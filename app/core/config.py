@@ -44,7 +44,15 @@ from app.core.channels import (
 # question unanswerable from the outside. Raise it with the tag, in the
 # same commit; pyproject carries the same number and a test pins the
 # two together, so neither can move alone.
-APP_VERSION = "1.4.0"
+#
+# WHAT THE NUMBER PROMISES, because the products read it as an
+# instruction. A MAJOR bump means the contract changed and the caller
+# must change with it; 2.0.0 is the schedule turning over -- the
+# preferences `schedule` key became a list of allowed periods, and a
+# product still sending the old object gets a 422 on every save. A
+# patch bump would have said "safe, do nothing", which is the loudest
+# kind of lie this service can tell.
+APP_VERSION = "2.0.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

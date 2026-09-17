@@ -16,7 +16,14 @@ from httpx import AsyncClient
 from app.core.database import get_session_factory
 from tests.helpers import create_recipient, next_phase3b_telegram_id
 
-_SCHEDULE = {"from": "22:00", "to": "08:00", "days": ["mon", "fri"]}
+# The wire form after R-5: a LIST of periods when delivery is
+# ALLOWED, each owned by its own day. The old constant was one quiet
+# window with a day set -- {"from": "22:00", "to": "08:00", "days":
+# ["mon", "fri"]} -- and it could not say what this says.
+_SCHEDULE = [
+    {"day": "mon", "from": "09:00", "to": "21:00"},
+    {"day": "fri", "from": "09:00", "to": "24:00"},
+]
 
 
 async def _seed_recipient() -> UUID:
@@ -142,20 +149,69 @@ class TestPatchSchedule:
             == _SCHEDULE
         )
 
-    async def test_days_normalized_to_week_order(
+    async def test_periods_come_back_in_canonical_order(
         self, client: AsyncClient,
     ) -> None:
-        """Input day order is free; the form comes back mon..sun,
-        de-duplicated -- ONE canonical spelling per window."""
+        """Input order is free; the form comes back sorted by day then
+        start -- ONE canonical spelling per schedule.
+
+        The old form of this test asserted the same property about the
+        DAY LIST of a single window (mon..sun, de-duplicated). It was
+        right about that model; there is no day list any more, so the
+        property moved to the periods themselves.
+        """
         recipient_id = await _seed_recipient()
         response = await client.patch(
             _prefs(recipient_id),
-            json={"schedule": {
-                "from": "23:00", "to": "07:00",
-                "days": ["sun", "mon", "sun"],
-            }},
+            json={"schedule": [
+                {"day": "fri", "from": "09:00", "to": "12:00"},
+                {"day": "mon", "from": "18:00", "to": "20:00"},
+                {"day": "mon", "from": "09:00", "to": "12:00"},
+            ]},
         )
-        assert response.json()["schedule"]["days"] == ["mon", "sun"]
+        assert response.status_code == 200, response.text
+        assert response.json()["schedule"] == [
+            {"day": "mon", "from": "09:00", "to": "12:00"},
+            {"day": "mon", "from": "18:00", "to": "20:00"},
+            {"day": "fri", "from": "09:00", "to": "12:00"},
+        ]
+
+    async def test_touching_periods_are_422(
+        self, client: AsyncClient,
+    ) -> None:
+        """One stretch has one spelling: 09-12 plus 12-18 is 09-18
+        written twice, and accepting both would let two stored values
+        mean one thing -- the defect class this release removes.
+        Refused rather than merged: a merge would change what the
+        person entered without telling them.
+        """
+        recipient_id = await _seed_recipient()
+        response = await client.patch(
+            _prefs(recipient_id),
+            json={"schedule": [
+                {"day": "mon", "from": "09:00", "to": "12:00"},
+                {"day": "mon", "from": "12:00", "to": "18:00"},
+            ]},
+        )
+        assert response.status_code == 422, response.text
+
+    async def test_a_full_day_ends_at_24_00(
+        self, client: AsyncClient,
+    ) -> None:
+        """THE ONE-MINUTE HOLE, closed on the wire too. The old model
+        could only approximate a whole day as 00:00-23:59, and a
+        notification went out at 23:59 on a day marked silent."""
+        recipient_id = await _seed_recipient()
+        response = await client.patch(
+            _prefs(recipient_id),
+            json={"schedule": [
+                {"day": "sat", "from": "00:00", "to": "24:00"},
+            ]},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["schedule"] == [
+            {"day": "sat", "from": "00:00", "to": "24:00"},
+        ]
 
     async def test_clear_with_null(self, client: AsyncClient) -> None:
         recipient_id = await _seed_recipient()
@@ -170,29 +226,32 @@ class TestPatchSchedule:
         recipient_id = await _seed_recipient()
         response = await client.patch(
             _prefs(recipient_id),
-            json={"schedule": {
-                "from": "22:00", "to": "08:00", "days": ["monday"],
-            }},
+            json={"schedule": [
+                {"day": "monday", "from": "09:00", "to": "12:00"},
+            ]},
         )
         assert response.status_code == 422
 
-    async def test_empty_days_is_422(self, client: AsyncClient) -> None:
+    async def test_empty_schedule_is_422(self, client: AsyncClient) -> None:
+        """An empty list would mean "never deliver": the deliveries
+        defer until they expire, which is a black hole rather than a
+        schedule. Clearing is `null`, and muting is what says "do not
+        send me this"."""
         recipient_id = await _seed_recipient()
         response = await client.patch(
-            _prefs(recipient_id),
-            json={"schedule": {"from": "22:00", "to": "08:00", "days": []}},
+            _prefs(recipient_id), json={"schedule": []},
         )
         assert response.status_code == 422
 
-    async def test_partial_window_is_422(
+    async def test_partial_period_is_422(
         self, client: AsyncClient,
     ) -> None:
-        """schedule replaces WHOLE: a window missing a field is not
-        a partial update, it is a malformed window."""
+        """schedule replaces WHOLE: a period missing a field is not a
+        partial update, it is a malformed period."""
         recipient_id = await _seed_recipient()
         response = await client.patch(
             _prefs(recipient_id),
-            json={"schedule": {"from": "22:00", "days": ["mon"]}},
+            json={"schedule": [{"day": "mon", "from": "09:00"}]},
         )
         assert response.status_code == 422
 
@@ -202,9 +261,23 @@ class TestPatchSchedule:
         recipient_id = await _seed_recipient()
         response = await client.patch(
             _prefs(recipient_id),
-            json={"schedule": {
-                "from": "22:00:30", "to": "08:00", "days": ["mon"],
-            }},
+            json={"schedule": [
+                {"day": "mon", "from": "09:00:30", "to": "12:00"},
+            ]},
+        )
+        assert response.status_code == 422
+
+    async def test_a_start_of_24_00_is_422(
+        self, client: AsyncClient,
+    ) -> None:
+        """24:00 is an END, not a time: a period starting there has
+        nothing after it."""
+        recipient_id = await _seed_recipient()
+        response = await client.patch(
+            _prefs(recipient_id),
+            json={"schedule": [
+                {"day": "mon", "from": "24:00", "to": "24:00"},
+            ]},
         )
         assert response.status_code == 422
 
