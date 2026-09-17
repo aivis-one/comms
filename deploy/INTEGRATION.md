@@ -99,6 +99,17 @@ Semantics:
   here. Treat this file with the same care as the rest of your
   secrets: the URL carries the redis password.
 
+**The stream and group names are half of an agreement, so they are
+written down on both sides.** The relay XADDs into the stream
+`comms:events`; comms reads it as the consumer group `comms`. Both are
+the defaults on the comms side (`COMMS_EVENTS_STREAM`,
+`COMMS_CONSUMER_GROUP` in `deploy/.env.example`), so a deploy that
+names neither works -- but a relay pointing at a different stream is
+not an error anywhere: it writes where nobody reads, and the
+notifications simply never arrive, with no failure to see on either
+side. If a deploy overrides either name, every product writing to it
+must be changed in the same step.
+
 The installer places all of this BEFORE it starts the product stack,
 so the backend comes up with the variables already in its env file and
 no restart is needed.
@@ -130,6 +141,123 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+## 3a. How a product declares its channels
+
+Every product has a different set of delivery channels, and a channel
+it does not have is not a failure -- it is a design decision. One rule
+expresses that, and it is the only mechanism:
+
+**A channel is decided by its own set of settings keys, and by nothing
+else.** A channel exists on a deploy when it has an implementation in
+this service and every key it declares is set:
+
+| the channel's key set | what it means | what happens |
+|---|---|---|
+| **every key empty** | this product has no such channel, by design | the service starts; the channel is absent |
+| **every key set** | the product has the channel | the channel is live |
+| **some keys set** | an integrator typo | **the service refuses to start**, naming the channel and every missing key |
+| **a malformed value** | an integrator typo | same refusal, naming the key and the shape expected |
+
+There is no mode, no global switch and no special case per channel. A
+channel that declares no keys at all is live by definition, because the
+empty set is trivially complete: that is how in-app delivery works --
+its delivery is the row the inbox reads, nothing leaves the process,
+and there is nothing to configure. A channel with no implementation in
+this service is absent on every deploy, whatever the environment says.
+
+The declared keys of every implemented channel live in one place,
+`app/core/channels.py`. That file is the answer to "which keys does
+this channel need"; this document does not duplicate the list.
+
+**A requested channel that the product does not have is a LOUD
+failure.** Asking for a channel whose key set is empty produces a
+delivery with status `failed`, immediately and without retries: the
+channel will not become configured between attempts. It is never
+reported as a success. The two situations that used to look identical
+are now distinguishable: a channel nobody requests is simply absent and
+costs nothing, while a channel that is requested but not configured is
+a lost notification and says so in the log
+(`delivery_channel_unavailable`) and in the delivery row.
+
+**Startup refusals are readable.** The configuration is built before
+logging is set up, so a refusal prints a message -- naming the channel
+and the keys -- and exits, rather than a traceback. When the refusal
+happens during an install, `comms-deploy.sh` prints the last lines of
+the application log where the installer output is, so the typo is
+visible without going looking for it.
+
+**What the first start tells you.** The `comms_started` log line
+carries a channel map: every channel with `live`, `not_configured` or
+`not_implemented`. The same map is served by `GET /health` under
+`channels`, so confirming it later needs a request rather than a grep
+through a container's log. That map is the way to confirm that a deploy
+sees the channels its installer meant to give it. One case needs it: a
+typo in *every* key name of a channel (unknown keys are ignored on
+purpose, so that a leftover variable in a shared env file cannot refuse
+a working deploy) leaves the key set empty and therefore reads as "no
+such channel". The map shows `not_configured` where the installer
+expected `live`; the in-code marker (`KNOWN CEILING` in
+`app/core/channels.py`) records the case and its agreed fix.
+
+**Email, concretely.** The channel is decided by its key set like any
+other, and its keys are declared in `app/core/channels.py`. Three of
+them decide it -- the provider API key, the provider domain, and the
+sender address -- and all three must be set together or left empty
+together. The sender has no default because it is a product fact; a
+default would make an incomplete set look complete. It accepts either a
+bare address or the display form `Name <address>`, since a signed
+sender delivers better, and a value carrying a line break is refused at
+startup.
+
+The provider region is different in kind: it has a default, so
+"unset" and "set to the default" cannot be told apart, and it therefore
+does NOT take part in deciding whether the channel exists -- a deploy
+with no email at all is not made incomplete by it. Its VALUE is still
+checked whenever it is spelled out, against a closed set of the
+provider's regions: a plausible-looking `eu-west` refuses startup
+instead of failing every send later.
+
+**What the key set cannot check.** A syntactically perfect set with a
+wrong API key, or with a domain that is not verified with the provider,
+starts cleanly and fails on every message. That is by construction: a
+network check at startup would make the service's boot depend on the
+provider being reachable. The loudness therefore sits at send time --
+the first refusal the provider attributes to configuration rather than
+to the message is logged as `email_channel_not_viable`, once, naming
+the channel; the messages after it are ordinary per-message lines, so a
+dead channel is a signal instead of a thousand identical entries.
+
+**What email reads from the profile.** Its own fields under its own
+channel: `{type: {email: {subject, body}}}`. Nothing new enters the
+profile contract, and a profile that declares neither field stays
+valid -- the subject falls back to the notification title, and, when
+that is blank, to the type key, because an empty subject is filed as
+spam. The body falls back to the stored body and never to another
+channel's template, whose markup would arrive as raw characters.
+Declaring email templates does not make a notification use the channel:
+the channel list comes from the request that created it, and from
+nowhere else.
+
+**One delivery path.** There is no SMTP fallback, deliberately: a
+second path no deploy exercises rots from the first day. The
+consequence is worth stating -- while the provider is unreachable, mail
+does not go out at all. Delivery is retried, and products that send
+codes re-send them on request.
+
+**Time.** A product that mails short-lived codes should set `expiry_at`
+on the notification to the life of the code. Delivery is retried on
+transient failures, and when the provider asks to be retried later the
+service honours the wait it names -- which can exceed the life of a
+code by a wide margin. `expiry_at` is what stops a delivery that has
+outlived its point; without it the service has no way to know.
+
+**Scope of this rule: sending channels only.** A future inbound side
+(receiving bot updates) is a separate capability with its own keys and
+its own switch, and is not a channel of this registry. One bot has
+exactly one update receiver, so a receiver switched on by the mere
+presence of a sending token would start at a deploy that only asked to
+send.
+
 ## 4. What the integration code does with all this
 
 Consumers of the variables above are the integration track in the
@@ -147,6 +275,26 @@ velo repo:
 None of that is wired here; this file only accounts for the network
 path, the credentials and the profile being in place before that code
 runs.
+
+## How long comms keeps things
+
+Two questions every product asks once, answered here so the answer is
+not a trip through our source. Both are deploy-side settings with
+defaults; both are days-granular, and both treat a value of zero or
+less as "never".
+
+- **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
+  **90**. A notification in a terminal state (and its deliveries) is
+  removed by the worker's retention pass after that many days. Nothing
+  is removed while a delivery is still pending.
+- **Threads closing themselves**: `THREAD_AUTO_CLOSE_DAYS`, default
+  **30**. A thread with no activity for that long is closed by the
+  same worker. Closing is a status change -- the thread, its messages
+  and the participants' read pointers stay.
+
+A deploy that wants either behaviour off sets the value to 0. A
+product that needs history kept longer than comms keeps it should
+retain its own copy: comms is the delivery service, not the archive.
 
 ## Compose project name
 

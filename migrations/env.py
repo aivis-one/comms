@@ -27,6 +27,7 @@ from app.audience.models import (  # noqa: F401
 )
 from app.core.config import settings
 from app.core.database import Base
+from app.core.schema_objects import include_object
 
 # Phase 1: notification engine
 from app.engine.models import Notification, NotificationDelivery  # noqa: F401
@@ -42,6 +43,18 @@ from app.messaging.models import (  # noqa: F401
 )
 
 # ---------------------------------------------------------------------------
+#
+# AUTOGENERATE FILTER (R-3). Schema invariants are declared in the
+# migrations, not in __table_args__, so Base.metadata does not carry
+# them and autogenerate would offer to DROP them -- ten index removals
+# on a schema at head, four of them uniqueness that products depend on.
+# include_object mutes exactly those objects, by name, and nothing
+# else; the list and the reasoning live in app/core/schema_objects.py.
+#
+# It is passed to BOTH configure calls. In the offline branch it is
+# inert today -- autogenerate needs a connection, so --sql mode never
+# consults it -- and it is there so that the two configurations cannot
+# drift apart, not because it fires.
 
 config = context.config
 
@@ -59,6 +72,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -70,6 +84,7 @@ def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
+        include_object=include_object,
     )
 
     with context.begin_transaction():

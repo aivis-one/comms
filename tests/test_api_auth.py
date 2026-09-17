@@ -8,7 +8,7 @@
 #   - no header / wrong scheme / wrong token -> 401, and the response
 #     never echoes anything the client sent;
 #   - the right token -> through;
-#   - empty configured token (stub mode) -> auth disabled;
+#   - empty configured token (development) -> auth disabled;
 #   - /health and /ready stay open regardless (installer/docker
 #     healthchecks carry no secret).
 # =============================================================================
@@ -89,13 +89,18 @@ class TestAuthRequired:
         assert response.status_code == 401
 
 
-class TestAuthDisabledInStub:
+class TestAuthDisabledInDevelopment:
     async def test_empty_token_disables_auth(
         self, client: AsyncClient,
     ) -> None:
-        """Default test config: no token -> the API is open (stub
-        mode; real mode cannot even start without the token, see
-        test_config_validation)."""
+        """Default test config: no token -> the API is open.
+
+        R-0: the class was named for the stub mode of the removed global
+        channel switch, under which an empty token was legal. That state
+        is now reachable in development only (any other APP_ENV refuses
+        to start without the token, see test_config_validation); the
+        suite reproduces it with the autouse api_auth_disabled fixture.
+        """
         assert settings.comms_service_token == ""
         response = await client.get(_inbox_url())
         assert response.status_code == 200

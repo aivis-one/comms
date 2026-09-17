@@ -12,8 +12,18 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import Integer
 
+from app.core.constants import (
+    MAX_GROUP_KEY_LEN,
+    MAX_NOTIFICATION_PRIORITY,
+    MAX_TELEGRAM_ID,
+    MAX_TYPE_KEY_LEN,
+    MIN_NOTIFICATION_PRIORITY,
+    MIN_TELEGRAM_ID,
+)
 from app.core.exceptions import ValidationError
+from app.engine.models import Notification
 from app.transport.events import (
     GroupChanged,
     NotificationRequest,
@@ -199,6 +209,81 @@ class TestNotificationRequestSchema:
                 "notification_request", _request_data(priority=True),
             ))
 
+    @pytest.mark.parametrize(
+        "priority", [MIN_NOTIFICATION_PRIORITY, MAX_NOTIFICATION_PRIORITY],
+    )
+    def test_priority_at_the_ends_of_the_column_range_parses(
+        self, priority: int,
+    ) -> None:
+        """The pair to the refusals below: the bound is the Integer
+        column's range and nothing narrower. comms does not own what a
+        product means by priority, so a scale of its own would be a
+        policy invented in passing."""
+        event = parse_event(_envelope(
+            "notification_request", _request_data(priority=priority),
+        ))
+        assert isinstance(event, NotificationRequest)
+        assert event.priority == priority
+
+    @pytest.mark.parametrize(
+        "priority",
+        [MAX_NOTIFICATION_PRIORITY + 1, MIN_NOTIFICATION_PRIORITY - 1],
+    )
+    def test_priority_outside_the_column_range_is_terminal(
+        self, priority: int,
+    ) -> None:
+        """The last field of the class R-2 closed. Unbounded, this
+        value passed the parser and died on the INSERT -- where a
+        producer's mistake is diagnosed as our internal fault and
+        retried before it reaches the DLQ. Now it is named here and
+        terminal at once."""
+        with pytest.raises(ValidationError, match="priority"):
+            parse_event(_envelope(
+                "notification_request", _request_data(priority=priority),
+            ))
+
+    def test_the_priority_bound_is_the_columns_own_range(self) -> None:
+        """The ANCHOR the parse pair above cannot be.
+
+        That pair feeds the parser the value named by the constant and
+        checks it is accepted -- so moving the constant moves both
+        sides and the pair stays green. It guards the parser against
+        using a different number than the constant, and nothing more.
+        What ties the constant to the COLUMN is this: the column is a
+        plain Integer (not BigInteger, not SmallInteger -- both of
+        which subclass it, hence the exact type check), and an
+        Integer's range is what the bound must be. Widen the column and
+        this test is the one that says the bound moved too.
+        """
+        column_type = Notification.__table__.c.priority.type
+        assert type(column_type) is Integer
+        assert MIN_NOTIFICATION_PRIORITY == -(2**31)
+        assert MAX_NOTIFICATION_PRIORITY == 2**31 - 1
+
+    def test_type_longer_than_the_column_is_refused_here(self) -> None:
+        """NO DEFECT HID BEHIND the 200 that used to stand here: a type
+        longer than the column cannot be registered (the profile loader
+        caps keys at the same constant), so the registry refused it
+        before any INSERT. Only the WORDING moves -- the field is named
+        at the boundary instead of the profile printing its whole
+        declared list."""
+        with pytest.raises(ValidationError, match="type"):
+            parse_event(_envelope(
+                "notification_request",
+                _request_data(type="t" * (MAX_TYPE_KEY_LEN + 1)),
+            ))
+
+    def test_a_type_of_exactly_the_column_width_still_parses(self) -> None:
+        """The pair. Parsing judges the string form only; whether the
+        type is REGISTERED is the handler's question, and it is asked
+        against the live registry."""
+        key = "t" * MAX_TYPE_KEY_LEN
+        event = parse_event(_envelope(
+            "notification_request", _request_data(type=key),
+        ))
+        assert isinstance(event, NotificationRequest)
+        assert event.type == key
+
 
 class TestActionDataRules:
     """Item 5: the early line of defense."""
@@ -281,6 +366,59 @@ class TestSyncSchemas:
                 "v": 1, "group_key": "g",
                 "recipient_id": str(uuid4()), "member": "yes",
             }))
+
+    @pytest.mark.parametrize("length", [MAX_GROUP_KEY_LEN, 1])
+    def test_group_key_up_to_the_column_width_parses(
+        self, length: int,
+    ) -> None:
+        """The pair to the refusal below: the boundary sits where the
+        column sits, not wherever is convenient."""
+        event = parse_event(_envelope("group_changed", {
+            "v": 1, "group_key": "g" * length,
+            "recipient_id": str(uuid4()), "member": True,
+        }))
+        assert isinstance(event, GroupChanged)
+        assert len(event.group_key) == length
+
+    def test_group_key_past_the_column_width_is_terminal(self) -> None:
+        """This parser used to accept 200 characters against a column
+        of MAX_GROUP_KEY_LEN, with a comment asserting the column was
+        String(200). Anything in between passed here and died on the
+        INSERT -- which the consumer treats as a possibly-transient
+        failure, so it retried six times before the DLQ. Nothing that
+        WORKED changed; the shape of the refusal did.
+        """
+        with pytest.raises(ValidationError, match="group_key"):
+            parse_event(_envelope("group_changed", {
+                "v": 1, "group_key": "g" * (MAX_GROUP_KEY_LEN + 1),
+                "recipient_id": str(uuid4()), "member": True,
+            }))
+
+    @pytest.mark.parametrize(
+        "telegram_id", [MAX_TELEGRAM_ID + 1, MIN_TELEGRAM_ID - 1],
+    )
+    def test_telegram_id_outside_the_column_range_is_terminal(
+        self, telegram_id: int,
+    ) -> None:
+        """Out of the BigInteger range the value is not a large id, it
+        is a broken one -- and unbounded it reached the INSERT."""
+        with pytest.raises(ValidationError, match="telegram_id"):
+            parse_event(_envelope("user_upserted", {
+                "v": 1, "recipient_id": str(uuid4()),
+                "telegram_id": telegram_id, "email": None,
+                "locale": "en", "timezone": None, "active": True,
+            }))
+
+    def test_telegram_id_at_the_edge_of_the_range_parses(self) -> None:
+        """The pair. Parsing only -- nothing is stored, so this costs
+        the shared id band nothing (tests/helpers.py)."""
+        event = parse_event(_envelope("user_upserted", {
+            "v": 1, "recipient_id": str(uuid4()),
+            "telegram_id": MAX_TELEGRAM_ID, "email": None,
+            "locale": "en", "timezone": None, "active": True,
+        }))
+        assert isinstance(event, UserUpserted)
+        assert event.telegram_id == MAX_TELEGRAM_ID
 
 
 class TestReminderCancelSchema:

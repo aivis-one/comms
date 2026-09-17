@@ -236,6 +236,16 @@ class TestWorkerPickup:
     async def test_due_reminder_delivered_future_waits(
         self, db_session: AsyncSession,
     ) -> None:
+        """A due reminder is delivered; a future one waits.
+
+        R-0: this test requested telegram and relied on the old stub,
+        which made an UNCONFIGURED channel "succeed". Its subject is
+        reminder pickup, not the channel, and delivery does not branch
+        on the channel before the formatter (app/engine/service.py
+        deliver_notification). An unconfigured telegram now FAILS
+        permanently -- so the test asks for in_app, the channel that is
+        live on every deploy by definition (zero declared keys).
+        """
         recipient = await create_recipient(db_session)
 
         # Scheduled normally, then backdated to "due" (time passing).
@@ -245,7 +255,7 @@ class TestWorkerPickup:
             anchor_at=datetime.now(UTC) + timedelta(hours=2),
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
+            channels=["in_app"],
         )
         # Still in the future.
         future = await schedule_reminders(
@@ -254,7 +264,7 @@ class TestWorkerPickup:
             anchor_at=datetime.now(UTC) + timedelta(hours=48),
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
+            channels=["in_app"],
         )
         due[0].scheduled_at = datetime.now(UTC) - timedelta(seconds=1)
         await db_session.commit()

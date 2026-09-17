@@ -20,7 +20,8 @@
 #   product's comms-profile/.
 #
 # ENVIRONMENT:
-#     CHANNELS_MODE=stub   -> nothing ever leaves the process
+#     channel keys empty   -> nothing ever leaves the process (the
+#                             CHANNEL FENCE below, set by this file)
 #     TEMPLATES_DIR empty  -> startup profile load is a no-op in dev;
 #                             the stub_profile fixture installs the
 #                             fixture profile explicitly per test
@@ -46,9 +47,43 @@
 #   purpose -- one would be set once "just to run it here" and stay set,
 #   and a guard that can be turned off reads as a setting rather than as
 #   "you are about to erase production".
+#
+# CHANNEL FENCE -- why this file writes os.environ before importing app:
+#   A channel is live when its key set is full (app/core/channels.py),
+#   and the suite may run where a live key set sits in the environment
+#   (the deployed container carries the real bot token). So the fence
+#   lives HERE, not in whoever invokes pytest: before the settings
+#   object is built, every declared key of every channel is blanked --
+#   environment variables beat the .env file -- and every external
+#   channel reads as not configured. The keys come from the channel
+#   spec, so a channel added later is fenced without anyone remembering.
+#   A test that needs a LIVE channel builds one explicitly
+#   (formatters.build_formatters with full settings and a fake Bot).
+#   Second line: the network tripwire fixtures below make any real
+#   outbound request fail the test -- ONE PER CLIENT LIBRARY. The
+#   telegram tripwire patches aiogram's transport, which says nothing
+#   about plain HTTP: an email double that forgot to inject a fake
+#   client would have walked straight out to the provider.
+#
+#   COMMS_SERVICE_TOKEN is required outside development, and the suite
+#   runs with APP_ENV=ci -- so the fence also supplies a suite token,
+#   replacing whatever the environment holds (the suite never needs a
+#   real one). The autouse `api_auth_disabled` fixture then runs every
+#   test with auth off, as a development deploy runs; auth itself is
+#   exercised explicitly in test_api_auth / test_api_recipients.
 # =============================================================================
 
+# ruff: noqa: E402 -- the fence below must run before any settings import.
+
 from __future__ import annotations
+
+import os
+
+from app.core.channels import channel_env_keys
+
+for _key in channel_env_keys():
+    os.environ[_key] = ""
+os.environ["COMMS_SERVICE_TOKEN"] = "suite-service-token"
 
 import subprocess
 import sys
@@ -65,6 +100,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.config import settings
 from app.core.database import dispose_engine, get_session_factory
+from app.engine.formatters import reset_formatters
 from app.engine.models import Notification, NotificationDelivery
 from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.profile.loader import FileProfileSource, install_profile, load_profile
@@ -200,6 +236,68 @@ def stub_profile() -> Generator[None, None, None]:
     install_profile(_FIXTURE_PROFILE)
     yield
     registry.reset()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def network_tripwire() -> Generator[None, None, None]:
+    """Any real Telegram API request fails the test that made it.
+
+    Patched at aiogram's transport, below every Bot: a fake Bot never
+    reaches it, a real one always would.
+    """
+    from aiogram.client.session.aiohttp import AiohttpSession
+
+    async def _refuse(*args: object, **kwargs: object) -> object:
+        raise RuntimeError(
+            "network tripwire: a test reached the real Telegram API"
+        )
+
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(AiohttpSession, "make_request", _refuse)
+    yield
+    patcher.undo()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def http_network_tripwire() -> Generator[None, None, None]:
+    """Any real HTTP request fails the test that made it.
+
+    Patched at httpx's transport, below every client: a client built on
+    a MockTransport never reaches it, a real one always would.
+    """
+    from httpx import AsyncHTTPTransport
+
+    async def _refuse(*args: object, **kwargs: object) -> object:
+        raise RuntimeError(
+            "network tripwire: a test reached the real network over HTTP"
+        )
+
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(AsyncHTTPTransport, "handle_async_request", _refuse)
+    yield
+    patcher.undo()
+
+
+@pytest.fixture(autouse=True)
+def fresh_formatters() -> Generator[None, None, None]:
+    """Every test starts with no channel registry built.
+
+    The registry is built from settings on first use; a test that
+    patches settings must not inherit a registry built before it.
+    """
+    reset_formatters()
+    yield
+    reset_formatters()
+
+
+@pytest.fixture(autouse=True)
+def api_auth_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the API with auth off, as a development deploy runs it.
+
+    The fence above supplies a token only so that settings can be built
+    under APP_ENV=ci; tests that exercise auth set their own token.
+    """
+    monkeypatch.setattr(settings, "comms_service_token", "")
 
 
 # ---------------------------------------------------------------------------

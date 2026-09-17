@@ -38,7 +38,10 @@ jobs:
     env:
       APP_ENV: ci
       DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
-      CHANNELS_MODE: stub
+      # Required outside development; `alembic upgrade head` below
+      # builds the settings before the suite's own fence runs. A test
+      # value -- the suite replaces it anyway (tests/conftest.py).
+      COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
 
     steps:
       - name: Check out
@@ -49,11 +52,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      # From the lock, so CI tests the package set the image ships --
+      # the project itself without deps, since the lock already has
+      # them and re-resolving would defeat the pin.
+      - name: Install dependencies (pinned)
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
 
       - name: Apply migrations (alembic upgrade head)
         run: alembic upgrade head
+
+      # Turns the autogenerate filter from a patch into a detector
+      # (R-3). Red when a model changed without a migration, and red
+      # when a migration-only object was added without being listed in
+      # app/core/schema_objects.py. It says nothing about the objects
+      # already listed there -- the suite asserts those exist.
+      - name: Schema matches the models (alembic check)
+        run: alembic check
 
       - name: Run tests
         run: pytest -q

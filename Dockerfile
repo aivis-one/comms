@@ -28,7 +28,7 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-COPY pyproject.toml ./
+COPY pyproject.toml requirements.lock ./
 
 # Install DEPENDENCIES ONLY -- the project itself is never pip-installed
 # (runtime imports the `app` package via PYTHONPATH, see below; that is
@@ -43,10 +43,17 @@ COPY pyproject.toml ./
 # accident into a hard error. Extracting the dependency list keeps this
 # layer keyed on pyproject.toml alone -- source changes do not reinstall
 # dependencies, which is the whole point of the two-stage split.
+#
+# FROM THE LOCK, NOT FROM THE RANGES. pyproject states ranges, so
+# extracting its dependency list here -- which is what this layer used
+# to do -- resolved them afresh on every build: the image built today
+# and the image built next month carried different versions of every
+# transitive package, and nothing recorded which. requirements.lock is
+# the resolution itself, regenerated deliberately (see its header) in
+# the same commit as any dependency change.
 RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip && \
-    python -c 'import tomllib; p = tomllib.load(open("pyproject.toml", "rb"))["project"]; print("\n".join(p["dependencies"] + p["optional-dependencies"]["dev"]))' > /tmp/requirements.txt && \
-    /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+    /opt/venv/bin/pip install --no-cache-dir -r requirements.lock
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime

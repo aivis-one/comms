@@ -48,13 +48,20 @@ from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Body, Depends
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_service_auth
 from app.audience import sync
 from app.audience.models import Recipient
+from app.core.constants import (
+    MAX_EMAIL_LEN,
+    MAX_LOCALE_LEN,
+    MAX_TELEGRAM_ID,
+    MAX_TIMEZONE_LEN,
+    MIN_TELEGRAM_ID,
+)
 from app.core.database import get_db_session
 
 logger = structlog.get_logger()
@@ -72,14 +79,28 @@ class RecipientSnapshot(BaseModel):
     Every field is required -- see the module header on why an absent
     key must not degrade into a default. extra="forbid" turns a
     misspelled field into a 422 instead of a silently ignored one.
+
+    EVERY BOUND IS THE COLUMN'S OWN CONSTANT (R-2 item 1), so the four
+    that have a column cannot drift from it. Unbounded, each of them
+    reached the INSERT: a 321-character address, a nine-character
+    locale or a telegram id outside the BigInteger range came back as
+    a database error -- a 500 telling an integrator that the SERVICE
+    broke, on input only they can fix. The nullable fields are bounded
+    too: optional is not unmeasured.
+
+    min_length is deliberately NOT set on locale: "" is a value the
+    column accepts and sync overwrites wholesale, and rejecting it
+    here would be a new policy rather than a mirrored column.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    telegram_id: int | None
-    email: str | None
-    locale: str
-    timezone: str | None
+    telegram_id: int | None = Field(
+        ge=MIN_TELEGRAM_ID, le=MAX_TELEGRAM_ID,
+    )
+    email: str | None = Field(max_length=MAX_EMAIL_LEN)
+    locale: str = Field(max_length=MAX_LOCALE_LEN)
+    timezone: str | None = Field(max_length=MAX_TIMEZONE_LEN)
     active: bool
 
 

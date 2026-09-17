@@ -175,10 +175,21 @@ class TestResolveStage:
 
 
 class TestDeliverAndRollup:
-    """End-to-end batch processing with the stub channel."""
+    """End-to-end batch processing: in_app (live by definition) and
+    explicit formatter doubles -- no channel succeeds by default."""
 
     async def test_happy_path_sent(self, db_session: AsyncSession) -> None:
-        """create -> process -> delivery SENT, notification SENT."""
+        """create -> process -> delivery SENT, notification SENT.
+
+        R-0: this test requested telegram and relied on the old stub,
+        which made an UNCONFIGURED channel "succeed". Its subject is the
+        pipeline (create -> process -> rollup), not the channel, and
+        delivery does not branch on the channel before the formatter
+        (app/engine/service.py deliver_notification). An unconfigured
+        telegram now FAILS permanently -- so the test asks for in_app,
+        the channel that is live on every deploy by definition (zero
+        declared keys).
+        """
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
@@ -187,7 +198,7 @@ class TestDeliverAndRollup:
             body="World",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
+            channels=["in_app"],
         )
         await db_session.commit()
 

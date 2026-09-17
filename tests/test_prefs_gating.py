@@ -303,7 +303,16 @@ class TestMuteGating:
     async def test_mixed_audience_delivers_to_unmuted_only(
         self, db_session: AsyncSession,
     ) -> None:
-        """Muted recipients are dropped; the rest deliver -> SENT."""
+        """Muted recipients are dropped; the rest deliver -> SENT.
+
+        R-0: this test requested telegram and relied on the old stub,
+        which made an UNCONFIGURED channel "succeed". Its subject is the
+        mute gate, not the channel, and delivery does not branch on the
+        channel before the formatter (app/engine/service.py
+        deliver_notification). An unconfigured telegram now FAILS
+        permanently -- so the test asks for in_app, the channel that is
+        live on every deploy by definition (zero declared keys).
+        """
         muted = await _phase2_recipient(db_session)
         listening = await _phase2_recipient(db_session)
         await set_category_muted(db_session, muted.id, "unit_updates", True)
@@ -314,7 +323,7 @@ class TestMuteGating:
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram"],
+            channels=["in_app"],
         )
         await db_session.commit()
 
@@ -438,7 +447,16 @@ class TestQuietHoursGating:
     async def test_delivery_sends_outside_window(
         self, db_session: AsyncSession,
     ) -> None:
-        """A window elsewhere in the day does not block delivery."""
+        """A window elsewhere in the day does not block delivery.
+
+        R-0: this test requested telegram and relied on the old stub,
+        which made an UNCONFIGURED channel "succeed". Its subject is the
+        quiet-hours gate, not the channel, and delivery does not branch
+        on the channel before the formatter (app/engine/service.py
+        deliver_notification). An unconfigured telegram now FAILS
+        permanently -- so the test asks for in_app, the channel that is
+        live on every deploy by definition (zero declared keys).
+        """
         recipient = await _phase2_recipient(db_session)
         quiet_from, quiet_to, days = _window_missing_now()
         await set_quiet_hours(
@@ -452,7 +470,7 @@ class TestQuietHoursGating:
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
+            channels=["in_app"],
         )
         await db_session.commit()
 
@@ -562,7 +580,16 @@ class TestLateMuteAtDeliver:
     ) -> None:
         """One of two mutes while backoff-gated: the muted delivery
         closes SKIPPED with its transient history intact, the other
-        sends, the notification rolls up SENT."""
+        sends, the notification rolls up SENT.
+
+        R-0: this test requested telegram and relied on the old stub,
+        which made an UNCONFIGURED channel "succeed". Its subject is the
+        late-mute gate, not the channel, and delivery does not branch on
+        the channel before the formatter (app/engine/service.py
+        deliver_notification). An unconfigured telegram now FAILS
+        permanently -- so the test asks for in_app, the channel that is
+        live on every deploy by definition (zero declared keys).
+        """
         muted = await _phase2_recipient(db_session)
         listening = await _phase2_recipient(db_session)
         notification = await create_notification(
@@ -572,7 +599,7 @@ class TestLateMuteAtDeliver:
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram"],
+            channels=["in_app"],
         )
         await db_session.commit()
 

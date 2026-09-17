@@ -32,7 +32,7 @@ import structlog
 from app.core.config import settings
 from app.core.database import dispose_engine
 from app.core.logging import setup_logging
-from app.engine.formatters import close_formatters
+from app.engine.formatters import close_formatters, init_formatters
 from app.engine.processor import cleanup_terminal_notifications
 from app.engine.worker import run_notification_batch
 from app.messaging.processor import auto_close_idle_threads
@@ -197,6 +197,11 @@ def main() -> None:
     # The worker renders templates -> it MUST have the profile. A
     # broken profile kills the process at startup (ProfileError).
     install_profile_from_settings()
+    # The worker is the only process that delivers -> it builds the
+    # channel registry BEFORE its loop. A registry that cannot be built
+    # kills the worker here, at startup, instead of surfacing on the
+    # first delivery (the build logs the channel map).
+    init_formatters()
     asyncio.run(_main())
 
 
