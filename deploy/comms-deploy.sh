@@ -36,11 +36,13 @@ set -uo pipefail
 #
 # THREE LIFECYCLE VERBS, THREE DIFFERENT WIDTHS -- the difference is
 # deliberate and easy to erase by "unifying" them later:
-#   restart  bounces the THREE app containers only, and waits for
-#            health. Narrow because its job is re-reading data the
-#            service only loads at startup (the profile); the
-#            datastores hold state and bouncing them for an
-#            application-level change is gratuitous risk.
+#   restart  RECREATES the THREE app containers only, and waits for
+#            health. Narrow because its job is delivering what the
+#            service only reads when a container starts -- the profile
+#            AND the environment (see cmd_restart for why a signal
+#            cannot deliver the second); the datastores hold state and
+#            bouncing them for an application-level change is
+#            gratuitous risk.
 #   stop     takes the WHOLE stack down, postgres and redis included.
 #            It is the switch you throw when the machine goes off, not
 #            an application-level operation.
@@ -278,13 +280,23 @@ wait_for_app() {
         sleep 2
     done
     echo -e "${RED}✗ comms-app did not become healthy${NC}"
-    # The reason is in the container log -- a refused start prints a
-    # readable message naming the broken keys. Show it here, where the
-    # person running the install is looking, instead of pointing away.
+    show_app_log_tail
+    return 1
+}
+
+# Print the last lines of comms-app and where the full log is.
+#
+# The reason for a refused start is in the container log -- comms-app
+# prints a readable message naming the broken keys. Shown where the
+# person running the command is looking, instead of pointing away.
+# ONE copy, called from every place a start can fail: wait_for_app, and
+# each `compose up` whose failure exits before wait_for_app runs --
+# there compose's own last word is "dependency failed to start", which
+# names the container but not the reason.
+show_app_log_tail() {
     echo "Last lines of comms-app:"
     $COMPOSE_CMD logs --no-color --tail=20 comms-app 2>&1 | sed 's/^/  /'
     echo "Full logs: $0 logs comms-app"
-    return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -303,6 +315,7 @@ cmd_install() {
     echo "Building and starting the comms stack..."
     if ! $COMPOSE_CMD up -d --build; then
         echo -e "${RED}✗ compose up failed${NC}"
+        show_app_log_tail
         exit 1
     fi
     if ! wait_for_app; then
@@ -331,8 +344,18 @@ cmd_update() {
     fi
     # Recreated comms-app re-runs `alembic upgrade head` in its
     # command before serving -- the migration IS the restart path.
-    if ! $COMPOSE_CMD up -d; then
+    # The three app containers are recreated ALWAYS, by name. Whether
+    # plain `up -d` notices an edited .env depends on how the installed
+    # compose version hashes a service, and this path must not depend
+    # on it: an undetected environment change costs an hour, a
+    # recreate costs seconds (cmd_restart says why a signal is not
+    # enough either).
+    # postgres and redis are NOT named, so compose applies its default
+    # to them -- recreated only when their own definition changed --
+    # which is what `up -d` did before.
+    if ! $COMPOSE_CMD up -d --force-recreate comms-app comms-worker comms-consumer; then
         echo -e "${RED}✗ compose up failed${NC}"
+        show_app_log_tail
         exit 1
     fi
     if ! wait_for_app; then
@@ -341,32 +364,44 @@ cmd_update() {
     echo -e "${GREEN}✓ comms updated (pulled, rebuilt, migrated)${NC}"
 }
 
-# Restart the three application containers -- API, worker, consumer --
+# Recreate the three application containers -- API, worker, consumer --
 # and wait for the API to be healthy again.
 #
-# NOT a hot reload. The name says restart because that is all it is:
-# the processes read their profile once, at startup, so a profile that
-# changed on the bind-mounted path reaches them by being restarted.
-# Naming it after the profile would promise a reload endpoint that is
-# deliberately not built.
+# NOT a hot reload. The processes read their profile and their
+# environment once, when the container starts; restart delivers both by
+# starting new containers. Naming it after the profile would promise a
+# reload endpoint that is deliberately not built.
+#
+# RECREATE, NOT SIGNAL. `compose restart` stops and starts the SAME
+# container, and a container's environment is fixed when it is
+# CREATED: env_file (deploy/.env) is read at creation, not at start. A
+# signalled restart therefore re-reads the profile from its bind mount
+# but runs on the OLD environment -- an operator who fixed .env and ran
+# restart would get the old process back without a word. `up
+# --force-recreate` creates the containers anew and so reads .env
+# again.
 #
 # postgres and redis are left alone on purpose: they hold the data, and
 # bouncing them for an application-level change is gratuitous risk.
+# --no-deps is what guarantees it: without it compose also converges
+# the datastores, recreating them if their definition changed since
+# they were created.
 cmd_restart() {
     echo -e "${CYAN}== comms restart ==${NC}"
     cd_compose
-    if ! $COMPOSE_CMD restart comms-app comms-worker comms-consumer; then
+    if ! $COMPOSE_CMD up -d --force-recreate --no-deps comms-app comms-worker comms-consumer; then
         echo -e "${RED}✗ restart failed${NC}"
+        show_app_log_tail
         exit 1
     fi
-    # `compose restart` returns as soon as it has signalled the
-    # containers -- it says nothing about what happened next. comms-app
-    # validates its profile during startup and dies on a bad one, which
-    # is a health failure a few seconds later, not a non-zero exit here.
+    # `up -d` can return before comms-app has finished starting: it
+    # validates its profile and environment during startup and dies on
+    # a bad one, which may be a health failure a few seconds later
+    # rather than a non-zero exit here.
     if ! wait_for_app; then
         exit 1
     fi
-    echo -e "${GREEN}✓ comms-app / comms-worker / comms-consumer restarted${NC}"
+    echo -e "${GREEN}✓ comms-app / comms-worker / comms-consumer recreated${NC}"
 }
 
 # Bring the whole stack up and wait until it is actually serving.
@@ -398,6 +433,7 @@ cmd_start() {
     ensure_network
     if ! $COMPOSE_CMD up -d; then
         echo -e "${RED}✗ start failed${NC}"
+        show_app_log_tail
         exit 1
     fi
     if ! wait_for_app; then

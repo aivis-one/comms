@@ -276,6 +276,54 @@ None of that is wired here; this file only accounts for the network
 path, the credentials and the profile being in place before that code
 runs.
 
+## Operating the comms stack
+
+What an operator needs on the box, collected here because every item
+below has already cost an hour of searching once. The script named
+below is `/opt/comms/repo/deploy/comms-deploy.sh`.
+
+**Where the environment lives.** The real file is `/opt/comms/.env`,
+outside the checkout, so `update` (a `git pull`) never touches secrets.
+`deploy/.env` is a symbolic link to it; compose reads the link. Edit
+`/opt/comms/.env` -- editing through the link edits the same file, and
+there is no second copy.
+
+**How an edited environment reaches the processes.** By recreating the
+containers, never by a signal: a container's environment is fixed when
+the container is created, and `docker compose restart` starts the same
+container again with the old one. Both lifecycle verbs of the script
+recreate:
+
+- `comms-deploy.sh restart` recreates `comms-app`, `comms-worker` and
+  `comms-consumer`, leaves `comms-postgres` and `comms-redis` untouched,
+  and waits for `comms-app` to be healthy. This is the verb for an
+  edited `.env` or profile.
+- `comms-deploy.sh update` pulls, rebuilds, and recreates the same three
+  containers; the datastores are recreated only when their own compose
+  definition changed.
+
+**Is it healthy.** The API has no host port, so health is read from the
+inside. Docker's own verdict, which is what the script waits on:
+
+    docker inspect --format '{{.State.Health.Status}}' comms-app
+
+The readiness answer itself, from inside the container:
+
+    docker exec comms-app python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/ready').read().decode())"
+
+**Why it did not start.** comms refuses to start on a broken
+configuration or profile and says why in its own log. `install`,
+`update`, `start` and `restart` print the last lines of it when a start
+fails; to read more:
+
+    docker logs --tail 40 comms-app
+
+**Where email will go.** The provider address is derived from the
+region setting, not written in the environment. Read what the running
+process actually uses:
+
+    docker exec comms-app python -c "from app.core.config import settings; print(settings.email_api_base_url)"
+
 ## How long comms keeps things
 
 Two questions every product asks once, answered here so the answer is

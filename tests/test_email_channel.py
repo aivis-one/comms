@@ -24,6 +24,9 @@
 # (aiogram transport, httpx transport) fail any test that slips out.
 # =============================================================================
 
+import asyncio
+import base64
+import json
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -59,7 +62,7 @@ from app.engine.formatters import (
 )
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import process_pending_notifications
-from app.engine.service import create_notification
+from app.engine.service import _deliver_single, create_notification
 from app.profile.registry import registry
 from tests.helpers import create_recipient
 
@@ -677,6 +680,266 @@ class TestFailureClasses:
             e["event"] == "email_channel_not_viable" for e in logs
         )
         assert any(e["event"] == "email_rejected" for e in logs)
+
+
+
+# -- F0-comms items 1 and 3: the provider's reason, on any body --------------
+
+# Every failure path of _interpret: (id, status, headers, the text the
+# record carries before the provider's reason). The configuration path
+# by status is here; the configuration path by a sender-fault 400 is
+# JSON-only by design and is covered in TestFailureClasses.
+_FAILURE_PATHS = [
+    ("config_401", 401, {}, "provider refused on configuration (401)"),
+    ("config_403", 403, {}, "provider refused on configuration (403)"),
+    ("rejected_400", 400, {}, "provider rejected the message (400)"),
+    ("rejected_404", 404, {}, "provider rejected the message (404)"),
+    ("provider_500", 500, {}, "provider error (500)"),
+    ("rate_limit_no_wait", 429, {}, "provider rate limit (429)"),
+    (
+        "rate_limit_named_wait", 429, {"Retry-After": "90"},
+        "rate limited by channel: retry after 90.0s",
+    ),
+]
+_PATH_IDS = [path[0] for path in _FAILURE_PATHS]
+_PATHS = [path[1:3] for path in _FAILURE_PATHS]
+_PATHS_WITH_HEAD = [path[1:] for path in _FAILURE_PATHS]
+
+# Sentinel secrets, one per form the sanitizer knows; the shapes and
+# the reasoning are in tests/test_formatters.py (_SECRET_FORMS) --
+# repeated here in literal form, not imported, so that neither test
+# module depends on the other.
+# Provider-shaped sentinels are BUILT here, never written whole: a
+# literal in the provider's shape is what repository secret scanning
+# blocks a push on (see tests/test_formatters.py for the same rule).
+_TG_SECRET = "AAH" + "sentinel" * 4
+_MG_KEY = "c0ffee00" * 4 + "-" + "1a2b3c4d" + "-" + "5e6f7a8b"
+_MG_BASIC = base64.b64encode(f"api:{_MG_KEY}".encode()).decode()
+
+_SECRET_BODIES = [
+    ("database_url", "5e17" * 12,
+     "postgresql+asyncpg://comms:" + "5e17" * 12 + "@comms-postgres:5432/comms"),
+    ("redis_url", "4d0c" * 12,
+     "redis://:" + "4d0c" * 12 + "@comms-redis:6379/0"),
+    ("service_token", "7a9b" * 16, "Authorization: Bearer " + "7a9b" * 16),
+    ("service_token_bare", "7a9b" * 16, "echo " + "7a9b" * 16),
+    ("telegram_token", _TG_SECRET,
+     "https://api.telegram.org/bot8123456789:" + _TG_SECRET + "/sendMessage"),
+    ("mailgun_key", _MG_KEY, "key " + _MG_KEY),
+    ("mailgun_basic", _MG_BASIC, "Authorization: Basic " + _MG_BASIC),
+]
+_REASON = "Upstream gate says no"
+
+
+async def _outcome(provider: _Provider) -> tuple[Any, list[dict[str, Any]]]:
+    """What the service layer would record, and every log line emitted
+    on the way -- the formatter's AND the service layer's own, through
+    the real _deliver_single."""
+    formatter = _formatter(provider)
+    with capture_logs() as logs:
+        _, outcome = await _deliver_single(
+            asyncio.Semaphore(1), formatter,
+            _notification(), _delivery(), _recipient(),
+        )
+    return outcome, logs
+
+
+async def _raised(provider: _Provider) -> Exception:
+    """The exception itself: its text is what a traceback in the
+    service layer's delivery_error line prints, unsanitized."""
+    formatter = _formatter(provider)
+    try:
+        await formatter.deliver(_notification(), _delivery(), _recipient())
+    except Exception as exc:  # the test inspects whatever was raised
+        return exc
+    raise AssertionError("the provider's failure raised nothing")
+
+
+def _provider_messages(logs: list[dict[str, Any]]) -> list[Any]:
+    return [e["provider_message"] for e in logs if "provider_message" in e]
+
+
+class TestProviderReasonOnAnyBody:
+    """The reason the provider named reaches the record and the log on
+    every body shape and every failure path -- sanitized, and never
+    confused with the marker for a body that said nothing."""
+
+    @pytest.mark.parametrize(
+        ("status", "headers", "head"), _PATHS_WITH_HEAD, ids=_PATH_IDS,
+    )
+    async def test_a_plain_text_body_names_its_reason(
+        self, status: int, headers: dict[str, str], head: str,
+    ) -> None:
+        """The defect that cost an hour: Mailgun answers 401/403 with a
+        plain "Forbidden", and the record carried an empty tail."""
+        provider = _Provider(status=status, body="Forbidden", headers=headers)
+        outcome, logs = await _outcome(provider)
+        assert outcome.error == f"{head}: Forbidden"
+        assert "Forbidden" in str(await _raised(provider))
+        for value in _provider_messages(logs):
+            assert value == "Forbidden"
+
+    @pytest.mark.parametrize("status", [401, 403, 400])
+    async def test_the_log_carries_the_reason_where_the_formatter_logs(
+        self, status: int,
+    ) -> None:
+        provider = _Provider(status=status, body="Forbidden")
+        _, logs = await _outcome(provider)
+        messages = _provider_messages(logs)
+        assert messages
+        assert all(value == "Forbidden" for value in messages)
+
+    @pytest.mark.parametrize(
+        ("status", "headers", "head"), _PATHS_WITH_HEAD, ids=_PATH_IDS,
+    )
+    async def test_a_json_message_behaves_as_before(
+        self, status: int, headers: dict[str, str], head: str,
+    ) -> None:
+        """Before this change the 429-with-a-wait text carried no
+        reason at all; every other path read exactly this."""
+        provider = _Provider(
+            status=status, payload={"message": "Invalid private key"},
+            headers=headers,
+        )
+        outcome, _ = await _outcome(provider)
+        assert outcome.error == f"{head}: Invalid private key"
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            (json.dumps({"text": "text field only"}), "text field only"),
+            (json.dumps({"message": "   ", "text": "the text"}), "the text"),
+            (json.dumps({"error": "unknown key"}), '{"error": "unknown key"}'),
+            (json.dumps(["not", "a", "mapping"]), '["not", "a", "mapping"]'),
+            (json.dumps("a json string"), '"a json string"'),
+            ("<html>\n  <b>502</b>\n  gateway\n</html>",
+             "<html> <b>502</b> gateway </html>"),
+        ],
+        ids=["text_key", "blank_message", "neither_key", "json_list",
+             "json_string", "html_page"],
+    )
+    async def test_every_body_shape_names_a_reason(
+        self, body: str, expected: str,
+    ) -> None:
+        """No key-by-key rescue: whatever the provider sent is the
+        reason when the JSON keys hold nothing."""
+        outcome, _ = await _outcome(_Provider(status=403, body=body))
+        assert outcome.error.endswith(f": {expected}")
+
+    async def test_a_huge_body_is_cut_after_redaction(self) -> None:
+        """Whitespace padding collapses, which pulls text from deep in
+        the body to the front: the secret there must already be gone
+        when the cut happens."""
+        secret = "4d0c" * 12
+        body = " " * 20000 + f"redis://:{secret}@comms-redis:6379/0 " + "z" * 5000
+        outcome, logs = await _outcome(_Provider(status=403, body=body))
+        assert secret[:8] not in outcome.error
+        assert "@comms-redis:6379/0" in outcome.error
+        assert len(outcome.error) < 300
+        for value in _provider_messages(logs):
+            assert secret[:8] not in value
+            assert len(value) == 300
+
+    @pytest.mark.parametrize(
+        ("status", "headers", "head"), _PATHS_WITH_HEAD, ids=_PATH_IDS,
+    )
+    @pytest.mark.parametrize("body", ["", "   \n\t "], ids=["empty", "blank"])
+    async def test_an_empty_body_says_so_by_its_separator(
+        self, status: int, headers: dict[str, str], head: str, body: str,
+    ) -> None:
+        """Not an empty tail -- the defect -- and not a text that could
+        pass for the provider's words: the marker follows a COMMA, the
+        provider's words always follow a colon."""
+        provider = _Provider(status=status, body=body, headers=headers)
+        outcome, logs = await _outcome(provider)
+        assert outcome.error == f"{head}, empty body"
+        for value in _provider_messages(logs):
+            assert value is None
+
+    @pytest.mark.parametrize("body", ["empty body", ", empty body"])
+    async def test_no_body_can_pass_for_the_marker(self, body: str) -> None:
+        outcome, logs = await _outcome(_Provider(status=403, body=body))
+        assert outcome.error.endswith(f": {body}")
+        assert _provider_messages(logs) == [body, body]
+
+    async def test_classification_never_reads_the_fallback(self) -> None:
+        """Finding 1 of the gate: the sender-fault markers are
+        substrings, and a proxy page that happens to contain one must
+        still fail ONE message, not declare the channel dead. Its words
+        still reach the record."""
+        page = "<html>sandbox maintenance: from address check</html>"
+        provider = _Provider(status=400, body=page)
+        outcome, logs = await _outcome(provider)
+        assert not any(e["event"] == "email_channel_not_viable" for e in logs)
+        assert outcome.error.startswith(
+            "provider rejected the message (400): "
+        )
+        assert "sandbox maintenance" in outcome.error
+
+    async def test_an_empty_body_is_not_a_sender_fault(self) -> None:
+        """The marker is built after classification and never enters
+        it: an empty 400 stays the one-message class."""
+        _, logs = await _outcome(_Provider(status=400, body=""))
+        assert not any(e["event"] == "email_channel_not_viable" for e in logs)
+
+    async def test_rate_limit_keeps_its_deferral_and_gains_the_reason(
+        self,
+    ) -> None:
+        """The deferral still comes from Retry-After alone; the reason
+        rides in the text the service layer records when it records
+        one (on an exhausted deferral budget)."""
+        provider = _Provider(
+            status=429, body="Slow down", headers={"Retry-After": "90"},
+        )
+        outcome, _ = await _outcome(provider)
+        assert outcome.retry_after == 90.0
+        assert outcome.error == (
+            "rate limited by channel: retry after 90.0s: Slow down"
+        )
+        raised = await _raised(provider)
+        assert isinstance(raised, RateLimitedError)
+        assert raised.retry_after == 90.0
+
+
+class TestNoSecretInTheRecord:
+    """F0-comms item 3, the pair to item 1: writing the provider's words
+    into the record must not write our secrets with them. Checked on
+    every failure path, on both body shapes, in the record, in every
+    log field, and in the raised text -- and each check is paired with
+    the provider's reason being there and non-empty."""
+
+    @pytest.mark.parametrize(("status", "headers"), _PATHS, ids=_PATH_IDS)
+    @pytest.mark.parametrize(
+        ("secret", "form"),
+        [entry[1:] for entry in _SECRET_BODIES],
+        ids=[entry[0] for entry in _SECRET_BODIES],
+    )
+    @pytest.mark.parametrize("shape", ["plain", "json"])
+    async def test_the_secret_goes_and_the_reason_stays(
+        self,
+        status: int,
+        headers: dict[str, str],
+        secret: str,
+        form: str,
+        shape: str,
+    ) -> None:
+        words = f"{_REASON} {form} end"
+        body = words if shape == "plain" else json.dumps({"message": words})
+        provider = _Provider(status=status, body=body, headers=headers)
+
+        outcome, logs = await _outcome(provider)
+        raised = await _raised(provider)
+
+        assert outcome.error is not None
+        assert secret not in outcome.error
+        assert _REASON in outcome.error
+        assert secret not in str(raised)
+        assert _REASON in str(raised)
+        for entry in logs:
+            for value in entry.values():
+                assert secret not in str(value)
+        for value in _provider_messages(logs):
+            assert _REASON in value
 
 
 class TestLoudnessIsPerState:

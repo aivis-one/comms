@@ -20,6 +20,7 @@
 #     validated at link build, loud PermanentDeliveryError
 # =============================================================================
 
+import base64
 from types import SimpleNamespace
 from typing import Any
 
@@ -40,6 +41,7 @@ from app.engine.formatters import (
     close_formatters,
     get_formatter,
     sanitize_error,
+    sanitize_text,
 )
 from app.engine.models import Notification, NotificationDelivery
 from app.profile.registry import registry
@@ -550,6 +552,203 @@ class TestSanitizeError:
 
     def test_plain_message_untouched(self) -> None:
         assert sanitize_error(Exception("plain failure")) == "plain failure"
+
+
+
+# Sentinel secrets for the form tests. Each is the SHAPE the real secret
+# has (comms-deploy.sh mints hex 24/32 bytes; a telegram token is
+# <id>:<35 chars>; a Mailgun key is <32hex>-<8hex>-<8hex> or
+# key-<32hex>) and none is a substring of any text a test surrounds it
+# with, so "the sentinel is absent" can only mean "it was redacted".
+_PG_PASS = "5e17" * 12  # 48 hex, openssl rand -hex 24
+_REDIS_PASS = "4d0c" * 12
+_SERVICE_TOKEN = "7a9b" * 16  # 64 hex, openssl rand -hex 32
+# BUILT AT RUNTIME, NEVER WRITTEN WHOLE: a literal in the provider's
+# shape is exactly what repository secret scanning looks for, and a
+# fake key that blocks a push is a test that cannot ship. The shape the
+# sanitizer sees at run time is unchanged.
+_TG_SECRET = "AAH" + "sentinel" * 4  # 35 chars, the bot token's secret part
+_TG_TOKEN = "8123456789:" + _TG_SECRET
+_MG_KEY = "c0ffee00" * 4 + "-" + "1a2b3c4d" + "-" + "5e6f7a8b"
+_MG_LEGACY = "key" + "-" + "beef0000" * 4
+_BASIC = base64.b64encode(f"api:{_MG_KEY}".encode()).decode()
+
+# (name, text as it appears in a real error, sentinel, a piece of the
+# ordinary text around it that must SURVIVE). The texts are the shapes
+# the error actually takes: the DSN and the redis URL exactly as
+# comms-deploy.sh writes them, the telegram token inside the URL an
+# aiohttp error prints (aiogram wraps it as "<class>: <error>").
+_SECRET_FORMS = [
+    (
+        "database_url",
+        f"connect failed postgresql+asyncpg://comms:{_PG_PASS}"
+        "@comms-postgres:5432/comms",
+        _PG_PASS,
+        "@comms-postgres:5432/comms",
+    ),
+    (
+        "redis_url_empty_user",
+        f"Error connecting to redis://:{_REDIS_PASS}@comms-redis:6379/0",
+        _REDIS_PASS,
+        "@comms-redis:6379/0",
+    ),
+    (
+        "service_token_bearer",
+        f"invalid Authorization: Bearer {_SERVICE_TOKEN} rejected",
+        _SERVICE_TOKEN,
+        "rejected",
+    ),
+    (
+        "service_token_bare",
+        f"token mismatch {_SERVICE_TOKEN} rejected",
+        _SERVICE_TOKEN,
+        "rejected",
+    ),
+    (
+        "password_bare",
+        f"AUTH {_REDIS_PASS} called without any password configured",
+        _REDIS_PASS,
+        "called without any password configured",
+    ),
+    (
+        "telegram_token_in_url",
+        "ClientResponseError: 502, message='Bad Gateway', "
+        f"url='https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'",
+        _TG_SECRET,
+        "/sendMessage",
+    ),
+    (
+        "telegram_token_bare",
+        f"token {_TG_TOKEN} is invalid",
+        _TG_SECRET,
+        "is invalid",
+    ),
+    (
+        "mailgun_key_bare",
+        f"request with {_MG_KEY} refused",
+        _MG_KEY,
+        "refused",
+    ),
+    (
+        "mailgun_key_legacy_bare",
+        f"request with {_MG_LEGACY} refused",
+        _MG_LEGACY,
+        "refused",
+    ),
+    (
+        "mailgun_key_basic_header",
+        f"sent Authorization: Basic {_BASIC} upstream",
+        _BASIC,
+        "upstream",
+    ),
+]
+
+
+class TestSanitizeForms:
+    """F0-comms item 2: every form in which a configured secret exists
+    is redacted -- checked on the form as it appears in an error text,
+    with the ordinary text around it kept (a sanitizer that blanks the
+    whole line would pass every "secret absent" check and report
+    nothing)."""
+
+    @pytest.mark.parametrize(
+        ("text", "secret", "kept"),
+        [form[1:] for form in _SECRET_FORMS],
+        ids=[form[0] for form in _SECRET_FORMS],
+    )
+    def test_the_secret_goes_and_the_text_stays(
+        self, text: str, secret: str, kept: str,
+    ) -> None:
+        cleaned = sanitize_text(text)
+        assert secret not in cleaned
+        assert "[redacted]" in cleaned
+        assert kept in cleaned
+
+    @pytest.mark.parametrize(
+        "text",
+        [form[1] for form in _SECRET_FORMS],
+        ids=[form[0] for form in _SECRET_FORMS],
+    )
+    def test_idempotent_on_every_form(self, text: str) -> None:
+        """The email path sanitizes where the provider's text enters
+        and the service layer sanitizes the exception again: a second
+        pass must change nothing."""
+        once = sanitize_text(text)
+        assert sanitize_text(once) == once
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            f"Authorization: Basic {_BASIC}",
+            f"Authorization: Bearer {_SERVICE_TOKEN}",
+            f"password=postgresql://comms:{_PG_PASS}@db/comms",
+            f"url=redis://:{_REDIS_PASS}@comms-redis:6379/0",
+            f"api_key={_MG_KEY}",
+            f"token={_TG_TOKEN}",
+        ],
+    )
+    def test_idempotent_where_patterns_overlap(self, text: str) -> None:
+        """Two patterns reach the same span here; the second pass must
+        find nothing either of them would change."""
+        once = sanitize_text(text)
+        assert sanitize_text(once) == once
+        for secret in (_BASIC, _SERVICE_TOKEN, _PG_PASS, _REDIS_PASS,
+                       _MG_KEY, _TG_SECRET):
+            assert secret not in once
+
+    def test_repeated_secret_goes_everywhere(self) -> None:
+        text = f"first {_MG_KEY} then {_MG_KEY} end"
+        cleaned = sanitize_text(text)
+        assert _MG_KEY not in cleaned
+        assert cleaned == "first [redacted] then [redacted] end"
+
+    def test_several_forms_in_one_text(self) -> None:
+        text = " ".join(form[1] for form in _SECRET_FORMS)
+        cleaned = sanitize_text(text)
+        for _, _, secret, kept in _SECRET_FORMS:
+            assert secret not in cleaned
+            assert kept in cleaned
+
+    def test_a_raw_at_sign_in_a_password_leaves_no_tail(self) -> None:
+        """The password runs to the LAST @ of the authority."""
+        cleaned = sanitize_text("postgresql://comms:hun@ter2@db/comms")
+        assert "ter2" not in cleaned
+        assert "://comms:[redacted]@db/comms" in cleaned
+
+    def test_an_empty_password_stays_a_well_formed_line(self) -> None:
+        cleaned = sanitize_text("redis://:@comms-redis:6379/0 down")
+        assert cleaned == "redis://:[redacted]@comms-redis:6379/0 down"
+        assert sanitize_text(cleaned) == cleaned
+
+    def test_empty_text_stays_empty(self) -> None:
+        assert sanitize_text("") == ""
+
+    def test_the_record_cut_never_splits_a_secret(self) -> None:
+        """sanitize_error cuts at 2000 AFTER redacting: a secret that
+        straddles the cut would otherwise leave its prefix behind,
+        which no pattern recognises once the @ is gone."""
+        text = "x" * 1985 + f" redis://:{_REDIS_PASS}@comms-redis:6379/0"
+        cleaned = sanitize_error(Exception(text))
+        assert len(cleaned) == 2000
+        assert _REDIS_PASS[:8] not in cleaned
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "basic auth failed",
+            "retry at 12:30:00",
+            "<20260912.1@mg.test>",
+            "request 1b4e28ba-2fa1-11d2-883f-0016d3cca427 failed",
+            "commit da39a3ee5e6b4b0d3255bfef95601890afd80709 built",
+            "provider refused on configuration (401): Forbidden",
+        ],
+    )
+    def test_ordinary_text_is_not_mistaken_for_a_secret(
+        self, text: str,
+    ) -> None:
+        """The shape patterns stop short of message ids, uuids and a
+        40-hex commit id -- the long-hex pattern starts at 48."""
+        assert sanitize_text(text) == text
 
 
 class TestComposition:
