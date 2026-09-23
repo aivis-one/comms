@@ -16,10 +16,17 @@
 #                            layer caught it)
 #   DBAPIError      -> 500  (the safety net, R-2 item 5 -- see below)
 #
-# Exception messages are written by our own service layer and carry no
-# secrets (credentials are sanitized at the formatter boundary), so
-# they are safe to return verbatim in `detail`. The database's are NOT,
-# which is exactly why the last handler does not pass its own through.
+# The messages of the three service exceptions are returned verbatim in
+# `detail`. That is safe because of WHERE they are written: every one is
+# raised by our own code with a text built from the request's input and
+# entity ids -- never from settings, and never from a provider's or a
+# driver's error (the two cursor handlers quote the decode error of the
+# caller's own cursor). Channel failures never reach this module: they
+# end in the delivery record, and the redaction of their text in the
+# record and the logs (app/engine/formatters.py, sanitize_text) is
+# unrelated to what this module returns. The database's messages are
+# NOT safe, which is exactly why the last handler does not pass its own
+# through.
 # =============================================================================
 
 import structlog

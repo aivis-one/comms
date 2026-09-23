@@ -57,6 +57,7 @@
 # =============================================================================
 
 import re
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html import escape
@@ -481,7 +482,14 @@ class TelegramFormatter:
             # the service defers via next_retry_at instead of burning
             # an attempt (Phase 2.2).
             if isinstance(exc, TelegramRetryAfter):
-                raise RateLimitedError(float(exc.retry_after)) from exc
+                # exc.message is aiogram's own frame ("Flood control
+                # exceeded ... Retry in N seconds.") followed by
+                # Telegram's description, so it is never empty: the
+                # tail always carries words, never the empty marker.
+                raise RateLimitedError(
+                    float(exc.retry_after),
+                    _reason_tail(_clean_reason(exc.message), 200),
+                ) from exc
             error_msg = str(exc).lower()
             for perm_error in _PERMANENT_ERRORS:
                 if perm_error in error_msg:
@@ -903,6 +911,18 @@ def _provider_reason(response: Any, payload: dict[str, Any]) -> str | None:
             break
     else:
         text = response.text
+    return _clean_reason(text)
+
+
+def _clean_reason(text: str) -> str | None:
+    """A provider's words made safe to record, or None if there are none.
+
+    Sanitized over the WHOLE text first, then whitespace-collapsed so a
+    multi-line page or message stays one readable line. Collapsing
+    never joins two tokens, so it cannot assemble a secret the patterns
+    did not see. Shared by every channel that reads a provider's words,
+    so they are cleaned by one piece of code.
+    """
     collapsed = " ".join(sanitize_text(text).split())
     return collapsed or None
 
@@ -1062,6 +1082,28 @@ def sanitize_text(text: str) -> str:
 def sanitize_error(exc: Exception) -> str:
     """An exception's text with secrets removed, cut to the record size."""
     return sanitize_text(str(exc))[:2000]
+
+
+def sanitized_traceback(exc: BaseException) -> str:
+    """The traceback structlog's format_exc_info would render, redacted.
+
+    For a log line that must keep the stack but cannot let the renderer
+    print it raw: log it as `exception=sanitized_traceback(exc)` instead
+    of logger.exception(). The key and the text are what format_exc_info
+    produces, so the record keeps its shape.
+
+    Redacted as ONE text, never cut: traceback.format_exception prints
+    str() of every exception in the chain (__cause__, __context__), the
+    notes and the members of an exception group, and a secret can sit in
+    any of them -- the aiogram network error carries the bot's URL both
+    in its own text and in its __cause__. Frame locals are not printed
+    by this formatter, so they are not a path. What the patterns cannot
+    recognise is the KNOWN CEILING on _LONG_HEX_RE; this is another
+    caller of sanitize_text, not another sanitizer.
+    """
+    rendered = "".join(traceback.format_exception(exc))
+    # format_exc_info drops the one trailing newline; so does this.
+    return sanitize_text(rendered.removesuffix("\n"))
 
 
 def _escape_html_variables(variables: dict[str, Any]) -> dict[str, Any]:

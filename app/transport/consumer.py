@@ -28,7 +28,7 @@
 #              inline backoff, then DLQ + XACK.
 #   duplicate  (idempotency_key collision) -> XACK only: a replay is
 #              the at-least-once contract working, not an error.
-#   unexpected (any other exception) -> log with traceback + DLQ +
+#   unexpected (any other exception) -> log with a redacted traceback + DLQ +
 #              XACK: an unknown bug in ONE event must not wedge the
 #              whole stream (poison-pill rule) -- the DLQ preserves
 #              the evidence.
@@ -61,6 +61,7 @@ from sqlalchemy.exc import OperationalError
 from app.core.config import settings
 from app.core.database import get_session_factory
 from app.core.exceptions import NotFoundError, ValidationError
+from app.engine.formatters import sanitize_text, sanitized_traceback
 from app.transport.events import parse_event
 from app.transport.handlers import HandleResult, handle_event
 
@@ -226,7 +227,7 @@ class StreamConsumer:
                         "event_retries_exhausted",
                         entry_id=_id_str(entry_id),
                         attempts=attempt,
-                        error=str(exc),
+                        error=sanitize_text(str(exc)),
                     )
                     await self._to_dlq(
                         entry_id, fields,
@@ -241,15 +242,20 @@ class StreamConsumer:
                     entry_id=_id_str(entry_id),
                     attempt=attempt,
                     delay=delay,
-                    error=str(exc),
+                    error=sanitize_text(str(exc)),
                 )
                 await asyncio.sleep(delay)
             except Exception as exc:
                 # Unknown bug in ONE event must not wedge the stream
                 # (poison-pill rule): preserve the evidence, move on.
-                logger.exception(
+                # Not logger.exception(): the renderer would print the
+                # chain raw -- an OperationalError's text is its SQL and
+                # bound parameters. Same event, level and `exception`
+                # key, redacted (app/engine/formatters.py).
+                logger.error(
                     "event_unexpected_error",
                     entry_id=_id_str(entry_id),
+                    exception=sanitized_traceback(exc),
                 )
                 await self._to_dlq(
                     entry_id, fields,
@@ -283,7 +289,14 @@ class StreamConsumer:
         prefix also self-documents which fields the CONSUMER added.
         The stream is capped (approximate MAXLEN) so a misbehaving
         producer cannot grow it without bound.
+
+        The reason is redacted HERE, the one point every dead-letter
+        path passes: the DLQ is a stream in the shared redis, and a
+        reason is an exception's text (an OperationalError's is its SQL
+        and bound parameters). The envelope fields are the producer's
+        own and stay verbatim.
         """
+        reason = sanitize_text(reason)
         # redis-py's FieldT alias is invariant in dict params, so a
         # plain dict[str, str] does not satisfy it; alias it exactly.
         payload: dict[FieldT, EncodableT] = {

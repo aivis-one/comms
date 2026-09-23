@@ -293,10 +293,31 @@ wait_for_app() {
 # each `compose up` whose failure exits before wait_for_app runs --
 # there compose's own last word is "dependency failed to start", which
 # names the container but not the reason.
+#
+# When comms-app has printed NOTHING -- it was created but never
+# started because a datastore it depends on did not become healthy --
+# its empty tail is a dead end, so the datastores' tails follow. Only
+# then: on an ordinary refused start the output is what it always was.
 show_app_log_tail() {
+    local app_tail service service_tail
+    app_tail=$($COMPOSE_CMD logs --no-color --tail=20 comms-app 2>&1)
     echo "Last lines of comms-app:"
-    $COMPOSE_CMD logs --no-color --tail=20 comms-app 2>&1 | sed 's/^/  /'
-    echo "Full logs: $0 logs comms-app"
+    if [ -n "${app_tail//[[:space:]]/}" ]; then
+        echo "$app_tail" | sed 's/^/  /'
+        echo "Full logs: $0 logs comms-app"
+        return 0
+    fi
+    echo "  (no output -- comms-app never ran; its dependencies follow)"
+    for service in comms-postgres comms-redis; do
+        service_tail=$($COMPOSE_CMD logs --no-color --tail=20 "$service" 2>&1)
+        echo "Last lines of $service:"
+        if [ -n "${service_tail//[[:space:]]/}" ]; then
+            echo "$service_tail" | sed 's/^/  /'
+        else
+            echo "  (no output)"
+        fi
+    done
+    echo "Full logs: $0 logs <service>"
 }
 
 # ------------------------------------------------------------------------------

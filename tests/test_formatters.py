@@ -20,12 +20,20 @@
 #     validated at link build, loud PermanentDeliveryError
 # =============================================================================
 
+import asyncio
 import base64
 from types import SimpleNamespace
 from typing import Any
 
+import aiohttp
 import pytest
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+import structlog
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
+from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import Settings
@@ -42,8 +50,10 @@ from app.engine.formatters import (
     get_formatter,
     sanitize_error,
     sanitize_text,
+    sanitized_traceback,
 )
 from app.engine.models import Notification, NotificationDelivery
+from app.engine.service import _deliver_single
 from app.profile.registry import registry
 from tests.helpers import next_telegram_id
 
@@ -928,3 +938,192 @@ class TestPresentationKeys:
         assert registry.get_template(
             "en", "unit_plain", "telegram", "button_text",
         ) == "Go"
+
+
+# -- F0.1-comms: failures reach the log redacted ----------------------------
+
+# Built, never written whole (a literal in the provider's shape is what
+# push protection blocks on). The same shapes as _TG_TOKEN above.
+_TG_URL = "https://api.telegram.org/bot" + _TG_TOKEN + "/sendMessage"
+
+
+def _raised_from(cause: BaseException, outer: BaseException) -> BaseException:
+    """`outer` raised `from cause`, both with real tracebacks -- the
+    shape aiogram's make_request produces (raise ... from e)."""
+    try:
+        try:
+            raise cause
+        except BaseException as inner:
+            raise outer from inner
+    except BaseException as exc:
+        return exc
+
+
+def _network_error() -> BaseException:
+    """What aiogram raises on a URL-carrying aiohttp failure, read from
+    aiogram 3.31.0 session/aiohttp.py::make_request: the aiohttp error
+    text in the message, the aiohttp error itself as __cause__."""
+    cause = aiohttp.InvalidURL(_TG_URL)
+    return _raised_from(cause, TelegramNetworkError(
+        method=SimpleNamespace(),  # type: ignore[arg-type]
+        message=f"{type(cause).__name__}: {cause}",
+    ))
+
+
+async def _tg_outcome(error: BaseException) -> tuple[Any, list[dict[str, Any]]]:
+    """Through the REAL service step, capturing every log line on the
+    way -- the formatter's and _deliver_single's own."""
+    fmt = TelegramFormatter(bot=_FakeBot(error=error), bot_url=BOT_URL)  # type: ignore[arg-type]
+    with capture_logs() as logs:
+        _, outcome = await _deliver_single(
+            asyncio.Semaphore(1), fmt,
+            _notification(), _delivery(), _recipient(),
+        )
+    return outcome, logs
+
+
+def _no_secret_anywhere(
+    secret: str, outcome: Any, logs: list[dict[str, Any]],
+) -> None:
+    assert secret not in (outcome.error or "")
+    for entry in logs:
+        for value in entry.values():
+            assert secret not in str(value)
+
+
+class TestTelegramFailuresReachTheLogRedacted:
+    """F0.1 items 1-3 on the telegram path, end to end: the bot token in
+    an aiohttp error's URL rides in the network error's text AND in its
+    __cause__; before this change logger.exception() handed both to the
+    renderer raw, which capture_logs could not even see (it records
+    exc_info=True, not the rendered text). The log now carries the
+    rendered traceback itself, redacted, in the same `exception` key."""
+
+    async def test_network_error_token_leaves_no_trace(self) -> None:
+        outcome, logs = await _tg_outcome(_network_error())
+        _no_secret_anywhere(_TG_SECRET, outcome, logs)
+        (entry,) = [e for e in logs if e["event"] == "delivery_error"]
+        assert entry["log_level"] == "error"
+        assert "exc_info" not in entry
+        rendered = entry["exception"]
+        # The pair: the chain is all there, only the token is gone.
+        assert "InvalidURL" in rendered
+        assert "The above exception was the direct cause" in rendered
+        assert "TelegramNetworkError: HTTP Client says" in rendered
+        assert rendered.count("api.telegram.org/[redacted]/sendMessage") == 2
+
+    async def test_network_error_stays_transient(self) -> None:
+        outcome, _ = await _tg_outcome(_network_error())
+        assert not outcome.permanent
+        assert outcome.retry_after is None
+        assert outcome.error.startswith("HTTP Client says - InvalidURL: ")
+
+    async def test_permanent_failure_log_is_redacted(self) -> None:
+        error = _raised_from(
+            aiohttp.InvalidURL(_TG_URL),
+            TelegramAPIError(
+                method=SimpleNamespace(),  # type: ignore[arg-type]
+                message=f"Forbidden: bot was blocked by the user {_TG_URL}",
+            ),
+        )
+        outcome, logs = await _tg_outcome(error)
+        assert outcome.permanent
+        _no_secret_anywhere(_TG_SECRET, outcome, logs)
+        (entry,) = [
+            e for e in logs if e["event"] == "delivery_permanent_failure"
+        ]
+        assert "bot was blocked by the user" in entry["error"]
+
+    async def test_rate_limit_carries_telegram_words(self) -> None:
+        error = TelegramRetryAfter(
+            method=SimpleNamespace(),  # type: ignore[arg-type]
+            message=f"Too Many Requests: retry after 42 {_TG_URL}",
+            retry_after=42,
+        )
+        outcome, logs = await _tg_outcome(error)
+        assert outcome.retry_after == 42.0
+        _no_secret_anywhere(_TG_SECRET, outcome, logs)
+        assert outcome.error.startswith(
+            "rate limited by channel: retry after 42.0s: Flood control"
+        )
+        assert "Too Many Requests: retry after 42" in outcome.error
+
+    async def test_rate_limit_with_no_description_still_has_words(
+        self,
+    ) -> None:
+        """Telegram's own description empty: aiogram's frame remains, so
+        the reason is never the empty-body marker (the None branch of
+        the tail is unreachable on this path and has no test)."""
+        error = TelegramRetryAfter(
+            method=SimpleNamespace(),  # type: ignore[arg-type]
+            message="",
+            retry_after=7,
+        )
+        outcome, _ = await _tg_outcome(error)
+        assert outcome.retry_after == 7.0
+        assert not outcome.error.endswith(", empty body")
+        assert "Retry in 7 seconds. Original description:" in outcome.error
+
+
+class TestSanitizedTraceback:
+    """The rendered traceback, as format_exc_info renders it, redacted
+    over every part of the chain."""
+
+    def test_the_same_text_format_exc_info_renders(self) -> None:
+        """Without secrets it IS format_exc_info's output, byte for
+        byte: the log keeps its shape."""
+        exc = _raised_from(KeyError("k"), RuntimeError("outer"))
+        rendered = structlog.processors.format_exc_info(
+            None, "error", {"exc_info": exc},  # type: ignore[arg-type]
+        )["exception"]
+        assert sanitized_traceback(exc) == rendered
+
+    def test_secret_only_in_the_cause(self) -> None:
+        exc = _raised_from(
+            ValueError(f"url={_TG_URL}"), RuntimeError("wrapped"),
+        )
+        assert _TG_URL not in str(exc)
+        text = sanitized_traceback(exc)
+        assert _TG_SECRET not in text
+        assert "ValueError" in text and "RuntimeError: wrapped" in text
+
+    def test_secret_only_in_the_implicit_context(self) -> None:
+        try:
+            try:
+                raise ValueError(f"redis://:{_REDIS_PASS}@comms-redis:6379/0")
+            except ValueError:
+                raise RuntimeError("while handling")  # noqa: B904 -- the implicit chain IS the case
+        except RuntimeError as exc:
+            text = sanitized_traceback(exc)
+        assert _REDIS_PASS not in text
+        assert "During handling of the above exception" in text
+        assert "@comms-redis:6379/0" in text
+
+    def test_secret_in_a_note(self) -> None:
+        exc = RuntimeError("failed")
+        exc.add_note(f"key was {_MG_KEY}")
+        text = sanitized_traceback(exc)
+        assert _MG_KEY not in text
+        assert "key was [redacted]" in text
+
+    def test_secret_in_an_exception_group_member(self) -> None:
+        exc = ExceptionGroup("batch", [ValueError(f"token {_SERVICE_TOKEN}")])
+        text = sanitized_traceback(exc)
+        assert _SERVICE_TOKEN not in text
+        assert "ValueError: token [redacted]" in text
+
+    def test_repeated_secret_in_text_and_cause(self) -> None:
+        exc = _raised_from(ValueError(_TG_URL), RuntimeError(_TG_URL))
+        text = sanitized_traceback(exc)
+        assert _TG_SECRET not in text
+        assert text.count("/[redacted]/sendMessage") == 2
+
+    def test_an_exception_without_text_still_says_what_it_was(self) -> None:
+        text = sanitized_traceback(_raised_from(OSError(), KeyError()))
+        assert text.endswith("KeyError")
+        assert "OSError" in text
+
+    def test_idempotent(self) -> None:
+        text = sanitized_traceback(_network_error())
+        assert sanitize_text(text) == text
+

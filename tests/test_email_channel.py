@@ -942,6 +942,50 @@ class TestNoSecretInTheRecord:
             assert _REASON in value
 
 
+
+class TestSecondPassChangesNothing:
+    """F0.1 correction 4: the email path redacts where the provider's
+    text enters; the service layer now redacts its log lines again
+    (sanitize_text on the permanent path, sanitized_traceback on the
+    catch-all). The second pass must be byte-for-byte a no-op."""
+
+    @pytest.mark.parametrize(
+        ("secret", "form"),
+        [entry[1:] for entry in _SECRET_BODIES],
+        ids=[entry[0] for entry in _SECRET_BODIES],
+    )
+    async def test_permanent_log_equals_the_once_redacted_text(
+        self, secret: str, form: str,
+    ) -> None:
+        provider = _Provider(status=403, body=f"{_REASON} {form} end")
+        raised = await _raised(provider)
+        _, logs = await _outcome(provider)
+        (entry,) = [
+            e for e in logs if e["event"] == "delivery_permanent_failure"
+        ]
+        assert entry["error"] == str(raised)[:200]
+        assert secret not in entry["error"]
+        assert _REASON in entry["error"]
+
+    @pytest.mark.parametrize(
+        ("secret", "form"),
+        [entry[1:] for entry in _SECRET_BODIES],
+        ids=[entry[0] for entry in _SECRET_BODIES],
+    )
+    async def test_catch_all_log_carries_the_once_redacted_text(
+        self, secret: str, form: str,
+    ) -> None:
+        provider = _Provider(status=500, body=f"{_REASON} {form} end")
+        raised = await _raised(provider)
+        _, logs = await _outcome(provider)
+        (entry,) = [e for e in logs if e["event"] == "delivery_error"]
+        assert "exc_info" not in entry
+        # The exception line of the traceback is the entry-redacted text,
+        # unchanged by the second pass.
+        assert f"EmailTransientError: {raised}" in entry["exception"]
+        assert secret not in entry["exception"]
+
+
 class TestLoudnessIsPerState:
     async def test_first_configuration_failure_is_a_line_of_its_own(
         self,

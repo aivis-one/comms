@@ -58,6 +58,8 @@ from app.engine.formatters import (
     RateLimitedError,
     get_formatter,
     sanitize_error,
+    sanitize_text,
+    sanitized_traceback,
 )
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.resolver import resolve_targets
@@ -625,7 +627,7 @@ async def _deliver_single(
                 "delivery_permanent_failure",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
-                error=str(exc)[:200],
+                error=sanitize_text(str(exc))[:200],
             )
             return delivery, _DeliveryOutcome(
                 permanent=True, error=sanitize_error(exc),
@@ -650,10 +652,15 @@ async def _deliver_single(
                 error=f"Timeout after {_DELIVER_TIMEOUT_SECONDS}s",
             )
         except Exception as exc:
-            logger.exception(
+            # Not logger.exception(): the renderer would print the chain
+            # raw, and the telegram network error carries the bot token
+            # in its text and in its __cause__. Same event, same level,
+            # same `exception` key -- redacted (formatters.py).
+            logger.error(
                 "delivery_error",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
+                exception=sanitized_traceback(exc),
             )
             return delivery, _DeliveryOutcome(
                 error=sanitize_error(exc),

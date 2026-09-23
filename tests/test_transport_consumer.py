@@ -21,15 +21,19 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID, uuid4
 
+import aiohttp
 import pytest
 from fakeredis import aioredis as fakeaioredis
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 import app.transport.consumer as consumer_module
 from app.audience.models import GroupMembership, Recipient
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.core.exceptions import ValidationError
 from app.engine.models import Notification
 from app.transport.consumer import StreamConsumer
 from tests.helpers import create_recipient, next_phase3c_telegram_id
@@ -542,3 +546,175 @@ class TestReminderCancel:
 
         await _run_until(StreamConsumer(redis), acked)
         assert await redis.exists(settings.dlq_stream) == 0
+
+
+# -- F0.1-comms item 4: the consumer's logs and DLQ carry no secret ---------
+
+# Built, never written whole (push protection reads literals).
+_TG_SECRET = "AAH" + "sentinel" * 4
+_TG_URL = "https://api.telegram.org/bot8123456789:" + _TG_SECRET + "/sendMessage"
+_REDIS_PASS = "4d0c" * 12
+
+
+def _chained(cause: BaseException, outer: BaseException) -> BaseException:
+    """`outer` raised from `cause`, with real tracebacks."""
+    try:
+        try:
+            raise cause
+        except BaseException as inner:
+            raise outer from inner
+    except BaseException as exc:
+        return exc
+
+
+def _operational_error() -> OperationalError:
+    """SQLAlchemy's text is the failed SQL plus its bound parameters; a
+    parameter here carries the secret."""
+    return OperationalError(
+        "INSERT INTO recipients (locale, note) VALUES ($1, $2)",
+        ("en", f"redis://:{_REDIS_PASS}@comms-redis:6379/0"),
+        Exception("connection refused"),
+    )
+
+
+# (id, the exception handle_event raises, the secret, what the DLQ
+# reason must still say, the log event that carries the text, its key).
+_CONSUMER_FAILURES = [
+    (
+        "unexpected_secret_only_in_cause",
+        lambda: _chained(aiohttp.InvalidURL(_TG_URL),
+                         RuntimeError("send failed")),
+        _TG_SECRET,
+        "unexpected: RuntimeError: send failed",
+        "event_unexpected_error", "exception",
+    ),
+    (
+        "unexpected_secret_in_text_and_cause",
+        lambda: _chained(aiohttp.InvalidURL(_TG_URL),
+                         RuntimeError(f"send failed {_TG_URL}")),
+        _TG_SECRET,
+        "unexpected: RuntimeError: send failed",
+        "event_unexpected_error", "exception",
+    ),
+    (
+        "operational_error_sql_and_params",
+        _operational_error,
+        _REDIS_PASS,
+        "retries exhausted: (builtins.Exception) connection refused",
+        "event_retries_exhausted", "error",
+    ),
+    (
+        "terminal_validation_error",
+        lambda: ValidationError(f"bad channel url {_TG_URL}"),
+        _TG_SECRET,
+        "bad channel url https://api.telegram.org/[redacted]/sendMessage",
+        "event_dead_lettered", "reason",
+    ),
+]
+
+
+class TestConsumerRedactsItsFailures:
+    """The DLQ is a stream in the shared redis; its reason and every
+    consumer log line pass through sanitize_text / sanitized_traceback.
+    Checked on the full path: a real event, the real loop, the DLQ
+    entry as redis holds it, every captured log field."""
+
+    @pytest.mark.parametrize(
+        ("make_error", "secret", "reason_says", "log_event", "log_key"),
+        [case[1:] for case in _CONSUMER_FAILURES],
+        ids=[case[0] for case in _CONSUMER_FAILURES],
+    )
+    async def test_no_secret_and_the_reason_stays(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        fast_backoff: None,
+        monkeypatch: pytest.MonkeyPatch,
+        make_error: Callable[[], BaseException],
+        secret: str,
+        reason_says: str,
+        log_event: str,
+        log_key: str,
+    ) -> None:
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise make_error()
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
+
+        async def dead_lettered_and_acked() -> bool:
+            length: int = await redis.xlen(settings.dlq_stream)
+            return length == 1 and await _no_pending(redis, stream)
+
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), dead_lettered_and_acked)
+
+        entries = await redis.xrange(settings.dlq_stream)
+        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
+        for value in fields.values():
+            assert secret not in value
+        assert fields["_dlq_error"].startswith(reason_says)
+
+        for entry in logs:
+            assert "exc_info" not in entry
+            for value in entry.values():
+                assert secret not in str(value)
+        carriers = [e[log_key] for e in logs if e["event"] == log_event]
+        assert carriers and all(carriers)
+
+    async def test_the_traceback_keeps_the_whole_chain(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise _chained(aiohttp.InvalidURL(_TG_URL), RuntimeError("x"))
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
+
+        async def dead_lettered() -> bool:
+            length: int = await redis.xlen(settings.dlq_stream)
+            return length == 1
+
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), dead_lettered)
+
+        (entry,) = [e for e in logs if e["event"] == "event_unexpected_error"]
+        assert entry["log_level"] == "error"
+        assert "InvalidURL" in entry["exception"]
+        assert "The above exception was the direct cause" in entry["exception"]
+        assert "api.telegram.org/[redacted]/sendMessage" in entry["exception"]
+
+    async def test_every_retry_log_is_redacted(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        fast_backoff: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same secret on every attempt: each of the four retry
+        lines is redacted, and each still names the failure."""
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise _operational_error()
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
+
+        async def dead_lettered() -> bool:
+            length: int = await redis.xlen(settings.dlq_stream)
+            return length == 1
+
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), dead_lettered)
+
+        retries = [e for e in logs if e["event"] == "event_retry_scheduled"]
+        assert len(retries) == 4
+        for entry in retries:
+            assert _REDIS_PASS not in entry["error"]
+            assert "INSERT INTO recipients" in entry["error"]
+
