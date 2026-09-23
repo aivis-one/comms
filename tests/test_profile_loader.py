@@ -6,7 +6,8 @@
 #   templates is legal; startup entry point honors TEMPLATES_DIR.
 # Item 2: a broken profile explodes AT LOAD TIME with a pointed
 #   message -- tree shape, the YAML flow-mapping trap, format-spec dry
-#   run, category shape; templates for unregistered types only warn.
+#   run, category shape; since F1.1 a template for an undeclared type
+#   refuses too (tests/test_profile_schema.py covers the schema).
 # Item 3: locale fallback chain (recipient locale -> default locale ->
 #   stored title/body) -- all three steps.
 #
@@ -66,16 +67,24 @@ def _write_profile(
 ) -> Path:
     """Materialize a throwaway profile directory under tmp_path.
 
-    msg_types=False skips the appended chat-baseline block -- for
-    tests that need a NON-mapping types document or that exercise the
-    chat-baseline validation itself.
+    `types_yaml` is the BODY of the `types:` section, written flat as
+    before F1.1; the helper wraps it into the schema-version-2
+    document ({version: 2, types: ...}) so these tests keep asserting
+    what they did. msg_types=False skips the appended chat-baseline
+    block -- for tests that need a NON-mapping types section or that
+    exercise the chat-baseline validation itself.
     """
     root.mkdir(parents=True, exist_ok=True)
     if msg_types:
         if types_yaml and not types_yaml.endswith("\n"):
             types_yaml += "\n"
         types_yaml += _MSG_TYPES_YAML
-    (root / "types.yaml").write_text(types_yaml, encoding="utf-8")
+    body = "".join(
+        f"  {line}\n" if line.strip() else "\n"
+        for line in types_yaml.splitlines()
+    )
+    document = f"version: 2\ntypes:\n{body}"
+    (root / "types.yaml").write_text(document, encoding="utf-8")
     templates_dir = root / "templates"
     templates_dir.mkdir(exist_ok=True)
     for locale, content in (templates or {}).items():
@@ -189,7 +198,8 @@ class TestValidator:
     """Item 2: broken profiles explode at load time, with hints."""
 
     def test_types_as_list_rejected_with_hint(self, tmp_path: Path) -> None:
-        """The type dictionary must be a mapping, not a list."""
+        """The type dictionary (the `types` section) must be a mapping,
+        not a list."""
         root = _write_profile(
             tmp_path, "- unit_event\n- unit_plain\n", msg_types=False,
         )
@@ -260,33 +270,40 @@ class TestValidator:
         with pytest.raises(ProfileError, match="Invalid YAML"):
             load_profile(FileProfileSource(root))
 
-    def test_template_for_unregistered_type_warns(
+    def test_template_for_unregistered_type_refuses_startup(
         self, tmp_path: Path,
     ) -> None:
-        """A template for a type missing from the dictionary is a
-        loud warning, not a startup failure (additive contract)."""
+        """A template for a type missing from the dictionary refuses
+        startup, naming the file and the type.
+
+        Was test_template_for_unregistered_type_warns: it asserted a
+        loud warning and that the template was still carried. That was
+        right while the profile tolerated keys it did not know (a
+        template could ship ahead of its type). F1.1 (spec §9.4) removed
+        that tolerance: the most likely cause is a typo in the type
+        key, and a template under a typo is never rendered -- the same
+        "typo reads as absence" class, so it refuses now."""
         root = _write_profile(
             tmp_path,
             "unit_event: {}\n",
             {"en": 'ghost_type:\n  telegram:\n    body: "{body}"\n'},
         )
-        with capture_logs() as logs:
-            profile = load_profile(FileProfileSource(root))
-        assert any(
-            log["event"] == "template_for_unregistered_type"
-            and log["type"] == "ghost_type"
-            for log in logs
-        )
-        # The template is still carried (the type may be enabled later).
-        assert "ghost_type" in profile.templates["en"]
+        with pytest.raises(
+            ProfileError,
+            match=r"templates/en\.yaml: template for type 'ghost_type', "
+            r"which types\.yaml does not declare",
+        ):
+            load_profile(FileProfileSource(root))
 
     def test_empty_types_document_fails_chat_baseline(
         self, tmp_path: Path,
     ) -> None:
-        """An empty types.yaml no longer loads: the chat-baseline
+        """An empty `types` section does not load: the chat-baseline
         contract (Release-Hardening item 3a) demands the three msg.*
         declarations, so zero types is a startup error. The emptiness
-        warning still fires first (diagnostic breadcrumb)."""
+        warning still fires first (diagnostic breadcrumb). An empty
+        FILE is refused earlier, for declaring no schema version
+        (tests/test_profile_schema.py)."""
         root = _write_profile(tmp_path, "# nothing yet\n", msg_types=False)
         with capture_logs() as logs, pytest.raises(
             ProfileError, match=r"msg\.participant_message",
@@ -294,16 +311,27 @@ class TestValidator:
             load_profile(FileProfileSource(root))
         assert any(log["event"] == "profile_types_empty" for log in logs)
 
-    def test_unknown_spec_keys_tolerated(self, tmp_path: Path) -> None:
-        """Unknown per-type fields pass through silently (additive)."""
+    def test_unknown_spec_key_refuses_startup(self, tmp_path: Path) -> None:
+        """An unknown per-type field refuses startup, naming the type,
+        the key and the allowed fields.
+
+        Was test_unknown_spec_keys_tolerated: it asserted that an
+        unknown field passed through silently and the known one still
+        applied. That was right while a type record carried only a
+        category, where an extra key meant nothing. F1.1 (spec §9.4)
+        turned the record into a route, where `chanels:` silently
+        ignored sends the type down the default channels -- so the
+        tolerance is gone, and only the reserved x- namespace passes
+        (tests/test_profile_schema.py)."""
         root = _write_profile(
             tmp_path,
             "unit_event:\n  category: cat_a\n  future_field: whatever\n",
         )
-        profile = load_profile(FileProfileSource(root))
-        registry.reset()
-        install_profile(profile)
-        assert registry.category_of("unit_event") == "cat_a"
+        with pytest.raises(ProfileError) as excinfo:
+            load_profile(FileProfileSource(root))
+        message = str(excinfo.value)
+        assert "type 'unit_event': unknown field 'future_field'" in message
+        assert "expected one of: category, channels," in message
 
 
 class TestLocaleFallbackChain:
@@ -616,7 +644,7 @@ class TestChatBaselineValidation:
         root = _write_profile(tmp_path, "unit_event: {}\n")
         profile = load_profile(FileProfileSource(root))
         for key in MSG_TYPE_KEYS:
-            assert profile.types[key]["category"]
+            assert profile.types[key].value("category")
 
     def test_missing_msg_type_key_fails(self, tmp_path: Path) -> None:
         """Dropping any one of the three keys is a startup error that
@@ -699,14 +727,21 @@ class TestProfileDomainFence:
 
     def test_domain_in_types_spec_fails(self, tmp_path: Path) -> None:
         """A domain smuggled into a types.yaml spec value (even an
-        unknown, tolerated field) dies at startup, named by key path."""
+        x- extension key, the one kind of key the schema does not read)
+        dies at startup, named by key path.
+
+        Before F1.1 the smuggling vehicle was an unknown field
+        (`landing`); unknown fields now refuse on their own, which would
+        make this test pass without the fence. The x- namespace is the
+        remaining place a free value can sit, so the fence is asserted
+        there."""
         root = _write_profile(
             tmp_path,
-            'unit_event:\n  category: cat_a\n  landing: "https://example.com/x"\n',
+            'unit_event:\n  category: cat_a\n  x-landing: "https://example.com/x"\n',
         )
         with pytest.raises(
             ProfileError,
-            match=r"type 'unit_event'\.landing contains an external domain",
+            match=r"type 'unit_event'\.x-landing contains an external domain",
         ):
             load_profile(FileProfileSource(root))
 

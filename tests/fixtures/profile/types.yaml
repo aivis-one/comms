@@ -1,51 +1,86 @@
 # =============================================================================
-# COMMS test profile -- notification type dictionary
+# COMMS test profile -- notification type records
 # =============================================================================
 # REFERENCE SHAPE for the real product profile (comms-profile/ in the
-# product repo). A MAPPING {type_key: {spec}}, not a list -- per-type
-# fields (category today, more later) extend without a format change.
+# product repo): schema version 2 (app/profile/loader.py).
 #
-# Spec fields:
-#   category -- preference category for mute gating (optional). Family
-#               granularity: several types may share one category
-#               (see the unit_rem_* family below). A type WITHOUT a
-#               category is exempt from mute gating.
+#   version: 2          -- required; any other version refuses startup
+#   types:              -- a MAPPING {type_key: {field: value}}
 #
-# Unknown spec fields are tolerated (additive contract): a newer
-# profile keeps working against an older service.
+# A type record is CLOSED: only the fields below, plus keys in the
+# reserved x- namespace. Any other key refuses startup by name -- a
+# typo must not read as "not declared". Every field is optional; an
+# omitted field takes the comms default, and the registry remembers
+# which layer decided (registry.explain).
+#
+#   category              -- preference category for mute gating. Family
+#                            granularity: several types may share one
+#                            (see the unit_rem_* family below). A type
+#                            WITHOUT a category is exempt from mute gating.
+#   channels              -- non-empty list of channel names
+#                            (in_app, telegram, email); default [in_app]
+#   lane                  -- interactive | critical | normal | bulk;
+#                            default normal
+#   push_on               -- outcome | outcome_and_deferral | none;
+#                            default none
+#   expires_after         -- duration literal: 30s, 15m, 24h, 7d;
+#                            default: no expiry
+#   retry_max_attempts    -- integer >= 1; default from settings
+#   retry_backoff_seconds -- integer >= 0; default from settings
+#   max_body_chars        -- integer from 1 to MAX_BODY_LEN (the body
+#                            column width); default MAX_BODY_LEN
 # =============================================================================
 
-# Single event type with its own category.
-unit_event:
-  category: unit_updates
+version: 2
 
-# A reminder FAMILY: three types, ONE category -- muting
-# "unit_reminder" gates all three.
-unit_rem_24h:
-  category: unit_reminder
-unit_rem_1h:
-  category: unit_reminder
-unit_rem_10m:
-  category: unit_reminder
+types:
+  # Single event type with its own category.
+  unit_event:
+    category: unit_updates
 
-# A type with an EMPTY spec: legal (no category -> never mute-gated,
-# no templates required -- stored title/body are the fallback).
-unit_plain: {}
+  # A reminder FAMILY: three types, ONE category -- muting
+  # "unit_reminder" gates all three.
+  unit_rem_24h:
+    category: unit_reminder
+  unit_rem_1h:
+    category: unit_reminder
+  unit_rem_10m:
+    category: unit_reminder
 
-# Presentation-keys demo (Phase 3a item 1): the template sheet for
-# this type carries button_text / disable_preview / silent -- see
-# templates/en.yaml for the reference shape.
-unit_presented: {}
+  # A type with an EMPTY spec: legal (no category -> never mute-gated,
+  # no templates required -- stored title/body are the fallback).
+  unit_plain: {}
 
-# -----------------------------------------------------------------------------
-# Messaging chat types (Phase 4c). comms emits these abstract keys; the
-# product profile maps them to the locked msg_* categories. A thread-
-# closed notice goes to the client -> the participant category.
-# (The real VELO dictionary supplies these in Phase 6.)
-# -----------------------------------------------------------------------------
-msg.participant_message:
-  category: msg_participants
-msg.support_message:
-  category: msg_support
-msg.thread_closed:
-  category: msg_participants
+  # Presentation-keys demo (Phase 3a item 1): the template sheet for
+  # this type carries button_text / disable_preview / silent -- see
+  # templates/en.yaml for the reference shape.
+  unit_presented: {}
+
+  # -----------------------------------------------------------------------------
+  # Messaging chat types (Phase 4c). comms emits these abstract keys; the
+  # product profile maps them to the locked msg_* categories. A thread-
+  # closed notice goes to the client -> the participant category.
+  # (The real VELO dictionary supplies these in Phase 6.)
+  # -----------------------------------------------------------------------------
+  msg.participant_message:
+    category: msg_participants
+  msg.support_message:
+    category: msg_support
+  msg.thread_closed:
+    category: msg_participants
+
+  # Every routing field spelled out (reference shape). `category` is
+  # left out on purpose -- the one field this record takes from the
+  # comms default (no category -> not mute-gated). Channels
+  # are in_app only ON PURPOSE: the suite runs with every external
+  # channel's keys blanked (tests/conftest.py), and the startup path
+  # refuses a route into a channel this deploy did not configure.
+  unit_routed:
+    channels: [in_app]
+    lane: interactive
+    push_on: outcome
+    expires_after: 15m
+    retry_max_attempts: 2
+    retry_backoff_seconds: 0
+    max_body_chars: 1000
+    x-note: "extension keys are tolerated and never reach the record"

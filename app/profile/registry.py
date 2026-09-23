@@ -14,6 +14,13 @@
 # Phase 2 adds real profile loading from disk (app/profile/loader.py)
 # and per-type preference categories for mute gating.
 #
+# F1.1 adds the TYPE RECORD: the closed, typed set of fields a profile
+# may declare per notification type (app/profile/loader.py owns the
+# schema). The registry stores, for every field of every type, the
+# VALUE and the LAYER that decided it -- the profile, or the comms
+# default -- so "why did this type go there" has an answer that code
+# can ask for (explain), not only a line in the startup log.
+#
 # TEMPLATE STRUCTURE (same shape as cbshome YAML, held in memory):
 #   {locale: {type: {channel: {field: leaf}}}}
 #   e.g. templates["en"]["unit_event"]["telegram"]["body"]
@@ -30,7 +37,10 @@
 #   API serve traffic; reads are lock-free dict lookups.
 # =============================================================================
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any
 
 import structlog
 
@@ -39,6 +49,46 @@ logger = structlog.get_logger()
 # Nested template mapping: {type: {channel: {field: leaf}}}; a leaf
 # is a template string or a presentation flag (Phase 3a item 1).
 TemplateTree = dict[str, dict[str, dict[str, str | bool]]]
+
+
+class Layer(StrEnum):
+    """Which layer decided a field of a type record."""
+
+    # The product profile declared the field for this type.
+    PROFILE = "profile"
+    # The profile left the field out; comms supplied the value.
+    DEFAULT = "default"
+
+
+@dataclass(frozen=True)
+class Decided:
+    """One field of one type: the value and who decided it.
+
+    `source` says WHERE the value came from, in words an operator can
+    follow: the profile file for the profile layer; for the default
+    layer, either "comms default" or the setting the default is read
+    from (the retry defaults are a reference to settings, not a copy).
+    """
+
+    value: Any
+    layer: Layer
+    source: str
+
+
+@dataclass(frozen=True)
+class TypeRecord:
+    """Every field of one notification type, each with its layer.
+
+    Built by the profile loader, which guarantees that EVERY field of
+    the schema is present -- a field is either declared or defaulted,
+    never missing.
+    """
+
+    fields: Mapping[str, Decided]
+
+    def value(self, field: str) -> Any:
+        """The effective value of a field (KeyError if not a field)."""
+        return self.fields[field].value
 
 
 class ProfileRegistry:
@@ -53,18 +103,32 @@ class ProfileRegistry:
         # to "reminder"). A type without a category is exempt from
         # mute gating.
         self._categories: dict[str, str] = {}
+        # type_key -> the full type record with layers (F1.1). Only a
+        # type installed from a profile has one: tests that register a
+        # bare key directly get no record, and explain() says so.
+        self._records: dict[str, TypeRecord] = {}
 
     # -- Types --
 
-    def register_type(self, key: str, *, category: str | None = None) -> None:
+    def register_type(
+        self,
+        key: str,
+        *,
+        category: str | None = None,
+        record: TypeRecord | None = None,
+    ) -> None:
         """Register a single notification type key.
 
         `category` (optional) links the type to a preference category
         for mute gating; the profile's type dictionary supplies it.
+        `record` (optional) is the type's full record with layers, as
+        the profile loader built it.
         """
         if not key:
             raise ValueError("Notification type key must be non-empty")
         self._types.add(key)
+        if record is not None:
+            self._records[key] = record
         if category is not None:
             if not category:
                 raise ValueError(
@@ -98,6 +162,32 @@ class ProfileRegistry:
         be set for a category the profile actually declares.
         """
         return frozenset(self._categories.values())
+
+    # -- Type records (F1.1) --
+
+    def record_of(self, type_key: str) -> TypeRecord | None:
+        """The type's record; None if it was not installed from a
+        profile (unknown type, or a bare key registered directly)."""
+        return self._records.get(type_key)
+
+    def explain(self, type_key: str, field: str) -> Decided:
+        """Why a field of a type has its value: value, layer, source.
+
+        Raises LookupError naming what is missing -- an unknown type or
+        field must never read as "decided by default".
+        """
+        record = self._records.get(type_key)
+        if record is None:
+            raise LookupError(
+                f"type {type_key!r} has no profile record: it is not "
+                f"declared in the installed profile"
+            )
+        if field not in record.fields:
+            raise LookupError(
+                f"{field!r} is not a field of the type record; fields: "
+                f"{', '.join(sorted(record.fields))}"
+            )
+        return record.fields[field]
 
     # -- Templates --
 
@@ -175,6 +265,7 @@ class ProfileRegistry:
         self._types.clear()
         self._templates.clear()
         self._categories.clear()
+        self._records.clear()
         logger.info("profile_registry_reset")
 
 
