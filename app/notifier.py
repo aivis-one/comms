@@ -38,7 +38,6 @@ from uuid import UUID
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
@@ -49,7 +48,7 @@ from app.core.constants import (
 from app.core.database import get_session_factory
 from app.engine.constants import TargetType
 from app.engine.models import Notification
-from app.engine.service import create_notification
+from app.engine.service import Intake, accept_notification, canonical_fingerprint
 from app.messaging.constants import OperatorKind
 from app.messaging.membership import member_ids
 from app.messaging.models import Message, Thread
@@ -57,18 +56,6 @@ from app.messaging.models import Message, Thread
 logger = structlog.get_logger()
 
 _CLOSE_NOTIFY_BATCH_SIZE = 500
-
-# The ONE unique on notifications is the idempotency key. Filter the
-# dedup IntegrityError by that index name (mirroring messaging's
-# _is_dedup_violation) so a FUTURE constraint is NOT silently swallowed
-# as a "duplicate" -- it re-raises and surfaces on the caller path.
-_IDEMPOTENCY_INDEX_NAME = "uq_notifications_idempotency_key"
-
-
-def _is_idempotency_violation(exc: IntegrityError) -> bool:
-    """True iff the IntegrityError is the notifications idempotency
-    unique firing (a benign dedup), not some other constraint."""
-    return _IDEMPOTENCY_INDEX_NAME in str(exc.orig)
 
 # -- Abstract chat notification TYPE keys comms emits. The profile
 # attaches a preference category to each; this service reads that
@@ -122,7 +109,7 @@ def _message_idempotency_key(message_id: UUID, recipient_id: UUID) -> str:
 
     One message may ping up to two recipients; the key is per-recipient
     so both pings are distinct, and a replay of the same (message,
-    recipient) is the DB's dedup arbiter (partial-unique on
+    recipient) is the DB's dedup arbiter (unique on
     notifications.idempotency_key).
     """
     return f"msg:{message_id}:{recipient_id}"
@@ -149,34 +136,48 @@ async def _emit_message_notification(
     """Create ONE message-ping notification, deduped on replay.
 
     Returns the created notification, or None when this (message,
-    recipient) pair was already emitted -- the partial-unique index on
-    notifications.idempotency_key is the dedup arbiter (a SAVEPOINT
-    keeps the caller's session usable on the collision).
+    recipient) pair was already emitted -- the unique index on
+    notifications.idempotency_key is the dedup arbiter
+    (accept_notification; its SAVEPOINT keeps the caller's session
+    usable on the collision).
     """
     key = _message_idempotency_key(message.id, recipient)
-    try:
-        async with session.begin_nested():
-            notification = await create_notification(
-                session,
-                type=type_key,
-                title=_NEW_MESSAGE_TITLE,
-                body=_NEW_MESSAGE_BODY,
-                target_type=TargetType.USER.value,
-                target_value=str(recipient),
-                action_data=_open_thread_action_data(
-                    thread.id, sender_id=message.sender
-                ),
-                idempotency_key=key,
-            )
-    except IntegrityError as exc:
-        if not _is_idempotency_violation(exc):
-            raise  # a real, non-dedup constraint -- surface it
-        logger.info(
-            "message_notification_deduped",
+    fields = {
+        "type": type_key,
+        "title": _NEW_MESSAGE_TITLE,
+        "body": _NEW_MESSAGE_BODY,
+        "target_type": TargetType.USER.value,
+        "target_value": str(recipient),
+        "action_data": _open_thread_action_data(
+            thread.id, sender_id=message.sender
+        ),
+    }
+    acceptance = await accept_notification(
+        session,
+        idempotency_key=key,
+        fingerprint=canonical_fingerprint(fields),
+        **fields,
+    )
+    if acceptance.outcome is not Intake.ACCEPTED:
+        # DUPLICATE is the replay this key exists for. CONFLICT means
+        # the key is held by other content -- a product key that
+        # happens to equal this internal one: logged loudly, the chat
+        # message itself is unaffected.
+        log = (
+            logger.info
+            if acceptance.outcome is Intake.DUPLICATE
+            else logger.error
+        )
+        log(
+            "message_notification_deduped"
+            if acceptance.outcome is Intake.DUPLICATE
+            else "message_notification_key_conflict",
             thread_id=str(thread.id),
             recipient=str(recipient),
+            idempotency_key=key,
         )
         return None
+    notification = acceptance.notification
 
     logger.info(
         "message_notification_created",
@@ -297,22 +298,33 @@ async def _emit_close_notification(session: AsyncSession, thread: Thread) -> Non
     if when is None:
         return  # defensive: only flagged threads are passed here
     key = _close_idempotency_key(thread.id, when)
-    try:
-        async with session.begin_nested():
-            await create_notification(
-                session,
-                type=TYPE_THREAD_CLOSED,
-                title=_THREAD_CLOSED_TITLE,
-                body=_THREAD_CLOSED_BODY,
-                target_type=TargetType.USER.value,
-                target_value=str(thread.client),
-                action_data=_open_thread_action_data(thread.id),
-                idempotency_key=key,
-            )
-    except IntegrityError as exc:
-        if not _is_idempotency_violation(exc):
-            raise  # a real, non-dedup constraint -- surface it
-        logger.info("close_notification_deduped", thread_id=str(thread.id))
+    fields = {
+        "type": TYPE_THREAD_CLOSED,
+        "title": _THREAD_CLOSED_TITLE,
+        "body": _THREAD_CLOSED_BODY,
+        "target_type": TargetType.USER.value,
+        "target_value": str(thread.client),
+        "action_data": _open_thread_action_data(thread.id),
+    }
+    acceptance = await accept_notification(
+        session,
+        idempotency_key=key,
+        fingerprint=canonical_fingerprint(fields),
+        **fields,
+    )
+    if acceptance.outcome is not Intake.ACCEPTED:
+        log = (
+            logger.info
+            if acceptance.outcome is Intake.DUPLICATE
+            else logger.error
+        )
+        log(
+            "close_notification_deduped"
+            if acceptance.outcome is Intake.DUPLICATE
+            else "close_notification_key_conflict",
+            thread_id=str(thread.id),
+            idempotency_key=key,
+        )
         return
     logger.info(
         "close_notification_created",

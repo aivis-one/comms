@@ -22,16 +22,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_session_factory
 from app.engine.constants import DeliveryStatus, TargetType
 from app.engine.service import create_notification, resolve_notification
-from tests.helpers import create_recipient, next_phase3b_telegram_id
+from tests.helpers import create_recipient, intake_fields, next_phase3b_telegram_id
 
 
 async def _seed_inbox(
     count: int = 2,
     *,
-    channels: list[str] | None = None,
+    type_key: str = "unit_event_in_app",
     action_data: dict[str, Any] | None = None,
 ) -> tuple[UUID, list[UUID]]:
     """Recipient with N SENT deliveries, committed for the API to see.
+
+    The channels come from the fixture profile's record of `type_key`
+    (F1.2: a request never names a channel) -- in_app by default.
 
     sent_at ascends one second per delivery (oldest first), so
     "newest-first" assertions are deterministic. Returns
@@ -47,12 +50,12 @@ async def _seed_inbox(
         for index in range(count):
             notification = await create_notification(
                 session,
-                type="unit_event",
+                **intake_fields(),
+                type=type_key,
                 title=f"Title {index}",
                 body=f"Body {index}",
                 target_type=TargetType.USER,
                 target_value=str(recipient.id),
-                channels=channels or ["in_app"],
                 action_data=(
                     action_data
                     if action_data is not None
@@ -98,7 +101,7 @@ class TestInboxFeed:
             "id", "type", "title", "body", "action_data",
             "priority", "sent_at", "read_at", "created_at",
         }
-        assert item["type"] == "unit_event"
+        assert item["type"] == "unit_event_in_app"
         assert item["read_at"] is None
         # ISO 8601 strings parse back.
         datetime.fromisoformat(item["sent_at"])
@@ -125,7 +128,7 @@ class TestInboxFeed:
         appears neither in the feed nor in the badge (its read_at
         stays NULL forever and would inflate the counter)."""
         recipient_id, _ = await _seed_inbox(
-            count=1, channels=["telegram"],
+            count=1, type_key="unit_event",
         )
         response = await client.get(_inbox(recipient_id))
         payload = response.json()
@@ -249,7 +252,7 @@ class TestMarkRead:
         """read-all touches in_app rows only: a sent telegram
         delivery keeps read_at NULL."""
         recipient_id, _ = await _seed_inbox(
-            count=1, channels=["telegram", "in_app"],
+            count=1, type_key="unit_event_telegram_in_app",
         )
         await client.post(f"{_inbox(recipient_id)}/read-all")
 

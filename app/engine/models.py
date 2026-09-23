@@ -57,7 +57,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from app.core.constants import (
+    FINGERPRINT_LEN,
     MAX_BODY_LEN,
+    MAX_CORRELATION_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_TITLE_LEN,
     MAX_TYPE_KEY_LEN,
@@ -103,42 +105,95 @@ class Notification(UUIDMixin, Base):
         nullable=False,
     )
 
-    # Producer-supplied dedup key for stream-ingested notification
-    # requests (Phase 3c item 2): at-least-once delivery replays are
-    # collapsed by the partial unique index on this column (migration
-    # 0005); NULL for notifications created by other paths (tests,
-    # future internal producers) -- NULLs never collide.
-    #
-    # KNOWN CEILING -- dedup window is bounded by retention.
-    # Mechanics: dedup is reliable only while the stream's trim
-    # horizon < NOTIFICATION_RETENTION_DAYS -- retention deletes the
-    # notification row, freeing its key, so a replay arriving AFTER
-    # the row is purged creates a duplicate. With retention disabled
-    # (NOTIFICATION_RETENTION_DAYS <= 0, 3a.1) the window is infinite
-    # (safe; table growth is retention's concern, not dedup's).
-    # Status: acknowledged by design (Phase 3c review, part C).
-    # Backlog: covered by the marker itself, no BL entry -- config
-    # relationship, not code work.
-    # Unfreeze trigger: stream trim horizon configured anywhere near
-    # NOTIFICATION_RETENTION_DAYS, or replay-after-purge observed.
-    # Agreed fix shape: none needed while the inequality holds; if it
-    # ever breaks, a dedicated processed-keys table with its OWN
-    # retention decoupled from notifications.
-    # Rejected: a separate processed_events table NOW -- it merely
-    # moves the same retention question to a second table.
-    idempotency_key: Mapped[str | None] = mapped_column(
+    # The request's idempotency key (F1.2: REQUIRED on every intake
+    # path). The plain unique index uq_notifications_idempotency_key
+    # (migrations 0005, 0012) makes the database the arbiter of "same
+    # key": a second insert fails on flush, and the service then
+    # compares FINGERPRINTS to tell a replay from a conflict
+    # (app/engine/service.py accept_notification). How long the key
+    # keeps answering is bounded by retention -- the KNOWN CEILING on
+    # `fingerprint` below says how.
+    idempotency_key: Mapped[str] = mapped_column(
         String(MAX_IDEMPOTENCY_KEY_LEN),
-        nullable=True,
-        default=None,
+        nullable=False,
     )
 
-    # Deep-link intent + template variables + internal keys ("_channels").
+    # SHA-256 hex digest of the request's BYTES -- what "the same
+    # content" means under one key. Compared, never read: equality of
+    # bytes is not an interpretation of meaning (spec §5.8). Two ways
+    # of computing it exist, one per kind of producer (see
+    # stream_fingerprint / canonical_fingerprint in
+    # app/engine/service.py for why).
+    #
+    # KNOWN CEILING -- dedup AND conflict detection are bounded by
+    # retention.
+    #   1. Mechanics: the key answers only while its notification row
+    #      exists. Retention deletes the row after
+    #      NOTIFICATION_RETENTION_DAYS, freeing the key: a replay that
+    #      arrives after the purge is accepted as NEW -- with the same
+    #      bytes it duplicates the job, with different bytes it is not
+    #      reported as a conflict. With retention disabled
+    #      (NOTIFICATION_RETENTION_DAYS <= 0) the window is infinite.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: none -- a relationship between two settings
+    #      (stream trim horizon, retention), not code work.
+    #   4. Promotion trigger (observable): the stream's trim horizon is
+    #      configured near NOTIFICATION_RETENTION_DAYS, or a
+    #      notification_materialized log line names a key that an
+    #      earlier, already purged notification carried.
+    #   5. Agreed fix shape: a dedicated processed-keys table (key +
+    #      fingerprint) with its OWN retention, decoupled from
+    #      notifications.
+    #   6. Rejected: that table NOW -- it merely moves the same
+    #      retention question to a second table; and "never purge the
+    #      key" -- unbounded growth for a replay window nobody uses.
+    fingerprint: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN),
+        nullable=False,
+    )
+
+    # The channels the profile routed this type to AT INTAKE (F1.2): a
+    # snapshot, so a restart with another profile never re-routes a job
+    # that was already accepted. The channel is never named by the
+    # caller -- only the profile decides.
+    channels: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+    )
+
+    # The product's own reference from the envelope (F1.2). Stored and
+    # handed back untouched; comms never interprets it.
+    correlation: Mapped[str | None] = mapped_column(
+        String(MAX_CORRELATION_LEN),
+        nullable=True,
+    )
+
+    # Deep-link intent + template variables -- the LETTER, opaque.
     # {"action": "open_thread", "params": {"thread_id": "uuid"}, ...}
     action_data: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB,
         nullable=True,
     )
 
+    # KNOWN CEILING -- every notification carries the same priority.
+    #   1. Mechanics: the processor still orders its batch by this
+    #      column, but since F1.2 nothing sets it -- the priority left
+    #      the request (it is not an envelope field, and comms may not
+    #      read the letter), so every row holds the server default and
+    #      the ordering degenerates to scheduled_at.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: phase 4 (isolation lanes), which replaces
+    #      priority-in-one-queue with lanes; the inbox field that still
+    #      reports it goes with the resource protocol (F1.4).
+    #   4. Promotion trigger (observable): a lane consumer is written
+    #      (anything reading the profile field `lane`), or the inbox
+    #      resource contract is reopened.
+    #   5. Agreed fix shape: drop the column, its place in the processor
+    #      ordering and index, and the inbox field, together.
+    #   6. Rejected: keeping priority on the wire until then -- a field
+    #      the processor reads is a decision taken on a request's
+    #      content, and a priority inside one queue does not isolate
+    #      anything anyway (spec §8.2).
     priority: Mapped[int] = mapped_column(
         Integer,
         default=5,
@@ -155,6 +210,14 @@ class Notification(UUIDMixin, Base):
     expiry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+    # Which layer decided expiry_at (F1.2): the envelope, the profile's
+    # expires_after, or the comms default (no expiry). A registry.Layer
+    # value -- read back through service.expiry_of().
+    expiry_layer: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
     )
 
     status: Mapped[str] = mapped_column(
@@ -292,3 +355,62 @@ class NotificationDelivery(UUIDMixin, Base):
             f"channel={self.channel} status={self.status} "
             f"recipient={self.recipient_id}>"
         )
+
+
+class IntakeOutcome(UUIDMixin, Base):
+    """A request that was NOT accepted, recorded under its key (F1.2).
+
+    Two classes, told apart by `outcome`, not by text:
+      rejected_at_intake -- the envelope could not be accepted (unknown
+                            type, malformed address, expiry already
+                            passed, unknown field): the PRODUCT's
+                            responsibility, the job was never taken;
+      conflict           -- the key is taken by an accepted job whose
+                            bytes differ: the product reused a key for
+                            new content. The accepted job is untouched
+                            and referenced by notification_id.
+    A failure AFTER intake is not here: it is the accepted
+    notification's own status.
+
+    A rejection does NOT occupy the key: a product that fixes its
+    request may resend it under the same key and have it accepted.
+
+    Nothing reads these rows for the product yet -- reading by key is
+    phase 2. Until then service.intake_outcomes_for() is the
+    programmatic answer. The unique index on (idempotency_key,
+    fingerprint, outcome) lives in migration 0012
+    (app/core/schema_objects.py): a replay of the same bytes records
+    nothing new.
+    """
+
+    __tablename__ = "intake_outcomes"
+
+    idempotency_key: Mapped[str] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN),
+        nullable=False,
+    )
+    fingerprint: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN),
+        nullable=False,
+    )
+    outcome: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+    )
+    # Redacted, human-readable; classification is `outcome`.
+    reason: Mapped[str] = mapped_column(
+        String(2000),
+        nullable=False,
+    )
+    # The accepted job a conflict collided with; NULL for a rejection.
+    # SET NULL, not CASCADE: retention purging the job must not erase
+    # the record that a conflict happened.
+    notification_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("notifications.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )

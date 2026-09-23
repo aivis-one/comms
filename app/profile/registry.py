@@ -52,8 +52,15 @@ TemplateTree = dict[str, dict[str, dict[str, str | bool]]]
 
 
 class Layer(StrEnum):
-    """Which layer decided a field of a type record."""
+    """Which layer decided a value.
 
+    For a type record: the profile, or the comms default. For a value
+    of an accepted request that the envelope may set over the profile
+    (the expiry, F1.2): the envelope as well.
+    """
+
+    # The request's own envelope carried the value (F1.2).
+    ENVELOPE = "envelope"
     # The product profile declared the field for this type.
     PROFILE = "profile"
     # The profile left the field out; comms supplied the value.

@@ -48,6 +48,7 @@ from app.profile.loader import (
     parse_profile,
 )
 from app.profile.registry import Layer, ProfileRegistry
+from tests.helpers import configure_every_channel
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -735,7 +736,16 @@ class TestShippedProfiles:
         )
         assert set(profile.types) == set(MSG_TYPE_KEYS)
 
-    def test_fixture_profile_loads_against_the_suite_deploy(self) -> None:
+    def test_fixture_profile_loads_against_a_full_deploy(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Was ..._against_the_suite_deploy: the fixture routed nothing
+        but in_app, so the suite's own deploy (externals blanked) could
+        load it. Since F1.2 the fixture routes types to telegram and
+        email -- the channel is the profile's -- so it is loaded on a
+        deploy that has every channel. What it pinned still holds: the
+        reference record is decided by the profile, field by field."""
+        configure_every_channel(monkeypatch)
         profile = load_profile(
             FileProfileSource(REPO_ROOT / "tests" / "fixtures" / "profile"),
             loader_module.deploy_channel_states(),

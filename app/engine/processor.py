@@ -54,6 +54,7 @@ from app.core.database import get_session_factory
 from app.engine.constants import DeliveryStatus, NotificationStatus
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
+    delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
     resolve_notification,
@@ -302,6 +303,7 @@ async def cleanup_terminal_notifications() -> int:
     cutoff = datetime.now(UTC) - timedelta(days=retention_days)
     started = time.monotonic()
     total = 0
+    intake_deleted = 0
 
     async with factory() as session:
         try:
@@ -315,6 +317,13 @@ async def cleanup_terminal_notifications() -> int:
                 total += deleted
                 if deleted < _RETENTION_BATCH_SIZE:
                     break
+            # The records of requests that were NOT accepted follow the
+            # same horizon (F1.2): one statement -- the table holds only
+            # refusals, it is small by nature.
+            intake_deleted = await delete_intake_outcomes_before(
+                session, cutoff=cutoff,
+            )
+            await session.commit()
         except Exception:
             await session.rollback()
             logger.exception("retention_pass_error", deleted=total)
@@ -325,6 +334,7 @@ async def cleanup_terminal_notifications() -> int:
     logger.info(
         "retention_pass",
         deleted=total,
+        intake_outcomes_deleted=intake_deleted,
         duration_ms=round((time.monotonic() - started) * 1000, 1),
         retention_days=retention_days,
     )

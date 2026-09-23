@@ -51,7 +51,7 @@ from app.engine.service import (
     resolve_notification,
     rollup_notification,
 )
-from tests.helpers import create_recipient, next_phase2_telegram_id
+from tests.helpers import create_recipient, intake_fields, next_phase2_telegram_id
 
 
 async def _phase2_recipient(
@@ -320,12 +320,12 @@ class TestMuteGating:
         for family_type in ("unit_rem_24h", "unit_rem_1h"):
             notification = await create_notification(
                 db_session,
+                **intake_fields(),
                 type=family_type,
                 title="T",
                 body="B",
                 target_type=TargetType.USER,
                 target_value=str(recipient.id),
-                channels=["telegram"],
             )
             deliveries = await resolve_notification(db_session, notification)
             assert deliveries == []
@@ -341,12 +341,12 @@ class TestMuteGating:
         )
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram"],
         )
         deliveries = await resolve_notification(db_session, notification)
         assert deliveries == []
@@ -371,12 +371,12 @@ class TestMuteGating:
         await set_category_muted(db_session, muted.id, "unit_updates", True)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["in_app"],
         )
         await db_session.commit()
 
@@ -397,12 +397,12 @@ class TestMuteGating:
             await set_category_muted(db_session, recipient.id, category, True)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_plain",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         deliveries = await resolve_notification(db_session, notification)
         assert len(deliveries) == 1
@@ -433,12 +433,12 @@ class TestMuteGating:
         )
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await resolve_notification(db_session, notification)
         assert notification.status == NotificationStatus.SKIPPED
@@ -475,12 +475,12 @@ class TestQuietHoursGating:
         )
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -521,12 +521,12 @@ class TestQuietHoursGating:
         )
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["in_app"],
         )
         await db_session.commit()
 
@@ -542,12 +542,12 @@ class TestQuietHoursGating:
         recipient = await _phase2_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -596,12 +596,12 @@ class TestLateMuteAtDeliver:
         )
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -646,12 +646,12 @@ class TestLateMuteAtDeliver:
         listening = await _phase2_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["in_app"],
         )
         await db_session.commit()
 
@@ -706,12 +706,12 @@ class TestLateMuteAtDeliver:
         for status_a, status_b, expected in cases:
             notification = await create_notification(
                 db_session,
+                **intake_fields(),
                 type="unit_event",
                 title="T",
                 body="B",
                 target_type=TargetType.ALL,
                 target_value="*",
-                channels=["telegram"],
             )
             deliveries = await resolve_notification(db_session, notification)
             assert len(deliveries) == 2
@@ -734,12 +734,12 @@ class TestLateMuteAtDeliver:
             await _phase2_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram"],
         )
         deliveries = await resolve_notification(db_session, notification)
         assert len(deliveries) == 3
@@ -783,12 +783,12 @@ class TestScheduleDeferralVsExpiry:
         # now+1h.
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
             expiry_at=datetime.now(UTC) + timedelta(hours=1),
         )
         await db_session.commit()

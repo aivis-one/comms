@@ -83,13 +83,22 @@ class IndexShape:
 # autogenerate -- which is why each one needs muting by name.
 MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
     # -- Uniqueness that is an invariant, not an optimization --
-    # Replay of a stream event collapses onto one notification.
+    # One key, one accepted job (F1.2: plain, the key is NOT NULL).
+    # Replay of a request collapses onto it; other bytes are a conflict.
     "uq_notifications_idempotency_key": IndexShape(
         unique=True,
         definition=(
             "CREATE UNIQUE INDEX uq_notifications_idempotency_key "
-            "ON public.notifications USING btree (idempotency_key) "
-            "WHERE (idempotency_key IS NOT NULL)"
+            "ON public.notifications USING btree (idempotency_key)"
+        ),
+    ),
+    # A replay of the same rejected or conflicting bytes records once.
+    "uq_intake_outcomes_key_fingerprint_outcome": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_intake_outcomes_key_fingerprint_outcome "
+            "ON public.intake_outcomes USING btree "
+            "(idempotency_key, fingerprint, outcome)"
         ),
     ),
     # "One eternal DM per pair" -- partial unique index.

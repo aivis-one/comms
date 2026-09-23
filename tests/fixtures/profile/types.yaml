@@ -35,26 +35,60 @@ version: 2
 
 types:
   # Single event type with its own category.
+  # The channels live HERE, per type (F1.2) -- a request never names
+  # one. unit_event goes to telegram; the unit_event_* siblings carry
+  # the other channel sets the suite needs, with the same category (so
+  # one mute gates them all) and the same template sheets (YAML anchors
+  # in templates/*.yaml).
   unit_event:
     category: unit_updates
+    channels: [telegram]
+  unit_event_in_app:
+    category: unit_updates
+    channels: [in_app]
+  unit_event_email:
+    category: unit_updates
+    channels: [email]
+  unit_event_telegram_in_app:
+    category: unit_updates
+    channels: [telegram, in_app]
+  unit_event_in_app_email:
+    category: unit_updates
+    channels: [in_app, email]
+  unit_event_telegram_email:
+    category: unit_updates
+    channels: [telegram, email]
 
   # A reminder FAMILY: three types, ONE category -- muting
   # "unit_reminder" gates all three.
   unit_rem_24h:
     category: unit_reminder
+    channels: [telegram]
   unit_rem_1h:
     category: unit_reminder
+    channels: [telegram]
   unit_rem_10m:
     category: unit_reminder
+    channels: [telegram]
 
-  # A type with an EMPTY spec: legal (no category -> never mute-gated,
-  # no templates required -- stored title/body are the fallback).
-  unit_plain: {}
+  # No category (never mute-gated) and no templates -- stored
+  # title/body are the fallback.
+  unit_plain:
+    channels: [telegram]
+
+  # A type with an EMPTY spec: legal -- every field from the comms
+  # default (channels: in_app, no category, no expiry).
+  unit_bare: {}
+
+  # A profile-declared expiry (F1.2): counted from scheduled_at.
+  unit_expiring:
+    expires_after: 1h
 
   # Presentation-keys demo (Phase 3a item 1): the template sheet for
   # this type carries button_text / disable_preview / silent -- see
   # templates/en.yaml for the reference shape.
-  unit_presented: {}
+  unit_presented:
+    channels: [telegram]
 
   # -----------------------------------------------------------------------------
   # Messaging chat types (Phase 4c). comms emits these abstract keys; the

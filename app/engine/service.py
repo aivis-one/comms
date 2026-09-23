@@ -8,6 +8,16 @@
 #   - deliveries reference recipients (sync projection), not Users
 #   - formatter credentials/locale come from Recipient columns
 #
+# FUNCTIONS (intake, F1.2):
+#   accept_notification()   -- THE intake: create under a key, or answer
+#                              duplicate / conflict by fingerprint
+#   stream_fingerprint(), canonical_fingerprint() -- the two ways a
+#                              request's bytes are fingerprinted
+#   record_intake_outcome(), intake_outcomes_for() -- requests that
+#                              were NOT accepted, under their key
+#   expiry_of()             -- the expiry of a job and the layer that
+#                              decided it
+#
 # FUNCTIONS (pipeline):
 #   create_notification()   -- create a Notification record (validated)
 #   resolve_notification()  -- expand targets into NotificationDelivery rows
@@ -32,13 +42,20 @@
 # =============================================================================
 
 import asyncio
+import hashlib
+import json
 import random
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
 import structlog
 from sqlalchemy import delete, func, or_, select, tuple_, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import Recipient
@@ -47,8 +64,8 @@ from app.audience.schedule import recipient_deferred_until
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.engine.constants import (
-    DeliveryChannel,
     DeliveryStatus,
+    IntakeOutcomeClass,
     NotificationStatus,
     TargetType,
 )
@@ -61,15 +78,17 @@ from app.engine.formatters import (
     sanitize_text,
     sanitized_traceback,
 )
-from app.engine.models import Notification, NotificationDelivery
+from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
 from app.engine.resolver import resolve_targets
-from app.profile.registry import registry
+from app.profile.registry import Decided, Layer, registry
 
 logger = structlog.get_logger()
 
 # Valid infrastructure enum values for input validation.
 _VALID_TARGET_TYPES = frozenset(e.value for e in TargetType)
-_VALID_CHANNELS = frozenset(e.value for e in DeliveryChannel)
+
+# The one unique index that means "this key is taken" (migration 0012).
+IDEMPOTENCY_INDEX_NAME = "uq_notifications_idempotency_key"
 
 # Timeout for a single formatter.deliver() call.
 _DELIVER_TIMEOUT_SECONDS = 30
@@ -85,6 +104,199 @@ _RATE_LIMIT_JITTER_MAX_FRACTION = 0.5
 _MAX_CONCURRENT_DELIVERIES = 20
 
 
+# -----------------------------------------------------------------------------
+# Intake (F1.2)
+# -----------------------------------------------------------------------------
+#
+# TWO WAYS TO FINGERPRINT, ONE PER KIND OF PRODUCER, and why two. The
+# fingerprint answers one question -- "are these the same bytes under
+# this key?" -- and it must be answered WITHOUT reading the request.
+#
+#   stream_fingerprint     -- a product's request arrives as bytes on
+#                             the wire (the `data` field of the stream
+#                             entry). The digest is taken over exactly
+#                             those bytes, before any parsing: nothing
+#                             is normalised, so nothing is interpreted.
+#                             A product that re-serialises the same
+#                             meaning differently gets a conflict --
+#                             loud, which is the right side to err on.
+#   canonical_fingerprint  -- comms' own producers (the chat notifier)
+#                             never had wire bytes; their request is a
+#                             set of arguments. The digest is taken over
+#                             a canonical JSON of those arguments
+#                             (sorted keys, fixed separators), so the
+#                             same call always yields the same digest.
+#
+# The two never have to agree: a product key and an internal key live
+# in one index, and if they ever coincide the digests differ by
+# construction, so the collision surfaces as a conflict instead of as a
+# silent duplicate.
+
+
+def stream_fingerprint(data: bytes) -> str:
+    """Digest of a stream request's `data` bytes, as they arrived."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical_fingerprint(fields: Mapping[str, Any]) -> str:
+    """Digest of an internal producer's arguments, canonically encoded."""
+    encoded = json.dumps(
+        fields,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+class Intake(StrEnum):
+    """What accept_notification did with a request."""
+
+    ACCEPTED = "accepted"
+    # Same key, same bytes: the existing job, nothing new created.
+    DUPLICATE = "duplicate"
+    # Same key, other bytes: nothing created, the existing job untouched.
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class Acceptance:
+    """The outcome of one intake and the job it concerns.
+
+    `notification` is the created job for ACCEPTED, and the job that
+    already holds the key for DUPLICATE and CONFLICT.
+    """
+
+    outcome: Intake
+    notification: Notification
+
+
+async def accept_notification(
+    session: AsyncSession,
+    *,
+    idempotency_key: str,
+    fingerprint: str,
+    **fields: Any,
+) -> Acceptance:
+    """Accept one request under its key -- the single intake.
+
+    The DATABASE decides "is this key taken": the insert runs inside a
+    SAVEPOINT, and the unique index turns a second insert into an
+    IntegrityError. No pre-flight SELECT -- a check-then-insert races
+    with itself; the constraint does not. Two concurrent intakes of one
+    key therefore produce ONE job: the second insert waits for the
+    first transaction and then fails, and only then is the holder read
+    and its fingerprint compared -- equal bytes answer DUPLICATE, other
+    bytes CONFLICT. Never two jobs.
+
+    The comparison is of digests only (spec §5.8): the request is not
+    parsed, decoded or interpreted for it.
+
+    ValidationError from create_notification (a request that cannot be
+    accepted) propagates -- the savepoint is rolled back, and the
+    caller records the rejection.
+    """
+    try:
+        async with session.begin_nested():
+            notification = await create_notification(
+                session,
+                idempotency_key=idempotency_key,
+                fingerprint=fingerprint,
+                **fields,
+            )
+    except IntegrityError as exc:
+        # Only OUR index means "key taken"; any other violation is a
+        # real bug and must not be swallowed as a replay.
+        if IDEMPOTENCY_INDEX_NAME not in str(exc.orig):
+            raise
+        holder = (
+            await session.execute(
+                select(Notification).where(
+                    Notification.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one()
+        outcome = (
+            Intake.DUPLICATE
+            if holder.fingerprint == fingerprint
+            else Intake.CONFLICT
+        )
+        return Acceptance(outcome=outcome, notification=holder)
+    return Acceptance(outcome=Intake.ACCEPTED, notification=notification)
+
+
+async def record_intake_outcome(
+    session: AsyncSession,
+    *,
+    idempotency_key: str,
+    fingerprint: str,
+    outcome: IntakeOutcomeClass,
+    reason: str,
+    notification_id: UUID | None = None,
+) -> None:
+    """Record a request that was not accepted, under its key.
+
+    The reason is redacted: it quotes the producer's input, and this
+    row outlives the event. A replay of the same bytes with the same
+    outcome records nothing new (unique index, migration 0012).
+    """
+    statement = (
+        pg_insert(IntakeOutcome)
+        .values(
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+            outcome=outcome.value,
+            reason=sanitize_text(reason)[:2000],
+            notification_id=notification_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["idempotency_key", "fingerprint", "outcome"],
+        )
+    )
+    await session.execute(statement)
+
+
+async def intake_outcomes_for(
+    session: AsyncSession, idempotency_key: str,
+) -> list[IntakeOutcome]:
+    """Every recorded non-acceptance under a key, oldest first.
+
+    The programmatic answer until reading by key exists for the
+    product (phase 2).
+    """
+    rows = await session.execute(
+        select(IntakeOutcome)
+        .where(IntakeOutcome.idempotency_key == idempotency_key)
+        .order_by(IntakeOutcome.received_at, IntakeOutcome.id)
+    )
+    return list(rows.scalars().all())
+
+
+async def delete_intake_outcomes_before(
+    session: AsyncSession, *, cutoff: datetime,
+) -> int:
+    """Retention for intake_outcomes: rows received before `cutoff`."""
+    result = await session.execute(
+        delete(IntakeOutcome).where(IntakeOutcome.received_at < cutoff)
+    )
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+
+def expiry_of(notification: Notification) -> Decided:
+    """The job's expiry and the layer that decided it."""
+    layer = Layer(notification.expiry_layer)
+    source = {
+        Layer.ENVELOPE: "envelope: expiry_at",
+        Layer.PROFILE: (
+            f"profile: expires_after of {notification.type!r}, "
+            f"counted from scheduled_at"
+        ),
+        Layer.DEFAULT: "comms default: no expiry declared",
+    }[layer]
+    return Decided(value=notification.expiry_at, layer=layer, source=source)
+
+
 async def create_notification(
     session: AsyncSession,
     *,
@@ -93,42 +305,50 @@ async def create_notification(
     body: str,
     target_type: str,
     target_value: str,
-    channels: list[str] | None = None,
+    idempotency_key: str,
+    fingerprint: str,
     action_data: dict[str, Any] | None = None,
-    priority: int = 5,
     scheduled_at: datetime | None = None,
     expiry_at: datetime | None = None,
-    idempotency_key: str | None = None,
+    correlation: str | None = None,
 ) -> Notification:
     """Create a new Notification record.
 
+    Intake goes through accept_notification, which adds the
+    duplicate / conflict decision; this function is the insert under
+    it and never decides anything about the key.
+
     Args:
         session: Active DB session (caller commits).
-        type: A notification type key registered by the product profile.
-        title: Notification title.
-        body: Notification body text.
+        type: A notification type key declared by the product profile.
+            The type's CHANNELS come from its profile record and are
+            snapshotted onto the row -- the caller never names one.
+        title: Stored fallback title (the letter).
+        body: Stored fallback body (the letter).
         target_type: TargetType value (user, group, all).
         target_value: Bare target specifier ("<uuid>", "<group_key>", "*").
-        idempotency_key: Producer-supplied dedup key (stream ingest,
-            Phase 3c); the partial unique index makes the database the
-            dedup arbiter -- the caller catches IntegrityError on
-            flush and treats it as a duplicate. None = no dedup.
-        channels: Delivery channels. Defaults to ["in_app"].
-        action_data: Optional JSONB action payload (deep-link intent +
-            template variables).
-        priority: 1=highest, 5=default.
-        scheduled_at: When to process. Defaults to now.
-        expiry_at: Optional TTL deadline.
+        idempotency_key: The request's key -- required on every path.
+        fingerprint: Digest of the request's bytes (see above).
+        action_data: Optional JSONB letter (deep-link intent + template
+            variables).
+        scheduled_at: "Not before" -- when the job becomes deliverable.
+            Defaults to now.
+        expiry_at: The envelope's expiry. Wins over the profile's
+            expires_after, which counts from scheduled_at.
+        correlation: The product's own reference, stored untouched.
 
     Returns:
         The created Notification (flushed, not committed).
 
     Raises:
-        ValidationError: On unregistered type, invalid target_type or
-            channel values.
+        ValidationError: The request cannot be accepted -- undeclared
+            type, invalid target_type, an expiry already passed or not
+            after scheduled_at.
     """
-    # -- Validate against the profile registry (de-domainization) --
-    if not registry.is_registered(type):
+    # -- The profile record IS the registration (every installed type
+    # has one; a type without a record is not declared). --
+    record = registry.record_of(type)
+    if record is None:
         raise ValidationError(
             f"Unregistered notification type: {type}. "
             f"Registered: {', '.join(sorted(registry.registered_types()))}"
@@ -140,18 +360,34 @@ async def create_notification(
             f"Valid: {', '.join(sorted(_VALID_TARGET_TYPES))}"
         )
 
-    if channels is None:
-        channels = [DeliveryChannel.IN_APP]
-
-    invalid_channels = set(channels) - _VALID_CHANNELS
-    if invalid_channels:
-        raise ValidationError(
-            f"Invalid channels: {invalid_channels}. "
-            f"Valid: {', '.join(sorted(_VALID_CHANNELS))}"
-        )
-
+    now = datetime.now(UTC)
     if scheduled_at is None:
-        scheduled_at = datetime.now(UTC)
+        scheduled_at = now
+
+    # -- Expiry: the envelope over the profile, the layer kept. --
+    if expiry_at is not None:
+        if expiry_at <= now:
+            raise ValidationError(
+                f"expiry_at {expiry_at.isoformat()} has already passed "
+                f"(now {now.isoformat()}): the request could never be "
+                f"delivered in time"
+            )
+        if expiry_at <= scheduled_at:
+            raise ValidationError(
+                f"expiry_at {expiry_at.isoformat()} is not after "
+                f"scheduled_at {scheduled_at.isoformat()}: the request "
+                f"would expire before it becomes deliverable"
+            )
+        expiry_layer = Layer.ENVELOPE
+    else:
+        expires_after: timedelta | None = record.value("expires_after")
+        if expires_after is not None:
+            expiry_at = scheduled_at + expires_after
+            expiry_layer = Layer.PROFILE
+        else:
+            expiry_layer = Layer.DEFAULT
+
+    channels = list(record.value("channels"))
 
     notification = Notification(
         type=type,
@@ -160,24 +396,17 @@ async def create_notification(
         target_type=target_type,
         target_value=target_value,
         action_data=action_data,
-        priority=priority,
+        channels=channels,
+        correlation=correlation,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
+        expiry_layer=expiry_layer.value,
         idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
         status=NotificationStatus.PENDING,
     )
     session.add(notification)
     await session.flush()
-
-    # Store channels in action_data for the resolve stage (cbshome
-    # mechanism: reassigning the whole dict keeps SQLAlchemy tracking).
-    if notification.action_data is None:
-        notification.action_data = {"_channels": channels}
-    else:
-        notification.action_data = {
-            **notification.action_data,
-            "_channels": channels,
-        }
 
     logger.info(
         "notification_created",
@@ -186,6 +415,7 @@ async def create_notification(
         target=f"{target_type}:{target_value}",
         channels=channels,
         scheduled_at=scheduled_at.isoformat(),
+        expiry_layer=expiry_layer.value,
     )
 
     return notification
@@ -274,10 +504,8 @@ async def resolve_notification(
             )
             return []
 
-    # Get channels from action_data.
-    channels = (notification.action_data or {}).get(
-        "_channels", [DeliveryChannel.IN_APP]
-    )
+    # The channels the profile routed the type to at intake.
+    channels = notification.channels
 
     # Create delivery records.
     deliveries: list[NotificationDelivery] = []

@@ -6,7 +6,7 @@
 # stored title/body. Locales do not need to mirror each other.
 # =============================================================================
 
-unit_event:
+unit_event: &unit_event_sheet
   telegram:
     body: "RU: {body}"
 
@@ -16,3 +16,11 @@ unit_event:
 unit_presented:
   telegram:
     button_text: "Открыть {title}"
+
+# The unit_event_* siblings (types.yaml) share unit_event's sheet: a YAML
+# alias, one sheet, no copies to drift.
+unit_event_in_app: *unit_event_sheet
+unit_event_email: *unit_event_sheet
+unit_event_telegram_in_app: *unit_event_sheet
+unit_event_in_app_email: *unit_event_sheet
+unit_event_telegram_email: *unit_event_sheet

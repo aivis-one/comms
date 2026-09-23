@@ -12,21 +12,18 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Integer
 
 from app.core.constants import (
     MAX_GROUP_KEY_LEN,
-    MAX_NOTIFICATION_PRIORITY,
     MAX_TELEGRAM_ID,
     MAX_TYPE_KEY_LEN,
-    MIN_NOTIFICATION_PRIORITY,
     MIN_TELEGRAM_ID,
 )
 from app.core.exceptions import ValidationError
-from app.engine.models import Notification
 from app.transport.events import (
     GroupChanged,
     NotificationRequest,
+    RejectedNotificationRequest,
     ReminderCancel,
     UserUpserted,
     parse_event,
@@ -36,6 +33,19 @@ from app.transport.events import (
 
 def _envelope(event: str, data: dict[str, Any]) -> dict[str, str]:
     return {"event": event, "data": json.dumps(data)}
+
+
+def _rejected(data: dict[str, Any]) -> RejectedNotificationRequest:
+    """Parse a notification_request that must be REJECTED under its key.
+
+    Since F1.2 a request whose key is readable is never an exception:
+    the refusal comes back as data, to be recorded under the key.
+    """
+    event = parse_event(_envelope("notification_request", data))
+    assert isinstance(event, RejectedNotificationRequest), event
+    assert event.idempotency_key == data["idempotency_key"]
+    assert len(event.fingerprint) == 64
+    return event
 
 
 def _request_data(**overrides: Any) -> dict[str, Any]:
@@ -86,30 +96,31 @@ class TestEnvelope:
 
 
 class TestVersionBarrier:
-    """Amendment A: 'v' is validated on EVERY event."""
+    """Amendment A: 'v' is validated on EVERY event.
 
-    def test_missing_v_is_terminal(self) -> None:
+    For notification_request the barrier still refuses -- but since
+    F1.2 a request whose key is readable is refused UNDER that key (a
+    RejectedNotificationRequest), not dead-lettered: the product can
+    find the refusal. These tests asserted a terminal ValidationError;
+    the refusal is the same, only its address changed. The other events
+    still raise (test_version_barrier_applies below).
+    """
+
+    def test_missing_v_is_refused(self) -> None:
         data = _request_data()
         del data["v"]
-        with pytest.raises(ValidationError, match="unsupported schema"):
-            parse_event(_envelope("notification_request", data))
+        assert "unsupported schema" in _rejected(data).reason
 
-    def test_unsupported_v_is_terminal(self) -> None:
-        with pytest.raises(ValidationError, match="unsupported schema"):
-            parse_event(
-                _envelope("notification_request", _request_data(v=2))
-            )
+    def test_unsupported_v_is_refused(self) -> None:
+        assert "unsupported schema" in _rejected(_request_data(v=2)).reason
 
     def test_bool_and_float_v_rejected(self) -> None:
         """Python's True == 1 and 1.0 == 1 must not open the barrier:
         'v' is strictly a JSON integer (review 3c.1)."""
         for bad_v in (True, 1.0):
-            with pytest.raises(
-                ValidationError, match="unsupported schema",
-            ):
-                parse_event(_envelope(
-                    "notification_request", _request_data(v=bad_v),
-                ))
+            assert "unsupported schema" in _rejected(
+                _request_data(v=bad_v),
+            ).reason
 
     def test_v1_passes_all_events(self) -> None:
         rid = str(uuid4())
@@ -138,127 +149,94 @@ class TestVersionBarrier:
 
 class TestNotificationRequestSchema:
     def test_full_round(self) -> None:
+        """Every envelope field and the letter, parsed. Before F1.2 this
+        round also carried `channels` and `priority`; both left the
+        request (the channel is the profile's, priority is not an
+        envelope field) -- see test_channels_and_priority_are_refused."""
         data = _request_data(
-            channels=["in_app", "telegram"],
             action_data={"action": "open_unit",
                          "params": {"unit_id": "42"}, "amount": 100},
-            priority=1,
             scheduled_at="2026-07-15T10:00:00+00:00",
             expiry_at="2026-07-16T10:00:00+00:00",
+            correlation="order-17",
         )
         event = parse_event(_envelope("notification_request", data))
         assert isinstance(event, NotificationRequest)
-        assert event.channels == ["in_app", "telegram"]
-        assert event.priority == 1
+        assert event.correlation == "order-17"
         assert event.scheduled_at is not None
         assert event.scheduled_at.tzinfo is not None
+        assert event.action_data == data["action_data"]
 
     def test_defaults(self) -> None:
         event = parse_event(
             _envelope("notification_request", _request_data())
         )
         assert isinstance(event, NotificationRequest)
-        assert event.channels is None
         assert event.action_data is None
-        assert event.priority == 5
+        assert event.correlation is None
         assert event.scheduled_at is None
         assert event.expiry_at is None
 
-    @pytest.mark.parametrize("field", [
-        "idempotency_key", "type", "target_type", "target_value",
-        "title", "body",
-    ])
-    def test_required_fields(self, field: str) -> None:
+    def test_missing_key_is_terminal(self) -> None:
+        """No key, no address: the one required field whose absence is
+        still a DLQ case (KNOWN CEILING in app/transport/events.py)."""
         data = _request_data()
-        del data[field]
-        with pytest.raises(ValidationError):
+        del data["idempotency_key"]
+        with pytest.raises(ValidationError, match="idempotency_key"):
             parse_event(_envelope("notification_request", data))
 
+    @pytest.mark.parametrize("field", [
+        "type", "target_type", "target_value", "title", "body",
+    ])
+    def test_required_fields(self, field: str) -> None:
+        """Was: every required field missing -> ValidationError. With a
+        readable key the refusal is recorded under it instead (F1.2)."""
+        data = _request_data()
+        del data[field]
+        assert f"required field {field!r} is missing" in _rejected(data).reason
+
     def test_user_target_must_be_uuid(self) -> None:
-        with pytest.raises(ValidationError, match="not a valid uuid"):
-            parse_event(_envelope(
-                "notification_request",
-                _request_data(target_value="not-a-uuid"),
-            ))
+        assert "not a valid uuid" in _rejected(
+            _request_data(target_value="not-a-uuid"),
+        ).reason
 
     def test_all_target_must_be_star(self) -> None:
-        with pytest.raises(ValidationError, match='must be "\\*"'):
-            parse_event(_envelope(
-                "notification_request",
-                _request_data(target_type="all", target_value="everyone"),
-            ))
+        assert 'must be "*"' in _rejected(
+            _request_data(target_type="all", target_value="everyone"),
+        ).reason
 
     def test_naive_datetime_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="timezone offset"):
-            parse_event(_envelope(
-                "notification_request",
-                _request_data(scheduled_at="2026-07-15T10:00:00"),
-            ))
+        assert "timezone offset" in _rejected(
+            _request_data(scheduled_at="2026-07-15T10:00:00"),
+        ).reason
 
     def test_overlong_idempotency_key(self) -> None:
+        """A key longer than its column cannot become an address: still
+        terminal, the DLQ."""
         with pytest.raises(ValidationError, match="exceeds 200"):
             parse_event(_envelope(
                 "notification_request",
                 _request_data(idempotency_key="x" * 201),
             ))
 
-    def test_bool_priority_rejected(self) -> None:
-        """bool is an int subclass -- 'priority': true is a bug."""
-        with pytest.raises(ValidationError, match="integer"):
-            parse_event(_envelope(
-                "notification_request", _request_data(priority=True),
-            ))
-
-    @pytest.mark.parametrize(
-        "priority", [MIN_NOTIFICATION_PRIORITY, MAX_NOTIFICATION_PRIORITY],
-    )
-    def test_priority_at_the_ends_of_the_column_range_parses(
-        self, priority: int,
+    @pytest.mark.parametrize("field,value", [
+        ("channels", ["in_app"]),
+        ("priority", 1),
+        ("priority", True),
+        ("priority", 2**31),
+    ])
+    def test_channels_and_priority_are_refused(
+        self, field: str, value: Any,
     ) -> None:
-        """The pair to the refusals below: the bound is the Integer
-        column's range and nothing narrower. comms does not own what a
-        product means by priority, so a scale of its own would be a
-        policy invented in passing."""
-        event = parse_event(_envelope(
-            "notification_request", _request_data(priority=priority),
-        ))
-        assert isinstance(event, NotificationRequest)
-        assert event.priority == priority
-
-    @pytest.mark.parametrize(
-        "priority",
-        [MAX_NOTIFICATION_PRIORITY + 1, MIN_NOTIFICATION_PRIORITY - 1],
-    )
-    def test_priority_outside_the_column_range_is_terminal(
-        self, priority: int,
-    ) -> None:
-        """The last field of the class R-2 closed. Unbounded, this
-        value passed the parser and died on the INSERT -- where a
-        producer's mistake is diagnosed as our internal fault and
-        retried before it reaches the DLQ. Now it is named here and
-        terminal at once."""
-        with pytest.raises(ValidationError, match="priority"):
-            parse_event(_envelope(
-                "notification_request", _request_data(priority=priority),
-            ))
-
-    def test_the_priority_bound_is_the_columns_own_range(self) -> None:
-        """The ANCHOR the parse pair above cannot be.
-
-        That pair feeds the parser the value named by the constant and
-        checks it is accepted -- so moving the constant moves both
-        sides and the pair stays green. It guards the parser against
-        using a different number than the constant, and nothing more.
-        What ties the constant to the COLUMN is this: the column is a
-        plain Integer (not BigInteger, not SmallInteger -- both of
-        which subclass it, hence the exact type check), and an
-        Integer's range is what the bound must be. Widen the column and
-        this test is the one that says the bound moved too.
-        """
-        column_type = Notification.__table__.c.priority.type
-        assert type(column_type) is Integer
-        assert MIN_NOTIFICATION_PRIORITY == -(2**31)
-        assert MAX_NOTIFICATION_PRIORITY == 2**31 - 1
+        """Replaces five tests that pinned how `channels` and
+        `priority` parsed (the priority ones: bool refused, the column
+        range at both ends, the constant tied to the Integer column).
+        F1.2 removed both fields from the request -- the channel is the
+        profile's, and priority is not an envelope field comms may read
+        -- so ANY value of either is refused, by name, under the key."""
+        reason = _rejected(_request_data(**{field: value})).reason
+        assert f"unknown field(s) {field!r}" in reason
+        assert "chosen by the profile" in reason
 
     def test_type_longer_than_the_column_is_refused_here(self) -> None:
         """NO DEFECT HID BEHIND the 200 that used to stand here: a type
@@ -267,11 +245,9 @@ class TestNotificationRequestSchema:
         before any INSERT. Only the WORDING moves -- the field is named
         at the boundary instead of the profile printing its whole
         declared list."""
-        with pytest.raises(ValidationError, match="type"):
-            parse_event(_envelope(
-                "notification_request",
-                _request_data(type="t" * (MAX_TYPE_KEY_LEN + 1)),
-            ))
+        assert "'type' exceeds" in _rejected(
+            _request_data(type="t" * (MAX_TYPE_KEY_LEN + 1)),
+        ).reason
 
     def test_a_type_of_exactly_the_column_width_still_parses(self) -> None:
         """The pair. Parsing judges the string form only; whether the

@@ -17,18 +17,15 @@
 #                        (app/profile/loader.py) + ingest validation of
 #                        the notification_request event
 #                        (app/transport/events.py)
-#   MIN_NOTIFICATION_PRIORITY / MAX_NOTIFICATION_PRIORITY --
-#                        notifications.priority (app/engine/models.py)
-#                        + the notification_request envelope
-#                        (app/transport/events.py)
-#                        + profile type-key check  (app/profile/loader.py)
 #   MAX_CATEGORY_LEN  -- category_mutes.category   (app/audience/models.py)
 #                        + profile category check  (app/profile/loader.py)
 #   MAX_TITLE_LEN / MAX_BODY_LEN -- notifications.title / .body
 #                        (app/engine/models.py) + ingest validation
 #                        (app/transport/events.py)
-#   MAX_IDEMPOTENCY_KEY_LEN -- notifications.idempotency_key
-#                        (app/engine/models.py) + ingest validation of
+#   MAX_IDEMPOTENCY_KEY_LEN / MAX_CORRELATION_LEN / FINGERPRINT_LEN --
+#                        notifications.idempotency_key / .correlation /
+#                        .fingerprint (app/engine/models.py) + the
+#                        intake_outcomes table + ingest validation of
 #                        the notification_request event
 #                        (app/transport/events.py)
 #   MAX_EMAIL_LEN / MAX_LOCALE_LEN / MAX_TIMEZONE_LEN /
@@ -79,6 +76,16 @@ MAX_BODY_LEN = 5000
 # part of the FROZEN event contract: 1..200 chars.
 MAX_IDEMPOTENCY_KEY_LEN = 200
 
+# Width of notifications.correlation -- the product's own reference on
+# the envelope (F1.2), stored untouched and never interpreted. Two
+# consumers: the column (app/engine/models.py) and the envelope parser
+# (app/transport/events.py).
+MAX_CORRELATION_LEN = 200
+
+# notifications.fingerprint -- a SHA-256 hex digest (F1.2), the
+# byte-level identity of a request under its idempotency key.
+FINGERPRINT_LEN = 64
+
 # -----------------------------------------------------------------------------
 # Recipient snapshot widths (R-2 item 1)
 # -----------------------------------------------------------------------------
@@ -107,18 +114,6 @@ MAX_TIMEZONE_LEN = 64
 # group_memberships.group_key -- opaque product-facing audience key
 # ("masters", "admins"). Same width class as sections.key.
 MAX_GROUP_KEY_LEN = 100
-
-# notifications.priority -- an opaque product number behind an Integer
-# column, and the LAST field of the class R-2 closed. The bound is the
-# column's range and nothing narrower, for the reason already written
-# at threads.priority: comms does not own what a product means by
-# priority, so a scale of its own (1..10, say) would be a policy
-# invented in passing. Out of range the value is not a high priority,
-# it is a broken one -- and unbounded it passed the envelope parser and
-# died on the INSERT, where the producer's mistake is diagnosed as our
-# internal fault and retried before reaching the DLQ.
-MIN_NOTIFICATION_PRIORITY = -(2**31)
-MAX_NOTIFICATION_PRIORITY = 2**31 - 1
 
 # recipients.telegram_id is a BigInteger, and the bound IS the column's
 # range: comms does not own the id space (the platform does), so any

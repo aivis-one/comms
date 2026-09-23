@@ -8,8 +8,10 @@
 # sender -> no push (KNOWN CEILING: pool-push deferred).
 # =============================================================================
 
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.prefs import set_category_muted
 from app.engine.constants import NotificationStatus
 from app.engine.models import Notification
-from app.engine.service import resolve_notification
+from app.engine.service import Intake, accept_notification, resolve_notification
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Message, Thread
 from app.messaging.operators import claim_thread
@@ -25,7 +27,6 @@ from app.messaging.threads import create_or_get_thread, post_message
 from app.notifier import (
     TYPE_PARTICIPANT_MESSAGE,
     TYPE_SUPPORT_MESSAGE,
-    _is_idempotency_violation,
     notify_new_message,
 )
 from tests.helpers import (
@@ -208,20 +209,40 @@ class TestSectionOperatorSide:
 
 class TestIdempotencyGuard:
     """4c.1-A: the dedup catch is name-filtered -- the idempotency
-    unique is a duplicate, any other constraint must re-raise."""
+    unique is a duplicate, any other constraint must re-raise.
 
-    def test_idempotency_index_is_recognized(self) -> None:
-        exc = IntegrityError(
-            "INSERT ...",
-            {},
-            Exception(
-                'duplicate key value violates unique constraint '
-                '"uq_notifications_idempotency_key"'
-            ),
+    The guard lived in app/notifier.py as _is_idempotency_violation and
+    was tested as a predicate over a hand-built IntegrityError. F1.2
+    moved it into app/engine/service.py accept_notification, the one
+    intake every producer now shares; the property is asserted there,
+    through the real path, in both directions."""
+
+    async def test_idempotency_index_is_recognized(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """A second intake under a taken key is answered, not raised."""
+        fields = {
+            "type": TYPE_PARTICIPANT_MESSAGE,
+            "title": "T",
+            "body": "B",
+            "target_type": "all",
+            "target_value": "*",
+        }
+        first = await accept_notification(
+            db_session, idempotency_key="guard:k", fingerprint="a" * 64,
+            **fields,
         )
-        assert _is_idempotency_violation(exc) is True
+        second = await accept_notification(
+            db_session, idempotency_key="guard:k", fingerprint="a" * 64,
+            **fields,
+        )
+        assert first.outcome is Intake.ACCEPTED
+        assert second.outcome is Intake.DUPLICATE
+        assert second.notification.id == first.notification.id
 
-    def test_other_constraint_is_not_swallowed(self) -> None:
+    async def test_other_constraint_is_not_swallowed(
+        self, db_session: AsyncSession,
+    ) -> None:
         exc = IntegrityError(
             "INSERT ...",
             {},
@@ -230,4 +251,14 @@ class TestIdempotencyGuard:
                 '"notifications_some_future_fkey"'
             ),
         )
-        assert _is_idempotency_violation(exc) is False
+        with (
+            patch(
+                "app.engine.service.create_notification", side_effect=exc,
+            ),
+            pytest.raises(IntegrityError, match="some_future_fkey"),
+        ):
+            await accept_notification(
+                db_session, idempotency_key="guard:x", fingerprint="a" * 64,
+                type=TYPE_PARTICIPANT_MESSAGE, title="T", body="B",
+                target_type="all", target_value="*",
+            )

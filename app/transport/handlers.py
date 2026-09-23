@@ -5,8 +5,13 @@
 # The bridge from parsed events to the EXISTING service layer -- no
 # business logic of its own:
 #
-#   NotificationRequest -> engine.create_notification (+ dedup by the
-#                          idempotency_key unique index, item 2/3)
+#   NotificationRequest -> engine.accept_notification (F1.2): accepted,
+#                          or a duplicate (same key, same bytes), or a
+#                          conflict (same key, other bytes) recorded
+#                          under the key
+#   RejectedNotificationRequest / a request create_notification cannot
+#                          accept -> recorded under its key as
+#                          rejected_at_intake
 #   UserUpserted        -> audience.sync.user_upserted   (item 4)
 #   GroupChanged        -> audience.sync.group_changed   (item 4)
 #   ReminderCancel      -> engine.reminders.cancel_reminders
@@ -18,13 +23,17 @@
 # rule: wire them, do not rewrite them).
 #
 # Error classification (consumed by consumer.py):
-#   ValidationError -- terminal (unregistered type, invalid channel):
-#                      the event will never succeed -> DLQ + ACK.
+#   HandleResult.REJECTED / CONFLICT -- a notification request that was
+#                      not accepted and IS recorded under its key: the
+#                      product's side of the line (spec §5.4). ACK,
+#                      no DLQ -- the record is the one copy of the fact.
+#   ValidationError -- terminal for the other events: the event will
+#                      never succeed -> DLQ + ACK.
 #   NotFoundError   -- retryable: group_changed arrived before its
 #                      user_upserted (momentary sync lag) -> bounded
 #                      backoff, then DLQ.
 #   HandleResult.DUPLICATE -- not an error: an at-least-once replay
-#                      collapsed by the unique index -> ACK, no DLQ.
+#                      of the same bytes -> ACK, no DLQ.
 #
 # Each event is handled inside ITS OWN session/transaction (the
 # consumer opens it): a failed event rolls back completely and never
@@ -34,17 +43,23 @@
 import enum
 
 import structlog
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience import sync
+from app.core.exceptions import ValidationError
+from app.engine.constants import IntakeOutcomeClass
 from app.engine.reminders import cancel_reminders
-from app.engine.service import create_notification
+from app.engine.service import (
+    Intake,
+    accept_notification,
+    record_intake_outcome,
+)
 from app.messaging.membership import set_membership
 from app.transport.events import (
     GroupChanged,
     NotificationRequest,
     ParsedEvent,
+    RejectedNotificationRequest,
     ReminderCancel,
     SectionMembershipChanged,
     UserUpserted,
@@ -56,6 +71,9 @@ logger = structlog.get_logger()
 class HandleResult(enum.StrEnum):
     PROCESSED = "processed"
     DUPLICATE = "duplicate"
+    # Not accepted, recorded under the key (intake_outcomes).
+    REJECTED = "rejected"
+    CONFLICT = "conflict"
 
 
 async def handle_event(
@@ -69,6 +87,10 @@ async def handle_event(
     """
     if isinstance(event, NotificationRequest):
         return await _handle_notification_request(session, event)
+    if isinstance(event, RejectedNotificationRequest):
+        return await _reject(
+            session, event.idempotency_key, event.fingerprint, event.reason,
+        )
     if isinstance(event, UserUpserted):
         await sync.user_upserted(
             session,
@@ -129,42 +151,59 @@ async def handle_event(
 async def _handle_notification_request(
     session: AsyncSession, event: NotificationRequest
 ) -> HandleResult:
-    """Materialize a notification request; collapse replays.
+    """Accept a notification request, or record why it was not.
 
-    The DATABASE is the dedup arbiter: the partial unique index on
-    notifications.idempotency_key (migration 0005) turns a replayed
-    insert into an IntegrityError on flush -- caught here, reported as
-    DUPLICATE. No pre-flight SELECT: a check-then-insert would race
-    with itself under redelivery, the constraint cannot.
+    The DATABASE is the arbiter of "same key" (accept_notification);
+    this function only maps its answer onto the stream's vocabulary and
+    records what the product must be able to find under its key.
     """
     try:
-        # SAVEPOINT so the IntegrityError rolls back only this insert,
-        # keeping the outer session usable for the caller's commit.
-        async with session.begin_nested():
-            notification = await create_notification(
-                session,
-                type=event.type,
-                title=event.title,
-                body=event.body,
-                target_type=event.target_type,
-                target_value=event.target_value,
-                channels=event.channels,
-                action_data=event.action_data,
-                priority=event.priority,
-                scheduled_at=event.scheduled_at,
-                expiry_at=event.expiry_at,
-                idempotency_key=event.idempotency_key,
-            )
-    except IntegrityError as exc:
-        # Only OUR unique index means "duplicate" -- any other
-        # integrity violation is a real bug and must not be silently
-        # swallowed as a replay.
-        if "uq_notifications_idempotency_key" not in str(exc.orig):
-            raise
+        acceptance = await accept_notification(
+            session,
+            idempotency_key=event.idempotency_key,
+            fingerprint=event.fingerprint,
+            type=event.type,
+            title=event.title,
+            body=event.body,
+            target_type=event.target_type,
+            target_value=event.target_value,
+            action_data=event.action_data,
+            scheduled_at=event.scheduled_at,
+            expiry_at=event.expiry_at,
+            correlation=event.correlation,
+        )
+    except ValidationError as exc:
+        # The request cannot be accepted (undeclared type, an expiry
+        # already passed, ...): the product's responsibility, recorded.
+        return await _reject(
+            session, event.idempotency_key, event.fingerprint, str(exc),
+        )
+
+    notification = acceptance.notification
+    if acceptance.outcome is Intake.CONFLICT:
+        await record_intake_outcome(
+            session,
+            idempotency_key=event.idempotency_key,
+            fingerprint=event.fingerprint,
+            outcome=IntakeOutcomeClass.CONFLICT,
+            reason=(
+                f"idempotency key {event.idempotency_key!r} is taken by "
+                f"notification {notification.id} with different content; "
+                f"a new request needs a new key"
+            ),
+            notification_id=notification.id,
+        )
+        logger.warning(
+            "notification_request_conflict",
+            idempotency_key=event.idempotency_key,
+            notification_id=str(notification.id),
+        )
+        return HandleResult.CONFLICT
+    if acceptance.outcome is Intake.DUPLICATE:
         logger.info(
             "notification_request_duplicate",
             idempotency_key=event.idempotency_key,
-            type=event.type,
+            notification_id=str(notification.id),
         )
         return HandleResult.DUPLICATE
 
@@ -176,3 +215,21 @@ async def _handle_notification_request(
         target=f"{event.target_type}:{event.target_value}",
     )
     return HandleResult.PROCESSED
+
+
+async def _reject(
+    session: AsyncSession, idempotency_key: str, fingerprint: str, reason: str,
+) -> HandleResult:
+    await record_intake_outcome(
+        session,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+        outcome=IntakeOutcomeClass.REJECTED_AT_INTAKE,
+        reason=reason,
+    )
+    logger.warning(
+        "notification_request_rejected",
+        idempotency_key=idempotency_key,
+        reason=reason,
+    )
+    return HandleResult.REJECTED

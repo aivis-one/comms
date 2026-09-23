@@ -42,7 +42,11 @@ from app.profile.loader import (
 )
 from app.profile.registry import registry
 from tests.conftest import FIXTURE_PROFILE_DIR
-from tests.helpers import next_phase2_telegram_id
+from tests.helpers import (
+    configure_every_channel,
+    intake_fields,
+    next_phase2_telegram_id,
+)
 
 BOT_URL = "https://t.me/comms_testbot"
 
@@ -130,12 +134,12 @@ class TestFixtureProfileLoads:
         """Item 1 done-when: a dictionary type with no templates works."""
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_plain",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram"],
         )
         assert notification.type == "unit_plain"
 
@@ -146,7 +150,13 @@ class TestStartupEntryPoint:
     def test_installs_from_configured_dir(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A configured TEMPLATES_DIR loads the profile at startup."""
+        """A configured TEMPLATES_DIR loads the profile at startup.
+
+        The deploy is given every channel first: the fixture profile
+        routes types to telegram and email (F1.2), and the startup path
+        refuses a route into an unconfigured channel -- which is the
+        cross-check working, not what this test is about."""
+        configure_every_channel(monkeypatch)
         monkeypatch.setattr(
             settings, "templates_dir", str(FIXTURE_PROFILE_DIR),
         )

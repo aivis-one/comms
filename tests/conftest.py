@@ -101,7 +101,7 @@ from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.config import settings
 from app.core.database import dispose_engine, get_session_factory
 from app.engine.formatters import reset_formatters
-from app.engine.models import Notification, NotificationDelivery
+from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
 from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.profile.loader import FileProfileSource, install_profile, load_profile
 from app.profile.registry import registry
@@ -216,6 +216,9 @@ async def clean_db(apply_migrations: None) -> AsyncGenerator[None, None]:
         await session.execute(delete(Thread))
         await session.execute(delete(Section))
         await session.execute(delete(NotificationDelivery))
+        # Intake records (F1.2) reference notifications with SET NULL:
+        # deleting the job alone would leave them behind.
+        await session.execute(delete(IntakeOutcome))
         await session.execute(delete(Notification))
         await session.execute(delete(CategoryMute))
         await session.execute(delete(GroupMembership))

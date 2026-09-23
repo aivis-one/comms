@@ -64,7 +64,7 @@ from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import process_pending_notifications
 from app.engine.service import _deliver_single, create_notification
 from app.profile.registry import registry
-from tests.helpers import create_recipient
+from tests.helpers import create_recipient, intake_fields
 
 _KEY = "key-0123456789"
 _DOMAIN = "mail.example.test"
@@ -1266,12 +1266,12 @@ class TestThroughThePipeline:
         recipient.email = "pipeline@example.test"
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_email",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["email"],
         )
         await db_session.commit()
 
@@ -1293,12 +1293,12 @@ class TestThroughThePipeline:
         recipient.email = None
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_email",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["email"],
         )
         await db_session.commit()
 
@@ -1323,12 +1323,12 @@ class TestThroughThePipeline:
         recipient.email = None
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app_email",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["in_app", "email"],
         )
         await db_session.commit()
 
@@ -1392,12 +1392,12 @@ class TestConsumersAreUntouched:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["in_app"],
         )
         await db_session.commit()
 

@@ -40,6 +40,15 @@
 import enum
 
 
+class IntakeOutcomeClass(enum.StrEnum):
+    """Why a request was not accepted (intake_outcomes.outcome, F1.2)."""
+
+    # The envelope could not be accepted -- the product's side.
+    REJECTED_AT_INTAKE = "rejected_at_intake"
+    # The key is taken by an accepted job with different bytes.
+    CONFLICT = "conflict"
+
+
 class NotificationStatus(enum.StrEnum):
     """Notification lifecycle status."""
 

@@ -34,7 +34,9 @@ from app.audience.models import GroupMembership, Recipient
 from app.core.config import settings
 from app.core.database import get_session_factory
 from app.core.exceptions import ValidationError
+from app.engine.constants import IntakeOutcomeClass
 from app.engine.models import Notification
+from app.engine.service import intake_outcomes_for
 from app.transport.consumer import StreamConsumer
 from tests.helpers import create_recipient, next_phase3c_telegram_id
 
@@ -217,7 +219,6 @@ class TestEndToEnd:
         data = _request_data(
             action_data={"action": "open_unit",
                          "params": {"unit_id": "42"}, "amount": 100},
-            channels=["in_app"],
         )
         await _xadd(redis, stream, "notification_request", data)
 
@@ -238,10 +239,12 @@ class TestEndToEnd:
         )).scalar_one()
         assert row.type == "unit_event"
         assert row.title == "T"
-        # The pipeline's channel stash merged in by create_notification.
-        assert row.action_data is not None
-        assert row.action_data["_channels"] == ["in_app"]
-        assert row.action_data["amount"] == 100
+        # The channels are the PROFILE's record of the type, snapshotted
+        # at intake (F1.2). Before, the request named ["in_app"] and it
+        # was stashed in action_data["_channels"]; that key is gone and
+        # the letter comes back exactly as sent.
+        assert row.channels == ["telegram"]
+        assert row.action_data == data["action_data"]
 
 
 class TestIdempotency:
@@ -385,15 +388,17 @@ class TestPoisonPill:
         stream: str,
         db_session: AsyncSession,
     ) -> None:
-        """Item 6b: broken JSON, unknown event and an unsupported
-        version each land in the DLQ; the valid event BEHIND them is
-        still processed."""
+        """Item 6b: broken JSON and an unknown event land in the DLQ; an
+        unsupported version with a READABLE key is recorded under that
+        key (F1.2 -- it used to land in the DLQ too: the refusal is the
+        same, it now has an address the product can use); the valid
+        event BEHIND them is still processed."""
         rid = uuid4()
         await redis.xadd(stream, {"event": "notification_request",
                                   "data": "{broken"})
         await _xadd(redis, stream, "user_deleted", {"v": 1})
-        await _xadd(redis, stream, "notification_request",
-                    _request_data(v=2))
+        versioned = _request_data(v=2)
+        await _xadd(redis, stream, "notification_request", versioned)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(rid))
 
         async def tail_processed_and_acked() -> bool:
@@ -404,14 +409,21 @@ class TestPoisonPill:
 
         await _run_until(StreamConsumer(redis), tail_processed_and_acked)
 
-        assert await redis.xlen(settings.dlq_stream) == 3
+        assert await redis.xlen(settings.dlq_stream) == 2
         reasons = [
             {k.decode(): v.decode() for k, v in fields.items()}["_dlq_error"]
             for _id, fields in await redis.xrange(settings.dlq_stream)
         ]
         assert any("not valid JSON" in r for r in reasons)
         assert any("unknown event" in r for r in reasons)
-        assert any("unsupported schema version" in r for r in reasons)
+        assert not any("unsupported schema version" in r for r in reasons)
+        outcomes = await intake_outcomes_for(
+            db_session, versioned["idempotency_key"],
+        )
+        assert [o.outcome for o in outcomes] == [
+            IntakeOutcomeClass.REJECTED_AT_INTAKE,
+        ]
+        assert "unsupported schema version" in outcomes[0].reason
 
     async def test_unregistered_type_is_terminal(
         self,
@@ -420,24 +432,30 @@ class TestPoisonPill:
         db_session: AsyncSession,
     ) -> None:
         """A ValidationError from the SERVICE layer (unregistered
-        type) is terminal too: DLQ, no retry burn."""
-        await _xadd(redis, stream, "notification_request",
-                    _request_data(type="not_in_profile"))
+        type) is terminal too: no retry burn. Since F1.2 it is recorded
+        under the request's key as rejected_at_intake instead of being
+        dead-lettered -- one copy of the fact, where the product can
+        find it (the DLQ verbatim-envelope promise is pinned by the
+        unreadable-key cases above)."""
+        data = _request_data(type="not_in_profile")
+        await _xadd(redis, stream, "notification_request", data)
 
-        async def dead_lettered() -> bool:
-            length: int = await redis.xlen(settings.dlq_stream)
-            return length == 1
+        async def recorded() -> bool:
+            db_session.expire_all()
+            return bool(await intake_outcomes_for(
+                db_session, data["idempotency_key"],
+            )) and await _no_pending(redis, stream)
 
-        await _run_until(StreamConsumer(redis), dead_lettered)
-        entries = await redis.xrange(settings.dlq_stream)
-        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
-        assert "Unregistered notification type" in fields["_dlq_error"]
-        # Original envelope preserved verbatim for re-ingestion; the
-        # consumer's diagnostics live under the _dlq_ prefix and can
-        # never shadow producer fields (review 3c.1).
-        assert fields["event"] == "notification_request"
-        assert "not_in_profile" in fields["data"]
-        assert fields["_dlq_source_entry_id"]
+        await _run_until(StreamConsumer(redis), recorded)
+        (outcome,) = await intake_outcomes_for(
+            db_session, data["idempotency_key"],
+        )
+        assert outcome.outcome == IntakeOutcomeClass.REJECTED_AT_INTAKE
+        assert "Unregistered notification type" in outcome.reason
+        assert await redis.xlen(settings.dlq_stream) == 0
+        assert await _notification_count(
+            db_session, data["idempotency_key"],
+        ) == 0
 
 
 class TestEntrypoint:

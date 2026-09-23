@@ -169,15 +169,20 @@ The declared keys of every implemented channel live in one place,
 `app/core/channels.py`. That file is the answer to "which keys does
 this channel need"; this document does not duplicate the list.
 
-**A requested channel that the product does not have is a LOUD
-failure.** Asking for a channel whose key set is empty produces a
-delivery with status `failed`, immediately and without retries: the
-channel will not become configured between attempts. It is never
-reported as a success. The two situations that used to look identical
-are now distinguishable: a channel nobody requests is simply absent and
-costs nothing, while a channel that is requested but not configured is
-a lost notification and says so in the log
-(`delivery_channel_unavailable`) and in the delivery row.
+**A request never names a channel.** The profile routes each type to
+its channels (`types.<type>.channels`), and the startup refuses a
+profile that routes a type into a channel whose key set is empty on
+this deploy -- so a running service cannot be asked for a channel it
+does not have. A request that still carries `channels` (or any other
+unknown field) is rejected at intake and recorded under its key.
+
+**One case still reaches a missing channel at delivery, and it is
+LOUD.** A job snapshots its channels when it is accepted. If a restart
+then removes a channel from both the profile and the deploy, jobs
+accepted before the restart still carry it: their delivery on that
+channel fails immediately, without retries, and says so in the log
+(`delivery_channel_unavailable`) and in the delivery row. It is never
+reported as a success.
 
 **Startup refusals are readable.** The configuration is built before
 logging is set up, so a refusal prints a message -- naming the channel
@@ -235,8 +240,9 @@ that is blank, to the type key, because an empty subject is filed as
 spam. The body falls back to the stored body and never to another
 channel's template, whose markup would arrive as raw characters.
 Declaring email templates does not make a notification use the channel:
-the channel list comes from the request that created it, and from
-nowhere else.
+the channel list comes from the type's record in the profile
+(`channels`), taken when the request is accepted, and from nowhere
+else.
 
 **One delivery path.** There is no SMTP fallback, deliberately: a
 second path no deploy exercises rots from the first day. The

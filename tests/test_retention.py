@@ -41,7 +41,11 @@ from app.worker import (
     reset_retention_gate,
     run_worker_batch,
 )
-from tests.helpers import create_recipient, next_phase3a_telegram_id
+from tests.helpers import (
+    create_recipient,
+    next_phase3a_telegram_id,
+    notification_row_fields,
+)
 
 
 async def _make_notification(
@@ -64,6 +68,7 @@ async def _make_notification(
         "target_value": "*",
         "status": status,
         "created_at": datetime.now(UTC) - timedelta(days=age_days),
+        **notification_row_fields(),
     }
     defaults.update(overrides)
     notification = Notification(**defaults)

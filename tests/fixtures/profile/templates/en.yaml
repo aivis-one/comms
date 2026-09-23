@@ -10,7 +10,7 @@
 # unquoted form at startup with a hint).
 # =============================================================================
 
-unit_event:
+unit_event: &unit_event_sheet
   telegram:
     title: "{title}"
     body: "{body} [{extra}]"
@@ -35,3 +35,11 @@ unit_presented:
     button_text: "Open {title}"
     disable_preview: false
     silent: true
+
+# The unit_event_* siblings (types.yaml) share unit_event's sheet: a YAML
+# alias, one sheet, no copies to drift.
+unit_event_in_app: *unit_event_sheet
+unit_event_email: *unit_event_sheet
+unit_event_telegram_in_app: *unit_event_sheet
+unit_event_in_app_email: *unit_event_sheet
+unit_event_telegram_email: *unit_event_sheet

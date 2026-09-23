@@ -19,29 +19,47 @@
 #
 # SCHEMAS (data), all fields validated here:
 #
-#   notification_request (deduplicated by idempotency_key):
-#     v                1                      -- required
-#     idempotency_key  str 1..200             -- required, unique per
-#                                                logical request (e.g.
-#                                                the outbox row id)
+#   notification_request -- an ENVELOPE plus an opaque LETTER (F1.2).
+#   The field set is CLOSED: any other field refuses the request, so a
+#   producer still sending `channels` or `priority` learns it is not
+#   choosing anything (the channel is the profile's, spec §5.2).
+#
+#     v                1                      -- required (protocol
+#                                                framing, not the job)
+#   envelope -- what comms reads, because without it comms cannot
+#   deliver:
+#     idempotency_key  str 1..200             -- required; the same key
+#                                                is the same job
 #     type             str                    -- required; must be
-#                                                registered by profile
-#                                                (checked in handler)
-#     target_type      "user"|"group"|"all"   -- required
+#                                                declared by the
+#                                                profile, which routes
+#                                                it to its channels
+#     target_type      "user"|"group"|"all"   -- required (the address)
 #     target_value     "<uuid>"|"<group_key>"|"*"  -- required; form
 #                                                checked per target_type
+#     scheduled_at     iso8601 WITH tz        -- optional, "not before"
+#     expiry_at        iso8601 WITH tz        -- optional; must lie in
+#                                                the future and after
+#                                                scheduled_at; wins over
+#                                                the profile's
+#                                                expires_after
+#     correlation      str 1..200             -- optional; the
+#                                                product's reference,
+#                                                stored untouched
+#   letter -- carried, never interpreted:
 #     title            str 1..500             -- required (stored
 #                                                fallback; templates
 #                                                override at delivery)
 #     body             str 1..5000            -- required
-#     channels         [str]                  -- optional, default
-#                                                ["in_app"]; values
-#                                                validated by
-#                                                create_notification
 #     action_data      {..}                   -- optional, see below
-#     priority         int                    -- optional, default 5
-#     scheduled_at     iso8601 WITH tz        -- optional
-#     expiry_at        iso8601 WITH tz        -- optional
+#
+#   INTAKE (handlers.py): same key + same bytes -> the existing job;
+#   same key + other bytes -> conflict, recorded under the key. A
+#   request whose KEY is readable but which cannot be accepted (any
+#   rule below, an undeclared type, an expiry already passed) is
+#   REJECTED AT INTAKE and recorded under its key -- never the DLQ.
+#   Only a request whose key cannot be read goes to the DLQ: there is
+#   nothing to attach the rejection to.
 #
 #   user_upserted (naturally idempotent -- upsert; snapshot
 #   discipline: ALL fields required, "no value" is an explicit null):
@@ -89,7 +107,7 @@
 # remain the second line):
 #   - a JSON object;
 #   - keys are non-empty strings; keys starting with "_" are REJECTED
-#     (reserved for internal pipeline use, e.g. "_channels");
+#     (reserved for comms; reminder_cancel relies on it);
 #   - "action" (optional): non-empty string -- the deep-link intent;
 #   - "params" (optional): object of SCALAR values -- deep-link params;
 #   - every OTHER key is a template variable and must be a SCALAR
@@ -105,8 +123,28 @@
 #   - sync events are safe to replay any number of times;
 #   - notification_request replays are collapsed by idempotency_key.
 #
-# All validation failures raise ValidationError -- classified TERMINAL
-# by the consumer (log + DLQ + XACK), per the poison-pill rule.
+# Validation failures raise ValidationError -- classified TERMINAL by the
+# consumer (log + DLQ + XACK), per the poison-pill rule. The one
+# exception is a notification_request whose key is readable: it is
+# returned as RejectedNotificationRequest and recorded under the key.
+#
+# KNOWN CEILING -- a request whose key cannot be read is invisible to
+# the product.
+#   1. Mechanics: without a readable idempotency_key (data is not a
+#      JSON object, the key is absent, not a string, empty or longer
+#      than the column) there is no address to record the rejection
+#      under; the entry goes only to the DLQ, which the product does
+#      not read.
+#   2. Status: acknowledged by design (spec §6.3 names this boundary).
+#   3. Backlog ref: none -- no key, no address; nothing to build.
+#   4. Promotion trigger (observable): an event_dead_lettered log line
+#      for a notification_request (the DLQ entry's `event` field).
+#   5. Agreed fix shape: none on comms' side; the producer's outbox
+#      must never emit a request without a well-formed key.
+#   6. Rejected: recording under a DERIVED key (the entry id, a hash
+#      of the bytes) -- the product never knew that key, so it could
+#      never look the rejection up; a record nobody can find is not a
+#      receipt.
 # =============================================================================
 
 import json
@@ -117,20 +155,20 @@ from uuid import UUID
 
 from app.core.constants import (
     MAX_BODY_LEN,
+    MAX_CORRELATION_LEN,
     MAX_EMAIL_LEN,
     MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_LOCALE_LEN,
-    MAX_NOTIFICATION_PRIORITY,
     MAX_TELEGRAM_ID,
     MAX_TIMEZONE_LEN,
     MAX_TITLE_LEN,
     MAX_TYPE_KEY_LEN,
-    MIN_NOTIFICATION_PRIORITY,
     MIN_TELEGRAM_ID,
 )
 from app.core.exceptions import ValidationError
 from app.engine.constants import TargetType
+from app.engine.service import stream_fingerprint
 from app.messaging.constants import MAX_SECTION_KEY_LEN, MAX_SECTION_LABEL_LEN
 
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
@@ -179,17 +217,32 @@ _MAX_SECTION_LABEL_LEN = MAX_SECTION_LABEL_LEN
 
 @dataclass(frozen=True)
 class NotificationRequest:
+    # -- envelope --
     idempotency_key: str
+    fingerprint: str
     type: str
     target_type: str
     target_value: str
-    title: str
-    body: str
-    channels: list[str] | None
-    action_data: dict[str, Any] | None
-    priority: int
     scheduled_at: datetime | None
     expiry_at: datetime | None
+    correlation: str | None
+    # -- letter --
+    title: str
+    body: str
+    action_data: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class RejectedNotificationRequest:
+    """A request whose key is readable but which cannot be parsed.
+
+    Not an exception: it is recorded under its key (handlers.py), the
+    product's side of the responsibility line (spec §5.4).
+    """
+
+    idempotency_key: str
+    fingerprint: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -236,6 +289,7 @@ class ReminderCancel:
 
 ParsedEvent = (
     NotificationRequest
+    | RejectedNotificationRequest
     | UserUpserted
     | GroupChanged
     | SectionMembershipChanged
@@ -310,8 +364,8 @@ def _int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    # bool is an int subclass -- reject it explicitly: "priority":
-    # true is a producer bug, not priority 1.
+    # bool is an int subclass -- reject it explicitly: "telegram_id":
+    # true is a producer bug, not id 1.
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValidationError(
             f"{event}: field {field!r} must be an integer"
@@ -374,8 +428,8 @@ def validate_action_data(
     """Enforce the action_data rules (see module header).
 
     The early line of defense (item 5): everything here would
-    otherwise fail LATER and WORSE -- an underscore key would collide
-    with the pipeline's "_channels", a list variable would render as
+    otherwise fail LATER and WORSE -- an underscore key would take a
+    name reserved for comms, a list variable would render as
     "['a', 'b']" in a user-facing message, a non-scalar param would
     blow up deep-link encoding at delivery after burning a resolve.
     """
@@ -391,7 +445,7 @@ def validate_action_data(
         if key.startswith("_"):
             raise ValidationError(
                 f"{event}: action_data key {key!r} is reserved "
-                f"(underscore prefix is internal, e.g. _channels)"
+                f"(the underscore prefix is reserved for comms)"
             )
         if key == "action":
             if not isinstance(value, str) or not value:
@@ -476,7 +530,9 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
 
     Raises ValidationError (terminal -> DLQ) on ANY malformation:
     missing envelope fields, unknown event name, broken JSON, missing
-    or unsupported schema version, schema violations.
+    or unsupported schema version, schema violations -- EXCEPT for a
+    notification_request whose key is readable, which comes back as a
+    RejectedNotificationRequest (see _parse_notification_intake).
     """
     decoded = {_decode(k): _decode(v) for k, v in fields.items()}
 
@@ -493,22 +549,47 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
     if event not in KNOWN_EVENTS:
         raise ValidationError(f"envelope: unknown event {event!r}")
 
+    data = _json_object(decoded[ENVELOPE_DATA_FIELD], event)
+    if event == EVENT_NOTIFICATION_REQUEST:
+        return _parse_notification_intake(data, _raw_data(fields))
+    _check_version(data, event)
+
+    if event == EVENT_USER_UPSERTED:
+        return _parse_user_upserted(data)
+    if event == EVENT_GROUP_CHANGED:
+        return _parse_group_changed(data)
+    if event == EVENT_SECTION_MEMBERSHIP_CHANGED:
+        return _parse_section_membership_changed(data)
+    return _parse_reminder_cancel(data)
+
+
+def _raw_data(fields: dict[Any, Any]) -> bytes:
+    """The `data` field's bytes exactly as the stream delivered them."""
+    for key, value in fields.items():
+        if _decode(key) == ENVELOPE_DATA_FIELD:
+            return value if isinstance(value, bytes) else value.encode("utf-8")
+    raise AssertionError("parse_event checked the data field first")
+
+
+def _json_object(text: str, event: str) -> dict[str, Any]:
     try:
-        data = json.loads(decoded[ENVELOPE_DATA_FIELD])
+        data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValidationError(
             f"{event}: data is not valid JSON: {exc}"
         ) from exc
     if not isinstance(data, dict):
         raise ValidationError(f"{event}: data must be a JSON object")
+    return data
 
+
+def _check_version(data: dict[str, Any], event: str) -> None:
     # Version barrier (review 3c amendment A): validated on EVERY
     # event, from day one with a single version -- a v2 payload must
-    # land in the DLQ, never be silently parsed under v1 semantics.
-    # STRICTLY an int (review 3c.1): Python's `True == 1` and
-    # `1.0 == 1` would otherwise let "v": true / "v": 1.0 slip through
-    # a bare membership test -- the barrier must be at least as strict
-    # as the scalar discipline it guards (_int rejects bool too).
+    # never be silently parsed under v1 semantics. STRICTLY an int
+    # (review 3c.1): Python's `True == 1` and `1.0 == 1` would
+    # otherwise let "v": true / "v": 1.0 slip through a bare
+    # membership test.
     version = data.get("v")
     if (
         not isinstance(version, int)
@@ -522,35 +603,72 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
             f"integer); a missing 'v' is a producer bug"
         )
 
-    if event == EVENT_NOTIFICATION_REQUEST:
-        return _parse_notification_request(data)
-    if event == EVENT_USER_UPSERTED:
-        return _parse_user_upserted(data)
-    if event == EVENT_GROUP_CHANGED:
-        return _parse_group_changed(data)
-    if event == EVENT_SECTION_MEMBERSHIP_CHANGED:
-        return _parse_section_membership_changed(data)
-    return _parse_reminder_cancel(data)
+
+# The closed field set of notification_request (F1.2): envelope,
+# letter and the protocol version. Anything else refuses the request.
+_NOTIFICATION_REQUEST_FIELDS = frozenset({
+    "v",
+    # envelope
+    "idempotency_key",
+    "type",
+    "target_type",
+    "target_value",
+    "scheduled_at",
+    "expiry_at",
+    "correlation",
+    # letter
+    "title",
+    "body",
+    "action_data",
+})
 
 
-def _parse_notification_request(data: dict[str, Any]) -> NotificationRequest:
+def _parse_notification_intake(
+    data: dict[str, Any], raw: bytes,
+) -> NotificationRequest | RejectedNotificationRequest:
+    """The key first, then everything else.
+
+    The key is read BEFORE any other rule, so that a malformed title
+    does not take a readable key down to the DLQ with it: once the key
+    is known, every refusal has an address (spec §6.3). An unreadable
+    key raises -- see the KNOWN CEILING in the module header.
+    """
     event = EVENT_NOTIFICATION_REQUEST
-
     idempotency_key = _string(
         _require(data, "idempotency_key", event),
         "idempotency_key", event, max_len=MAX_IDEMPOTENCY_KEY_LEN,
     )
-    # Type registration is checked in the handler against the live
+    fingerprint = stream_fingerprint(raw)
+    try:
+        _check_version(data, event)
+        return _parse_notification_request(data, idempotency_key, fingerprint)
+    except ValidationError as exc:
+        return RejectedNotificationRequest(
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+            reason=str(exc),
+        )
+
+
+def _parse_notification_request(
+    data: dict[str, Any], idempotency_key: str, fingerprint: str,
+) -> NotificationRequest:
+    event = EVENT_NOTIFICATION_REQUEST
+
+    unknown = sorted(set(data) - _NOTIFICATION_REQUEST_FIELDS)
+    if unknown:
+        raise ValidationError(
+            f"{event}: unknown field(s) {', '.join(map(repr, unknown))}; "
+            f"allowed: {', '.join(sorted(_NOTIFICATION_REQUEST_FIELDS))}. "
+            f"The channel is chosen by the profile, per type -- a request "
+            f"never names it"
+        )
+
+    # Type declaration is checked in the handler against the live
     # registry (create_notification); here only the string form.
     type_ = _string(
-        # MAX_TYPE_KEY_LEN, not the 200 that stood here: the number
-        # was copied by hand against a column of 50. NO DEFECT HID
-        # BEHIND IT -- a type longer than 50 cannot be registered (the
-        # profile loader caps keys at the same constant), so the
-        # registry refused it before any INSERT. What changes is the
-        # WORDING for types of 51..200 characters: the field is named
-        # here instead of the profile's whole declared list being
-        # printed. Both refusals are terminal.
+        # MAX_TYPE_KEY_LEN: a type longer than the column cannot be
+        # declared (the profile loader caps keys at the same constant).
         _require(data, "type", event), "type", event,
         max_len=MAX_TYPE_KEY_LEN,
     )
@@ -568,33 +686,9 @@ def _parse_notification_request(data: dict[str, Any]) -> NotificationRequest:
         max_len=MAX_BODY_LEN,
     )
 
-    channels: list[str] | None = None
-    if data.get("channels") is not None:
-        raw_channels = data["channels"]
-        if not isinstance(raw_channels, list) or not raw_channels:
-            raise ValidationError(
-                f"{event}: channels must be a non-empty list of "
-                f"channel names"
-            )
-        channels = [
-            _string(c, "channels[]", event, max_len=20)
-            for c in raw_channels
-        ]
-        # Channel VALUES are validated by create_notification against
-        # the single source of truth (_VALID_CHANNELS) -- not
-        # duplicated here.
-
     action_data: dict[str, Any] | None = None
     if data.get("action_data") is not None:
         action_data = validate_action_data(data["action_data"])
-
-    priority = 5
-    if data.get("priority") is not None:
-        priority = _int(
-            data["priority"], "priority", event,
-            minimum=MIN_NOTIFICATION_PRIORITY,
-            maximum=MAX_NOTIFICATION_PRIORITY,
-        )
 
     scheduled_at: datetime | None = None
     if data.get("scheduled_at") is not None:
@@ -605,18 +699,27 @@ def _parse_notification_request(data: dict[str, Any]) -> NotificationRequest:
     if data.get("expiry_at") is not None:
         expiry_at = _datetime(data["expiry_at"], "expiry_at", event)
 
+    correlation: str | None = None
+    if data.get("correlation") is not None:
+        # Non-empty: an empty reference is a producer bug, "no
+        # reference" is the absence of the field.
+        correlation = _string(
+            data["correlation"], "correlation", event,
+            max_len=MAX_CORRELATION_LEN,
+        )
+
     return NotificationRequest(
         idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
         type=type_,
         target_type=target_type,
         target_value=target_value,
-        title=title,
-        body=body,
-        channels=channels,
-        action_data=action_data,
-        priority=priority,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
+        correlation=correlation,
+        title=title,
+        body=body,
+        action_data=action_data,
     )
 
 
@@ -740,7 +843,7 @@ def _parse_reminder_cancel(data: dict[str, Any]) -> ReminderCancel:
     )
     if correlation_key.startswith("_"):
         # Underscore keys are rejected by validate_action_data at
-        # schedule time (reserved for the pipeline, e.g. _channels),
+        # intake (the prefix is reserved for comms),
         # so a cancel correlated on one could never match anything --
         # loud producer bug, not a silent zero-row update.
         raise ValidationError(

@@ -26,8 +26,22 @@
 #   retryable  (NotFoundError: group_changed before its user_upserted;
 #              OperationalError: transient DB hiccup) -> bounded
 #              inline backoff, then DLQ + XACK.
-#   duplicate  (idempotency_key collision) -> XACK only: a replay is
-#              the at-least-once contract working, not an error.
+#   duplicate  (same key, same bytes) -> XACK only: a replay is the
+#              at-least-once contract working, not an error.
+#   rejected / conflict (a notification request not accepted, F1.2)
+#              -> XACK only: the refusal is RECORDED under the request's
+#              key in the same transaction; the DLQ would be a second
+#              copy of the same fact.
+#
+# DURABILITY OF INTAKE -- the order is COMMIT, THEN XACK, and it must
+# never be swapped (spec §5.4: a receipt without a record is a promise
+# that disappears on a crash). The entry is acknowledged only after
+# the transaction that wrote the job -- or the record of its refusal --
+# has committed. A crash between the two leaves the entry pending; the
+# next start replays it (_drain_pending), and the replay is collapsed
+# by the key: same bytes -> duplicate, nothing created twice. An ack
+# before the commit would lose the job on a crash in between; batching
+# acks or acknowledging on read would do exactly that.
 #   unexpected (any other exception) -> log with a redacted traceback + DLQ +
 #              XACK: an unknown bug in ONE event must not wedge the
 #              whole stream (poison-pill rule) -- the DLQ preserves
@@ -193,11 +207,18 @@ class StreamConsumer:
             try:
                 async with self._session_factory() as session:
                     result = await handle_event(session, event)
+                    # COMMIT BEFORE XACK -- see DURABILITY OF INTAKE.
                     await session.commit()
                 if result is HandleResult.DUPLICATE:
                     logger.info(
                         "event_duplicate_acked",
                         entry_id=_id_str(entry_id),
+                    )
+                elif result in (HandleResult.REJECTED, HandleResult.CONFLICT):
+                    logger.info(
+                        "event_not_accepted_recorded",
+                        entry_id=_id_str(entry_id),
+                        result=result.value,
                     )
                 else:
                     logger.info(
