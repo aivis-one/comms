@@ -33,6 +33,7 @@ from app.notifier import (
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4c_telegram_id,
     next_seam_t2_telegram_id,
 )
@@ -48,7 +49,7 @@ async def _dm(session: AsyncSession) -> tuple[Thread, UUID, UUID]:
     client = await _rid(session)
     master = await _rid(session)
     thread = await create_or_get_thread(
-        session, client=client,
+        session, **intake_fields(), client=client,
         operator_kind=OperatorKind.USER, operator_value=master,
         kind=ThreadKind.DM,
     )
@@ -59,7 +60,7 @@ async def _section(session: AsyncSession) -> tuple[Thread, UUID]:
     client = await _rid(session)
     section = await create_section(session, key=f"nm-{uuid4().hex[:8]}")
     thread = await create_or_get_thread(
-        session, client=client,
+        session, **intake_fields(), client=client,
         operator_kind=OperatorKind.SECTION, operator_value=section.id,
         kind=ThreadKind.TICKET, subject_type="practice", subject_id="s",
     )
@@ -68,7 +69,7 @@ async def _section(session: AsyncSession) -> tuple[Thread, UUID]:
 
 async def _post(session: AsyncSession, thread: Thread, sender: UUID) -> Message:
     return await post_message(
-        session, thread_id=thread.id, sender=sender, body="hello"
+        session, **intake_fields(), thread_id=thread.id, sender=sender, body="hello"
     )
 
 

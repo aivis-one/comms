@@ -196,7 +196,7 @@ class TestFailureClass:
 
 
 class TestDeadTelegramToken:
-    """Правка 5: a rejected bot token is a dead channel from the first
+    """Amendment 5: a rejected bot token is a dead channel from the first
     attempt, and the attempt budget is not spent on it."""
 
     async def test_unauthorized_is_configuration_at_once(

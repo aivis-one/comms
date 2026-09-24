@@ -22,6 +22,7 @@ from app.messaging.threads import create_or_get_thread, post_message
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4b_telegram_id,
 )
 
@@ -39,7 +40,7 @@ async def _make_section_thread(
     client_id: UUID,
 ) -> Thread:
     return await create_or_get_thread(
-        session,
+        session, **intake_fields(),
         client=client_id,
         operator_kind=OperatorKind.SECTION,
         operator_value=section_id,
@@ -121,7 +122,11 @@ class TestRetagSection:
             db_session, section_id=section.id, subject_id="h", client_id=client
         )
         await post_message(
-            db_session, thread_id=thread.id, sender=client, body="before retag"
+            db_session,
+            **intake_fields(),
+            thread_id=thread.id,
+            sender=client,
+            body="before retag",
         )
         await retag_thread(
             db_session,
@@ -146,7 +151,7 @@ class TestRetagFrozen:
         master = await _rid(db_session)
         section = await create_section(db_session, key="rt-frozen")
         user_thread = await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.USER, operator_value=master,
             kind=ThreadKind.DM,
         )

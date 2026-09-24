@@ -47,7 +47,7 @@ from app.core.constants import (
 from app.core.database import get_session_factory
 from app.core.exceptions import ValidationError as ServiceValidationError
 from app.transport.events import parse_event
-from tests.helpers import create_recipient, next_t64_telegram_id
+from tests.helpers import create_recipient, next_snapshot_version, next_t64_telegram_id
 
 _TOKEN = "t64-recipient-upsert-token"
 
@@ -70,6 +70,9 @@ def _snapshot(**overrides: Any) -> dict[str, Any]:
     to check.
     """
     body: dict[str, Any] = {
+        # The next version, as a product's next change of the person
+        # would carry (F1.4) -- every call supersedes the one before.
+        "version": next_snapshot_version(),
         "telegram_id": next_t64_telegram_id(),
         "email": "recipient@example.test",
         "locale": "en",
@@ -111,7 +114,10 @@ class TestUpsert:
         response = await client.put(_url(recipient_id), json=body)
 
         assert response.status_code == 200
-        assert response.json() == {"recipient_id": str(recipient_id), **body}
+        # `deleted` is new in F1.4 (forgetting): a live recipient says so.
+        assert response.json() == {
+            "recipient_id": str(recipient_id), **body, "deleted": False,
+        }
 
         stored = await _load(recipient_id)
         assert stored is not None
@@ -310,6 +316,7 @@ def _unbanded(**overrides: Any) -> dict[str, Any]:
     the tests that do.
     """
     body: dict[str, Any] = {
+        "version": next_snapshot_version(),
         "telegram_id": None,
         "email": "recipient@example.test",
         "locale": "en",
@@ -388,6 +395,7 @@ class TestSnapshotBounds:
         where nothing is stored.
         """
         assert RecipientSnapshot(
+            version=1,
             telegram_id=MAX_TELEGRAM_ID,
             email=None,
             locale="en",

@@ -130,7 +130,9 @@ async def process_pending_notifications() -> int:
                 ),
                 Notification.scheduled_at <= now,
             )
-            .order_by(Notification.priority, Notification.scheduled_at)
+            # Oldest due first. Priority left the ordering with the
+            # column (F1.4); isolation is the job of lanes (phase 4).
+            .order_by(Notification.scheduled_at)
             # Review 1.1: cap the batch; the tail is picked up on the
             # next tick (the worker loop is eternal anyway).
             .limit(settings.notification_batch_size)

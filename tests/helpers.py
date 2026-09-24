@@ -17,11 +17,13 @@
 # =============================================================================
 
 import itertools
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
+from app.audience.sync import apply_snapshot, snapshot_fingerprint
 from app.messaging.models import Section
 
 TELEGRAM_ID_BAND_START = 80000
@@ -258,11 +260,17 @@ async def create_recipient(
     active: bool = True,
 ) -> Recipient:
     """Create a recipient row (id = simulated product user id)."""
+    resolved_tg = telegram_id if telegram_id is not None else next_telegram_id()
     recipient = Recipient(
         id=recipient_id or uuid4(),
-        telegram_id=(
-            telegram_id if telegram_id is not None else next_telegram_id()
+        # A row written straight into the table stands for a snapshot
+        # the product sent at version 1 (F1.4: every row has one).
+        version=1,
+        snapshot_fingerprint=snapshot_fingerprint(
+            telegram_id=resolved_tg, email=email, locale=locale,
+            timezone=None, active=active,
         ),
+        telegram_id=resolved_tg,
         email=email,
         locale=locale,
         active=active,
@@ -347,3 +355,23 @@ def configure_every_channel(monkeypatch: object) -> None:
         "email_from_address": "comms@unit-test.invalid",
     }.items():
         monkeypatch.setattr(settings, name, value)  # type: ignore[attr-defined]
+
+
+
+# -- Snapshots (F1.4) ----------------------------------------------------------
+# A snapshot carries the product's monotonic version. Tests that apply a
+# sequence of snapshots to one recipient -- the way a product changes a
+# person over time -- take the next version from one counter, so each
+# call supersedes the one before it, as the product's would.
+_snapshot_versions = itertools.count(1)
+
+
+def next_snapshot_version() -> int:
+    return next(_snapshot_versions)
+
+
+async def upsert_snapshot(session: AsyncSession, **fields: Any) -> Recipient:
+    """apply_snapshot with the next version (see above)."""
+    return await apply_snapshot(
+        session, version=next_snapshot_version(), **fields,
+    )

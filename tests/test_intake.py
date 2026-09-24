@@ -57,7 +57,7 @@ from app.transport.events import (
     parse_event,
 )
 from app.transport.handlers import HandleResult, handle_event
-from tests.helpers import create_recipient
+from tests.helpers import create_recipient, intake_fields
 
 _WAIT_TIMEOUT = 5.0
 
@@ -476,7 +476,7 @@ class TestCorrelation:
 
 
 # -----------------------------------------------------------------------------
-# Правка 4 -- two fingerprints, and one meaning through both paths
+# Amendment 4 -- two fingerprints, and one meaning through both paths
 # -----------------------------------------------------------------------------
 
 
@@ -499,11 +499,13 @@ class TestTwoFingerprints:
         from app.messaging.threads import create_or_get_thread, post_message
 
         thread = await create_or_get_thread(
-            db_session, client=client.id, operator_kind=OperatorKind.USER,
+            db_session,
+                **intake_fields(), client=client.id, operator_kind=OperatorKind.USER,
             operator_value=sender.id, kind=ThreadKind.DM,
         )
         message = await post_message(
-            db_session, thread_id=thread.id, sender=client.id, body="hi",
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=client.id, body="hi",
         )
         await db_session.refresh(thread)
         (ping,) = await notify_new_message(db_session, thread=thread, message=message)

@@ -223,7 +223,7 @@ class TestResponseShape:
             "/api/v1/threads", params={"operator": str(operator)}
         )
         assert listed.status_code == 200
-        for entry in listed.json()["threads"]:
+        for entry in listed.json()["items"]:
             assert set(entry) == FROZEN_THREAD_KEYS
 
         status = await client.post(

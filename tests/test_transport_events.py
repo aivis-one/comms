@@ -84,7 +84,9 @@ class TestEnvelope:
 
     def test_unknown_event_name(self) -> None:
         with pytest.raises(ValidationError, match="unknown event"):
-            parse_event(_envelope("user_deleted", {"v": 1}))
+            # Was "user_deleted" -- a real event since F1.4 (forgetting),
+            # so the unknown name has to be one comms truly lacks.
+            parse_event(_envelope("user_renamed", {"v": 1}))
 
     def test_broken_json(self) -> None:
         with pytest.raises(ValidationError, match="not valid JSON"):
@@ -132,7 +134,7 @@ class TestVersionBarrier:
         )
         assert isinstance(
             parse_event(_envelope("user_upserted", {
-                "v": 1, "recipient_id": rid, "telegram_id": None,
+                "v": 1, "recipient_id": rid, "version": 1, "telegram_id": None,
                 "email": None, "locale": "en", "timezone": None,
                 "active": True,
             })),
@@ -306,12 +308,12 @@ class TestSyncSchemas:
         """Snapshot discipline: 'no value' is an explicit null, an
         absent key is a producer bug."""
         base: dict[str, Any] = {
-            "v": 1, "recipient_id": str(uuid4()), "telegram_id": 85000,
+            "v": 1, "recipient_id": str(uuid4()), "version": 1, "telegram_id": 85000,
             "email": "a@b.c", "locale": "en",
             "timezone": "Europe/Berlin", "active": True,
         }
-        for field in ("recipient_id", "telegram_id", "email", "locale",
-                      "timezone", "active"):
+        for field in ("recipient_id", "version", "telegram_id", "email",
+                      "locale", "timezone", "active"):
             data = dict(base)
             del data[field]
             with pytest.raises(ValidationError, match="missing"):
@@ -323,7 +325,7 @@ class TestSyncSchemas:
 
     def test_user_upserted_explicit_nulls(self) -> None:
         event = parse_event(_envelope("user_upserted", {
-            "v": 1, "recipient_id": str(uuid4()), "telegram_id": None,
+            "v": 1, "recipient_id": str(uuid4()), "version": 1, "telegram_id": None,
             "email": None, "locale": "en", "timezone": None,
             "active": False,
         }))
@@ -385,7 +387,7 @@ class TestSyncSchemas:
         is a broken one -- and unbounded it reached the INSERT."""
         with pytest.raises(ValidationError, match="telegram_id"):
             parse_event(_envelope("user_upserted", {
-                "v": 1, "recipient_id": str(uuid4()),
+                "v": 1, "recipient_id": str(uuid4()), "version": 1,
                 "telegram_id": telegram_id, "email": None,
                 "locale": "en", "timezone": None, "active": True,
             }))
@@ -394,7 +396,7 @@ class TestSyncSchemas:
         """The pair. Parsing only -- nothing is stored, so this costs
         the shared id band nothing (tests/helpers.py)."""
         event = parse_event(_envelope("user_upserted", {
-            "v": 1, "recipient_id": str(uuid4()),
+            "v": 1, "recipient_id": str(uuid4()), "version": 1,
             "telegram_id": MAX_TELEGRAM_ID, "email": None,
             "locale": "en", "timezone": None, "active": True,
         }))

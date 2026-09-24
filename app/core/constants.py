@@ -76,6 +76,16 @@ MAX_BODY_LEN = 5000
 # part of the FROZEN event contract: 1..200 chars.
 MAX_IDEMPOTENCY_KEY_LEN = 200
 
+# ONE page-size bound for every listing route (F1.4, app/api/paging.py):
+# out of 1..PAGE_LIMIT_MAX is refused, never clamped.
+PAGE_LIMIT_MAX = 100
+PAGE_LIMIT_DEFAULT = 20
+
+# recipients.version is a BigInteger: the snapshot version's ceiling is
+# the column's (F1.4). The floor is 1 -- 0 marks rows written before
+# versions existed (migration 0014).
+MAX_SNAPSHOT_VERSION = 2**63 - 1
+
 # Width of notifications.correlation -- the product's own reference on
 # the envelope (F1.2), stored untouched and never interpreted. Two
 # consumers: the column (app/engine/models.py) and the envelope parser

@@ -32,12 +32,14 @@
 #
 # DELIVERY STATUS LIFECYCLE (F1.3):
 #   pending -> sent | failed (+ FailureClass) | suppressed | expired
-#            | cancelled
+#            | cancelled | recipient_inactive
 #   pending -> pending with a WaitReason (schedule, 429, backoff)
 #
 #   SUPPRESSED -- the recipient muted the category while the delivery
-#   waited: not a fault, not a send. EXPIRED / CANCELLED -- the parent
-#   was closed while this delivery waited.
+#   waited: not a fault, not a send. RECIPIENT_INACTIVE -- the product
+#   deactivated or deleted the recipient while it waited (F1.4).
+#   EXPIRED / CANCELLED -- the parent was closed while this delivery
+#   waited.
 # =============================================================================
 
 import enum
@@ -96,6 +98,11 @@ class DeliveryStatus(enum.StrEnum):
     # The parent expired / was cancelled while this delivery waited.
     EXPIRED = "expired"
     CANCELLED = "cancelled"
+    # The product deactivated or deleted the recipient between resolve
+    # and send (F1.4): not a failure (nothing to fix) and not a mute
+    # (the product decided, not the recipient). Which of the two is on
+    # the recipient row (recipients.deleted_at).
+    RECIPIENT_INACTIVE = "recipient_inactive"
 
 
 class FailureClass(enum.StrEnum):

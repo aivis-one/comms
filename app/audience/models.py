@@ -41,6 +41,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.constants import (
+    FINGERPRINT_LEN,
     MAX_CATEGORY_LEN,
     MAX_EMAIL_LEN,
     MAX_GROUP_KEY_LEN,
@@ -65,6 +66,33 @@ class Recipient(TimestampMixin, Base):
         primary_key=True,
     )
 
+    # -- The snapshot's order and identity (F1.4, spec §10.2) --
+    # The product's monotonic version of this snapshot. A snapshot older
+    # than the stored one is refused on BOTH write paths by ONE rule
+    # (audience/sync.py apply_snapshot), so the order events arrive in
+    # stops mattering. 0 = written before versions existed (migration
+    # 0014); the product's first versioned snapshot (>= 1) supersedes it.
+    version: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    # Digest of the stored snapshot's fields: an equal version with
+    # other bytes is a conflict, not a replay.
+    snapshot_fingerprint: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN),
+        nullable=False,
+    )
+    # Set when the product deleted the recipient (F1.4, spec §10.4). The
+    # row stays as a TOMBSTONE -- threads and messages reference it with
+    # RESTRICT, and the delivery history must not cascade away -- but
+    # every field that reaches the person is NULL and active is false,
+    # which CHECK ck_recipients_tombstone holds in the database. A
+    # tombstone is terminal: no snapshot revives it.
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     telegram_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
@@ -76,11 +104,12 @@ class Recipient(TimestampMixin, Base):
         nullable=True,
     )
 
-    locale: Mapped[str] = mapped_column(
+    # NULL = no language (F1.4): the product said so explicitly, and the
+    # renderer falls back to the deploy default. An empty string is not
+    # a second way to say it -- CHECK ck_recipients_locale_not_blank.
+    locale: Mapped[str | None] = mapped_column(
         String(MAX_LOCALE_LEN),
-        nullable=False,
-        default="en",
-        server_default="en",
+        nullable=True,
     )
 
     active: Mapped[bool] = mapped_column(

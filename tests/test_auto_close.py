@@ -25,6 +25,7 @@ from app.messaging.threads import create_or_get_thread, post_message
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4b_telegram_id,
 )
 
@@ -84,7 +85,7 @@ class TestAutoClosePass:
         async with factory() as s:
             section = await create_section(s, key="ac-sec")
             thread = await create_or_get_thread(
-                s, client=client,
+                s, **intake_fields(), client=client,
                 operator_kind=OperatorKind.SECTION, operator_value=section.id,
                 kind=ThreadKind.TICKET, subject_type="practice", subject_id="i",
             )
@@ -103,7 +104,7 @@ class TestAutoClosePass:
         async with factory() as s:
             section = await create_section(s, key="ac-off")
             thread = await create_or_get_thread(
-                s, client=client,
+                s, **intake_fields(), client=client,
                 operator_kind=OperatorKind.SECTION, operator_value=section.id,
                 kind=ThreadKind.TICKET, subject_type="practice", subject_id="o",
             )
@@ -120,7 +121,7 @@ class TestAutoClosePass:
         master = await _new_client(factory)
         async with factory() as s:
             thread = await create_or_get_thread(
-                s, client=client,
+                s, **intake_fields(), client=client,
                 operator_kind=OperatorKind.USER, operator_value=master,
                 kind=ThreadKind.DM,
             )
@@ -140,7 +141,7 @@ class TestAutoClosePass:
         async with factory() as s:
             section = await create_section(s, key="ac-active")
             thread = await create_or_get_thread(
-                s, client=client,
+                s, **intake_fields(), client=client,
                 operator_kind=OperatorKind.SECTION, operator_value=section.id,
                 kind=ThreadKind.TICKET, subject_type="practice", subject_id="a",
             )
@@ -158,7 +159,7 @@ class TestAutoClosePass:
         async with factory() as s:
             section = await create_section(s, key="ac-revive")
             thread = await create_or_get_thread(
-                s, client=client,
+                s, **intake_fields(), client=client,
                 operator_kind=OperatorKind.SECTION, operator_value=section.id,
                 kind=ThreadKind.TICKET, subject_type="practice", subject_id="r",
             )
@@ -169,7 +170,8 @@ class TestAutoClosePass:
         assert await _status(factory, tid) == "closed"
 
         async with factory() as s:
-            await post_message(s, thread_id=tid, sender=client, body="back")
+            await post_message(s,
+                **intake_fields(), thread_id=tid, sender=client, body="back")
             await s.commit()
         assert await _status(factory, tid) == "open"
 
@@ -184,12 +186,12 @@ class TestAutoCloseBatch:
         )
         section = await create_section(db_session, key="ac-batch")
         older = await create_or_get_thread(
-            db_session, client=client.id,
+            db_session, **intake_fields(), client=client.id,
             operator_kind=OperatorKind.SECTION, operator_value=section.id,
             kind=ThreadKind.TICKET, subject_type="practice", subject_id="old",
         )
         newer = await create_or_get_thread(
-            db_session, client=client.id,
+            db_session, **intake_fields(), client=client.id,
             operator_kind=OperatorKind.SECTION, operator_value=section.id,
             kind=ThreadKind.TICKET, subject_type="practice", subject_id="new",
         )

@@ -58,11 +58,13 @@ from app.audience.models import Recipient
 from app.core.constants import (
     MAX_EMAIL_LEN,
     MAX_LOCALE_LEN,
+    MAX_SNAPSHOT_VERSION,
     MAX_TELEGRAM_ID,
     MAX_TIMEZONE_LEN,
     MIN_TELEGRAM_ID,
 )
 from app.core.database import get_db_session
+from app.forgetting import forget_recipient
 
 logger = structlog.get_logger()
 
@@ -74,34 +76,38 @@ router = APIRouter(
 
 
 class RecipientSnapshot(BaseModel):
-    """PUT body: the five sync-owned fields carried alongside the id.
+    """PUT body: the product's VERSIONED snapshot of one recipient.
 
     Every field is required -- see the module header on why an absent
     key must not degrade into a default. extra="forbid" turns a
     misspelled field into a 422 instead of a silently ignored one.
 
-    EVERY BOUND IS THE COLUMN'S OWN CONSTANT (R-2 item 1), so the four
-    that have a column cannot drift from it. Unbounded, each of them
-    reached the INSERT: a 321-character address, a nine-character
-    locale or a telegram id outside the BigInteger range came back as
-    a database error -- a 500 telling an integrator that the SERVICE
-    broke, on input only they can fix. The nullable fields are bounded
-    too: optional is not unmeasured.
-
-    min_length is deliberately NOT set on locale: "" is a value the
-    column accepts and sync overwrites wholesale, and rejecting it
-    here would be a new policy rather than a mirrored column.
+    EVERY BOUND IS THE COLUMN'S OWN CONSTANT (R-2 item 1). The VALUE
+    rules -- a blank string or a telegram id of 0 is not a way to say
+    "no value", null is -- live in ONE place for this route and the
+    user_upserted event: audience/sync.py apply_snapshot (F1.4; before,
+    this model accepted an empty locale that the event refused).
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    version: int = Field(ge=1, le=MAX_SNAPSHOT_VERSION, strict=True)
     telegram_id: int | None = Field(
         ge=MIN_TELEGRAM_ID, le=MAX_TELEGRAM_ID,
     )
     email: str | None = Field(max_length=MAX_EMAIL_LEN)
-    locale: str = Field(max_length=MAX_LOCALE_LEN)
+    locale: str | None = Field(max_length=MAX_LOCALE_LEN)
     timezone: str | None = Field(max_length=MAX_TIMEZONE_LEN)
     active: bool
+
+
+class RecipientDeletion(BaseModel):
+    """DELETE body: the version of the deletion, ordered against the
+    snapshots by the same rule (audience/sync.py)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1, le=MAX_SNAPSHOT_VERSION, strict=True)
 
 
 def _wire(recipient: Recipient) -> dict[str, Any]:
@@ -114,11 +120,13 @@ def _wire(recipient: Recipient) -> dict[str, Any]:
     """
     return {
         "recipient_id": str(recipient.id),
+        "version": recipient.version,
         "telegram_id": recipient.telegram_id,
         "email": recipient.email,
         "locale": recipient.locale,
         "timezone": recipient.timezone,
         "active": recipient.active,
+        "deleted": recipient.deleted_at is not None,
     }
 
 
@@ -128,22 +136,21 @@ async def upsert_recipient(
     snapshot: RecipientSnapshot = Body(...),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Create or update one recipient, synchronously.
+    """Create or update one recipient, synchronously, by version.
 
     The product calls this before its first message to a new user, so
-    that the message has somewhere to land.
+    that the message has somewhere to land. A snapshot older than the
+    stored one is a 409 `stale_snapshot`; the stored version with other
+    content a 409 `conflict`; a deleted recipient a 409
+    `recipient_deleted` (app/api/errors.py).
     """
 
     async def _apply() -> Recipient:
-        """The one mapping from body to sync call, used by both paths.
-
-        A local closure rather than a kwargs dict: the dict erases the
-        per-field types, and rewriting the six arguments twice would be
-        two copies of the mapping for the first edit to desynchronise.
-        """
-        return await sync.user_upserted(
+        """The one mapping from body to the snapshot rule."""
+        return await sync.apply_snapshot(
             session,
             recipient_id=recipient_id,
+            version=snapshot.version,
             telegram_id=snapshot.telegram_id,
             email=snapshot.email,
             locale=snapshot.locale,
@@ -152,27 +159,39 @@ async def upsert_recipient(
         )
 
     try:
-        # SAVEPOINT, not bare call: user_upserted looks the recipient
-        # up and inserts when it finds nothing, so two writers racing
-        # on a brand-new id (this route and the stream consumer, or two
-        # product replicas) can both see nothing and both insert. The
-        # loser gets an IntegrityError on the primary key, and without
-        # the savepoint that error would poison the whole request
-        # transaction rather than just its insert.
+        # SAVEPOINT, not bare call: two writers racing on a brand-new id
+        # (this route and the stream consumer, or two product replicas)
+        # can both see nothing and both insert. The loser gets an
+        # IntegrityError on the primary key; the savepoint keeps the
+        # request's transaction usable.
         async with session.begin_nested():
             recipient = await _apply()
     except IntegrityError:
-        # The winner has committed by now -- that is what released the
-        # lock and turned our insert into this error. Rolling back the
-        # savepoint restored the session to its pre-insert state, so
-        # calling the SAME function again now finds the row and takes
-        # its update path. Retried exactly once: a second collision
-        # would mean the row both exists and does not, which is not a
-        # state this database can be in.
+        # The winner has committed by now. Calling the SAME rule again
+        # finds its row and compares versions against it. Retried once:
+        # a second collision would mean the row both exists and does
+        # not.
         logger.info(
             "recipient_upsert_raced",
             recipient_id=str(recipient_id),
         )
         recipient = await _apply()
 
+    return _wire(recipient)
+
+
+@router.delete("/{recipient_id}")
+async def delete_recipient(
+    recipient_id: UUID,
+    deletion: RecipientDeletion = Body(...),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Forget one recipient (app/forgetting.py). A repeat is not an
+    error; an id comms never heard of becomes a tombstone too, so a
+    snapshot still on its way cannot create the person afterwards."""
+    await forget_recipient(
+        session, recipient_id=recipient_id, version=deletion.version,
+    )
+    recipient = await session.get(Recipient, recipient_id)
+    assert recipient is not None
     return _wire(recipient)

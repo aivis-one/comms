@@ -61,15 +61,27 @@
 #   Only a request whose key cannot be read goes to the DLQ: there is
 #   nothing to attach the rejection to.
 #
-#   user_upserted (naturally idempotent -- upsert; snapshot
-#   discipline: ALL fields required, "no value" is an explicit null):
+#   user_upserted (a VERSIONED snapshot, F1.4; snapshot discipline:
+#   ALL fields required, "no value" is an explicit null -- never a
+#   blank string, never a telegram id of 0; the field set is CLOSED):
 #     v            1           -- required
 #     recipient_id "<uuid>"    -- required (product user id)
-#     telegram_id  int | null  -- required key
-#     email        str | null  -- required key
-#     locale       str         -- required, non-empty
-#     timezone     str | null  -- required key (IANA name)
+#     version      int >= 1    -- required; the product's monotonic
+#                                 snapshot version. Older than stored ->
+#                                 refused and acknowledged, its class
+#                                 in the log (audience/sync.py)
+#     telegram_id  int | null  -- required key, non-zero
+#     email        str | null  -- required key, non-blank
+#     locale       str | null  -- required key, non-blank
+#     timezone     str | null  -- required key (IANA name), non-blank
 #     active       bool        -- required
+#
+#   user_deleted (F1.4, spec §10.4): the product deleted the person;
+#   comms forgets how to reach them (app/forgetting.py). Ordered against
+#   snapshots by the same version rule; a repeat is a no-op:
+#     v            1           -- required
+#     recipient_id "<uuid>"    -- required
+#     version      int >= 1    -- required
 #
 #   group_changed (naturally idempotent both ways):
 #     v            1           -- required
@@ -154,6 +166,7 @@ from app.core.constants import (
     MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_LOCALE_LEN,
+    MAX_SNAPSHOT_VERSION,
     MAX_TELEGRAM_ID,
     MAX_TIMEZONE_LEN,
     MAX_TITLE_LEN,
@@ -173,6 +186,7 @@ ENVELOPE_DATA_FIELD = "data"
 
 EVENT_NOTIFICATION_REQUEST = "notification_request"
 EVENT_USER_UPSERTED = "user_upserted"
+EVENT_USER_DELETED = "user_deleted"
 EVENT_GROUP_CHANGED = "group_changed"
 EVENT_REMINDER_CANCEL = "reminder_cancel"
 EVENT_SECTION_MEMBERSHIP_CHANGED = "section_membership_changed"
@@ -180,6 +194,7 @@ EVENT_SECTION_MEMBERSHIP_CHANGED = "section_membership_changed"
 KNOWN_EVENTS = frozenset({
     EVENT_NOTIFICATION_REQUEST,
     EVENT_USER_UPSERTED,
+    EVENT_USER_DELETED,
     EVENT_GROUP_CHANGED,
     EVENT_REMINDER_CANCEL,
     EVENT_SECTION_MEMBERSHIP_CHANGED,
@@ -242,11 +257,18 @@ class RejectedNotificationRequest:
 @dataclass(frozen=True)
 class UserUpserted:
     recipient_id: UUID
+    version: int
     telegram_id: int | None
     email: str | None
-    locale: str
+    locale: str | None
     timezone: str | None
     active: bool
+
+
+@dataclass(frozen=True)
+class UserDeleted:
+    recipient_id: UUID
+    version: int
 
 
 @dataclass(frozen=True)
@@ -287,6 +309,7 @@ ParsedEvent = (
     NotificationRequest
     | RejectedNotificationRequest
     | UserUpserted
+    | UserDeleted
     | GroupChanged
     | SectionMembershipChanged
     | ReminderCancel
@@ -547,6 +570,8 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
 
     if event == EVENT_USER_UPSERTED:
         return _parse_user_upserted(data)
+    if event == EVENT_USER_DELETED:
+        return _parse_user_deleted(data)
     if event == EVENT_GROUP_CHANGED:
         return _parse_group_changed(data)
     if event == EVENT_SECTION_MEMBERSHIP_CHANGED:
@@ -714,12 +739,42 @@ def _parse_notification_request(
     )
 
 
+_USER_UPSERTED_FIELDS = frozenset({
+    "v", "recipient_id", "version", "telegram_id", "email", "locale",
+    "timezone", "active",
+})
+_USER_DELETED_FIELDS = frozenset({"v", "recipient_id", "version"})
+
+
+def _closed(data: dict[str, Any], allowed: frozenset[str], event: str) -> None:
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ValidationError(
+            f"{event}: unknown field(s) {', '.join(map(repr, unknown))}; "
+            f"allowed: {', '.join(sorted(allowed))}"
+        )
+
+
+def _version(data: dict[str, Any], event: str) -> int:
+    return _int(
+        _require(data, "version", event), "version", event,
+        minimum=1, maximum=MAX_SNAPSHOT_VERSION,
+    )
+
+
 def _parse_user_upserted(data: dict[str, Any]) -> UserUpserted:
+    """The wire form only; the value rules -- blank strings and a zero
+    telegram id refused -- live in ONE place for both write paths,
+    audience/sync.py apply_snapshot, so the PUT route and this event
+    cannot disagree again (before F1.4 this parser refused an empty
+    locale and the route accepted it)."""
     event = EVENT_USER_UPSERTED
+    _closed(data, _USER_UPSERTED_FIELDS, event)
 
     recipient_id = _uuid(
         _require(data, "recipient_id", event), "recipient_id", event,
     )
+    version = _version(data, event)
     telegram_id_raw = _require(data, "telegram_id", event)
     telegram_id = (
         None
@@ -733,12 +788,7 @@ def _parse_user_upserted(data: dict[str, Any]) -> UserUpserted:
         _require(data, "email", event), "email", event,
         max_len=MAX_EMAIL_LEN,
     )
-    # Every width here is the column's own constant. locale used to say
-    # 20 against a column of MAX_LOCALE_LEN: values in between were
-    # accepted by this parser and refused by the database. Nothing that
-    # WORKED stops working -- only the FORM of the refusal changes,
-    # from a retried database error to a terminal, named one.
-    locale = _string(
+    locale = _optional_string(
         _require(data, "locale", event), "locale", event,
         max_len=MAX_LOCALE_LEN,
     )
@@ -750,11 +800,23 @@ def _parse_user_upserted(data: dict[str, Any]) -> UserUpserted:
 
     return UserUpserted(
         recipient_id=recipient_id,
+        version=version,
         telegram_id=telegram_id,
         email=email,
         locale=locale,
         timezone=timezone,
         active=active,
+    )
+
+
+def _parse_user_deleted(data: dict[str, Any]) -> UserDeleted:
+    event = EVENT_USER_DELETED
+    _closed(data, _USER_DELETED_FIELDS, event)
+    return UserDeleted(
+        recipient_id=_uuid(
+            _require(data, "recipient_id", event), "recipient_id", event,
+        ),
+        version=_version(data, event),
     )
 
 

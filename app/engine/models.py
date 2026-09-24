@@ -186,32 +186,6 @@ class Notification(UUIDMixin, Base):
         nullable=True,
     )
 
-    # KNOWN CEILING -- every notification carries the same priority.
-    #   1. Mechanics: the processor still orders its batch by this
-    #      column, but since F1.2 nothing sets it -- the priority left
-    #      the request (it is not an envelope field, and comms may not
-    #      read the letter), so every row holds the server default and
-    #      the ordering degenerates to scheduled_at.
-    #   2. Status: acknowledged by design.
-    #   3. Backlog ref: phase 4 (isolation lanes), which replaces
-    #      priority-in-one-queue with lanes; the inbox field that still
-    #      reports it goes with the resource protocol (F1.4).
-    #   4. Promotion trigger (observable): a lane consumer is written
-    #      (anything reading the profile field `lane`), or the inbox
-    #      resource contract is reopened.
-    #   5. Agreed fix shape: drop the column, its place in the processor
-    #      ordering and index, and the inbox field, together.
-    #   6. Rejected: keeping priority on the wire until then -- a field
-    #      the processor reads is a decision taken on a request's
-    #      content, and a priority inside one queue does not isolate
-    #      anything anyway (spec §8.2).
-    priority: Mapped[int] = mapped_column(
-        Integer,
-        default=5,
-        server_default="5",
-        nullable=False,
-    )
-
     scheduled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

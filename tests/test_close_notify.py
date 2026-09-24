@@ -26,6 +26,7 @@ from app.notifier import TYPE_THREAD_CLOSED, consume_close_notifications
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4c_telegram_id,
 )
 
@@ -68,7 +69,7 @@ async def _make_section(
     async with factory() as s:
         section = await create_section(s, key=f"cn-{uuid4().hex[:8]}")
         thread = await create_or_get_thread(
-            s, client=client,
+            s, **intake_fields(), client=client,
             operator_kind=OperatorKind.SECTION, operator_value=section.id,
             kind=ThreadKind.TICKET, subject_type="practice", subject_id="s",
         )
@@ -111,7 +112,8 @@ class TestCloseNotifyConsumer:
             await s.commit()
         # client reopens (4b clears the flag) BEFORE the consumer runs
         async with factory() as s:
-            await post_message(s, thread_id=tid, sender=client, body="back")
+            await post_message(s,
+                **intake_fields(), thread_id=tid, sender=client, body="back")
             await s.commit()
 
         assert await consume_close_notifications() == 0
@@ -123,7 +125,7 @@ class TestCloseNotifyConsumer:
         master = await _new_recipient(factory)
         async with factory() as s:
             thread = await create_or_get_thread(
-                s, client=client,
+                s, **intake_fields(), client=client,
                 operator_kind=OperatorKind.USER, operator_value=master,
                 kind=ThreadKind.DM,
             )

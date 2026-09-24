@@ -282,6 +282,103 @@ None of that is wired here; this file only accounts for the network
 path, the credentials and the profile being in place before that code
 runs.
 
+## 5. The resource protocol (F1.4)
+
+Every resource route -- recipients, threads, messages, sections, read
+pointers, preferences, the inbox -- speaks the same language as a job.
+
+**One form of refusal.** Every error response of every route has one
+body, with a class a program can branch on:
+
+    {"error": {"class": "<class>", "message": "<text>", "fields": [...]}}
+
+| status | class | when |
+|---|---|---|
+| 401 | `unauthorized` | the service token is missing or wrong |
+| 403 | `forbidden` | the actor has no role in this thread |
+| 404 | `not_found` | the entity or the route does not exist |
+| 405 | `method_not_allowed` | the route exists, the method does not |
+| 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator |
+| 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
+| 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
+| 422 | `validation` | the input is wrong; `fields` names each input |
+| 500 | `internal` | our defect; the text carries nothing from it |
+
+The message is for a human; the class is the contract.
+
+**One way to page.** Every listing -- the inbox, the visible threads, a
+thread's messages -- takes `limit` (1..100, default 20) and `cursor`
+(the previous page's `next_cursor`, opaque) and answers
+`{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
+`unread` badge beside them. A `limit` outside 1..100 is **refused**
+(422), not clamped, and so is a malformed cursor.
+
+**Repeating a call.** A call that creates takes a required
+`Idempotency-Key` header (1..200 characters):
+`POST /api/v1/threads` and `POST /api/v1/threads/{id}/messages`. The
+same key with the same request -- method, path with its query, body
+bytes -- answers with the SAME thread or message in its current state,
+and pings nobody again; the same key with another request is a 409
+`conflict`. Every other mutating call is safe to repeat by
+construction, so it takes no key:
+
+| call | why a repeat is safe |
+|---|---|
+| `PUT /recipients/{id}` | a versioned snapshot: the version is its key |
+| `DELETE /recipients/{id}` | forgetting twice is forgetting once |
+| `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
+| `POST /threads/{id}/status` | sets a value; the same status is a no-op |
+| `POST /threads/{id}/retag` | sets a value |
+| `POST /threads/{id}/read` | the pointer only moves forward |
+| `POST /sections` | create-or-find by key |
+| `POST /inbox/{delivery_id}/read`, `POST /inbox/read-all` | set a value |
+| `PATCH /preferences` | sets values |
+
+`POST /threads/unread-counts` is a read that takes a body.
+
+**The recipient snapshot has a version.** Both write paths -- `PUT
+/api/v1/recipients/{id}` and the `user_upserted` event -- carry
+`version`, an integer the product increases with every change of the
+person (a counter or an updated-at in milliseconds). comms applies a
+snapshot only when its version is higher than the stored one: an event
+that arrives late cannot roll the address book back. The stored version
+with other content is a conflict. "No value" is an explicit `null` for
+`telegram_id`, `email`, `locale` and `timezone` -- a blank string or a
+telegram id of 0 is refused on both paths.
+
+**Deleting a person.** `DELETE /api/v1/recipients/{id}` with
+`{"version": N}`, or the `user_deleted` event `{v, recipient_id,
+version}`. comms forgets every way to reach them -- chat, address,
+language, time zone, schedule, groups, mutes, sections, read pointers --
+and closes their waiting deliveries as `recipient_inactive`. The row
+stays as a tombstone with the id alone, because the threads and messages
+they were part of stay: a conversation belongs to both sides, and what
+happens to message bodies is the product's decision. A deletion is
+final -- a person who returns gets a new id in the product. A
+recipient deactivated or deleted after a job was resolved is not sent
+to either: their delivery ends `recipient_inactive`, which is neither a
+failure nor a mute.
+
+**A group is read when the job is delivered.** A notification to a
+group reaches the members the group has when the job is resolved, at
+delivery time -- not when it was sent. A `group_changed` that arrives
+later is not seen by that job, in either direction: a member added
+after resolve does not receive it, a member removed after resolve
+still does. Send the membership before the job when the order matters.
+
+### What comms takes on trust
+
+comms checks ONE thing: the service token (`Authorization: Bearer`).
+Every actor a request names -- `participant`, `operator`, `sender`,
+`is_supervisor` -- is taken on trust. **Deriving them from the signed-in
+user is the product proxy's job**: a proxy that forwards an actor from
+its client lets a user read or write someone else's conversation, and
+the defect is the proxy's. comms enforces what a role in a thread
+allows (a participant posts in their thread, an operator in the threads
+their section serves) -- never who the caller really is. This is the
+one frozen part of the protocol; it is written down here, and
+`app/api/deps.py` points at this paragraph.
+
 ## Operating the comms stack
 
 What an operator needs on the box, collected here because every item

@@ -42,7 +42,12 @@ from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.operators import claim_thread
 from app.messaging.read_state import mark_read
 from app.messaging.threads import create_or_get_thread_detailed, post_message
-from tests.helpers import create_recipient, create_section, next_t51_telegram_id
+from tests.helpers import (
+    create_recipient,
+    create_section,
+    intake_fields,
+    next_t51_telegram_id,
+)
 
 _T0 = datetime(2026, 8, 17, 10, 0, tzinfo=UTC)
 _T1 = _T0 + timedelta(minutes=5)
@@ -65,7 +70,7 @@ async def _dm_thread(
     """A DM thread: assignee is PRE-ASSIGNED to operator_value (D1(i)),
     so the master is a participant by two roles at once."""
     thread, _ = await create_or_get_thread_detailed(
-        session,
+        session, **intake_fields(),
         client=client,
         operator_kind=OperatorKind.USER,
         operator_value=master,
@@ -80,7 +85,7 @@ async def _section_thread(
     """An UNCLAIMED section thread: assignee empty, operator_value is a
     section id. Visible to every operator, participant to none."""
     thread, _ = await create_or_get_thread_detailed(
-        session,
+        session, **intake_fields(),
         client=client,
         operator_kind=OperatorKind.SECTION,
         operator_value=section,
@@ -134,7 +139,7 @@ async def _list(
         "/api/v1/threads", params={"operator": str(operator), **params}
     )
     assert resp.status_code == 200, resp.text
-    threads: list[dict[str, Any]] = resp.json()["threads"]
+    threads: list[dict[str, Any]] = resp.json()["items"]
     return threads
 
 
@@ -159,15 +164,19 @@ class TestConsistencyWithPerThreadEndpoint:
             )
             # two unread for the master in A, one in B
             await post_message(
-                s, thread_id=thread_a, sender=customer, body="a1",
+                s, **intake_fields(), thread_id=thread_a, sender=customer, body="a1",
                 created_at=_T0,
             )
             await post_message(
-                s, thread_id=thread_a, sender=customer, body="a2",
+                s, **intake_fields(), thread_id=thread_a, sender=customer, body="a2",
                 created_at=_T1,
             )
             await post_message(
-                s, thread_id=thread_b, sender=other_customer, body="b1",
+                s,
+                **intake_fields(),
+                thread_id=thread_b,
+                sender=other_customer,
+                body="b1",
                 created_at=_T0,
             )
             await s.commit()
@@ -205,7 +214,7 @@ class TestConsistencyWithPerThreadEndpoint:
             master = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="m",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="m",
                 created_at=_T0,
             )
             await s.commit()
@@ -253,11 +262,11 @@ class TestFrozenPerThreadEndpointKeepsItsContract:
             stranger = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="one",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="one",
                 created_at=_T0,
             )
             await post_message(
-                s, thread_id=thread_id, sender=master, body="two",
+                s, **intake_fields(), thread_id=thread_id, sender=master, body="two",
                 created_at=_T1,
             )
             await s.commit()
@@ -291,7 +300,7 @@ class TestDmOperatorRole:
             master = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="hi",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="hi",
                 created_at=_T0,
             )
             await s.commit()
@@ -320,11 +329,11 @@ class TestDmOperatorRole:
             master = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="mine",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="mine",
                 created_at=_T0,
             )
             await post_message(
-                s, thread_id=thread_id, sender=master, body="theirs",
+                s, **intake_fields(), thread_id=thread_id, sender=master, body="theirs",
                 created_at=_T1,
             )
             await s.commit()
@@ -349,7 +358,7 @@ class TestDmOperatorRole:
             )
             await claim_thread(s, thread_id=thread_id, operator=agent)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="help",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="help",
                 created_at=_T0,
             )
             await s.commit()
@@ -384,7 +393,11 @@ class TestAbsenceMeansNotAParticipant:
                 s, client=customer, section=section.id
             )
             await post_message(
-                s, thread_id=pool_thread, sender=customer, body="queued",
+                s,
+                **intake_fields(),
+                thread_id=pool_thread,
+                sender=customer,
+                body="queued",
                 created_at=_T0,
             )
             await s.commit()
@@ -413,7 +426,11 @@ class TestAbsenceMeansNotAParticipant:
             supervisor = await _recipient(s)
             foreign = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=foreign, sender=customer, body="private",
+                s,
+                **intake_fields(),
+                thread_id=foreign,
+                sender=customer,
+                body="private",
                 created_at=_T0,
             )
             await s.commit()
@@ -436,7 +453,12 @@ class TestAbsenceMeansNotAParticipant:
             master = await _recipient(s)
             mine = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=mine, sender=customer, body="x", created_at=_T0,
+                s,
+                **intake_fields(),
+                thread_id=mine,
+                sender=customer,
+                body="x",
+                created_at=_T0,
             )
             await s.commit()
 
@@ -459,7 +481,7 @@ class TestWithUnreadIsStrictlyOptIn:
             master = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="hi",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="hi",
                 created_at=_T0,
             )
             await s.commit()
@@ -473,7 +495,7 @@ class TestWithUnreadIsStrictlyOptIn:
         )
         assert default.status_code == 200
         assert default.text == explicit_off.text
-        row = default.json()["threads"][0]
+        row = default.json()["items"][0]
         assert "unread" not in row
         assert set(row) == {
             "id",
@@ -500,7 +522,7 @@ class TestWithUnreadIsStrictlyOptIn:
             master = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="hi",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="hi",
                 created_at=_T0,
             )
             await s.commit()
@@ -527,7 +549,7 @@ class TestRepeat:
             master = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="hi",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="hi",
                 created_at=_T0,
             )
             await s.commit()
@@ -550,11 +572,11 @@ class TestRepeat:
             master = await _recipient(s)
             thread_id = await _dm_thread(s, client=customer, master=master)
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="a",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="a",
                 created_at=_T0,
             )
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="b",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="b",
                 created_at=_T1,
             )
             await s.commit()
@@ -655,7 +677,7 @@ class TestEmpty:
 
         async with factory() as s:
             await post_message(
-                s, thread_id=thread_id, sender=customer, body="hi",
+                s, **intake_fields(), thread_id=thread_id, sender=customer, body="hi",
                 created_at=_T0,
             )
             await s.commit()

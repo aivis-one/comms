@@ -74,7 +74,12 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.database import get_session_factory
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+    conflict_class,
+)
 from app.engine.formatters import sanitize_text, sanitized_traceback
 from app.transport.events import parse_event
 from app.transport.handlers import HandleResult, handle_event
@@ -229,6 +234,19 @@ class StreamConsumer:
                         event_type=type(event).__name__,
                         attempt=attempt,
                     )
+                await self._ack(entry_id)
+                return
+            except ConflictError as exc:
+                # Late or repeated, not broken (F1.4): the event cannot
+                # change what is recorded, and replaying it never will.
+                # Refused by CLASS, acknowledged, no dead letter.
+                logger.warning(
+                    "event_refused",
+                    entry_id=_id_str(entry_id),
+                    event_type=type(event).__name__,
+                    refusal_class=conflict_class(exc),
+                    reason=sanitize_text(str(exc)),
+                )
                 await self._ack(entry_id)
                 return
             except ValidationError as exc:

@@ -99,7 +99,8 @@ class TestInboxFeed:
         item = payload["items"][0]
         assert set(item) == {
             "id", "type", "title", "body", "action_data",
-            "priority", "sent_at", "read_at", "created_at",
+            # `priority` left the item in F1.4 (always 5 after F1.2).
+            "sent_at", "read_at", "created_at",
         }
         assert item["type"] == "unit_event_in_app"
         assert item["read_at"] is None
@@ -164,15 +165,26 @@ class TestInboxFeed:
         )
         assert response.status_code == 422
 
-    async def test_limit_clamped_not_rejected(
+    async def test_limit_outside_the_bounds_is_refused(
         self, client: AsyncClient,
     ) -> None:
+        """Was test_limit_clamped_not_rejected: out-of-range limits were
+        clamped and answered 200. F1.4 made every listing refuse them
+        (app/api/paging.py): a clamp silently changes the request -- a
+        typo of 100000 returned a hundred rows and said nothing. The
+        pair is the bounds themselves, which still pass."""
         recipient_id, _ = await _seed_inbox(count=2)
-        for bad_limit in (0, -5, 100000):
+        for bad_limit in (0, -5, 101, 100000):
             response = await client.get(
                 _inbox(recipient_id), params={"limit": bad_limit},
             )
-            assert response.status_code == 200
+            assert response.status_code == 422, bad_limit
+            assert response.json()["error"]["class"] == "validation"
+        for good_limit in (1, 100):
+            response = await client.get(
+                _inbox(recipient_id), params={"limit": good_limit},
+            )
+            assert response.status_code == 200, good_limit
 
 
 class TestUnreadCountEndpoint:

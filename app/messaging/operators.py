@@ -35,6 +35,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.constants import PAGE_LIMIT_DEFAULT
 from app.core.exceptions import NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind
 from app.messaging.membership import section_serves_clause, serves_section
@@ -42,12 +43,6 @@ from app.messaging.models import Section, Thread
 from app.messaging.threads import _is_dedup_violation, _recipient_exists
 
 logger = structlog.get_logger()
-
-# Keyset page bounds for list_visible_threads -- mirror the inbox
-# (INBOX_MAX_PAGE_SIZE): clamp, do not reject an out-of-range limit.
-VISIBLE_THREADS_MAX_PAGE_SIZE = 100
-VISIBLE_THREADS_DEFAULT_PAGE_SIZE = 20
-
 
 @dataclass(frozen=True)
 class OperatorScope:
@@ -269,7 +264,7 @@ async def list_visible_threads(
     *,
     operator: UUID,
     is_supervisor: bool = False,
-    limit: int = VISIBLE_THREADS_DEFAULT_PAGE_SIZE,
+    limit: int = PAGE_LIMIT_DEFAULT,
     cursor: tuple[datetime, UUID] | None = None,
 ) -> tuple[Sequence[Thread], tuple[datetime, UUID] | None]:
     """Threads an operator may SEE, most-recently-active first.
@@ -294,15 +289,14 @@ async def list_visible_threads(
     Keyset pagination (Phase 4c item 5): ordered by
     COALESCE(last_message_at, created_at) DESC, id DESC -- the EXACT
     ix_threads_activity order (EXPLAIN-confirmed Index Scan) and the
-    same keyset shape as the inbox. `limit` clamps to 1..100 (default
-    20, never rejected); `cursor` is the (activity, id) of the last row
+    same keyset shape as the inbox. `limit` is bounded by the route
+    (app/api/paging.py); `cursor` is the (activity, id) of the last row
     already seen and the next page is WHERE (activity, id) < cursor.
     The id tiebreak is DESC (was id ASC in 4b) to line up with the
     index and the cursor codec. Returns (threads, next_cursor);
     next_cursor is None on the final page. The opaque base64 wire form
     of the cursor lives at the API edge (parallel to the inbox codec).
     """
-    limit = max(1, min(limit, VISIBLE_THREADS_MAX_PAGE_SIZE))
     activity = func.coalesce(Thread.last_message_at, Thread.created_at)
 
     stmt = select(Thread)

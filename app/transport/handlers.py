@@ -12,7 +12,9 @@
 #   RejectedNotificationRequest / a request create_notification cannot
 #                          accept -> recorded under its key as
 #                          rejected_at_intake
-#   UserUpserted        -> audience.sync.user_upserted   (item 4)
+#   UserUpserted        -> audience.sync.apply_snapshot  (versioned,
+#                          F1.4 -- one rule with the PUT route)
+#   UserDeleted         -> forgetting.forget_recipient    (F1.4)
 #   GroupChanged        -> audience.sync.group_changed   (item 4)
 #   ReminderCancel      -> engine.reminders.cancel_reminders: jobs
 #                          matched by envelope correlation take the
@@ -30,6 +32,12 @@
 #                      no DLQ -- the record is the one copy of the fact.
 #   ValidationError -- terminal for the other events: the event will
 #                      never succeed -> DLQ + ACK.
+#   ConflictError   -- a sync event that is late or repeated rather than
+#                      broken (a stale or conflicting snapshot, a
+#                      deleted recipient, F1.4): refused, its CLASS in
+#                      the log, ACK, no DLQ. There is no record under a
+#                      key -- sync events carry none -- so the log line
+#                      is the one programmatic trace.
 #   NotFoundError   -- retryable: group_changed arrived before its
 #                      user_upserted (momentary sync lag) -> bounded
 #                      backoff, then DLQ.
@@ -55,6 +63,7 @@ from app.engine.service import (
     accept_notification,
     record_intake_outcome,
 )
+from app.forgetting import forget_recipient
 from app.messaging.membership import set_membership
 from app.transport.events import (
     GroupChanged,
@@ -63,6 +72,7 @@ from app.transport.events import (
     RejectedNotificationRequest,
     ReminderCancel,
     SectionMembershipChanged,
+    UserDeleted,
     UserUpserted,
 )
 
@@ -93,14 +103,20 @@ async def handle_event(
             session, event.idempotency_key, event.fingerprint, event.reason,
         )
     if isinstance(event, UserUpserted):
-        await sync.user_upserted(
+        await sync.apply_snapshot(
             session,
             recipient_id=event.recipient_id,
+            version=event.version,
             telegram_id=event.telegram_id,
             email=event.email,
             locale=event.locale,
             timezone=event.timezone,
             active=event.active,
+        )
+        return HandleResult.PROCESSED
+    if isinstance(event, UserDeleted):
+        await forget_recipient(
+            session, recipient_id=event.recipient_id, version=event.version,
         )
         return HandleResult.PROCESSED
     if isinstance(event, GroupChanged):

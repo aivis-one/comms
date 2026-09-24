@@ -666,6 +666,18 @@ async def deliver_notification(
         delivery.next_retry_at = None
         delivery.wait_reason = None
 
+        # -- Late activity gate (F1.4): deactivated or deleted by the
+        # product after resolve -> close out, no send. Checked first: a
+        # person the product removed is not asked about their mutes. --
+        if not recipient.active:
+            delivery.status = DeliveryStatus.RECIPIENT_INACTIVE
+            logger.info(
+                "delivery_recipient_inactive",
+                delivery_id=str(delivery.id),
+                recipient_id=str(delivery.recipient_id),
+            )
+            continue
+
         # -- Late-mute gate: muted while gated -> close out, no send --
         if delivery.recipient_id in muted:
             delivery.status = DeliveryStatus.SUPPRESSED
@@ -968,9 +980,12 @@ async def _deliver_single(
 # FOLD of theirs. One rule, applied by rollup_notification and by
 # nothing else:
 #
-#   1. SUPPRESSED deliveries are taken out first: a recipient's
-#      decision is neither a delivery nor a failure. If nothing else
-#      is left, the job is SUPPRESSED -- never FAILED.
+#   1. SUPPRESSED and RECIPIENT_INACTIVE deliveries are taken out
+#      first: a recipient's decision (a mute) and a product's decision
+#      (deactivated or deleted, F1.4) are neither a delivery nor a
+#      failure. If nothing else is left: SUPPRESSED when any recipient
+#      muted it, otherwise NO_RECIPIENTS -- by send time the product
+#      had removed everyone. Never FAILED.
 #   2. Any delivery still PENDING -> the job stays PROCESSING.
 #   3. Every remaining delivery SENT                 -> SENT.
 #   4. At least one SENT and at least one not sent   -> PARTIAL_SENT.
@@ -1037,9 +1052,13 @@ def _fold(statuses: set[str]) -> NotificationStatus | None:
     """THE FOLD over the set of delivery statuses; None = still open."""
     if not statuses:
         return NotificationStatus.NO_RECIPIENTS
-    active = statuses - {DeliveryStatus.SUPPRESSED}
+    active = statuses - {
+        DeliveryStatus.SUPPRESSED, DeliveryStatus.RECIPIENT_INACTIVE,
+    }
     if not active:
-        return NotificationStatus.SUPPRESSED
+        if DeliveryStatus.SUPPRESSED in statuses:
+            return NotificationStatus.SUPPRESSED
+        return NotificationStatus.NO_RECIPIENTS
     if DeliveryStatus.PENDING in active:
         return None
     if active == {DeliveryStatus.SENT}:
@@ -1061,6 +1080,55 @@ _CLOSING = {
 }
 
 _ACTIVE_STATUSES = (NotificationStatus.PENDING, NotificationStatus.PROCESSING)
+
+
+async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
+    """Close a deleted recipient's deliveries (F1.4, forgetting).
+
+    Every delivery of theirs still waiting takes RECIPIENT_INACTIVE
+    (wait fields cleared) and each affected job is folded (THE FOLD).
+    The jobs are locked FOR UPDATE and the lock is WAITED for, like
+    expiry and cancellation: an attempt in flight finishes first. Every
+    delivery of theirs, finished or not, loses its error_message -- a
+    provider's words may quote the address being forgotten.
+
+    Returns the number of deliveries closed.
+    """
+    parents = (
+        await session.execute(
+            select(Notification)
+            .where(
+                Notification.id.in_(
+                    select(NotificationDelivery.notification_id).where(
+                        NotificationDelivery.recipient_id == recipient_id,
+                        NotificationDelivery.status == DeliveryStatus.PENDING,
+                    )
+                ),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    closed = await session.execute(
+        update(NotificationDelivery)
+        .where(
+            NotificationDelivery.recipient_id == recipient_id,
+            NotificationDelivery.status == DeliveryStatus.PENDING,
+        )
+        .values(
+            status=DeliveryStatus.RECIPIENT_INACTIVE,
+            next_retry_at=None,
+            wait_reason=None,
+        )
+    )
+    await session.execute(
+        update(NotificationDelivery)
+        .where(NotificationDelivery.recipient_id == recipient_id)
+        .values(error_message=None)
+    )
+    for notification in parents:
+        await rollup_notification(session, notification)
+    await session.flush()
+    return int(closed.rowcount or 0)  # type: ignore[attr-defined]
 
 
 async def close_notifications(
@@ -1199,9 +1267,6 @@ def _navigation_intent(
     return intent
 
 
-# Hard ceiling on the inbox page size -- a page is a UI unit, not an
-# export API; anything bigger belongs to a different endpoint.
-INBOX_MAX_PAGE_SIZE = 100
 
 
 async def list_recipient_deliveries(
@@ -1236,7 +1301,8 @@ async def list_recipient_deliveries(
     Args:
         session: Active DB session (read-only).
         recipient_id: Recipient (= product user) id.
-        limit: Page size (clamped to 1..INBOX_MAX_PAGE_SIZE).
+        limit: Page size, already bounded by the route
+            (app/api/paging.py refuses anything outside 1..PAGE_LIMIT_MAX).
         cursor: (sent_at, id) of the last row already seen, or None
             for the first page.
         type_filter: Filter by Notification.type (exact match).
@@ -1247,7 +1313,6 @@ async def list_recipient_deliveries(
         next_cursor is the (sent_at, id) pair to request the next page
         with, or None when this page is the last.
     """
-    limit = max(1, min(limit, INBOX_MAX_PAGE_SIZE))
 
     conditions = [
         NotificationDelivery.recipient_id == recipient_id,
@@ -1299,7 +1364,6 @@ async def list_recipient_deliveries(
             "title": notification.title,
             "body": notification.body,
             "action_data": _navigation_intent(notification.action_data),
-            "priority": notification.priority,
         })
 
     next_cursor: tuple[datetime, UUID] | None = None

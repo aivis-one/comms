@@ -386,7 +386,9 @@ class TelegramFormatter:
                 the deep link cannot be encoded (item 3), or the
                 Telegram API reports a permanent failure.
         """
-        if not recipient.telegram_id:
+        # NULL is "no chat" (F1.4); a 0 can no longer arrive
+        # (ck_recipients_telegram_id_not_zero).
+        if recipient.telegram_id is None:
             raise NoAddressError("Recipient has no telegram_id")
 
         # Lazy import: aiogram types only needed on the real send path.
@@ -405,7 +407,13 @@ class TelegramFormatter:
         # (see the button block below).
         raw_variables = build_variables(notification)
         variables = _escape_html_variables(raw_variables)
-        locale = recipient.locale or settings.default_locale
+        # NULL is "no language" (F1.4) -- the one way to say it; a blank
+        # string can no longer arrive (ck_recipients_locale_not_blank).
+        locale = (
+            recipient.locale
+            if recipient.locale is not None
+            else settings.default_locale
+        )
 
         rendered_title = render(
             notification_type=notification.type,
@@ -675,7 +683,13 @@ class EmailFormatter:
         """Subject and body for this notification, in the recipient's
         locale, with the fallbacks the channel needs."""
         variables = build_variables(notification)
-        locale = recipient.locale or settings.default_locale
+        # NULL is "no language" (F1.4) -- the one way to say it; a blank
+        # string can no longer arrive (ck_recipients_locale_not_blank).
+        locale = (
+            recipient.locale
+            if recipient.locale is not None
+            else settings.default_locale
+        )
 
         rendered_subject = render(
             notification_type=notification.type,
@@ -886,9 +900,9 @@ def _usable_email_address(value: str | None) -> str | None:
     """
     if value is None:
         return None
+    # A blank address cannot arrive (F1.4: ck_recipients_email_not_blank,
+    # refused on both write paths); the strip only trims the edges.
     address = value.strip()
-    if not address:
-        return None
     if "@" not in address or address.startswith("@") or address.endswith("@"):
         return None
     if any(ch in address for ch in ("\r", "\n")) or " " in address:
@@ -902,8 +916,6 @@ def _address_defect(value: str | None) -> str:
     """Name the defect WITHOUT echoing the address (no PII in logs)."""
     if value is None:
         return "no address in the recipient snapshot"
-    if not value.strip():
-        return "the address is blank"
     return "the address is not a usable mailbox"
 
 

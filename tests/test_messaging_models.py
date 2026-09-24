@@ -31,7 +31,7 @@ from app.messaging.constants import (
 )
 from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.messaging.threads import create_or_get_thread, post_message
-from tests.helpers import create_recipient, next_phase4a_telegram_id
+from tests.helpers import create_recipient, intake_fields, next_phase4a_telegram_id
 
 
 async def _two_recipients(session: AsyncSession) -> tuple[UUID, UUID]:
@@ -50,7 +50,7 @@ class TestStatusDefault:
     ) -> None:
         client_id, op_id = await _two_recipients(db_session)
         thread = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -89,7 +89,7 @@ class TestRestrictOnRecipients:
         DB level (ondelete=RESTRICT, edit 3)."""
         client_id, op_id = await _two_recipients(db_session)
         await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -106,14 +106,14 @@ class TestRestrictOnRecipients:
     ) -> None:
         client_id, op_id = await _two_recipients(db_session)
         thread = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
             kind=ThreadKind.DM,
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread.id,
             sender=client_id,
             body="hi",

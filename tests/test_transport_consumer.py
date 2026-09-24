@@ -38,7 +38,11 @@ from app.engine.constants import IntakeOutcomeClass
 from app.engine.models import Notification
 from app.engine.service import intake_outcomes_for
 from app.transport.consumer import StreamConsumer
-from tests.helpers import create_recipient, next_phase3c_telegram_id
+from tests.helpers import (
+    create_recipient,
+    next_phase3c_telegram_id,
+    next_snapshot_version,
+)
 
 _WAIT_TIMEOUT = 5.0
 
@@ -105,6 +109,7 @@ def _user_upserted_data(recipient_id: UUID, **overrides: Any) -> dict[str, Any]:
     data: dict[str, Any] = {
         "v": 1,
         "recipient_id": str(recipient_id),
+        "version": next_snapshot_version(),
         "telegram_id": next_phase3c_telegram_id(),
         "email": None,
         "locale": "en",
@@ -396,7 +401,9 @@ class TestPoisonPill:
         rid = uuid4()
         await redis.xadd(stream, {"event": "notification_request",
                                   "data": "{broken"})
-        await _xadd(redis, stream, "user_deleted", {"v": 1})
+        # "user_deleted" is a real event since F1.4 (forgetting); the
+        # unknown name must be one comms truly lacks.
+        await _xadd(redis, stream, "user_renamed", {"v": 1})
         versioned = _request_data(v=2)
         await _xadd(redis, stream, "notification_request", versioned)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(rid))

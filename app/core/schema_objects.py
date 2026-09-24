@@ -146,12 +146,28 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "(recipient_id, status, read_at)"
         ),
     ),
-    "ix_notifications_status_scheduled_priority": IndexShape(
+    # The processor's pick order (F1.4: priority left the ordering and
+    # the table; the index was recreated without it).
+    "ix_notifications_status_scheduled": IndexShape(
         unique=False,
         definition=(
-            "CREATE INDEX ix_notifications_status_scheduled_priority "
-            "ON public.notifications USING btree "
-            "(status, scheduled_at, priority)"
+            "CREATE INDEX ix_notifications_status_scheduled "
+            "ON public.notifications USING btree (status, scheduled_at)"
+        ),
+    ),
+    # A repeated resource call answers with the row it created (F1.4).
+    "uq_messages_idempotency_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_messages_idempotency_key "
+            "ON public.messages USING btree (idempotency_key)"
+        ),
+    ),
+    "uq_threads_idempotency_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_threads_idempotency_key "
+            "ON public.threads USING btree (idempotency_key)"
         ),
     ),
     "ix_threads_activity": IndexShape(
@@ -199,6 +215,14 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_deliveries_failure_class",
     # A wait reason without a time (or the reverse) cannot exist (F1.3).
     "ck_deliveries_wait_reason",
+    # "No value" is NULL, never a blank string or a zero (F1.4).
+    "ck_recipients_locale_not_blank",
+    "ck_recipients_email_not_blank",
+    "ck_recipients_timezone_not_blank",
+    "ck_recipients_telegram_id_not_zero",
+    "ck_recipients_version_not_negative",
+    # A tombstone keeps nothing that reaches the person (F1.4).
+    "ck_recipients_tombstone",
 })
 
 # Everything the schema must carry although the metadata never mentions

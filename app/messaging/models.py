@@ -38,6 +38,7 @@ from uuid import UUID
 from sqlalchemy import DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.constants import FINGERPRINT_LEN, MAX_IDEMPOTENCY_KEY_LEN
 from app.core.database import Base
 from app.core.mixins import TimestampMixin, UUIDMixin
 from app.messaging.constants import (
@@ -97,6 +98,25 @@ class Thread(UUIDMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "threads"
+
+    # The caller's Idempotency-Key and the digest of its request -- method,
+    # path with parameters and the raw body bytes (F1.4, spec §10.7).
+    # The same key with the same digest answers with THIS row (a DM or
+    # a thread with a subject is also found by its dedup index under
+    # ANOTHER key -- it keeps the key it was created with); the same
+    # key with another digest is a conflict. The fact that the request
+    # was served IS this row: no response is cached (a cached response
+    # would be a second copy of the row's state). Unique index in
+    # migration 0014 (app/core/schema_objects.py); rows are never
+    # deleted, so the replay window is unbounded.
+    idempotency_key: Mapped[str] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN),
+        nullable=False,
+    )
+    fingerprint: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN),
+        nullable=False,
+    )
 
     # The recipient this thread is with (VELO: the client user).
     client: Mapped[UUID] = mapped_column(
@@ -228,6 +248,23 @@ class Message(UUIDMixin, Base):
 
     body: Mapped[str] = mapped_column(
         String(MAX_MESSAGE_BODY_LEN),
+        nullable=False,
+    )
+
+    # The caller's Idempotency-Key and the digest of its request -- method,
+    # path with parameters and the raw body bytes (F1.4, spec §10.7).
+    # The same key with the same digest answers with THIS row; the same
+    # key with another digest is a conflict. The fact that the request
+    # was served IS this row: no response is cached (a cached response
+    # would be a second copy of the row's state). Unique index in
+    # migration 0014 (app/core/schema_objects.py); rows are never
+    # deleted, so the replay window is unbounded.
+    idempotency_key: Mapped[str] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN),
+        nullable=False,
+    )
+    fingerprint: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN),
         nullable=False,
     )
 
