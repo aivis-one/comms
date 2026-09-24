@@ -53,10 +53,12 @@ value: that would be a second format of one fact. The kinds:
                            no failed child would contradict its own
                            fold.
 
-What to do about them -- the check query and the deletions, in this
-same breakdown -- is the step "Draining before the update to 0013" in
-deploy/INTEGRATION.md. This refusal names the counts and points there;
-it does not repeat the instructions.
+What to do about them is one command: `deploy/comms-deploy.sh drain`
+checks these same kinds and `drain --apply` deletes them
+(deploy/INTEGRATION.md, "The protocol update window"). The command runs
+THIS module's queries -- _BLOCKING_KINDS to count, _DRAIN_DELETES to
+delete -- so the breakdown exists once. This refusal names the counts
+and the command; it does not repeat the instructions.
 
 TRANSLATED, because the row itself says what it is:
   - delivery SKIPPED -> SUPPRESSED (the late mute is the one writer of
@@ -129,6 +131,40 @@ _BLOCKING_KINDS: dict[str, str] = {
 }
 
 
+# What `comms-deploy.sh drain --apply` deletes, per kind -- the SAME keys
+# as _BLOCKING_KINDS (tests/test_drain_source.py holds them equal). Whole
+# notifications go; their deliveries follow by ON DELETE CASCADE. Every
+# active job goes, not only those scheduled ahead: while this migration
+# refuses, comms-app is not healthy, so the worker and the consumer do
+# not run and the queue cannot drain by waiting. The product's events
+# wait in the stream and are read after the window.
+_DRAIN_DELETES: dict[str, str] = {
+    "active_jobs": (
+        "DELETE FROM notifications WHERE status IN ('pending', 'processing')"
+    ),
+    "skipped_without_children": (
+        "DELETE FROM notifications n WHERE n.status = 'skipped' "
+        "AND NOT EXISTS (SELECT 1 FROM notification_deliveries d "
+        "WHERE d.notification_id = n.id)"
+    ),
+    "skipped_mixed_children": (
+        "DELETE FROM notifications n WHERE n.status = 'skipped' "
+        "AND EXISTS (SELECT 1 FROM notification_deliveries d "
+        "WHERE d.notification_id = n.id AND d.status <> 'skipped')"
+    ),
+    "expired": "DELETE FROM notifications WHERE status = 'expired'",
+    "failed_without_children": (
+        "DELETE FROM notifications n WHERE n.status = 'failed' "
+        "AND NOT EXISTS (SELECT 1 FROM notification_deliveries d "
+        "WHERE d.notification_id = n.id)"
+    ),
+    "with_failed_delivery": (
+        "DELETE FROM notifications WHERE id IN (SELECT notification_id "
+        "FROM notification_deliveries WHERE status = 'failed')"
+    ),
+}
+
+
 def _refuse_on_ambiguous_rows() -> None:
     bind = op.get_bind()
     counts = {
@@ -140,8 +176,8 @@ def _refuse_on_ambiguous_rows() -> None:
         listed = ", ".join(f"{kind}={count}" for kind, count in blocking.items())
         raise RuntimeError(
             "migration 0013 refuses: these rows cannot be translated "
-            f"without a guess -- {listed}. See 'Draining before the update "
-            "to 0013' in deploy/INTEGRATION.md."
+            f"without a guess -- {listed}. Run `deploy/comms-deploy.sh "
+            "drain` (deploy/INTEGRATION.md, 'The protocol update window')."
         )
 
 

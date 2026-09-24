@@ -543,6 +543,171 @@ cmd_db() {
     esac
 }
 
+# Drain the rows migration 0013 refuses on (F1.5) -- the exit of the
+# protocol update window (deploy/INTEGRATION.md, "The protocol update
+# window"). ONE source for the breakdown: the queries are migration
+# 0013's own, _BLOCKING_KINDS to count and _DRAIN_DELETES to delete, run
+# by a one-off container of the image `update` built -- the same file
+# the refusing migration reads, so a kind added there is never missing
+# here (tests/test_drain_source.py).
+#
+#   drain           CHECK: counts per kind, deletes nothing, stops
+#                   nothing. It only reads; if it touches a table while
+#                   the migration runs it waits, it does not break --
+#                   so do not stop comms-app here "for symmetry".
+#   drain --apply   DELETE, in this order and in no other:
+#                   1. stop comms-app -- its restart loop re-runs the
+#                      migration, whose ALTER TABLE would race the
+#                      deletion; stopped, the race cannot exist. Not
+#                      stopped -> nothing is deleted (code 2);
+#                   2. dump the database -- AFTER the stop, so the dump
+#                      is not of a base the migration may still touch.
+#                      No dump -> nothing is deleted (code 2);
+#                   3. confirm: the operator types `yes` (no flag skips
+#                      it -- a deletion is seen by a person);
+#                   4. delete every kind in ONE transaction -- an
+#                      interruption rolls it all back;
+#                   5. check again and report before -> after, with the
+#                      dump's path and the next command: `start`.
+#
+# Exit codes: 0 clean, 1 rows to delete (or the deletion was declined),
+# 2 cannot check (database down, no schema, revision at or past 0013,
+# an image without migration 0013, a failed stop or dump).
+cmd_drain() {
+    cd_compose
+    load_env
+    local apply=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --apply) apply=1 ;;
+            *)
+                echo -e "${RED}Usage: $0 drain [--apply]${NC}"
+                exit 2
+                ;;
+        esac
+    done
+
+    if ! $COMPOSE_CMD ps --status running --services 2>/dev/null \
+            | grep -qx comms-postgres; then
+        echo -e "${RED}✗ comms-postgres is not running -- start the database first${NC}"
+        exit 2
+    fi
+
+    local rc=0
+    drain_driver check || rc=$?
+    if [ "$apply" -eq 0 ] || [ "$rc" -ne 1 ]; then
+        exit "$rc"
+    fi
+
+    echo -e "${YELLOW}This stops comms-app, dumps the database and DELETES the rows above.${NC}"
+    read -r -p "Type 'yes' to proceed: " answer
+    if [ "$answer" != "yes" ]; then
+        echo "Aborted -- nothing stopped, nothing deleted."
+        exit 1
+    fi
+
+    if ! $COMPOSE_CMD stop comms-app; then
+        echo -e "${RED}✗ could not stop comms-app -- nothing deleted${NC}"
+        exit 2
+    fi
+    echo -e "${CYAN}comms-app stopped.${NC}"
+
+    mkdir -p "$BACKUP_DIR"
+    local dump
+    dump="$BACKUP_DIR/comms-predrain-$(date -u +%Y%m%d-%H%M%S).sql"
+    if ! $COMPOSE_CMD exec -T comms-postgres \
+            pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$dump"; then
+        rm -f "$dump"
+        echo -e "${RED}✗ pg_dump failed -- nothing deleted (comms-app stays stopped)${NC}"
+        exit 2
+    fi
+    echo -e "${GREEN}✓ Dumped to $dump${NC}"
+
+    rc=0
+    drain_driver apply || rc=$?
+    echo "Dump taken before the deletion: $dump"
+    echo -e "${YELLOW}comms-app is STOPPED. Next: $0 start${NC}"
+    exit "$rc"
+}
+
+# The driver: one-off container of the built image, python on stdin.
+# Prints its own report; its exit code is cmd_drain's (see above).
+drain_driver() {
+    $COMPOSE_CMD run --rm --no-deps -T --entrypoint python comms-app - "$1" <<'PY'
+import asyncio
+import importlib.util
+import os
+import re
+import sys
+from pathlib import Path
+
+VERSIONS = Path("migrations/versions")
+
+
+def fail(message: str) -> None:
+    print(f"✗ {message}")
+    sys.exit(2)
+
+
+def migration_0013():
+    found = sorted(VERSIONS.glob("*_0013_*.py"))
+    if not found:
+        fail("the built image has no migration 0013 -- run update first")
+    spec = importlib.util.spec_from_file_location("m0013", found[0])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def known_revisions() -> set[str]:
+    pattern = re.compile(r'^revision: str = "([^"]+)"', re.M)
+    return {
+        m.group(1)
+        for path in VERSIONS.glob("*.py")
+        if (m := pattern.search(path.read_text(encoding="utf-8")))
+    }
+
+
+async def counts(conn, kinds: dict[str, str]) -> dict[str, int]:
+    return {kind: await conn.fetchval(query) for kind, query in kinds.items()}
+
+
+async def main(mode: str) -> int:
+    import asyncpg
+
+    module = migration_0013()
+    url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+    conn = await asyncpg.connect(url)
+    try:
+        if await conn.fetchval("SELECT to_regclass('alembic_version')") is None:
+            fail("no schema here (no alembic_version) -- nothing to drain")
+        revision = await conn.fetchval("SELECT version_num FROM alembic_version")
+        if revision not in known_revisions():
+            fail(f"revision {revision!r} is not in this image's migration chain")
+        if int(revision.split("_", 1)[0]) >= 13:
+            fail(f"the schema is at {revision}, at or past 0013 -- nothing to drain")
+        before = await counts(conn, module._BLOCKING_KINDS)
+        if mode == "check":
+            print(f"schema at {revision}; rows migration 0013 refuses on:")
+            for kind, count in before.items():
+                print(f"  {kind}={count}")
+            return 0 if not any(before.values()) else 1
+        async with conn.transaction():
+            for kind in module._BLOCKING_KINDS:
+                await conn.execute(module._DRAIN_DELETES[kind])
+        after = await counts(conn, module._BLOCKING_KINDS)
+        print("deleted, per kind (before -> after):")
+        for kind in before:
+            print(f"  {kind}: {before[kind]} -> {after[kind]}")
+        return 0 if not any(after.values()) else 1
+    finally:
+        await conn.close()
+
+
+sys.exit(asyncio.run(main(sys.argv[1])))
+PY
+}
+
 # Run the suite on THIS box, against an isolated database.
 #
 # WHY A BOX RUN EXISTS AT ALL, next to a CI that already runs the same
@@ -627,7 +792,10 @@ cmd_status() {
 # `db`, not verbs of the service, and are correctly not seen. Keep new
 # lifecycle verbs here, in this block: a verb added anywhere else is
 # invisible to the product, and the product will keep reporting that
-# this service cannot do it.
+# this service cannot do it. Products parse these labels with a regular
+# expression: the verbs are the case at column zero, and EVERY nested
+# case in this file is indented (cmd_db, cmd_drain) so its labels are
+# never read as verbs.
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;
     update)  shift; cmd_update "$@" ;;
@@ -638,8 +806,9 @@ case "${1:-}" in
     db)      shift; cmd_db "$@" ;;
     test)    shift; cmd_test "$@" ;;
     status)  shift; cmd_status "$@" ;;
+    drain)   shift; cmd_drain "$@" ;;
     *)
-        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|test|status}"
+        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|test|status|drain [--apply]}"
         exit 1
         ;;
 esac

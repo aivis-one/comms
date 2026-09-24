@@ -427,80 +427,40 @@ process actually uses:
 
     docker exec comms-app python -c "from app.core.config import settings; print(settings.email_api_base_url)"
 
-## Draining before the update to 0013
+## The protocol update window
 
-Migration 0013 (the lifecycle and outcome taxonomy) translates only
-the rows whose meaning the row itself states. A row it cannot
-translate without a guess makes it **refuse**: `comms-app` does not
-start, and `docker logs comms-app` names the kinds below with their
-counts. The reasons for each kind are in the migration's docstring
-(`migrations/versions/2026_09_24_0013_lifecycle_outcomes.py`). Run this
-step on the box **before** `comms-deploy.sh update`.
+The protocol lands on a box in ONE window: comms and the product move
+together. Migration 0013 (the lifecycle and outcome taxonomy) translates
+only the rows whose meaning the row itself states; on a row it cannot
+translate without a guess it **refuses**, `comms-app` does not start,
+and `docker logs comms-app` names each kind with its count. The kinds,
+and why each cannot be translated, are in the migration's docstring
+(`migrations/versions/2026_09_24_0013_lifecycle_outcomes.py`).
 
-All queries run inside the database container:
+The window, from comms' side -- every step is a verb of
+`deploy/comms-deploy.sh`, which the product's own CLI wraps:
 
-    docker exec -i comms-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+1. **`update`** -- pulls, builds and recreates the stack. On a box with
+   old rows the migration refuses: a red start, and `update` exits 1.
+   All migrations run in one transaction, so the database stays at the
+   revision it had before (0011 on a box that ran `main`).
+2. **`drain`** -- checks. Prints the count of every kind, under the
+   names the refusal uses, and deletes nothing. Exit 0 = clean, 1 = rows
+   to delete, 2 = it cannot check (the database is down, there is no
+   schema, the schema is already at or past 0013).
+3. **`drain --apply`** -- deletes. It stops `comms-app`, dumps the
+   database (the path is printed before and after), asks you to type
+   `yes`, and deletes every kind in one transaction -- the whole
+   notifications, their deliveries by cascade. **Every active job goes,
+   not only the old ones**: in a red start the worker and the consumer
+   do not run, so the queue cannot drain by waiting. The product's
+   events wait in the stream and are read after the window; jobs the
+   product still wants, it sends again. Sent history and the inbox stay.
+4. **`start`** -- brings the stack up: the migration passes, the
+   worker and the consumer start.
 
-**1. Stop intake and let the queue empty.** Stop the consumer, so no
-new job is accepted -- the product's events wait in the stream and are
-read after the update:
-
-    docker stop comms-consumer
-
-The worker keeps delivering. A job scheduled for the future
-(`scheduled_at` ahead, a reminder) does not leave the queue by waiting:
-its only exit before the update is to be deleted (it will not be sent)
-and re-emitted by the product afterwards.
-
-**2. Check.** Every count must be zero; the names are the ones the
-refusal prints:
-
-    SELECT
-      (SELECT count(*) FROM notifications
-        WHERE status IN ('pending', 'processing'))            AS active_jobs,
-      (SELECT count(*) FROM notifications n WHERE n.status = 'skipped'
-        AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
-                        WHERE d.notification_id = n.id))      AS skipped_without_children,
-      (SELECT count(*) FROM notifications n WHERE n.status = 'skipped'
-        AND EXISTS (SELECT 1 FROM notification_deliveries d
-                    WHERE d.notification_id = n.id
-                      AND d.status <> 'skipped'))             AS skipped_mixed_children,
-      (SELECT count(*) FROM notifications
-        WHERE status = 'expired')                             AS expired,
-      (SELECT count(*) FROM notifications n WHERE n.status = 'failed'
-        AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
-                        WHERE d.notification_id = n.id))      AS failed_without_children,
-      (SELECT count(DISTINCT notification_id) FROM notification_deliveries
-        WHERE status = 'failed')                              AS with_failed_delivery;
-
-**3. Delete what cannot be translated**, in the same breakdown. Whole
-notifications go; their deliveries follow by cascade. Everything else
--- sent history, the inbox -- stays.
-
-    -- active_jobs that will not drain by waiting (scheduled ahead):
-    DELETE FROM notifications
-      WHERE status = 'pending' AND scheduled_at > now();
-    -- skipped_without_children:
-    DELETE FROM notifications n WHERE n.status = 'skipped'
-      AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
-                      WHERE d.notification_id = n.id);
-    -- skipped_mixed_children:
-    DELETE FROM notifications n WHERE n.status = 'skipped'
-      AND EXISTS (SELECT 1 FROM notification_deliveries d
-                  WHERE d.notification_id = n.id AND d.status <> 'skipped');
-    -- expired:
-    DELETE FROM notifications WHERE status = 'expired';
-    -- failed_without_children:
-    DELETE FROM notifications n WHERE n.status = 'failed'
-      AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
-                      WHERE d.notification_id = n.id);
-    -- with_failed_delivery (the whole parent, not the failed delivery):
-    DELETE FROM notifications WHERE id IN (
-      SELECT notification_id FROM notification_deliveries
-      WHERE status = 'failed');
-
-Run the check again; with every count at zero, `comms-deploy.sh
-update`. The consumer comes back with the recreated containers.
+What the product wraps: `update`, `drain`, `drain --apply` and `start`,
+in that order, with the operator at the terminal for step 3.
 
 ## How long comms keeps things
 

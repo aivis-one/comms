@@ -136,7 +136,10 @@ async def test_migration_0013(at_head_afterwards: None) -> None:
         await make()
         stderr = await _migrate("upgrade", "head", expect_ok=False)
         assert f"{kind}=1" in stderr, (kind, stderr[-600:])
-        assert "Draining before the update to 0013" in stderr
+        # The refusal names the command that drains it (F1.5; before, it
+        # pointed at a section of raw queries in the document, which an
+        # operator limited to the product's CLI could not run).
+        assert "comms-deploy.sh drain" in stderr
         # The refusal names only what is there (the pair to the name).
         others = {"active_jobs", "skipped_without_children",
                   "skipped_mixed_children", "expired",
