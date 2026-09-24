@@ -140,6 +140,9 @@ async def test_migration_0013(at_head_afterwards: None) -> None:
         # pointed at a section of raw queries in the document, which an
         # operator limited to the product's CLI could not run).
         assert "comms-deploy.sh drain" in stderr
+        # ...and warns that the counts overlap (F1.6): one row can sit
+        # in two kinds, and an operator must not read the sum as rows.
+        assert "the sum is not the number of rows" in stderr
         # The refusal names only what is there (the pair to the name).
         others = {"active_jobs", "skipped_without_children",
                   "skipped_mixed_children", "expired",

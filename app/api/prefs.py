@@ -1,76 +1,26 @@
 # =============================================================================
-# COMMS Service -- Preferences API (E8-shaped facade) -- FROZEN CONTRACT
+# COMMS Service -- Preferences API (the settings-screen facade)
 # =============================================================================
 #
-# Phase 3b item 3. Preferences live in TWO homes (arch §2.5): category
-# mutes in the category_mutes table, the delivery schedule in the
-# allowed_windows column on the recipient. This facade hides both behind ONE
-# object shaped for the product's settings screen (VELO E8:
-# master_notifications) -- the Phase 6 proxy passes it through without
-# re-assembly or re-conversion.
+# Preferences live in TWO homes (arch §2.5): category mutes in the
+# category_mutes table, the delivery schedule in the allowed_windows
+# column on the recipient. This facade hides both behind ONE object
+# shaped for a product's settings screen, so the product proxy passes it
+# through without re-assembly or re-conversion.
 #
-# CONTRACT (Phase 6 product proxy consumes as-is):
-#
-#   GET  /api/v1/recipients/{rid}/preferences
-#     -> 200 {
-#          "categories": {"<category>": <bool>, ...},
-#              # one key per category the loaded profile DECLARES
-#              # (types.yaml `category` fields); true = enabled
-#              # (NOT muted). Emitted alphabetically -- display order
-#              # is product UI knowledge, not ours. Mutes for
-#              # categories the profile no longer declares are
-#              # omitted (they still gate nothing: no type maps to
-#              # them).
-#          "schedule": {
-#            "from": "22:00", "to": "08:00",     # local wall clock,
-#                                                # HH:MM; from > to
-#                                                # means overnight
-#            "days": ["mon", "fri"]              # window START days,
-#                                                # mon..sun order
-#          } | null,                             # null = no window
-#          "timezone": "<IANA name>" | null
-#              # READ-ONLY: sync-owned (product identity, arch §2.5).
-#              # Shown so the UI can caption the schedule; changing it
-#              # is a PRODUCT feature that syncs back into comms.
-#        }
-#     -> 404 for a recipient comms has not synced (unlike the inbox,
-#        preferences of a nonexistent recipient are not "empty" --
-#        there is no row to hang them on).
-#
-#   PATCH /api/v1/recipients/{rid}/preferences
-#     body: {
-#       "categories": {"<category>": <bool>, ...},   # PARTIAL: only
-#                                                    # listed toggles
-#                                                    # change; unknown
-#                                                    # category -> 422
-#       "schedule": {...} | null                     # FULL REPLACE
-#                                                    # when present
-#                                                    # (all three
-#                                                    # fields
-#                                                    # required);
-#                                                    # null clears;
-#                                                    # OMITTED leaves
-#                                                    # untouched
-#     }
-#     -> 200 <the full GET form>       # round-trip: writing then
-#                                      # reading is a fixed point
-#     Unknown body keys (including "timezone" -- read-only by design)
-#     are rejected with 422, not ignored: silently swallowing a field
-#     the client believed it set is how settings screens lie.
+# THE CONTRACT -- the GET and PATCH forms, the fields of a schedule
+# period and every rule of a write -- is written out in full in ONE
+# place: deploy/INTEGRATION.md, "6. Preferences". It is not repeated
+# here; tests/test_delivery_contract.py holds that section to the
+# models below and to what GET really returns. The error body and
+# paging are the protocol's (INTEGRATION.md, "5. The resource
+# protocol"); who may read whose preferences is the product proxy's
+# check (INTEGRATION.md, "What comms takes on trust").
 #
 # DAY-CODE CONVERSION (arch decision (a)): comms stores ISO weekdays
-# 1..7 but the wire form speaks E8 codes mon..sun -- converted HERE,
-# inside comms, both directions. The product receives the finished E8
-# form; if every client re-converted, this would be half a facade.
-#
-# TRUST MODEL (part of the frozen contract, review 3b): comms does NOT
-# verify that recipient_id belongs to the calling end user -- there is
-# no per-recipient authorization here at all. The shared service token
-# authenticates the PRODUCT (arch decision 14), and the product proxy
-# is the sole owner of the "user X may only read/write user X's
-# preferences" check. Phase 6 MUST substitute the recipient_id
-# server-side from its own authenticated session, never accept it
-# from the client.
+# 1..7 but the wire speaks the codes mon..sun -- converted HERE, inside
+# comms, both directions. The product receives the finished form; if
+# every client re-converted, this would be half a facade.
 # =============================================================================
 
 import re
@@ -286,8 +236,8 @@ async def patch_preferences_form(
 ) -> dict[str, Any]:
     """Partial write: listed toggles change, schedule replaces whole.
 
-    Returns the full updated form (round-trip stability is part of
-    the frozen contract).
+    Returns the full updated form: writing then reading is a fixed
+    point (INTEGRATION.md, "6. Preferences").
     """
     if patch.categories is not None:
         # Toggle semantics: true = enabled = NOT muted. Validation of

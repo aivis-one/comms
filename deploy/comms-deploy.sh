@@ -556,18 +556,24 @@ cmd_db() {
 #                   the migration runs it waits, it does not break --
 #                   so do not stop comms-app here "for symmetry".
 #   drain --apply   DELETE, in this order and in no other:
-#                   1. stop comms-app -- its restart loop re-runs the
+#                   1. check -- nothing to delete -> exit, nothing
+#                      stopped;
+#                   2. confirm: the operator types `yes` (no flag skips
+#                      it -- a deletion is seen by a person). BEFORE the
+#                      stop on purpose: an operator who declines must
+#                      find the stack exactly as it was, not with
+#                      comms-app stopped for a deletion that never
+#                      happened;
+#                   3. stop comms-app -- its restart loop re-runs the
 #                      migration, whose ALTER TABLE would race the
 #                      deletion; stopped, the race cannot exist. Not
 #                      stopped -> nothing is deleted (code 2);
-#                   2. dump the database -- AFTER the stop, so the dump
+#                   4. dump the database -- AFTER the stop, so the dump
 #                      is not of a base the migration may still touch.
 #                      No dump -> nothing is deleted (code 2);
-#                   3. confirm: the operator types `yes` (no flag skips
-#                      it -- a deletion is seen by a person);
-#                   4. delete every kind in ONE transaction -- an
+#                   5. delete every kind in ONE transaction -- an
 #                      interruption rolls it all back;
-#                   5. check again and report before -> after, with the
+#                   6. check again and report before -> after, with the
 #                      dump's path and the next command: `start`.
 #
 # Exit codes: 0 clean, 1 rows to delete (or the deletion was declined),

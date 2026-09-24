@@ -56,6 +56,26 @@ def _driver_source() -> str:
 # -----------------------------------------------------------------------------
 
 
+def _refusal_with_one_row(module: ModuleType) -> None:
+    """Run the migration's refusal against a stub connection that counts
+    one row of every kind -- the text, without a database."""
+
+    class _Result:
+        def scalar_one(self) -> int:
+            return 1
+
+    class _Bind:
+        def execute(self, _statement: Any) -> _Result:
+            return _Result()
+
+    original = module.op.get_bind
+    module.op.get_bind = lambda: _Bind()  # type: ignore[attr-defined]
+    try:
+        module._refuse_on_ambiguous_rows()
+    finally:
+        module.op.get_bind = original  # type: ignore[attr-defined]
+
+
 class TestOneSource:
     def test_every_counted_kind_has_its_deletion(self) -> None:
         module = _m0013()
@@ -72,9 +92,16 @@ class TestOneSource:
         assert "status = 'skipped'" not in script
 
     def test_the_refusal_names_the_verb(self) -> None:
-        source = MIGRATION.read_text(encoding="utf-8")
-        assert "comms-deploy.sh " in source and '"drain` (' in source
-        assert "The protocol update window" in source
+        """Asserted on the refusal as the operator reads it, not on how
+        the source happens to wrap it: the first version matched the
+        line break inside the string literal and broke on the first
+        sentence added before it (F1.6)."""
+        module = _m0013()
+        with pytest.raises(RuntimeError) as excinfo:
+            _refusal_with_one_row(module)
+        refusal = str(excinfo.value)
+        assert "`deploy/comms-deploy.sh drain`" in refusal
+        assert "The protocol update window" in refusal
 
 
 class TestTheDocument:

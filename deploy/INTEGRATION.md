@@ -379,6 +379,69 @@ their section serves) -- never who the caller really is. This is the
 one frozen part of the protocol; it is written down here, and
 `app/api/deps.py` points at this paragraph.
 
+## 6. Preferences
+
+One object per recipient for a settings screen: the category toggles,
+the delivery schedule and the recipient's time zone. Two routes,
+`GET` and `PATCH` on `/api/v1/recipients/{recipient_id}/preferences`;
+errors and trust are the protocol's (section 5). This section is the
+whole contract -- `app/api/prefs.py` points here.
+
+**The schedule is a list of ALLOWED periods.** A period says when comms
+MAY deliver, not when it must stay quiet. One period covers one day and
+never crosses midnight: an evening allowance that runs into the night
+is two periods, one per day. A screen built as "quiet hours" must
+convert to this form before it writes -- sending its quiet window as-is
+would store the opposite of what the person chose.
+
+`GET` answers:
+
+```json
+{
+  "categories": {"billing": true, "reminders": false},
+  "schedule": [
+    {"day": "mon", "from": "09:00", "to": "21:00"},
+    {"day": "sat", "from": "10:00", "to": "24:00"}
+  ],
+  "timezone": "Europe/Berlin"
+}
+```
+
+- `categories` -- one key per category the loaded profile declares,
+  alphabetical; `true` = enabled (not muted).
+- `schedule` -- the periods, or `null`: no schedule, deliver at any hour.
+- `timezone` -- read-only, the product's own snapshot field; periods are
+  read in this zone (the deploy default when `null`).
+- `404` for a recipient comms has never been sent.
+
+`PATCH` takes any of the two writable parts and answers with the full
+`GET` form -- writing then reading is a fixed point:
+
+```json
+{
+  "categories": {"reminders": true},
+  "schedule": [{"day": "tue", "from": "08:30", "to": "12:00"}]
+}
+```
+
+- `categories` -- PARTIAL: only the listed toggles change. An unknown
+  category is a 422, and the whole PATCH is one transaction.
+- `schedule` -- FULL REPLACE when present; `null` clears it; omitted,
+  it is left untouched.
+- An unknown key -- `timezone` included -- is a 422, never ignored.
+
+A period:
+
+| field | form | rule |
+|---|---|---|
+| `day` | `mon` `tue` `wed` `thu` `fri` `sat` `sun` | one day per period |
+| `from` | `HH:MM`, `00:00`..`23:59` | the start |
+| `to` | `HH:MM`, up to `24:00` | after `from` on the same day; `24:00` = end of the day |
+
+A list is refused (422) when it is empty -- send `null` to clear --
+or when two periods of one day overlap or touch: one stretch is one
+period.
+
 ## Operating the comms stack
 
 What an operator needs on the box, collected here because every item
@@ -445,7 +508,9 @@ The window, from comms' side -- every step is a verb of
    All migrations run in one transaction, so the database stays at the
    revision it had before (0011 on a box that ran `main`).
 2. **`drain`** -- checks. Prints the count of every kind, under the
-   names the refusal uses, and deletes nothing. Exit 0 = clean, 1 = rows
+   names the refusal uses, and deletes nothing. The kinds overlap -- one
+   row can count in more than one -- so the sum is not the number of
+   rows. Exit 0 = clean, 1 = rows
    to delete, 2 = it cannot check (the database is down, there is no
    schema, the schema is already at or past 0013).
 3. **`drain --apply`** -- deletes. It stops `comms-app`, dumps the

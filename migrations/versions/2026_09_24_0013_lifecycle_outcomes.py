@@ -176,8 +176,10 @@ def _refuse_on_ambiguous_rows() -> None:
         listed = ", ".join(f"{kind}={count}" for kind, count in blocking.items())
         raise RuntimeError(
             "migration 0013 refuses: these rows cannot be translated "
-            f"without a guess -- {listed}. Run `deploy/comms-deploy.sh "
-            "drain` (deploy/INTEGRATION.md, 'The protocol update window')."
+            f"without a guess -- {listed}. The kinds overlap -- one row can "
+            "count in more than one -- so the sum is not the number of rows. "
+            "Run `deploy/comms-deploy.sh drain` (deploy/INTEGRATION.md, "
+            "'The protocol update window')."
         )
 
 

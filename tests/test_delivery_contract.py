@@ -10,12 +10,15 @@
 # and somewhere else.
 # =============================================================================
 
+import json
 import re
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from app.api.prefs import PeriodIn, PreferencesPatch
 from app.core.config import APP_VERSION
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -184,3 +187,106 @@ class TestTheTemplatesCarryTheContract:
             documented = re.search(rf"^{key}=(.*)$", text, re.M)
             assert documented is not None
             assert documented.group(1).strip() == defaults[field].default
+
+
+# -----------------------------------------------------------------------------
+# The preferences contract: one full copy, held to the code
+# -----------------------------------------------------------------------------
+
+
+_DOC = (_ROOT / "deploy" / "INTEGRATION.md").read_text(encoding="utf-8")
+_PREFS_SOURCE = (_ROOT / "app" / "api" / "prefs.py").read_text(encoding="utf-8")
+
+# The 1.x schedule, in every form it was written: one quiet window as an
+# object {from, to, days} whose `days` were the days it STARTED on,
+# crossing midnight when from > to, with all three fields required.
+_REMOVED_MODEL_FORMS = (
+    '"days"', "`days`", "START", "overnight", "from > to",
+    "all three fields", "{from, to, days}", "FROZEN",
+)
+
+
+def _preferences_section() -> str:
+    start = _DOC.index("## 6. Preferences")
+    return _DOC[start:_DOC.index("\n## ", start + 1)]
+
+
+def _json_examples() -> list[dict[str, Any]]:
+    blocks = re.findall(r"```json\n(.*?)\n```", _preferences_section(), re.S)
+    return [json.loads(block) for block in blocks]
+
+
+def _prefs_header() -> str:
+    """The leading comment block of app/api/prefs.py."""
+    lines = []
+    for line in _PREFS_SOURCE.splitlines():
+        if not line.startswith("#"):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _period_fields() -> set[str]:
+    return {
+        field.alias or name for name, field in PeriodIn.model_fields.items()
+    }
+
+
+class TestThePreferencesContract:
+    """The contract of the settings screen lives in ONE full copy --
+    deploy/INTEGRATION.md, "6. Preferences" -- and the header of
+    app/api/prefs.py points at it. Before 3.0.0 the header was the only
+    copy, and it described the 1.x schedule (one quiet window, `days` as
+    start days, crossing midnight) years after the code had turned it
+    into a list of ALLOWED periods: a connector written from it would
+    have stored the opposite of the person's choice."""
+
+    def test_the_get_example_has_the_keys_get_returns(self) -> None:
+        get_example, _ = _json_examples()
+        assert set(get_example) == {"categories", "schedule", "timezone"}
+
+    async def test_the_get_example_matches_a_real_answer(
+        self, client: Any, db_session: Any,
+    ) -> None:
+        """What GET REALLY returns -- the facade's own keys and the
+        period's own keys -- is what the document shows."""
+        from tests.helpers import create_recipient
+
+        recipient = await create_recipient(db_session)
+        await db_session.commit()
+        get_example, _ = _json_examples()
+        url = f"/api/v1/recipients/{recipient.id}/preferences"
+        written = await client.patch(
+            url, json={"schedule": get_example["schedule"]},
+        )
+        assert written.status_code == 200, written.text
+        answer = (await client.get(url)).json()
+        assert set(answer) == set(get_example)
+        assert answer["schedule"], "the pair: a schedule was really stored"
+        for period in answer["schedule"]:
+            assert set(period) == set(get_example["schedule"][0])
+
+    def test_the_patch_example_has_the_writable_parts(self) -> None:
+        _, patch_example = _json_examples()
+        assert set(patch_example) == set(PreferencesPatch.model_fields)
+
+    def test_a_period_has_the_fields_the_model_takes(self) -> None:
+        get_example, patch_example = _json_examples()
+        for period in [*get_example["schedule"], *patch_example["schedule"]]:
+            assert set(period) == _period_fields()
+        table = re.findall(r"^\| `(\w+)` \|", _preferences_section(), re.M)
+        assert set(table) == _period_fields()
+
+    @pytest.mark.parametrize("form", _REMOVED_MODEL_FORMS)
+    def test_the_removed_model_is_gone(self, form: str) -> None:
+        assert form not in _preferences_section(), form
+        assert form not in _prefs_header(), form
+
+    def test_the_new_model_is_there(self) -> None:
+        """The pair: the section describes the list of allowed periods,
+        and the header points at the section instead of copying it."""
+        section = _preferences_section()
+        assert "list of ALLOWED periods" in section
+        assert '"day"' in section
+        assert "6. Preferences" in _prefs_header()
+        assert "GET /api" not in _prefs_header()

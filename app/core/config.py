@@ -47,12 +47,20 @@ from app.core.channels import (
 #
 # WHAT THE NUMBER PROMISES, because the products read it as an
 # instruction. A MAJOR bump means the contract changed and the caller
-# must change with it; 2.0.0 is the schedule turning over -- the
-# preferences `schedule` key became a list of allowed periods, and a
-# product still sending the old object gets a 422 on every save. A
-# patch bump would have said "safe, do nothing", which is the loudest
-# kind of lie this service can tell.
-APP_VERSION = "2.0.0"
+# must change with it. A patch bump would have said "safe, do nothing",
+# which is the loudest kind of lie this service can tell.
+#
+# 3.0.0 is the PROTOCOL turning over (phase 1): jobs and resources speak
+# a language 2.0.0 does not -- an envelope with a required key and the
+# channel chosen by the profile, outcomes as an enumeration, one error
+# body with a class, one way to page, a versioned recipient snapshot
+# that can be forgotten, idempotency keys on the calls that create, and
+# no `priority`. A product built against 2.0.0 cannot talk to it
+# unchanged, and under one number the question "which protocol runs
+# there" would have no answer. The tag is `v3.0.0`, set by the owner on
+# the merge commit. (2.0.0 was the schedule turning over: the
+# preferences `schedule` key became a list of allowed periods.)
+APP_VERSION = "3.0.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
