@@ -211,7 +211,8 @@ class Settings(BaseSettings):
     notification_max_rate_limit_deferrals: int = 10
 
     # Phase 3a item 5 (+3a.1): retention of TERMINAL notifications
-    # (SENT / PARTIAL_SENT / FAILED / SKIPPED / EXPIRED) -- rows older
+    # (every outcome: sent, partial_sent, failed, expired, cancelled,
+    # suppressed, no_recipients) -- rows older
     # than this are deleted
     # in batches by the worker's retention pass, deliveries follow by
     # FK cascade. Age is measured on created_at.

@@ -264,9 +264,14 @@ class TestNotificationRequestSchema:
 class TestActionDataRules:
     """Item 5: the early line of defense."""
 
-    def test_underscore_key_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="reserved"):
-            validate_action_data({"_channels": ["email"]})
+    def test_underscore_key_is_an_ordinary_variable(self) -> None:
+        """Was test_underscore_key_rejected: an underscore prefix was
+        reserved for comms' internal keys (the channel stash, then the
+        reminder_cancel correlation check). F1.2 took the channel out of
+        the letter and F1.3 took the cancel out of it; with no internal
+        key left, the prefix is an ordinary template variable -- and
+        build_variables renders it (tests/test_lifecycle.py)."""
+        assert validate_action_data({"_ref": "x"}) == {"_ref": "x"}
 
     def test_template_variable_must_be_scalar(self) -> None:
         with pytest.raises(ValidationError, match="template variable"):
@@ -398,16 +403,18 @@ class TestSyncSchemas:
 
 
 class TestReminderCancelSchema:
-    """Phase 6/T1 additive event (Master-chat approved 2026-07-28):
-    the wire mirror of engine/reminders.cancel_reminders."""
+    """The wire mirror of engine/reminders.cancel_reminders.
+
+    F1.3: the cancel carries the ENVELOPE `correlation` of the jobs; the
+    pair correlation_key / correlation_value (a key inside the letter
+    and its value) is gone and refused by name."""
 
     @staticmethod
     def _cancel_data(**overrides: Any) -> dict[str, Any]:
         base: dict[str, Any] = {
             "v": 1,
             "types": ["rem_24h", "rem_1h"],
-            "correlation_key": "booking_id",
-            "correlation_value": str(uuid4()),
+            "correlation": f"booking:{uuid4()}",
         }
         base.update(overrides)
         return base
@@ -417,7 +424,7 @@ class TestReminderCancelSchema:
         event = parse_event(_envelope("reminder_cancel", data))
         assert isinstance(event, ReminderCancel)
         assert event.types == ["rem_24h", "rem_1h"]
-        assert event.correlation_key == "booking_id"
+        assert event.correlation == data["correlation"]
         assert event.target_type is None
         assert event.target_value is None
 
@@ -431,7 +438,7 @@ class TestReminderCancelSchema:
         assert event.target_value == uid
 
     def test_required_fields(self) -> None:
-        for field in ("types", "correlation_key", "correlation_value"):
+        for field in ("types", "correlation"):
             data = self._cancel_data()
             del data[field]
             with pytest.raises(ValidationError, match="missing"):
@@ -453,13 +460,15 @@ class TestReminderCancelSchema:
                 "reminder_cancel", self._cancel_data(types=["ok", 5]),
             ))
 
-    def test_underscore_correlation_key_rejected(self) -> None:
-        """An underscore key cannot exist in action_data (reserved),
-        so the cancel could never match -- loud producer bug."""
-        with pytest.raises(ValidationError, match="reserved"):
+    @pytest.mark.parametrize("field", ["correlation_key", "correlation_value"])
+    def test_the_letter_keyed_fields_are_refused(self, field: str) -> None:
+        """Replaces test_underscore_correlation_key_rejected, whose
+        subject -- a correlation key read from action_data -- no longer
+        exists. A producer still sending the old pair must be told, not
+        ignored (the same class as an unknown profile key)."""
+        with pytest.raises(ValidationError, match=f"unknown field.*{field}"):
             parse_event(_envelope(
-                "reminder_cancel",
-                self._cancel_data(correlation_key="_channels"),
+                "reminder_cancel", self._cancel_data(**{field: "x"}),
             ))
 
     def test_half_target_rejected(self) -> None:

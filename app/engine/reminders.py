@@ -11,10 +11,12 @@
 #   The product schedules each reminder as its own notification_request
 #   under its own key.
 #
-#   What stays here is CANCELLATION: expiring PENDING reminders matched
-#   through a correlation key stored in action_data (velo:
-#   action_data["practice_id"].astext == str(practice_id)), reached by
-#   the reminder_cancel event.
+#   What stays here is CANCELLATION (reached by the reminder_cancel
+#   event): jobs are found by their ENVELOPE correlation -- equality on
+#   an opaque string the product sent, never a key of the letter
+#   (F1.3; before, the match read action_data[correlation_key], which
+#   is comms reading the letter to decide) -- and take the outcome
+#   CANCELLED, not EXPIRED.
 #
 #   The series scheduler that lived here (schedule_reminders) was
 #   removed in F1.2: nothing in the service called it, and every intake
@@ -25,11 +27,12 @@
 # =============================================================================
 
 import structlog
-from sqlalchemy import update
+from sqlalchemy import and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.engine.constants import NotificationStatus
 from app.engine.models import Notification
+from app.engine.service import close_notifications
 
 logger = structlog.get_logger()
 
@@ -38,54 +41,47 @@ async def cancel_reminders(
     session: AsyncSession,
     *,
     types: set[str],
-    correlation_key: str,
-    correlation_value: str,
+    correlation: str,
     target_type: str | None = None,
     target_value: str | None = None,
 ) -> int:
-    """Cancel pending reminders matched by correlation.
+    """Cancel the active jobs of these types sent with this correlation.
 
-    Marks PENDING notifications as EXPIRED where:
+    Matches ACTIVE jobs (pending, or resolved and still waiting --
+    before F1.3 only pending ones, so a reminder already resolved and
+    held by the recipient's schedule could not be cancelled) where:
       - type is in the given set,
-      - action_data[correlation_key] matches correlation_value,
-      - optionally, the target matches (velo's per-booking cancel
-        passed the user target; its per-practice cancel did not).
+      - correlation EQUALS the given one,
+      - optionally, the target matches.
+    Their waiting deliveries are cancelled and each job is folded
+    (app/engine/service.py THE FOLD). Finished jobs are untouched.
 
     Args:
         session: Database session (caller manages commit).
-        types: Reminder type keys to cancel.
-        correlation_key: action_data key (e.g. "<entity>_id").
-        correlation_value: Value to match.
+        types: Type keys to cancel.
+        correlation: The envelope correlation to match.
         target_type: Optional target_type filter.
         target_value: Optional target_value filter.
 
     Returns:
-        Count of expired notifications.
+        Count of cancelled jobs.
     """
     conditions = [
         Notification.type.in_(types),
-        Notification.status == NotificationStatus.PENDING,
-        Notification.action_data[correlation_key].astext
-        == correlation_value,
+        Notification.correlation == correlation,
     ]
     if target_type is not None:
         conditions.append(Notification.target_type == target_type)
     if target_value is not None:
         conditions.append(Notification.target_value == target_value)
 
-    stmt = (
-        update(Notification)
-        .where(*conditions)
-        .values(status=NotificationStatus.EXPIRED)
+    count = await close_notifications(
+        session, and_(*conditions), NotificationStatus.CANCELLED,
     )
-    result = await session.execute(stmt)
-    count: int = result.rowcount  # type: ignore[attr-defined]
-
     if count > 0:
         logger.info(
             "reminders_cancelled",
-            correlation=f"{correlation_key}={correlation_value}",
-            expired_count=count,
+            correlation=correlation,
+            cancelled_count=count,
         )
-
     return count

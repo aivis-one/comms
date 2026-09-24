@@ -195,6 +195,10 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
 MIGRATION_OWNED_CHECKS = frozenset({
     # A half subject_ref (one column set, the other NULL) is forbidden.
     "ck_threads_subject_ref_both_or_neither",
+    # A failed delivery without a failure class cannot exist (F1.3).
+    "ck_deliveries_failure_class",
+    # A wait reason without a time (or the reverse) cannot exist (F1.3).
+    "ck_deliveries_wait_reason",
 })
 
 # Everything the schema must carry although the metadata never mentions

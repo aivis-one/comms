@@ -59,6 +59,7 @@ from sqlalchemy.orm import Mapped, mapped_column, validates
 from app.core.constants import (
     FINGERPRINT_LEN,
     MAX_BODY_LEN,
+    MAX_CATEGORY_LEN,
     MAX_CORRELATION_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_TITLE_LEN,
@@ -161,8 +162,18 @@ class Notification(UUIDMixin, Base):
         nullable=False,
     )
 
+    # The preference category of the type AT INTAKE (F1.3): a snapshot,
+    # like `channels`, so a type removed from the profile after intake
+    # is still mute-gated by the category it was accepted with. NULL
+    # means the type had no category (never gated).
+    category: Mapped[str | None] = mapped_column(
+        String(MAX_CATEGORY_LEN),
+        nullable=True,
+    )
+
     # The product's own reference from the envelope (F1.2). Stored and
-    # handed back untouched; comms never interprets it.
+    # handed back untouched; comms never interprets it. Cancellation
+    # matches it by EQUALITY -- a comparison, not a reading (F1.3).
     correlation: Mapped[str | None] = mapped_column(
         String(MAX_CORRELATION_LEN),
         nullable=True,
@@ -329,13 +340,33 @@ class NotificationDelivery(UUIDMixin, Base):
         nullable=False,
     )
 
-    # Review 1.1: earliest moment the next transient retry may run.
-    # NULL = no gate (fresh delivery or terminal state). Set by the
-    # service on transient failure: now + base * 2**(attempts-1),
-    # capped; by quiet hours (window end); by a 429 (server-named
-    # retry_after + jitter).
+    # Review 1.1: earliest moment the next attempt may run. NULL = no
+    # gate: waiting for its turn, or finished. Set by the service on a
+    # transient failure (now + base * 2**(attempts-1), capped), by the
+    # recipient's schedule (next allowed period), by a 429 (provider's
+    # retry_after + jitter) -- each with its wait_reason below.
     next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # WHY next_retry_at is set (F1.3, spec §5.5): a WaitReason value.
+    # Set exactly when next_retry_at is, only on a pending delivery;
+    # both are cleared when the delivery is taken into an attempt.
+    # Enforced by CHECK ck_deliveries_wait_reason (migration 0013): a
+    # reason without a time, or a time without a reason, cannot exist.
+    wait_reason: Mapped[str | None] = mapped_column(
+        String(30),
+        nullable=True,
+    )
+
+    # WHY the delivery failed (F1.3, spec §5.6): a FailureClass value.
+    # Non-NULL exactly when status is failed -- CHECK
+    # ck_deliveries_failure_class (migration 0013): "failed without a
+    # class" cannot exist. error_message carries the provider's words;
+    # the CLASS is what a program reads, never the text.
+    failure_class: Mapped[str | None] = mapped_column(
+        String(30),
         nullable=True,
     )
 

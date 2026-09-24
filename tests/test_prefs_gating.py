@@ -9,11 +9,12 @@
 #   resolve, family granularity via the type dictionary); the schedule
 #   DEFER delivery via next_retry_at (never suppress), including
 #   backoff retries that land inside a window.
-# Item 7: SKIPPED -- empty-after-mute audiences end SKIPPED; the
+# Item 7: SUPPRESSED (F1.3; SKIPPED before) -- empty-after-mute
+# audiences end SUPPRESSED; the
 #   status is terminal (invisible to the poll, immune to rollup).
 # Phase 2.1 item 3: LATE MUTES -- a mute set while a delivery sits
 #   gated (backoff / schedule) closes it out with
-#   DeliveryStatus.SKIPPED at deliver time; rollup treats skips as
+#   DeliveryStatus.SUPPRESSED at deliver time; rollup treats skips as
 #   non-events (matrix covered below).
 #
 # Recipients here draw telegram_ids from the Phase 2 band 81000-81999.
@@ -41,6 +42,7 @@ from app.core.database import get_session_factory
 from app.core.exceptions import NotFoundError, ValidationError
 from app.engine.constants import (
     DeliveryStatus,
+    FailureClass,
     NotificationStatus,
     TargetType,
 )
@@ -307,7 +309,8 @@ class TestPreferenceApi:
 
 
 class TestMuteGating:
-    """Item 6 (mutes) + item 7 (SKIPPED): resolve-time gating."""
+    """Item 6 (mutes) + item 7 (SUPPRESSED, SKIPPED before F1.3):
+    resolve-time gating."""
 
     async def test_family_mute_gates_all_family_types(
         self, db_session: AsyncSession,
@@ -329,12 +332,15 @@ class TestMuteGating:
             )
             deliveries = await resolve_notification(db_session, notification)
             assert deliveries == []
-            assert notification.status == NotificationStatus.SKIPPED
+            assert notification.status == NotificationStatus.SUPPRESSED
 
-    async def test_all_muted_audience_marks_skipped(
+    async def test_all_muted_audience_marks_suppressed(
         self, db_session: AsyncSession,
     ) -> None:
-        """Everyone muted -> zero deliveries + SKIPPED, not FAILED."""
+        """Everyone muted -> zero deliveries + SUPPRESSED, not FAILED.
+
+        F1.3: was SKIPPED, which also meant "empty audience"; the
+        recipients' decision is its own outcome now."""
         recipient = await _phase2_recipient(db_session)
         await set_category_muted(
             db_session, recipient.id, "unit_updates", True,
@@ -350,7 +356,7 @@ class TestMuteGating:
         )
         deliveries = await resolve_notification(db_session, notification)
         assert deliveries == []
-        assert notification.status == NotificationStatus.SKIPPED
+        assert notification.status == NotificationStatus.SUPPRESSED
         assert await _fetch_deliveries(notification.id) == []
 
     async def test_mixed_audience_delivers_to_unmuted_only(
@@ -423,10 +429,11 @@ class TestMuteGating:
             set()
         )
 
-    async def test_skipped_is_terminal(
+    async def test_suppressed_is_terminal(
         self, db_session: AsyncSession,
     ) -> None:
-        """Item 7: SKIPPED is invisible to the poll and rollup-proof."""
+        """Item 7: SUPPRESSED (SKIPPED before F1.3) is invisible to the
+        poll and rollup-proof."""
         recipient = await _phase2_recipient(db_session)
         await set_category_muted(
             db_session, recipient.id, "unit_updates", True,
@@ -441,17 +448,17 @@ class TestMuteGating:
             target_value=str(recipient.id),
         )
         await resolve_notification(db_session, notification)
-        assert notification.status == NotificationStatus.SKIPPED
+        assert notification.status == NotificationStatus.SUPPRESSED
 
         # Rollup must not reinterpret "zero deliveries" as FAILED.
         await rollup_notification(db_session, notification)
-        assert notification.status == NotificationStatus.SKIPPED
+        assert notification.status == NotificationStatus.SUPPRESSED
         await db_session.commit()
 
         # The worker poll only sees PENDING/PROCESSING.
         assert await process_pending_notifications() == 0
         fresh = await _fetch_notification(notification.id)
-        assert fresh.status == NotificationStatus.SKIPPED
+        assert fresh.status == NotificationStatus.SUPPRESSED
 
 
 class TestQuietHoursGating:
@@ -583,13 +590,14 @@ class TestQuietHoursGating:
 
 class TestLateMuteAtDeliver:
     """Phase 2.1 item 3: mutes set after resolve close gated
-    deliveries out with DeliveryStatus.SKIPPED at deliver time."""
+    deliveries out with DeliveryStatus.SUPPRESSED (SKIPPED before F1.3)
+    at deliver time."""
 
     async def test_late_mute_closes_deferred_delivery(
         self, db_session: AsyncSession,
     ) -> None:
         """Done-when scenario: delivery created -> mute -> gate opens
-        -> NO send; delivery and notification end SKIPPED."""
+        -> NO send; delivery and notification end SUPPRESSED."""
         recipient = await _phase2_recipient(db_session)
         await set_schedule(
             db_session, recipient.id, windows=_allowed_later(),
@@ -621,17 +629,17 @@ class TestLateMuteAtDeliver:
         await process_pending_notifications()
 
         (delivery,) = await _fetch_deliveries(notification.id)
-        assert delivery.status == DeliveryStatus.SKIPPED
+        assert delivery.status == DeliveryStatus.SUPPRESSED
         assert delivery.attempts == 0  # a skip is not an attempt
         assert delivery.sent_at is None
         fresh = await _fetch_notification(notification.id)
-        assert fresh.status == NotificationStatus.SKIPPED
+        assert fresh.status == NotificationStatus.SUPPRESSED
 
     async def test_late_mute_mixed_audience_keeps_history(
         self, db_session: AsyncSession,
     ) -> None:
         """One of two mutes while backoff-gated: the muted delivery
-        closes SKIPPED with its transient history intact, the other
+        closes SUPPRESSED with its transient history intact, the other
         sends, the notification rolls up SENT.
 
         R-0: this test requested telegram and relied on the old stub,
@@ -677,28 +685,32 @@ class TestLateMuteAtDeliver:
             d.recipient_id: d
             for d in await _fetch_deliveries(notification.id)
         }
-        skipped = by_recipient[muted.id]
+        suppressed = by_recipient[muted.id]
         sent = by_recipient[listening.id]
-        assert skipped.status == DeliveryStatus.SKIPPED
-        assert skipped.attempts == 1  # prior transient history kept
-        assert skipped.error_message is not None
+        assert suppressed.status == DeliveryStatus.SUPPRESSED
+        assert suppressed.attempts == 1  # prior transient history kept
+        assert suppressed.error_message is not None
         assert sent.status == DeliveryStatus.SENT
         fresh = await _fetch_notification(notification.id)
         assert fresh.status == NotificationStatus.SENT
 
-    async def test_rollup_matrix_with_skipped(
+    async def test_rollup_matrix_with_suppressed(
         self, db_session: AsyncSession,
     ) -> None:
-        """Skips are non-events: the verdict comes from the rest."""
+        """Suppressions are non-events: the verdict comes from the rest.
+
+        F1.3: SKIPPED became SUPPRESSED at both levels (the "everyone
+        muted" half of the old SKIPPED); the verdicts are unchanged --
+        which is THE FOLD's rule 1, now written next to the code."""
         cases: list[tuple[str, str, str]] = [
-            (DeliveryStatus.SKIPPED, DeliveryStatus.SENT,
+            (DeliveryStatus.SUPPRESSED, DeliveryStatus.SENT,
              NotificationStatus.SENT),
-            (DeliveryStatus.SKIPPED, DeliveryStatus.FAILED,
+            (DeliveryStatus.SUPPRESSED, DeliveryStatus.FAILED,
              NotificationStatus.FAILED),
-            (DeliveryStatus.SKIPPED, DeliveryStatus.PENDING,
+            (DeliveryStatus.SUPPRESSED, DeliveryStatus.PENDING,
              NotificationStatus.PROCESSING),
-            (DeliveryStatus.SKIPPED, DeliveryStatus.SKIPPED,
-             NotificationStatus.SKIPPED),
+            (DeliveryStatus.SUPPRESSED, DeliveryStatus.SUPPRESSED,
+             NotificationStatus.SUPPRESSED),
         ]
         await _phase2_recipient(db_session)
         await _phase2_recipient(db_session)
@@ -715,8 +727,14 @@ class TestLateMuteAtDeliver:
             )
             deliveries = await resolve_notification(db_session, notification)
             assert len(deliveries) == 2
-            deliveries[0].status = status_a
-            deliveries[1].status = status_b
+            for delivery, status in zip(
+                deliveries, (status_a, status_b), strict=True,
+            ):
+                delivery.status = status
+                # A failed delivery carries its class (CHECK
+                # ck_deliveries_failure_class, F1.3).
+                if status == DeliveryStatus.FAILED:
+                    delivery.failure_class = FailureClass.MESSAGE_REJECTED
             await db_session.flush()
 
             await rollup_notification(db_session, notification)
@@ -728,8 +746,8 @@ class TestLateMuteAtDeliver:
     async def test_rollup_triple_mixed_is_partial_sent(
         self, db_session: AsyncSession,
     ) -> None:
-        """Phase 2.2 gap: the triple skipped+sent+failed -- after
-        subtracting the skip, {sent, failed} remains -> PARTIAL_SENT."""
+        """Phase 2.2 gap: the triple suppressed+sent+failed -- after
+        subtracting the suppression, {sent, failed} remains -> PARTIAL_SENT."""
         for _ in range(3):
             await _phase2_recipient(db_session)
         notification = await create_notification(
@@ -743,9 +761,10 @@ class TestLateMuteAtDeliver:
         )
         deliveries = await resolve_notification(db_session, notification)
         assert len(deliveries) == 3
-        deliveries[0].status = DeliveryStatus.SKIPPED
+        deliveries[0].status = DeliveryStatus.SUPPRESSED
         deliveries[1].status = DeliveryStatus.SENT
         deliveries[2].status = DeliveryStatus.FAILED
+        deliveries[2].failure_class = FailureClass.MESSAGE_REJECTED
         await db_session.flush()
 
         await rollup_notification(db_session, notification)

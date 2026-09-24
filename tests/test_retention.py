@@ -101,7 +101,11 @@ class TestRetentionPass:
                 NotificationStatus.SENT,
                 NotificationStatus.PARTIAL_SENT,
                 NotificationStatus.FAILED,
-                NotificationStatus.SKIPPED,
+                # F1.3: SKIPPED split into SUPPRESSED and NO_RECIPIENTS,
+                # and CANCELLED is new -- every outcome is retained away.
+                NotificationStatus.SUPPRESSED,
+                NotificationStatus.NO_RECIPIENTS,
+                NotificationStatus.CANCELLED,
                 NotificationStatus.EXPIRED,
             )
         ]

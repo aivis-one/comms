@@ -10,7 +10,7 @@
 #   - notify_new_message         -- item 1: a posted message pings the
 #     OTHER side of the thread through the Phase 2 gate (create a
 #     Notification of the right msg_* type; the engine mutes /
-#     hours / SKIPPED-on-empty it like any other). Called in-process by
+#     hours / no-recipients it like any other). Called in-process by
 #     the POST handler, in the SAME session as post_message (creation
 #     atomic with the message; delivery stays async on the worker tick).
 #   - consume_close_notifications -- item 2: the sibling of auto-close.
@@ -217,7 +217,7 @@ async def notify_new_message(
 
     Creation is atomic with the message (same session -- fork 3); the
     engine delivers on the worker tick and applies the SAME Phase 2
-    gate (mute / schedule / SKIPPED-on-empty) as any notification.
+    gate (mute / schedule / no-recipients) as any notification.
     Caller commits.
     """
     created: list[Notification] = []

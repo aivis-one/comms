@@ -24,10 +24,11 @@ from app.core.config import settings
 from app.core.database import get_session_factory
 from app.engine.constants import (
     DeliveryStatus,
+    FailureClass,
     NotificationStatus,
     TargetType,
 )
-from app.engine.formatters import PermanentDeliveryError
+from app.engine.formatters import MessageRejectedError
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import (
     cleanup_expired_notifications,
@@ -83,10 +84,14 @@ class _FailingFormatter:
 
 
 class _PermanentFormatter:
-    """Formatter that always fails permanently."""
+    """Formatter that always fails permanently.
+
+    Raises MessageRejectedError: since F1.3 MessageRejectedError is
+    abstract and a channel raises the subclass that IS its failure
+    class (a blocked bot -> this message rejected)."""
 
     async def deliver(self, *args: Any, **kwargs: Any) -> bool:
-        raise PermanentDeliveryError("bot was blocked by the user")
+        raise MessageRejectedError("bot was blocked by the user")
 
 
 class TestResolveStage:
@@ -135,13 +140,17 @@ class TestResolveStage:
         assert len(second) == 1
         assert first[0].id == second[0].id
 
-    async def test_no_targets_marks_skipped(
+    async def test_no_targets_marks_no_recipients(
         self, db_session: AsyncSession,
     ) -> None:
-        """Empty audience -> SKIPPED (Phase 2; was FAILED in Phase 1).
+        """Empty audience -> NO_RECIPIENTS (F1.3; SKIPPED since Phase 2,
+        FAILED in Phase 1).
 
         Nothing broke -- there was simply nobody to deliver to. FAILED
-        is reserved for real faults so it keeps alerting value.
+        is reserved for real faults so it keeps alerting value. Was
+        SKIPPED, which also meant "everyone muted"; the two are separate
+        outcomes now, because they call for different actions (fix the
+        sync / nothing to fix).
         """
         notification = await create_notification(
             db_session,
@@ -155,7 +164,7 @@ class TestResolveStage:
         deliveries = await resolve_notification(db_session, notification)
 
         assert deliveries == []
-        assert notification.status == NotificationStatus.SKIPPED
+        assert notification.status == NotificationStatus.NO_RECIPIENTS
 
     async def test_default_channel_is_in_app(
         self, db_session: AsyncSession,
@@ -269,7 +278,7 @@ class TestDeliverAndRollup:
     async def test_permanent_failure_no_attempt_increment(
         self, db_session: AsyncSession,
     ) -> None:
-        """PermanentDeliveryError -> FAILED immediately, attempts stay 0."""
+        """MessageRejectedError -> FAILED immediately, attempts stay 0."""
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
@@ -290,6 +299,7 @@ class TestDeliverAndRollup:
 
         (delivery,) = await _fetch_deliveries(notification.id)
         assert delivery.status == DeliveryStatus.FAILED
+        assert delivery.failure_class == FailureClass.MESSAGE_REJECTED
         assert delivery.attempts == 0
         assert delivery.next_retry_at is None
         assert delivery.error_message is not None
@@ -388,7 +398,7 @@ class TestDeliverAndRollup:
                 recipient: Any,
             ) -> bool:
                 if recipient.id == blocked.id:
-                    raise PermanentDeliveryError("chat not found")
+                    raise MessageRejectedError("chat not found")
                 return True
 
         with patch(
@@ -404,6 +414,9 @@ class TestDeliverAndRollup:
         by_recipient = {d.recipient_id: d for d in deliveries}
         assert by_recipient[healthy.id].status == DeliveryStatus.SENT
         assert by_recipient[blocked.id].status == DeliveryStatus.FAILED
+        assert by_recipient[blocked.id].failure_class == (
+            FailureClass.MESSAGE_REJECTED
+        )
 
 
 class TestRetryBackoff:

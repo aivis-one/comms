@@ -14,10 +14,11 @@
 #                          rejected_at_intake
 #   UserUpserted        -> audience.sync.user_upserted   (item 4)
 #   GroupChanged        -> audience.sync.group_changed   (item 4)
-#   ReminderCancel      -> engine.reminders.cancel_reminders
-#                          (Phase 6/T1 additive event; naturally
+#   ReminderCancel      -> engine.reminders.cancel_reminders: jobs
+#                          matched by envelope correlation take the
+#                          outcome CANCELLED (F1.3); naturally
 #                          idempotent -- a replay or a no-match set is
-#                          a zero-row update, never an error)
+#                          a zero-row update, never an error
 #
 # The Phase 2 sync functions are called AS-IS (the handoff's explicit
 # rule: wire them, do not rewrite them).
@@ -126,24 +127,21 @@ async def handle_event(
             member=event.member,
         )
         return HandleResult.PROCESSED
-    # ReminderCancel (Phase 6/T1). cancel_reminders expires PENDING
-    # matches only -- replays and no-match sets are zero-row updates,
-    # so at-least-once delivery needs no dedup here.
+    # ReminderCancel. cancel_reminders closes ACTIVE matches only --
+    # replays and no-match sets are zero-row updates, so at-least-once
+    # delivery needs no dedup here.
     assert isinstance(event, ReminderCancel)
     cancelled = await cancel_reminders(
         session,
         types=set(event.types),
-        correlation_key=event.correlation_key,
-        correlation_value=event.correlation_value,
+        correlation=event.correlation,
         target_type=event.target_type,
         target_value=event.target_value,
     )
     logger.info(
         "reminder_cancel_handled",
-        correlation=(
-            f"{event.correlation_key}={event.correlation_value}"
-        ),
-        expired_count=cancelled,
+        correlation=event.correlation,
+        cancelled_count=cancelled,
     )
     return HandleResult.PROCESSED
 

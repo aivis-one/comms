@@ -330,6 +330,81 @@ process actually uses:
 
     docker exec comms-app python -c "from app.core.config import settings; print(settings.email_api_base_url)"
 
+## Draining before the update to 0013
+
+Migration 0013 (the lifecycle and outcome taxonomy) translates only
+the rows whose meaning the row itself states. A row it cannot
+translate without a guess makes it **refuse**: `comms-app` does not
+start, and `docker logs comms-app` names the kinds below with their
+counts. The reasons for each kind are in the migration's docstring
+(`migrations/versions/2026_09_24_0013_lifecycle_outcomes.py`). Run this
+step on the box **before** `comms-deploy.sh update`.
+
+All queries run inside the database container:
+
+    docker exec -i comms-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+**1. Stop intake and let the queue empty.** Stop the consumer, so no
+new job is accepted -- the product's events wait in the stream and are
+read after the update:
+
+    docker stop comms-consumer
+
+The worker keeps delivering. A job scheduled for the future
+(`scheduled_at` ahead, a reminder) does not leave the queue by waiting:
+its only exit before the update is to be deleted (it will not be sent)
+and re-emitted by the product afterwards.
+
+**2. Check.** Every count must be zero; the names are the ones the
+refusal prints:
+
+    SELECT
+      (SELECT count(*) FROM notifications
+        WHERE status IN ('pending', 'processing'))            AS active_jobs,
+      (SELECT count(*) FROM notifications n WHERE n.status = 'skipped'
+        AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
+                        WHERE d.notification_id = n.id))      AS skipped_without_children,
+      (SELECT count(*) FROM notifications n WHERE n.status = 'skipped'
+        AND EXISTS (SELECT 1 FROM notification_deliveries d
+                    WHERE d.notification_id = n.id
+                      AND d.status <> 'skipped'))             AS skipped_mixed_children,
+      (SELECT count(*) FROM notifications
+        WHERE status = 'expired')                             AS expired,
+      (SELECT count(*) FROM notifications n WHERE n.status = 'failed'
+        AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
+                        WHERE d.notification_id = n.id))      AS failed_without_children,
+      (SELECT count(DISTINCT notification_id) FROM notification_deliveries
+        WHERE status = 'failed')                              AS with_failed_delivery;
+
+**3. Delete what cannot be translated**, in the same breakdown. Whole
+notifications go; their deliveries follow by cascade. Everything else
+-- sent history, the inbox -- stays.
+
+    -- active_jobs that will not drain by waiting (scheduled ahead):
+    DELETE FROM notifications
+      WHERE status = 'pending' AND scheduled_at > now();
+    -- skipped_without_children:
+    DELETE FROM notifications n WHERE n.status = 'skipped'
+      AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
+                      WHERE d.notification_id = n.id);
+    -- skipped_mixed_children:
+    DELETE FROM notifications n WHERE n.status = 'skipped'
+      AND EXISTS (SELECT 1 FROM notification_deliveries d
+                  WHERE d.notification_id = n.id AND d.status <> 'skipped');
+    -- expired:
+    DELETE FROM notifications WHERE status = 'expired';
+    -- failed_without_children:
+    DELETE FROM notifications n WHERE n.status = 'failed'
+      AND NOT EXISTS (SELECT 1 FROM notification_deliveries d
+                      WHERE d.notification_id = n.id);
+    -- with_failed_delivery (the whole parent, not the failed delivery):
+    DELETE FROM notifications WHERE id IN (
+      SELECT notification_id FROM notification_deliveries
+      WHERE status = 'failed');
+
+Run the check again; with every count at zero, `comms-deploy.sh
+update`. The consumer comes back with the recreated containers.
+
 ## How long comms keeps things
 
 Two questions every product asks once, answered here so the answer is

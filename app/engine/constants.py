@@ -18,23 +18,26 @@
 #     cbshome role:<r>      -> GROUP "role_<r>"
 #     velo    practice:<id> -> GROUP "practice_<id>"
 #
-# NOTIFICATION STATUS LIFECYCLE (cbshome base, incl. PARTIAL_SENT;
-# SKIPPED added in Phase 2):
-#   pending -> processing -> sent | partial_sent | failed | expired
-#                                 | skipped
+# NOTIFICATION STATUS LIFECYCLE (spec §5.5; F1.3):
+#   pending -> no_recipients | suppressed | expired | cancelled
+#   pending -> processing -> THE FOLD of the deliveries
+#                            (app/engine/service.py): sent |
+#                            partial_sent | failed | expired |
+#                            cancelled | suppressed | no_recipients
 #
-#   SKIPPED (terminal) -- the pipeline ran fine but there was nobody
-#   to deliver to: the audience resolved empty, or every resolved
-#   recipient has the notification's category muted. Neither a fault
-#   (FAILED would drown real alerts) nor a delivery (SENT would hide
-#   a broken sync).
+#   NO_RECIPIENTS and SUPPRESSED are the two facts one SKIPPED used to
+#   hide: an empty audience (fix the sync) and every recipient muted
+#   (their decision). Neither is a fault (FAILED would drown real
+#   alerts) nor a delivery (SENT would hide a broken sync).
 #
-# DELIVERY STATUS LIFECYCLE (SKIPPED added in Phase 2.1):
-#   pending -> sent | failed | skipped
+# DELIVERY STATUS LIFECYCLE (F1.3):
+#   pending -> sent | failed (+ FailureClass) | suppressed | expired
+#            | cancelled
+#   pending -> pending with a WaitReason (schedule, 429, backoff)
 #
-#   SKIPPED (terminal) -- the recipient muted the notification's
-#   category while the delivery sat gated (backoff or quiet hours).
-#   Mirrors the notification-level SKIPPED: not a fault, not a send.
+#   SUPPRESSED -- the recipient muted the category while the delivery
+#   waited: not a fault, not a send. EXPIRED / CANCELLED -- the parent
+#   was closed while this delivery waited.
 # =============================================================================
 
 import enum
@@ -50,7 +53,14 @@ class IntakeOutcomeClass(enum.StrEnum):
 
 
 class NotificationStatus(enum.StrEnum):
-    """Notification lifecycle status."""
+    """Notification lifecycle status (spec §5.5).
+
+    accepted -> queued -> in flight -> outcome. Active: PENDING (not
+    resolved yet), PROCESSING (resolved, deliveries on their way). The
+    rest are outcomes; the parent's outcome is the FOLD of its
+    deliveries (app/engine/service.py rollup_notification), except the
+    three that are decided before any delivery exists.
+    """
 
     PENDING = "pending"
     PROCESSING = "processing"
@@ -58,23 +68,71 @@ class NotificationStatus(enum.StrEnum):
     PARTIAL_SENT = "partial_sent"
     FAILED = "failed"
     EXPIRED = "expired"
-    # Terminal: pipeline OK, nobody to deliver to (empty audience or
-    # all recipients muted the category). Introduced in Phase 2; the
-    # status column is varchar, so no DDL is needed (append-only).
-    SKIPPED = "skipped"
+    # The product (or its reminder_cancel) cancelled the job (F1.3).
+    CANCELLED = "cancelled"
+    # Every recipient muted the category: the recipients' decision, NOT
+    # a failure -- nothing to fix (F1.3; was half of SKIPPED).
+    SUPPRESSED = "suppressed"
+    # The audience was empty: fix the product's sync (F1.3; was the
+    # other half of SKIPPED).
+    NO_RECIPIENTS = "no_recipients"
 
 
 class DeliveryStatus(enum.StrEnum):
-    """Per-recipient, per-channel delivery status."""
+    """Per-recipient, per-channel delivery status.
+
+    "In flight" is not a status: an attempt runs inside one transaction
+    under the notification's row lock and is never committed half-way,
+    so nothing outside can observe it.
+    """
 
     PENDING = "pending"
     SENT = "sent"
+    # Always with a FailureClass (CHECK ck_deliveries_failure_class).
     FAILED = "failed"
-    # Terminal: the recipient muted the category after the delivery
-    # row was created (late mute, re-checked at deliver time). Varchar
-    # column -- no DDL needed (append-only), same as the notification
-    # SKIPPED.
-    SKIPPED = "skipped"
+    # The recipient muted the category (late mute, re-checked at
+    # deliver time): the recipient's decision, not a failure.
+    SUPPRESSED = "suppressed"
+    # The parent expired / was cancelled while this delivery waited.
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class FailureClass(enum.StrEnum):
+    """Why a delivery failed -- four outcomes, four actions (spec §5.6).
+
+    Set together with DeliveryStatus.FAILED and only then; one channel
+    exception maps to exactly one class, in one place
+    (app/engine/service.py _deliver_single).
+    """
+
+    # The channel was unavailable for the whole attempt budget.
+    TRANSIENT_EXHAUSTED = "transient_exhausted"
+    # This message will not arrive; others go (recipient closed the
+    # channel, malformed letter for this channel, provider rejected it).
+    MESSAGE_REJECTED = "message_rejected"
+    # The channel is dead on this deploy -- fix the deploy. LOUD.
+    CONFIGURATION = "configuration"
+    # The recipient has no address in this channel -- fix the sync.
+    NO_ADDRESS = "no_address"
+
+
+class WaitReason(enum.StrEnum):
+    """Why a pending delivery waits (spec §5.5), next to next_retry_at.
+
+    Set exactly when next_retry_at is set (CHECK
+    ck_deliveries_wait_reason); both are cleared when the delivery is
+    taken into an attempt. A pending delivery with neither is waiting
+    for its turn in the queue.
+    """
+
+    # Outside the recipient's allowed delivery periods.
+    RECIPIENT_SCHEDULE = "recipient_schedule"
+    # The provider named a wait (HTTP 429).
+    PROVIDER_RATE_LIMIT = "provider_rate_limit"
+    # comms' own backoff after a transient failure -- neither the
+    # recipient nor the provider named it.
+    TRANSIENT_BACKOFF = "transient_backoff"
 
 
 class DeliveryChannel(enum.StrEnum):

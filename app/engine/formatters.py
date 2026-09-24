@@ -79,11 +79,39 @@ logger = structlog.get_logger()
 
 
 class PermanentDeliveryError(Exception):
-    """Raised when delivery fails permanently and should not be retried.
+    """A delivery failed permanently and must not be retried.
 
-    Examples: bot blocked by user, chat not found, recipient has no
-    telegram_id.
+    ABSTRACT (F1.3): a channel raises one of the three subclasses below,
+    never this class -- the subclass IS the failure class (spec §5.6),
+    and app/engine/service.py _deliver_single maps it to a FailureClass
+    in one place. Raising the base directly is refused at construction,
+    so a new raise site cannot silently drop the class.
     """
+
+    def __init__(self, *args: object) -> None:
+        if type(self) is PermanentDeliveryError:
+            raise TypeError(
+                "PermanentDeliveryError is abstract: raise "
+                "ConfigurationError, MessageRejectedError or NoAddressError"
+            )
+        super().__init__(*args)
+
+
+class ConfigurationError(PermanentDeliveryError):
+    """The channel is dead on this deploy: every message will die the
+    same way until the deploy changes (bad credentials, a channel that
+    is not configured, an account without rights). Logged LOUDLY."""
+
+
+class MessageRejectedError(PermanentDeliveryError):
+    """This message will not arrive; the channel is alive and other
+    messages go (the recipient closed the channel, the letter is
+    malformed for this channel, the provider refused this message)."""
+
+
+class NoAddressError(PermanentDeliveryError):
+    """The recipient has no usable address in this channel -- the
+    product's sync, not the channel, is what to fix."""
 
 
 class RateLimitedError(Exception):
@@ -196,7 +224,7 @@ class UnavailableChannelFormatter:
             channel=self._channel,
             reason=self._reason,
         )
-        raise PermanentDeliveryError(
+        raise ConfigurationError(
             f"channel '{self._channel}' is not available on this "
             f"deploy: {self._reason}"
         )
@@ -301,7 +329,7 @@ class TelegramFormatter:
 
         params = action_data.get("params") or {}
         if len(params) > 1:
-            raise PermanentDeliveryError(
+            raise MessageRejectedError(
                 f"deep link: action {action!r} carries {len(params)} "
                 f"parameters ({sorted(params)}); the startapp encoding "
                 f"fits at most ONE. Put composite targets behind an "
@@ -315,13 +343,13 @@ class TelegramFormatter:
             startapp = str(action)
 
         if len(startapp) > _STARTAPP_MAX_LEN:
-            raise PermanentDeliveryError(
+            raise MessageRejectedError(
                 f"deep link: startapp value is {len(startapp)} chars, "
                 f"the Telegram limit is {_STARTAPP_MAX_LEN}: "
                 f"{startapp[:80]!r}"
             )
         if not _STARTAPP_ALLOWED_RE.fullmatch(startapp):
-            raise PermanentDeliveryError(
+            raise MessageRejectedError(
                 f"deep link: startapp value contains characters outside "
                 f"[A-Za-z0-9_-]: {startapp!r}"
             )
@@ -359,11 +387,15 @@ class TelegramFormatter:
                 Telegram API reports a permanent failure.
         """
         if not recipient.telegram_id:
-            raise PermanentDeliveryError("Recipient has no telegram_id")
+            raise NoAddressError("Recipient has no telegram_id")
 
         # Lazy import: aiogram types only needed on the real send path.
         from aiogram.enums import ParseMode
-        from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+        from aiogram.exceptions import (
+            TelegramAPIError,
+            TelegramRetryAfter,
+            TelegramUnauthorizedError,
+        )
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         # Trust boundary (review 1.1): the TEMPLATE is trusted and may
@@ -490,10 +522,19 @@ class TelegramFormatter:
                     float(exc.retry_after),
                     _reason_tail(_clean_reason(exc.message), 200),
                 ) from exc
+            # A rejected bot token: the channel is dead for EVERY message
+            # until the deploy changes. Before F1.3 this fell through to
+            # the transient path and burned the whole attempt budget,
+            # ending as "transient attempts exhausted" -- a dead channel
+            # disguised as weather.
+            if isinstance(exc, TelegramUnauthorizedError):
+                raise ConfigurationError(
+                    f"Telegram rejected the bot token: {exc}"
+                ) from exc
             error_msg = str(exc).lower()
             for perm_error in _PERMANENT_ERRORS:
                 if perm_error in error_msg:
-                    raise PermanentDeliveryError(
+                    raise MessageRejectedError(
                         f"Telegram permanent failure: {exc}"
                     ) from exc
             # Transient error -- service layer retries.
@@ -591,7 +632,7 @@ class EmailFormatter:
             # delivery-time budget of the recipients who do have one. An
             # address that appears later is a reason for a NEW
             # notification from the product, not for reviving this one.
-            raise PermanentDeliveryError(
+            raise NoAddressError(
                 "recipient has no usable email address "
                 f"({_address_defect(recipient.email)})"
             )
@@ -761,7 +802,7 @@ class EmailFormatter:
             provider_message_id=payload.get("id"),
             provider_message=_reason_for_log(reason),
         )
-        raise PermanentDeliveryError(
+        raise MessageRejectedError(
             f"provider rejected the message ({status})"
             f"{_reason_tail(reason, 200)}"
         )
@@ -800,7 +841,7 @@ class EmailFormatter:
             status=status,
             provider_message=_reason_for_log(reason),
         )
-        raise PermanentDeliveryError(
+        raise ConfigurationError(
             f"provider refused on configuration ({status})"
             f"{_reason_tail(reason, 200)}"
         )
@@ -1133,10 +1174,10 @@ def build_variables(notification: Notification) -> dict[str, Any]:
     """
     variables: dict[str, Any] = {}
     if notification.action_data:
-        for key, value in notification.action_data.items():
-            # Skip internal keys (prefixed with underscore).
-            if not key.startswith("_"):
-                variables[key] = value
+        # Every key is a template variable: the letter carries no
+        # internal keys since F1.2 (the channel left action_data), and
+        # the underscore reservation that guarded them is gone (F1.3).
+        variables.update(notification.action_data)
     # Core fields always win over action_data.
     variables["title"] = notification.title
     variables["body"] = notification.body

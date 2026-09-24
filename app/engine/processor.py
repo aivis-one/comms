@@ -47,13 +47,14 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select
 
 from app.core.config import settings
 from app.core.database import get_session_factory
 from app.engine.constants import DeliveryStatus, NotificationStatus
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
+    close_notifications,
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
@@ -77,22 +78,19 @@ async def process_pending_notifications() -> int:
     now = datetime.now(UTC)
 
     # -- Step 0: Expire overdue notifications (own session) --
+    # Through the deliveries (F1.3): the waiting ones expire, the job is
+    # folded -- a job half of which went out is PARTIAL_SENT, and its
+    # waiting deliveries no longer stay PENDING forever.
     async with factory() as session:
         try:
-            expire_stmt = (
-                update(Notification)
-                .where(
-                    Notification.status.in_([
-                        NotificationStatus.PENDING,
-                        NotificationStatus.PROCESSING,
-                    ]),
+            expired_count = await close_notifications(
+                session,
+                and_(
                     Notification.expiry_at.isnot(None),
                     Notification.expiry_at < now,
-                )
-                .values(status=NotificationStatus.EXPIRED)
+                ),
+                NotificationStatus.EXPIRED,
             )
-            expire_result = await session.execute(expire_stmt)
-            expired_count: int = expire_result.rowcount  # type: ignore[attr-defined]
             if expired_count:
                 logger.info("notifications_expired", count=expired_count)
             await session.commit()
@@ -200,10 +198,11 @@ async def cleanup_expired_notifications() -> int:
 
     Removes notifications where:
       - expiry_at < now()
-      - status in (sent, partial_sent, expired, skipped)
+      - status is an outcome other than failed (a failure is kept for
+        inspection until general retention takes it)
 
-    SKIPPED is terminal (Phase 2): an expired skipped notification is
-    as dead as an expired sent one. General retention of terminal
+    Suppressed, no-recipients and cancelled are outcomes like sent: an
+    expired one is as dead as an expired sent one. General retention of terminal
     notifications (retention_days) is Phase 3 -- this cleanup only
     covers rows that carry an explicit expiry_at.
 
@@ -226,7 +225,9 @@ async def cleanup_expired_notifications() -> int:
                         NotificationStatus.SENT,
                         NotificationStatus.PARTIAL_SENT,
                         NotificationStatus.EXPIRED,
-                        NotificationStatus.SKIPPED,
+                        NotificationStatus.CANCELLED,
+                        NotificationStatus.SUPPRESSED,
+                        NotificationStatus.NO_RECIPIENTS,
                     ]),
                 )
             )

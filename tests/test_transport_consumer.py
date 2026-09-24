@@ -470,9 +470,10 @@ class TestEntrypoint:
 
 
 class TestReminderCancel:
-    """Phase 6/T1 additive event, e2e over the stream: a reminder is
-    a notification_request with a FUTURE scheduled_at; reminder_cancel
-    expires the PENDING matches by correlation. Recipients are not
+    """Phase 6/T1 event, e2e over the stream: a reminder is a
+    notification_request with a FUTURE scheduled_at; reminder_cancel
+    cancels the active matches by their ENVELOPE correlation (F1.3:
+    before, it read a key out of action_data and wrote EXPIRED). Recipients are not
     needed on either path (resolve happens at due time), so the issued
     T1 band 92000-92099 stays untouched here."""
 
@@ -487,10 +488,10 @@ class TestReminderCancel:
             type=type_,
             scheduled_at=(anchor - timedelta(hours=1)).isoformat(),
             expiry_at=anchor.isoformat(),
-            action_data={"booking_id": correlation_value},
+            correlation=correlation_value,
         )
 
-    async def test_cancel_expires_pending_reminders(
+    async def test_cancel_cancels_pending_reminders(
         self,
         redis: fakeaioredis.FakeRedis,
         stream: str,
@@ -508,8 +509,7 @@ class TestReminderCancel:
         await _xadd(redis, stream, "reminder_cancel", {
             "v": 1,
             "types": ["unit_rem_24h", "unit_rem_1h", "unit_rem_10m"],
-            "correlation_key": "booking_id",
-            "correlation_value": booking_id,
+            "correlation": booking_id,
         })
 
         async def all_acked() -> bool:
@@ -530,11 +530,11 @@ class TestReminderCancel:
             by_key[data["idempotency_key"]] = row
         assert (
             by_key[first["idempotency_key"]].status
-            == NotificationStatus.EXPIRED
+            == NotificationStatus.CANCELLED
         )
         assert (
             by_key[second["idempotency_key"]].status
-            == NotificationStatus.EXPIRED
+            == NotificationStatus.CANCELLED
         )
         # A different correlation value stays scheduled.
         assert (
@@ -554,8 +554,7 @@ class TestReminderCancel:
         await _xadd(redis, stream, "reminder_cancel", {
             "v": 1,
             "types": ["unit_rem_1h"],
-            "correlation_key": "booking_id",
-            "correlation_value": str(uuid4()),
+            "correlation": str(uuid4()),
         })
 
         async def acked() -> bool:

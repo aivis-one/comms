@@ -53,10 +53,7 @@ async def _series(
             body="",
             target_type=TargetType.USER,
             target_value=target_value,
-            action_data=(
-                {"event_id": correlation_value}
-                if correlation_value is not None else None
-            ),
+            correlation=correlation_value,
             scheduled_at=anchor_at - _LEADS[type_key],
             expiry_at=anchor_at,
         ))
@@ -64,12 +61,17 @@ async def _series(
 
 
 class TestCancelReminders:
-    """Correlation-based cancellation (velo mechanism, generic key)."""
+    """Correlation-based cancellation.
+
+    F1.3 changed two things these tests pinned: the match is the
+    ENVELOPE correlation (before: a key read out of action_data -- comms
+    reading the letter to decide), and a cancelled job ends CANCELLED
+    (before: EXPIRED, indistinguishable from a missed deadline)."""
 
     async def test_cancel_by_correlation(
         self, db_session: AsyncSession,
     ) -> None:
-        """Matching correlation -> EXPIRED; other correlation untouched."""
+        """Matching correlation -> CANCELLED; other correlation untouched."""
         recipient = await create_recipient(db_session)
         anchor = datetime.now(UTC) + timedelta(hours=25)
 
@@ -92,8 +94,7 @@ class TestCancelReminders:
         cancelled = await cancel_reminders(
             db_session,
             types=REMINDER_TYPES,
-            correlation_key="event_id",
-            correlation_value="ev-1",
+            correlation="ev-1",
         )
         await db_session.commit()
 
@@ -102,10 +103,10 @@ class TestCancelReminders:
         result = await db_session.execute(select(Notification))
         by_correlation: dict[str, list[str]] = {}
         for notification in result.scalars().all():
-            key = (notification.action_data or {})["event_id"]
+            key = notification.correlation or ""
             by_correlation.setdefault(key, []).append(notification.status)
 
-        assert set(by_correlation["ev-1"]) == {NotificationStatus.EXPIRED}
+        assert set(by_correlation["ev-1"]) == {NotificationStatus.CANCELLED}
         assert set(by_correlation["ev-2"]) == {NotificationStatus.PENDING}
 
     async def test_cancel_respects_target_filter(
@@ -129,8 +130,7 @@ class TestCancelReminders:
         cancelled = await cancel_reminders(
             db_session,
             types=REMINDER_TYPES,
-            correlation_key="event_id",
-            correlation_value="ev-1",
+            correlation="ev-1",
             target_type=TargetType.USER,
             target_value=str(alice.id),
         )
@@ -141,7 +141,7 @@ class TestCancelReminders:
         result = await db_session.execute(select(Notification))
         for notification in result.scalars().all():
             expected = (
-                NotificationStatus.EXPIRED
+                NotificationStatus.CANCELLED
                 if notification.target_value == str(alice.id)
                 else NotificationStatus.PENDING
             )
@@ -150,7 +150,7 @@ class TestCancelReminders:
     async def test_cancelled_reminder_never_delivers(
         self, db_session: AsyncSession,
     ) -> None:
-        """A cancelled (EXPIRED) reminder is invisible to the worker."""
+        """A cancelled reminder is invisible to the worker."""
         recipient = await create_recipient(db_session)
         anchor = datetime.now(UTC) + timedelta(hours=2)
 
@@ -167,8 +167,7 @@ class TestCancelReminders:
         await cancel_reminders(
             db_session,
             types=REMINDER_TYPES,
-            correlation_key="event_id",
-            correlation_value="ev-9",
+            correlation="ev-9",
         )
         # Simulate time passing: the reminder is now due (scheduled_at
         # is pipeline-mutable by design; only title/body are locked).

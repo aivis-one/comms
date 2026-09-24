@@ -77,37 +77,31 @@
 #     recipient_id "<uuid>"    -- required
 #     member       bool        -- required (true=ensure, false=remove)
 #
-#   reminder_cancel (ADDITIVE extension, Phase 6/T1, Master-chat
-#   approved 2026-07-28; the envelope is untouched and old producers
-#   are unaffected -- arch doc §4.3. Naturally idempotent: it expires
-#   PENDING reminders matched by correlation, and an already-expired
-#   or never-scheduled match set is simply a zero-row update. The wire
-#   form mirrors engine/reminders.cancel_reminders, which scheduling
-#   already reaches through notification_request's scheduled_at --
-#   "a reminder is just a Notification with a FUTURE scheduled_at"):
-#     v                 1          -- required
-#     types             [str]      -- required, non-empty list of
-#                                     reminder type keys to cancel
-#     correlation_key   str 1..200 -- required; the action_data key the
-#                                     reminders were scheduled with. An
-#                                     underscore prefix is rejected: such
-#                                     keys cannot exist in action_data
-#                                     (reserved) so the cancel could
-#                                     never match -- a producer bug.
-#     correlation_value str 1..500 -- required; value to match
-#     target_type       str | null -- optional filter; both target
-#     target_value      str | null    fields together or neither
-#                                     (a bare target_value is
-#                                     ambiguous); form checked per
-#                                     target_type as in
-#                                     notification_request
+#   reminder_cancel -- cancels jobs by their ENVELOPE correlation
+#   (F1.3). Naturally idempotent: an already finished or never
+#   scheduled match set is a zero-row update. The field set is CLOSED.
+#   Cancelled jobs take the outcome CANCELLED (their waiting deliveries
+#   too), never EXPIRED:
+#     v              1          -- required
+#     types          [str]      -- required, non-empty list of type
+#                                  keys to cancel
+#     correlation    str 1..200 -- required; equal to the
+#                                  `correlation` the jobs were sent
+#                                  with (an equality test on an opaque
+#                                  string -- comms never reads the
+#                                  letter to find them)
+#     target_type    str | null -- optional filter; both target
+#     target_value   str | null    fields together or neither (a bare
+#                                  target_value is ambiguous); form
+#                                  checked per target_type as in
+#                                  notification_request
 #
 # action_data rules (Phase 3c item 5, early line of defense; the
 # per-channel checks at delivery -- deep-link charset/64 from 3a --
 # remain the second line):
 #   - a JSON object;
-#   - keys are non-empty strings; keys starting with "_" are REJECTED
-#     (reserved for comms; reminder_cancel relies on it);
+#   - keys are non-empty strings (no prefix is reserved: F1.3 removed
+#     the underscore reservation with its last consumer);
 #   - "action" (optional): non-empty string -- the deep-link intent;
 #   - "params" (optional): object of SCALAR values -- deep-link params;
 #   - every OTHER key is a template variable and must be a SCALAR
@@ -281,8 +275,10 @@ class SectionMembershipChanged:
 @dataclass(frozen=True)
 class ReminderCancel:
     types: list[str]
-    correlation_key: str
-    correlation_value: str
+    # The envelope correlation of the jobs to cancel (F1.3): matched by
+    # equality against notifications.correlation, never inside the
+    # letter.
+    correlation: str
     target_type: str | None
     target_value: str | None
 
@@ -441,11 +437,6 @@ def validate_action_data(
         if not isinstance(key, str) or not key:
             raise ValidationError(
                 f"{event}: action_data keys must be non-empty strings"
-            )
-        if key.startswith("_"):
-            raise ValidationError(
-                f"{event}: action_data key {key!r} is reserved "
-                f"(the underscore prefix is reserved for comms)"
             )
         if key == "action":
             if not isinstance(value, str) or not value:
@@ -817,15 +808,27 @@ def _parse_section_membership_changed(
     )
 
 
-# Mirrors the length caps of the values being matched: a type key is
-# capped at 200 in _parse_notification_request; a correlation value is
-# an action_data scalar rendered to text -- 500 is a generous ceiling
-# for what is in practice an entity id.
-_MAX_CORRELATION_VALUE_LEN = 500
+
+# The closed field set of reminder_cancel (F1.3). The two fields it
+# had before -- correlation_key / correlation_value, a key INSIDE the
+# letter and its value -- are refused by name: a producer still sending
+# them must learn that the cancel reads the envelope now.
+_REMINDER_CANCEL_FIELDS = frozenset({
+    "v", "types", "correlation", "target_type", "target_value",
+})
 
 
 def _parse_reminder_cancel(data: dict[str, Any]) -> ReminderCancel:
     event = EVENT_REMINDER_CANCEL
+
+    unknown = sorted(set(data) - _REMINDER_CANCEL_FIELDS)
+    if unknown:
+        raise ValidationError(
+            f"{event}: unknown field(s) {', '.join(map(repr, unknown))}; "
+            f"allowed: {', '.join(sorted(_REMINDER_CANCEL_FIELDS))}. "
+            f"The cancel matches the envelope `correlation` of the jobs, "
+            f"never a key of their action_data"
+        )
 
     raw_types = _require(data, "types", event)
     if not isinstance(raw_types, list) or not raw_types:
@@ -837,24 +840,9 @@ def _parse_reminder_cancel(data: dict[str, Any]) -> ReminderCancel:
         _string(t, "types[]", event, max_len=200) for t in raw_types
     ]
 
-    correlation_key = _string(
-        _require(data, "correlation_key", event),
-        "correlation_key", event, max_len=200,
-    )
-    if correlation_key.startswith("_"):
-        # Underscore keys are rejected by validate_action_data at
-        # intake (the prefix is reserved for comms),
-        # so a cancel correlated on one could never match anything --
-        # loud producer bug, not a silent zero-row update.
-        raise ValidationError(
-            f"{event}: correlation_key {correlation_key!r} is "
-            f"reserved (underscore prefix cannot exist in "
-            f"action_data)"
-        )
-    correlation_value = _string(
-        _require(data, "correlation_value", event),
-        "correlation_value", event,
-        max_len=_MAX_CORRELATION_VALUE_LEN,
+    correlation = _string(
+        _require(data, "correlation", event),
+        "correlation", event, max_len=MAX_CORRELATION_LEN,
     )
 
     target_type_raw = data.get("target_type")
@@ -878,8 +866,7 @@ def _parse_reminder_cancel(data: dict[str, Any]) -> ReminderCancel:
 
     return ReminderCancel(
         types=types,
-        correlation_key=correlation_key,
-        correlation_value=correlation_value,
+        correlation=correlation,
         target_type=target_type,
         target_value=target_value,
     )

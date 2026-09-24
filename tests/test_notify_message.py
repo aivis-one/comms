@@ -3,7 +3,8 @@
 # =============================================================================
 # Mapping (fork 1): client message -> assignee (support); operator
 # message -> client (participant); sender never pinged; 0..2 notifs.
-# Gated by the SAME Phase 2 pipeline (mute -> SKIPPED). Per-recipient
+# Gated by the SAME Phase 2 pipeline (mute -> SUPPRESSED, SKIPPED before
+# F1.3). Per-recipient
 # idempotency dedups replays. Unclaimed section (assignee None) + client
 # sender -> no push (KNOWN CEILING: pool-push deferred).
 # =============================================================================
@@ -116,7 +117,7 @@ class TestMapping:
 
 
 class TestGating:
-    async def test_muted_support_recipient_skipped(
+    async def test_muted_support_recipient_suppressed(
         self, db_session: AsyncSession
     ) -> None:
         thread, client, master = await _dm(db_session)
@@ -127,7 +128,7 @@ class TestGating:
         )
         deliveries = await resolve_notification(db_session, notif)
         assert deliveries == []
-        assert notif.status == NotificationStatus.SKIPPED
+        assert notif.status == NotificationStatus.SUPPRESSED
 
     async def test_unmuted_recipient_resolves_to_delivery(
         self, db_session: AsyncSession

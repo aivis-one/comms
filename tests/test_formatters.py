@@ -37,7 +37,7 @@ from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import Settings
-from app.engine.constants import DeliveryChannel
+from app.engine.constants import DeliveryChannel, FailureClass
 from app.engine.formatters import (
     ChannelRegistry,
     InAppFormatter,
@@ -1013,8 +1013,11 @@ class TestTelegramFailuresReachTheLogRedacted:
         assert rendered.count("api.telegram.org/[redacted]/sendMessage") == 2
 
     async def test_network_error_stays_transient(self) -> None:
+        """A network error is transient: no failure class (F1.3: was
+        `not outcome.permanent`; the outcome now names the class, and a
+        transient error has none)."""
         outcome, _ = await _tg_outcome(_network_error())
-        assert not outcome.permanent
+        assert outcome.failure_class is None
         assert outcome.retry_after is None
         assert outcome.error.startswith("HTTP Client says - InvalidURL: ")
 
@@ -1027,7 +1030,10 @@ class TestTelegramFailuresReachTheLogRedacted:
             ),
         )
         outcome, logs = await _tg_outcome(error)
-        assert outcome.permanent
+        # Was `outcome.permanent`; since F1.3 the outcome names its
+        # class -- a blocked bot is this message rejected, not a dead
+        # channel and not a missing address.
+        assert outcome.failure_class is FailureClass.MESSAGE_REJECTED
         _no_secret_anywhere(_TG_SECRET, outcome, logs)
         (entry,) = [
             e for e in logs if e["event"] == "delivery_permanent_failure"

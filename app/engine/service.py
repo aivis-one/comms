@@ -65,12 +65,17 @@ from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.engine.constants import (
     DeliveryStatus,
+    FailureClass,
     IntakeOutcomeClass,
     NotificationStatus,
     TargetType,
+    WaitReason,
 )
 from app.engine.formatters import (
     ChannelFormatter,
+    ConfigurationError,
+    MessageRejectedError,
+    NoAddressError,
     PermanentDeliveryError,
     RateLimitedError,
     get_formatter,
@@ -388,6 +393,7 @@ async def create_notification(
             expiry_layer = Layer.DEFAULT
 
     channels = list(record.value("channels"))
+    category = record.value("category")
 
     notification = Notification(
         type=type,
@@ -397,6 +403,7 @@ async def create_notification(
         target_value=target_value,
         action_data=action_data,
         channels=channels,
+        category=category,
         correlation=correlation,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
@@ -436,10 +443,10 @@ async def resolve_notification(
     decided in one place. Types without a category bypass gating.
 
     Transitions notification status: pending -> processing.
-    Empty audience (nobody resolved, or everyone muted) -> SKIPPED:
-    the pipeline worked, there was just nobody to deliver to. FAILED
-    stays reserved for real faults (Phase 1 marked empty resolve as
-    FAILED -- cbshome base behavior; changed in Phase 2).
+    Nobody resolved -> NO_RECIPIENTS (fix the sync); everyone muted ->
+    SUPPRESSED (the recipients' decision). Neither is a failure (F1.3:
+    the two were one SKIPPED, which made a product look for a defect
+    where there was a choice, and miss one where there was a defect).
 
     Args:
         session: Active DB session (caller commits).
@@ -471,7 +478,9 @@ async def resolve_notification(
     )
 
     if not recipient_ids:
-        notification.status = NotificationStatus.SKIPPED
+        # Nobody to deliver to: the product's sync, not comms, is what
+        # to look at -- and not the recipients' choice either.
+        notification.status = NotificationStatus.NO_RECIPIENTS
         logger.warning(
             "notification_no_targets",
             notification_id=str(notification.id),
@@ -482,8 +491,10 @@ async def resolve_notification(
     # Evaluated at resolve time; for reminders that is the moment the
     # notification comes due, so the mute state is current as of send.
     # A mute set AFTER deliveries exist is caught by the second line
-    # at deliver time (late-mute re-check -> DeliveryStatus.SKIPPED).
-    category = registry.category_of(notification.type)
+    # at deliver time (late-mute re-check -> DeliveryStatus.SUPPRESSED).
+    # The category is the one snapshotted at intake (F1.3): a type
+    # removed from the profile since is still gated.
+    category = notification.category
     if category is not None:
         muted = await muted_recipient_ids(session, category, recipient_ids)
         if muted:
@@ -496,7 +507,8 @@ async def resolve_notification(
                 remaining=len(recipient_ids),
             )
         if not recipient_ids:
-            notification.status = NotificationStatus.SKIPPED
+            # Every recipient muted it: their decision, not a failure.
+            notification.status = NotificationStatus.SUPPRESSED
             logger.info(
                 "notification_all_muted",
                 notification_id=str(notification.id),
@@ -547,8 +559,10 @@ async def deliver_notification(
       backoff). So
       right before sending, recipients who muted the notification's
       category since resolve are closed out terminally with
-      DeliveryStatus.SKIPPED -- not FAILED (nothing broke), mirroring
-      the notification-level SKIPPED. One batched lookup per pass;
+      DeliveryStatus.SUPPRESSED -- not FAILED (nothing broke): the
+      recipient's decision, mirroring the notification-level
+      SUPPRESSED. The category is the intake snapshot (F1.3). One
+      batched lookup per pass;
       checked BEFORE the schedule gate (no point deferring a muted
       delivery). Attempts and error_message stay untouched (a skip is
       not an attempt; prior transient history is kept).
@@ -588,7 +602,12 @@ async def deliver_notification(
       field.)
     - Concurrent delivery via asyncio.gather + Semaphore.
     - asyncio.wait_for with timeout per formatter call.
-    - PermanentDeliveryError -> immediate FAILED, no attempts increment.
+    - PermanentDeliveryError -> immediate FAILED with its FailureClass,
+      no attempts increment (F1.3: the class is the exception's type).
+    - WAIT REASONS (F1.3): every path that sets next_retry_at sets
+      wait_reason with it (recipient schedule, provider rate limit,
+      transient backoff); a delivery taken into an attempt has both
+      cleared first, so a reason never outlives the wait it explains.
     - Transient failure gates the next attempt via next_retry_at
       (exponential backoff, review 1.1); gated deliveries are skipped.
     - Error messages sanitized to prevent credential leaks.
@@ -620,8 +639,9 @@ async def deliver_notification(
         r.id: r for r in recipient_result.scalars().all()
     }
 
-    # -- Late-mute re-check: one batched probe per pass --
-    category = registry.category_of(notification.type)
+    # -- Late-mute re-check: one batched probe per pass, over the
+    # category snapshotted at intake (F1.3) --
+    category = notification.category
     muted: set[UUID] = set()
     if category is not None:
         muted = await muted_recipient_ids(
@@ -633,20 +653,22 @@ async def deliver_notification(
     tasks = []
 
     for delivery in deliveries:
-        recipient = recipients_by_id.get(delivery.recipient_id)
-        if recipient is None:
-            delivery.status = DeliveryStatus.FAILED
-            delivery.error_message = "Recipient not found"
-            logger.warning(
-                "delivery_recipient_not_found",
-                delivery_id=str(delivery.id),
-                recipient_id=str(delivery.recipient_id),
-            )
-            continue
+        # Every delivery has its recipient row: recipient_id is a
+        # foreign key with ON DELETE CASCADE, so deleting a recipient
+        # deletes its deliveries. (A "recipient not found -> FAILED"
+        # branch stood here for a state that cannot exist; removed in
+        # F1.3 rather than given a failure class.)
+        recipient = recipients_by_id[delivery.recipient_id]
+
+        # -- Leaving the wait: the gate that held this delivery has
+        # opened; its reason goes with it. A gate below may set both
+        # again. --
+        delivery.next_retry_at = None
+        delivery.wait_reason = None
 
         # -- Late-mute gate: muted while gated -> close out, no send --
         if delivery.recipient_id in muted:
-            delivery.status = DeliveryStatus.SKIPPED
+            delivery.status = DeliveryStatus.SUPPRESSED
             logger.info(
                 "delivery_muted_skipped",
                 delivery_id=str(delivery.id),
@@ -662,6 +684,7 @@ async def deliver_notification(
         quiet_until = recipient_deferred_until(recipient, now)
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
+            delivery.wait_reason = WaitReason.RECIPIENT_SCHEDULE
             # Causality flag: the deferral pushes the delivery past
             # the notification's expiry -> step-0 will EXPIRE it
             # before it ever sends. Deliberate (a reminder deferred
@@ -692,8 +715,9 @@ async def deliver_notification(
 
         # Apply results to delivery objects (sequential, session-safe).
         for delivery, outcome in results:
-            if outcome.permanent:
+            if outcome.failure_class is not None:
                 delivery.status = DeliveryStatus.FAILED
+                delivery.failure_class = outcome.failure_class
                 delivery.error_message = outcome.error
             elif outcome.retry_after is not None:
                 # -- Channel rate limit (429): defer, don't burn --
@@ -743,6 +767,11 @@ async def deliver_notification(
                         seconds=delay,
                     )
                     delivery.next_retry_at = next_retry_at
+                    delivery.wait_reason = WaitReason.PROVIDER_RATE_LIMIT
+                    # The provider's words go into the record on EVERY
+                    # deferral (F1.3), not only when the budget runs out:
+                    # "where did it tear" is answered by the row.
+                    delivery.error_message = outcome.error
                     # Same causality flag as the quiet-hours gate: the
                     # deferral pushes the delivery past expiry -> the
                     # step-0 sweep will EXPIRE it, deliberately.
@@ -794,6 +823,7 @@ def _apply_transient_failure(
     delivery.error_message = error
     if delivery.attempts >= settings.notification_max_delivery_attempts:
         delivery.status = DeliveryStatus.FAILED
+        delivery.failure_class = FailureClass.TRANSIENT_EXHAUSTED
     else:
         # Exponential backoff gate: base * 2**(attempts-1),
         # capped. Without it all attempts burned within one
@@ -806,23 +836,46 @@ def _apply_transient_failure(
         delivery.next_retry_at = datetime.now(UTC) + timedelta(
             seconds=backoff_seconds,
         )
+        delivery.wait_reason = WaitReason.TRANSIENT_BACKOFF
+
+
+def _failure_class_of(exc: PermanentDeliveryError) -> FailureClass:
+    """The failure class a permanent channel exception stands for."""
+    if isinstance(exc, ConfigurationError):
+        return FailureClass.CONFIGURATION
+    if isinstance(exc, NoAddressError):
+        return FailureClass.NO_ADDRESS
+    if isinstance(exc, MessageRejectedError):
+        return FailureClass.MESSAGE_REJECTED
+    # PermanentDeliveryError refuses construction; a fourth subclass
+    # added without a class must fail loudly here, not pick one.
+    raise TypeError(f"no failure class for {type(exc).__name__}")
+
+
+def _error_text(exc: Exception) -> str:
+    """What goes into error_message: the redacted text, or -- when the
+    exception has none (KeyError(), a bare RuntimeError) -- its type.
+    An empty string would be the same silence F0 closed for provider
+    answers."""
+    return sanitize_error(exc) or type(exc).__name__
 
 
 class _DeliveryOutcome:
     """Result of a single delivery attempt."""
 
-    __slots__ = ("error", "permanent", "retry_after", "success")
+    __slots__ = ("error", "failure_class", "retry_after", "success")
 
     def __init__(
         self,
         *,
         success: bool = False,
-        permanent: bool = False,
+        failure_class: FailureClass | None = None,
         error: str | None = None,
         retry_after: float | None = None,
     ) -> None:
         self.success = success
-        self.permanent = permanent
+        # Non-None marks a permanent failure: its class, decided once.
+        self.failure_class = failure_class
         self.error = error
         # Non-None marks a channel rate limit (429): the server-named
         # wait in seconds. Handled by the apply loop against the
@@ -851,14 +904,26 @@ async def _deliver_single(
             )
             return delivery, _DeliveryOutcome(success=success)
         except PermanentDeliveryError as exc:
-            logger.warning(
+            # THE one place a channel exception becomes a failure class:
+            # the exception's type is the class (formatters raise only
+            # the three subclasses -- the base refuses construction).
+            failure_class = _failure_class_of(exc)
+            # A dead channel is LOUD (spec §5.6): every message will die
+            # the same way until the deploy changes.
+            log = (
+                logger.error
+                if failure_class is FailureClass.CONFIGURATION
+                else logger.warning
+            )
+            log(
                 "delivery_permanent_failure",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
+                failure_class=failure_class.value,
                 error=sanitize_text(str(exc))[:200],
             )
             return delivery, _DeliveryOutcome(
-                permanent=True, error=sanitize_error(exc),
+                failure_class=failure_class, error=_error_text(exc),
             )
         except RateLimitedError as exc:
             # Deliberately no log here: whether this becomes a deferral
@@ -866,7 +931,7 @@ async def _deliver_single(
             # apply loop (it owns the budget counter) -- that decision
             # log is the valuable one, and doubling it would be noise.
             return delivery, _DeliveryOutcome(
-                error=sanitize_error(exc),
+                error=_error_text(exc),
                 retry_after=exc.retry_after,
             )
         except TimeoutError:
@@ -891,40 +956,53 @@ async def _deliver_single(
                 exception=sanitized_traceback(exc),
             )
             return delivery, _DeliveryOutcome(
-                error=sanitize_error(exc),
+                error=_error_text(exc),
             )
+
+
+# -----------------------------------------------------------------------------
+# The parent's outcome -- THE FOLD (F1.3, spec §5.5)
+# -----------------------------------------------------------------------------
+#
+# A notification is one job with many deliveries; its outcome is the
+# FOLD of theirs. One rule, applied by rollup_notification and by
+# nothing else:
+#
+#   1. SUPPRESSED deliveries are taken out first: a recipient's
+#      decision is neither a delivery nor a failure. If nothing else
+#      is left, the job is SUPPRESSED -- never FAILED.
+#   2. Any delivery still PENDING -> the job stays PROCESSING.
+#   3. Every remaining delivery SENT                 -> SENT.
+#   4. At least one SENT and at least one not sent   -> PARTIAL_SENT.
+#   5. None SENT: any FAILED -> FAILED; else any EXPIRED -> EXPIRED;
+#      else CANCELLED. (A failure is what a product must act on, so it
+#      outranks the two outcomes that were decided on purpose.)
+#   6. No deliveries at all -> NO_RECIPIENTS: the recipients the
+#      deliveries were made for are gone (ON DELETE CASCADE removed
+#      them), so the audience is empty -- the same outcome as an empty
+#      resolve, not an anomaly FAILED.
+#
+# EXPIRY AND CANCELLATION GO THROUGH THE DELIVERIES (close_notifications
+# below): the waiting deliveries get the outcome, then the job is
+# folded by the same rule. A job half of which went out before its
+# expiry is PARTIAL_SENT, not EXPIRED. Only a job with no deliveries
+# yet (PENDING, not resolved) takes EXPIRED / CANCELLED directly.
+#
+# IN FLIGHT: an attempt runs inside the worker's transaction under a
+# row lock on the notification (processor.py, FOR UPDATE). Expiry and
+# cancellation lock the same row (FOR UPDATE, waiting, not skipping),
+# so they apply to the state AFTER the attempt: what was sent stays
+# sent, what is still waiting is closed.
 
 
 async def rollup_notification(
     session: AsyncSession,
     notification: Notification,
 ) -> None:
-    """Update Notification.status based on delivery statuses.
+    """Fold the deliveries' outcomes into the job's (see THE FOLD).
 
-    Only acts on PROCESSING notifications: terminal states set by
-    resolve (SKIPPED for empty/all-muted audiences) or the processor
-    (EXPIRED) must not be overwritten -- without the guard the
-    "no deliveries -> FAILED" branch below would clobber SKIPPED.
-    That branch stays as a safety net: a PROCESSING notification
-    without any deliveries is an anomaly, not a skip.
-
-    SKIPPED deliveries (late mutes, Phase 2.1) are non-events: they
-    are subtracted before the verdict, so they drag the outcome
-    neither toward FAILED nor toward SENT. Matrix:
-      - only skipped              -> notification SKIPPED (late
-        edition of "nobody to deliver to")
-      - skipped + sent            -> sent
-      - skipped + failed          -> failed
-      - skipped + sent + failed   -> partial_sent
-      - skipped + pending         -> stays processing (a gated
-        delivery is still alive; do not finalize early)
-
-    Rules over the remaining statuses (cbshome base, incl.
-    PARTIAL_SENT):
-      - All sent         -> sent
-      - All failed       -> failed
-      - Mix sent+failed  -> partial_sent
-      - Any pending      -> stays processing (not all delivered yet)
+    Acts on PROCESSING only: every other status is either not resolved
+    yet or already an outcome, and an outcome is never re-decided.
 
     Args:
         session: Active DB session (caller commits).
@@ -943,39 +1021,11 @@ async def rollup_notification(
     result = await session.execute(stmt)
     statuses = {row[0] for row in result.all()}
 
-    if not statuses:
-        notification.status = NotificationStatus.FAILED
+    verdict = _fold(statuses)
+    if verdict is None:
         return
-
-    # Skips are non-events -- judge the outcome by the rest.
-    active = statuses - {DeliveryStatus.SKIPPED}
-    if not active:
-        notification.status = NotificationStatus.SKIPPED
-        await session.flush()
-        logger.info(
-            "notification_rollup",
-            notification_id=str(notification.id),
-            status=notification.status,
-        )
-        return
-
-    has_pending = DeliveryStatus.PENDING in active
-    has_sent = DeliveryStatus.SENT in active
-    has_failed = DeliveryStatus.FAILED in active
-
-    if has_pending:
-        # Still processing -- don't change status.
-        return
-
-    if has_sent and not has_failed:
-        notification.status = NotificationStatus.SENT
-    elif has_failed and not has_sent:
-        notification.status = NotificationStatus.FAILED
-    else:
-        notification.status = NotificationStatus.PARTIAL_SENT
-
+    notification.status = verdict
     await session.flush()
-
     logger.info(
         "notification_rollup",
         notification_id=str(notification.id),
@@ -983,13 +1033,87 @@ async def rollup_notification(
     )
 
 
+def _fold(statuses: set[str]) -> NotificationStatus | None:
+    """THE FOLD over the set of delivery statuses; None = still open."""
+    if not statuses:
+        return NotificationStatus.NO_RECIPIENTS
+    active = statuses - {DeliveryStatus.SUPPRESSED}
+    if not active:
+        return NotificationStatus.SUPPRESSED
+    if DeliveryStatus.PENDING in active:
+        return None
+    if active == {DeliveryStatus.SENT}:
+        return NotificationStatus.SENT
+    if DeliveryStatus.SENT in active:
+        return NotificationStatus.PARTIAL_SENT
+    if DeliveryStatus.FAILED in active:
+        return NotificationStatus.FAILED
+    if DeliveryStatus.EXPIRED in active:
+        return NotificationStatus.EXPIRED
+    return NotificationStatus.CANCELLED
+
+
+# The two outcomes a job can be CLOSED with from outside the attempt,
+# and the delivery outcome each gives the deliveries still waiting.
+_CLOSING = {
+    NotificationStatus.EXPIRED: DeliveryStatus.EXPIRED,
+    NotificationStatus.CANCELLED: DeliveryStatus.CANCELLED,
+}
+
+_ACTIVE_STATUSES = (NotificationStatus.PENDING, NotificationStatus.PROCESSING)
+
+
+async def close_notifications(
+    session: AsyncSession,
+    condition: Any,
+    outcome: NotificationStatus,
+) -> int:
+    """Expire or cancel every ACTIVE job matching `condition`.
+
+    The waiting deliveries take the outcome and the job is folded (see
+    THE FOLD); a job with no deliveries yet takes the outcome directly.
+    A job already at an outcome is not touched -- that is the guard,
+    and a second call is a zero-row no-op. Rows are locked FOR UPDATE
+    and the lock is WAITED for: an attempt in flight finishes first.
+
+    Returns the number of jobs closed.
+    """
+    delivery_outcome = _CLOSING[outcome]
+    rows = await session.execute(
+        select(Notification)
+        .where(condition, Notification.status.in_(_ACTIVE_STATUSES))
+        .with_for_update()
+    )
+    notifications = list(rows.scalars().all())
+    for notification in notifications:
+        if notification.status == NotificationStatus.PENDING:
+            # Not resolved: no deliveries exist to carry the outcome.
+            notification.status = outcome
+            continue
+        await session.execute(
+            update(NotificationDelivery)
+            .where(
+                NotificationDelivery.notification_id == notification.id,
+                NotificationDelivery.status == DeliveryStatus.PENDING,
+            )
+            .values(
+                status=delivery_outcome,
+                next_retry_at=None,
+                wait_reason=None,
+            )
+        )
+        await rollup_notification(session, notification)
+    await session.flush()
+    return len(notifications)
+
+
 # ---------------------------------------------------------------------------
 # In-app inbox functions (cbshome Sprint 8.3; HTTP surface is Phase 3)
 # ---------------------------------------------------------------------------
 
 
-# Phase 3a item 5: terminal statuses subject to retention -- ALL five
-# of them. PARTIAL_SENT was missing from the original spec list; the
+# Phase 3a item 5: terminal statuses subject to retention -- ALL of
+# them (seven since F1.3). PARTIAL_SENT was missing from the original spec list; the
 # Phase 3a report flagged it (rows would be immortal: polling never
 # picks them up, rollup never returns to them) and Master-chat ruled
 # it IN (Phase 3a.1): a partial send is no less finished than a full
@@ -999,8 +1123,10 @@ _RETENTION_TERMINAL_STATUSES = (
     NotificationStatus.SENT,
     NotificationStatus.PARTIAL_SENT,
     NotificationStatus.FAILED,
-    NotificationStatus.SKIPPED,
     NotificationStatus.EXPIRED,
+    NotificationStatus.CANCELLED,
+    NotificationStatus.SUPPRESSED,
+    NotificationStatus.NO_RECIPIENTS,
 )
 
 

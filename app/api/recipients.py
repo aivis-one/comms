@@ -9,7 +9,7 @@
 # engine/resolver.py::_resolve_user selects the recipient by id and
 # active, an unknown id yields an empty list, and
 # engine/service.py::resolve_notification then marks the notification
-# SKIPPED with `notification_no_targets` -- terminal, with NO delivery
+# NO_RECIPIENTS with `notification_no_targets` -- terminal, with NO delivery
 # row created at all and no retry anywhere. A message that overtakes
 # the asynchronous identity sync is therefore lost silently and for
 # good. (Contrast group_changed, whose unknown recipient raises
