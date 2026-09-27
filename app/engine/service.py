@@ -8,6 +8,16 @@
 #   - deliveries reference recipients (sync projection), not Users
 #   - formatter credentials/locale come from Recipient columns
 #
+# FUNCTIONS (intake, F1.2):
+#   accept_notification()   -- THE intake: create under a key, or answer
+#                              duplicate / conflict by fingerprint
+#   stream_fingerprint(), canonical_fingerprint() -- the two ways a
+#                              request's bytes are fingerprinted
+#   record_intake_outcome(), intake_outcomes_for() -- requests that
+#                              were NOT accepted, under their key
+#   expiry_of()             -- the expiry of a job and the layer that
+#                              decided it
+#
 # FUNCTIONS (pipeline):
 #   create_notification()   -- create a Notification record (validated)
 #   resolve_notification()  -- expand targets into NotificationDelivery rows
@@ -32,13 +42,20 @@
 # =============================================================================
 
 import asyncio
+import hashlib
+import json
 import random
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
 import structlog
 from sqlalchemy import delete, func, or_, select, tuple_, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import Recipient
@@ -47,27 +64,36 @@ from app.audience.schedule import recipient_deferred_until
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.engine.constants import (
-    DeliveryChannel,
     DeliveryStatus,
+    FailureClass,
+    IntakeOutcomeClass,
     NotificationStatus,
     TargetType,
+    WaitReason,
 )
 from app.engine.formatters import (
     ChannelFormatter,
+    ConfigurationError,
+    MessageRejectedError,
+    NoAddressError,
     PermanentDeliveryError,
     RateLimitedError,
     get_formatter,
     sanitize_error,
+    sanitize_text,
+    sanitized_traceback,
 )
-from app.engine.models import Notification, NotificationDelivery
+from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
 from app.engine.resolver import resolve_targets
-from app.profile.registry import registry
+from app.profile.registry import Decided, Layer, registry
 
 logger = structlog.get_logger()
 
 # Valid infrastructure enum values for input validation.
 _VALID_TARGET_TYPES = frozenset(e.value for e in TargetType)
-_VALID_CHANNELS = frozenset(e.value for e in DeliveryChannel)
+
+# The one unique index that means "this key is taken" (migration 0012).
+IDEMPOTENCY_INDEX_NAME = "uq_notifications_idempotency_key"
 
 # Timeout for a single formatter.deliver() call.
 _DELIVER_TIMEOUT_SECONDS = 30
@@ -83,6 +109,199 @@ _RATE_LIMIT_JITTER_MAX_FRACTION = 0.5
 _MAX_CONCURRENT_DELIVERIES = 20
 
 
+# -----------------------------------------------------------------------------
+# Intake (F1.2)
+# -----------------------------------------------------------------------------
+#
+# TWO WAYS TO FINGERPRINT, ONE PER KIND OF PRODUCER, and why two. The
+# fingerprint answers one question -- "are these the same bytes under
+# this key?" -- and it must be answered WITHOUT reading the request.
+#
+#   stream_fingerprint     -- a product's request arrives as bytes on
+#                             the wire (the `data` field of the stream
+#                             entry). The digest is taken over exactly
+#                             those bytes, before any parsing: nothing
+#                             is normalised, so nothing is interpreted.
+#                             A product that re-serialises the same
+#                             meaning differently gets a conflict --
+#                             loud, which is the right side to err on.
+#   canonical_fingerprint  -- comms' own producers (the chat notifier)
+#                             never had wire bytes; their request is a
+#                             set of arguments. The digest is taken over
+#                             a canonical JSON of those arguments
+#                             (sorted keys, fixed separators), so the
+#                             same call always yields the same digest.
+#
+# The two never have to agree: a product key and an internal key live
+# in one index, and if they ever coincide the digests differ by
+# construction, so the collision surfaces as a conflict instead of as a
+# silent duplicate.
+
+
+def stream_fingerprint(data: bytes) -> str:
+    """Digest of a stream request's `data` bytes, as they arrived."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical_fingerprint(fields: Mapping[str, Any]) -> str:
+    """Digest of an internal producer's arguments, canonically encoded."""
+    encoded = json.dumps(
+        fields,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+class Intake(StrEnum):
+    """What accept_notification did with a request."""
+
+    ACCEPTED = "accepted"
+    # Same key, same bytes: the existing job, nothing new created.
+    DUPLICATE = "duplicate"
+    # Same key, other bytes: nothing created, the existing job untouched.
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class Acceptance:
+    """The outcome of one intake and the job it concerns.
+
+    `notification` is the created job for ACCEPTED, and the job that
+    already holds the key for DUPLICATE and CONFLICT.
+    """
+
+    outcome: Intake
+    notification: Notification
+
+
+async def accept_notification(
+    session: AsyncSession,
+    *,
+    idempotency_key: str,
+    fingerprint: str,
+    **fields: Any,
+) -> Acceptance:
+    """Accept one request under its key -- the single intake.
+
+    The DATABASE decides "is this key taken": the insert runs inside a
+    SAVEPOINT, and the unique index turns a second insert into an
+    IntegrityError. No pre-flight SELECT -- a check-then-insert races
+    with itself; the constraint does not. Two concurrent intakes of one
+    key therefore produce ONE job: the second insert waits for the
+    first transaction and then fails, and only then is the holder read
+    and its fingerprint compared -- equal bytes answer DUPLICATE, other
+    bytes CONFLICT. Never two jobs.
+
+    The comparison is of digests only (spec §5.8): the request is not
+    parsed, decoded or interpreted for it.
+
+    ValidationError from create_notification (a request that cannot be
+    accepted) propagates -- the savepoint is rolled back, and the
+    caller records the rejection.
+    """
+    try:
+        async with session.begin_nested():
+            notification = await create_notification(
+                session,
+                idempotency_key=idempotency_key,
+                fingerprint=fingerprint,
+                **fields,
+            )
+    except IntegrityError as exc:
+        # Only OUR index means "key taken"; any other violation is a
+        # real bug and must not be swallowed as a replay.
+        if IDEMPOTENCY_INDEX_NAME not in str(exc.orig):
+            raise
+        holder = (
+            await session.execute(
+                select(Notification).where(
+                    Notification.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one()
+        outcome = (
+            Intake.DUPLICATE
+            if holder.fingerprint == fingerprint
+            else Intake.CONFLICT
+        )
+        return Acceptance(outcome=outcome, notification=holder)
+    return Acceptance(outcome=Intake.ACCEPTED, notification=notification)
+
+
+async def record_intake_outcome(
+    session: AsyncSession,
+    *,
+    idempotency_key: str,
+    fingerprint: str,
+    outcome: IntakeOutcomeClass,
+    reason: str,
+    notification_id: UUID | None = None,
+) -> None:
+    """Record a request that was not accepted, under its key.
+
+    The reason is redacted: it quotes the producer's input, and this
+    row outlives the event. A replay of the same bytes with the same
+    outcome records nothing new (unique index, migration 0012).
+    """
+    statement = (
+        pg_insert(IntakeOutcome)
+        .values(
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+            outcome=outcome.value,
+            reason=sanitize_text(reason)[:2000],
+            notification_id=notification_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["idempotency_key", "fingerprint", "outcome"],
+        )
+    )
+    await session.execute(statement)
+
+
+async def intake_outcomes_for(
+    session: AsyncSession, idempotency_key: str,
+) -> list[IntakeOutcome]:
+    """Every recorded non-acceptance under a key, oldest first.
+
+    The programmatic answer until reading by key exists for the
+    product (phase 2).
+    """
+    rows = await session.execute(
+        select(IntakeOutcome)
+        .where(IntakeOutcome.idempotency_key == idempotency_key)
+        .order_by(IntakeOutcome.received_at, IntakeOutcome.id)
+    )
+    return list(rows.scalars().all())
+
+
+async def delete_intake_outcomes_before(
+    session: AsyncSession, *, cutoff: datetime,
+) -> int:
+    """Retention for intake_outcomes: rows received before `cutoff`."""
+    result = await session.execute(
+        delete(IntakeOutcome).where(IntakeOutcome.received_at < cutoff)
+    )
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+
+def expiry_of(notification: Notification) -> Decided:
+    """The job's expiry and the layer that decided it."""
+    layer = Layer(notification.expiry_layer)
+    source = {
+        Layer.ENVELOPE: "envelope: expiry_at",
+        Layer.PROFILE: (
+            f"profile: expires_after of {notification.type!r}, "
+            f"counted from scheduled_at"
+        ),
+        Layer.DEFAULT: "comms default: no expiry declared",
+    }[layer]
+    return Decided(value=notification.expiry_at, layer=layer, source=source)
+
+
 async def create_notification(
     session: AsyncSession,
     *,
@@ -91,42 +310,50 @@ async def create_notification(
     body: str,
     target_type: str,
     target_value: str,
-    channels: list[str] | None = None,
+    idempotency_key: str,
+    fingerprint: str,
     action_data: dict[str, Any] | None = None,
-    priority: int = 5,
     scheduled_at: datetime | None = None,
     expiry_at: datetime | None = None,
-    idempotency_key: str | None = None,
+    correlation: str | None = None,
 ) -> Notification:
     """Create a new Notification record.
 
+    Intake goes through accept_notification, which adds the
+    duplicate / conflict decision; this function is the insert under
+    it and never decides anything about the key.
+
     Args:
         session: Active DB session (caller commits).
-        type: A notification type key registered by the product profile.
-        title: Notification title.
-        body: Notification body text.
+        type: A notification type key declared by the product profile.
+            The type's CHANNELS come from its profile record and are
+            snapshotted onto the row -- the caller never names one.
+        title: Stored fallback title (the letter).
+        body: Stored fallback body (the letter).
         target_type: TargetType value (user, group, all).
         target_value: Bare target specifier ("<uuid>", "<group_key>", "*").
-        idempotency_key: Producer-supplied dedup key (stream ingest,
-            Phase 3c); the partial unique index makes the database the
-            dedup arbiter -- the caller catches IntegrityError on
-            flush and treats it as a duplicate. None = no dedup.
-        channels: Delivery channels. Defaults to ["in_app"].
-        action_data: Optional JSONB action payload (deep-link intent +
-            template variables).
-        priority: 1=highest, 5=default.
-        scheduled_at: When to process. Defaults to now.
-        expiry_at: Optional TTL deadline.
+        idempotency_key: The request's key -- required on every path.
+        fingerprint: Digest of the request's bytes (see above).
+        action_data: Optional JSONB letter (deep-link intent + template
+            variables).
+        scheduled_at: "Not before" -- when the job becomes deliverable.
+            Defaults to now.
+        expiry_at: The envelope's expiry. Wins over the profile's
+            expires_after, which counts from scheduled_at.
+        correlation: The product's own reference, stored untouched.
 
     Returns:
         The created Notification (flushed, not committed).
 
     Raises:
-        ValidationError: On unregistered type, invalid target_type or
-            channel values.
+        ValidationError: The request cannot be accepted -- undeclared
+            type, invalid target_type, an expiry already passed or not
+            after scheduled_at.
     """
-    # -- Validate against the profile registry (de-domainization) --
-    if not registry.is_registered(type):
+    # -- The profile record IS the registration (every installed type
+    # has one; a type without a record is not declared). --
+    record = registry.record_of(type)
+    if record is None:
         raise ValidationError(
             f"Unregistered notification type: {type}. "
             f"Registered: {', '.join(sorted(registry.registered_types()))}"
@@ -138,18 +365,35 @@ async def create_notification(
             f"Valid: {', '.join(sorted(_VALID_TARGET_TYPES))}"
         )
 
-    if channels is None:
-        channels = [DeliveryChannel.IN_APP]
-
-    invalid_channels = set(channels) - _VALID_CHANNELS
-    if invalid_channels:
-        raise ValidationError(
-            f"Invalid channels: {invalid_channels}. "
-            f"Valid: {', '.join(sorted(_VALID_CHANNELS))}"
-        )
-
+    now = datetime.now(UTC)
     if scheduled_at is None:
-        scheduled_at = datetime.now(UTC)
+        scheduled_at = now
+
+    # -- Expiry: the envelope over the profile, the layer kept. --
+    if expiry_at is not None:
+        if expiry_at <= now:
+            raise ValidationError(
+                f"expiry_at {expiry_at.isoformat()} has already passed "
+                f"(now {now.isoformat()}): the request could never be "
+                f"delivered in time"
+            )
+        if expiry_at <= scheduled_at:
+            raise ValidationError(
+                f"expiry_at {expiry_at.isoformat()} is not after "
+                f"scheduled_at {scheduled_at.isoformat()}: the request "
+                f"would expire before it becomes deliverable"
+            )
+        expiry_layer = Layer.ENVELOPE
+    else:
+        expires_after: timedelta | None = record.value("expires_after")
+        if expires_after is not None:
+            expiry_at = scheduled_at + expires_after
+            expiry_layer = Layer.PROFILE
+        else:
+            expiry_layer = Layer.DEFAULT
+
+    channels = list(record.value("channels"))
+    category = record.value("category")
 
     notification = Notification(
         type=type,
@@ -158,24 +402,18 @@ async def create_notification(
         target_type=target_type,
         target_value=target_value,
         action_data=action_data,
-        priority=priority,
+        channels=channels,
+        category=category,
+        correlation=correlation,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
+        expiry_layer=expiry_layer.value,
         idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
         status=NotificationStatus.PENDING,
     )
     session.add(notification)
     await session.flush()
-
-    # Store channels in action_data for the resolve stage (cbshome
-    # mechanism: reassigning the whole dict keeps SQLAlchemy tracking).
-    if notification.action_data is None:
-        notification.action_data = {"_channels": channels}
-    else:
-        notification.action_data = {
-            **notification.action_data,
-            "_channels": channels,
-        }
 
     logger.info(
         "notification_created",
@@ -184,6 +422,7 @@ async def create_notification(
         target=f"{target_type}:{target_value}",
         channels=channels,
         scheduled_at=scheduled_at.isoformat(),
+        expiry_layer=expiry_layer.value,
     )
 
     return notification
@@ -204,10 +443,10 @@ async def resolve_notification(
     decided in one place. Types without a category bypass gating.
 
     Transitions notification status: pending -> processing.
-    Empty audience (nobody resolved, or everyone muted) -> SKIPPED:
-    the pipeline worked, there was just nobody to deliver to. FAILED
-    stays reserved for real faults (Phase 1 marked empty resolve as
-    FAILED -- cbshome base behavior; changed in Phase 2).
+    Nobody resolved -> NO_RECIPIENTS (fix the sync); everyone muted ->
+    SUPPRESSED (the recipients' decision). Neither is a failure (F1.3:
+    the two were one SKIPPED, which made a product look for a defect
+    where there was a choice, and miss one where there was a defect).
 
     Args:
         session: Active DB session (caller commits).
@@ -239,7 +478,9 @@ async def resolve_notification(
     )
 
     if not recipient_ids:
-        notification.status = NotificationStatus.SKIPPED
+        # Nobody to deliver to: the product's sync, not comms, is what
+        # to look at -- and not the recipients' choice either.
+        notification.status = NotificationStatus.NO_RECIPIENTS
         logger.warning(
             "notification_no_targets",
             notification_id=str(notification.id),
@@ -250,8 +491,10 @@ async def resolve_notification(
     # Evaluated at resolve time; for reminders that is the moment the
     # notification comes due, so the mute state is current as of send.
     # A mute set AFTER deliveries exist is caught by the second line
-    # at deliver time (late-mute re-check -> DeliveryStatus.SKIPPED).
-    category = registry.category_of(notification.type)
+    # at deliver time (late-mute re-check -> DeliveryStatus.SUPPRESSED).
+    # The category is the one snapshotted at intake (F1.3): a type
+    # removed from the profile since is still gated.
+    category = notification.category
     if category is not None:
         muted = await muted_recipient_ids(session, category, recipient_ids)
         if muted:
@@ -264,7 +507,8 @@ async def resolve_notification(
                 remaining=len(recipient_ids),
             )
         if not recipient_ids:
-            notification.status = NotificationStatus.SKIPPED
+            # Every recipient muted it: their decision, not a failure.
+            notification.status = NotificationStatus.SUPPRESSED
             logger.info(
                 "notification_all_muted",
                 notification_id=str(notification.id),
@@ -272,10 +516,8 @@ async def resolve_notification(
             )
             return []
 
-    # Get channels from action_data.
-    channels = (notification.action_data or {}).get(
-        "_channels", [DeliveryChannel.IN_APP]
-    )
+    # The channels the profile routed the type to at intake.
+    channels = notification.channels
 
     # Create delivery records.
     deliveries: list[NotificationDelivery] = []
@@ -317,8 +559,10 @@ async def deliver_notification(
       backoff). So
       right before sending, recipients who muted the notification's
       category since resolve are closed out terminally with
-      DeliveryStatus.SKIPPED -- not FAILED (nothing broke), mirroring
-      the notification-level SKIPPED. One batched lookup per pass;
+      DeliveryStatus.SUPPRESSED -- not FAILED (nothing broke): the
+      recipient's decision, mirroring the notification-level
+      SUPPRESSED. The category is the intake snapshot (F1.3). One
+      batched lookup per pass;
       checked BEFORE the schedule gate (no point deferring a muted
       delivery). Attempts and error_message stay untouched (a skip is
       not an attempt; prior transient history is kept).
@@ -358,7 +602,12 @@ async def deliver_notification(
       field.)
     - Concurrent delivery via asyncio.gather + Semaphore.
     - asyncio.wait_for with timeout per formatter call.
-    - PermanentDeliveryError -> immediate FAILED, no attempts increment.
+    - PermanentDeliveryError -> immediate FAILED with its FailureClass,
+      no attempts increment (F1.3: the class is the exception's type).
+    - WAIT REASONS (F1.3): every path that sets next_retry_at sets
+      wait_reason with it (recipient schedule, provider rate limit,
+      transient backoff); a delivery taken into an attempt has both
+      cleared first, so a reason never outlives the wait it explains.
     - Transient failure gates the next attempt via next_retry_at
       (exponential backoff, review 1.1); gated deliveries are skipped.
     - Error messages sanitized to prevent credential leaks.
@@ -390,8 +639,9 @@ async def deliver_notification(
         r.id: r for r in recipient_result.scalars().all()
     }
 
-    # -- Late-mute re-check: one batched probe per pass --
-    category = registry.category_of(notification.type)
+    # -- Late-mute re-check: one batched probe per pass, over the
+    # category snapshotted at intake (F1.3) --
+    category = notification.category
     muted: set[UUID] = set()
     if category is not None:
         muted = await muted_recipient_ids(
@@ -403,12 +653,26 @@ async def deliver_notification(
     tasks = []
 
     for delivery in deliveries:
-        recipient = recipients_by_id.get(delivery.recipient_id)
-        if recipient is None:
-            delivery.status = DeliveryStatus.FAILED
-            delivery.error_message = "Recipient not found"
-            logger.warning(
-                "delivery_recipient_not_found",
+        # Every delivery has its recipient row: recipient_id is a
+        # foreign key with ON DELETE CASCADE, so deleting a recipient
+        # deletes its deliveries. (A "recipient not found -> FAILED"
+        # branch stood here for a state that cannot exist; removed in
+        # F1.3 rather than given a failure class.)
+        recipient = recipients_by_id[delivery.recipient_id]
+
+        # -- Leaving the wait: the gate that held this delivery has
+        # opened; its reason goes with it. A gate below may set both
+        # again. --
+        delivery.next_retry_at = None
+        delivery.wait_reason = None
+
+        # -- Late activity gate (F1.4): deactivated or deleted by the
+        # product after resolve -> close out, no send. Checked first: a
+        # person the product removed is not asked about their mutes. --
+        if not recipient.active:
+            delivery.status = DeliveryStatus.RECIPIENT_INACTIVE
+            logger.info(
+                "delivery_recipient_inactive",
                 delivery_id=str(delivery.id),
                 recipient_id=str(delivery.recipient_id),
             )
@@ -416,7 +680,7 @@ async def deliver_notification(
 
         # -- Late-mute gate: muted while gated -> close out, no send --
         if delivery.recipient_id in muted:
-            delivery.status = DeliveryStatus.SKIPPED
+            delivery.status = DeliveryStatus.SUPPRESSED
             logger.info(
                 "delivery_muted_skipped",
                 delivery_id=str(delivery.id),
@@ -432,6 +696,7 @@ async def deliver_notification(
         quiet_until = recipient_deferred_until(recipient, now)
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
+            delivery.wait_reason = WaitReason.RECIPIENT_SCHEDULE
             # Causality flag: the deferral pushes the delivery past
             # the notification's expiry -> step-0 will EXPIRE it
             # before it ever sends. Deliberate (a reminder deferred
@@ -462,8 +727,9 @@ async def deliver_notification(
 
         # Apply results to delivery objects (sequential, session-safe).
         for delivery, outcome in results:
-            if outcome.permanent:
+            if outcome.failure_class is not None:
                 delivery.status = DeliveryStatus.FAILED
+                delivery.failure_class = outcome.failure_class
                 delivery.error_message = outcome.error
             elif outcome.retry_after is not None:
                 # -- Channel rate limit (429): defer, don't burn --
@@ -513,6 +779,11 @@ async def deliver_notification(
                         seconds=delay,
                     )
                     delivery.next_retry_at = next_retry_at
+                    delivery.wait_reason = WaitReason.PROVIDER_RATE_LIMIT
+                    # The provider's words go into the record on EVERY
+                    # deferral (F1.3), not only when the budget runs out:
+                    # "where did it tear" is answered by the row.
+                    delivery.error_message = outcome.error
                     # Same causality flag as the quiet-hours gate: the
                     # deferral pushes the delivery past expiry -> the
                     # step-0 sweep will EXPIRE it, deliberately.
@@ -564,6 +835,7 @@ def _apply_transient_failure(
     delivery.error_message = error
     if delivery.attempts >= settings.notification_max_delivery_attempts:
         delivery.status = DeliveryStatus.FAILED
+        delivery.failure_class = FailureClass.TRANSIENT_EXHAUSTED
     else:
         # Exponential backoff gate: base * 2**(attempts-1),
         # capped. Without it all attempts burned within one
@@ -576,23 +848,46 @@ def _apply_transient_failure(
         delivery.next_retry_at = datetime.now(UTC) + timedelta(
             seconds=backoff_seconds,
         )
+        delivery.wait_reason = WaitReason.TRANSIENT_BACKOFF
+
+
+def _failure_class_of(exc: PermanentDeliveryError) -> FailureClass:
+    """The failure class a permanent channel exception stands for."""
+    if isinstance(exc, ConfigurationError):
+        return FailureClass.CONFIGURATION
+    if isinstance(exc, NoAddressError):
+        return FailureClass.NO_ADDRESS
+    if isinstance(exc, MessageRejectedError):
+        return FailureClass.MESSAGE_REJECTED
+    # PermanentDeliveryError refuses construction; a fourth subclass
+    # added without a class must fail loudly here, not pick one.
+    raise TypeError(f"no failure class for {type(exc).__name__}")
+
+
+def _error_text(exc: Exception) -> str:
+    """What goes into error_message: the redacted text, or -- when the
+    exception has none (KeyError(), a bare RuntimeError) -- its type.
+    An empty string would be the same silence F0 closed for provider
+    answers."""
+    return sanitize_error(exc) or type(exc).__name__
 
 
 class _DeliveryOutcome:
     """Result of a single delivery attempt."""
 
-    __slots__ = ("error", "permanent", "retry_after", "success")
+    __slots__ = ("error", "failure_class", "retry_after", "success")
 
     def __init__(
         self,
         *,
         success: bool = False,
-        permanent: bool = False,
+        failure_class: FailureClass | None = None,
         error: str | None = None,
         retry_after: float | None = None,
     ) -> None:
         self.success = success
-        self.permanent = permanent
+        # Non-None marks a permanent failure: its class, decided once.
+        self.failure_class = failure_class
         self.error = error
         # Non-None marks a channel rate limit (429): the server-named
         # wait in seconds. Handled by the apply loop against the
@@ -621,14 +916,26 @@ async def _deliver_single(
             )
             return delivery, _DeliveryOutcome(success=success)
         except PermanentDeliveryError as exc:
-            logger.warning(
+            # THE one place a channel exception becomes a failure class:
+            # the exception's type is the class (formatters raise only
+            # the three subclasses -- the base refuses construction).
+            failure_class = _failure_class_of(exc)
+            # A dead channel is LOUD (spec §5.6): every message will die
+            # the same way until the deploy changes.
+            log = (
+                logger.error
+                if failure_class is FailureClass.CONFIGURATION
+                else logger.warning
+            )
+            log(
                 "delivery_permanent_failure",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
-                error=str(exc)[:200],
+                failure_class=failure_class.value,
+                error=sanitize_text(str(exc))[:200],
             )
             return delivery, _DeliveryOutcome(
-                permanent=True, error=sanitize_error(exc),
+                failure_class=failure_class, error=_error_text(exc),
             )
         except RateLimitedError as exc:
             # Deliberately no log here: whether this becomes a deferral
@@ -636,7 +943,7 @@ async def _deliver_single(
             # apply loop (it owns the budget counter) -- that decision
             # log is the valuable one, and doubling it would be noise.
             return delivery, _DeliveryOutcome(
-                error=sanitize_error(exc),
+                error=_error_text(exc),
                 retry_after=exc.retry_after,
             )
         except TimeoutError:
@@ -650,46 +957,67 @@ async def _deliver_single(
                 error=f"Timeout after {_DELIVER_TIMEOUT_SECONDS}s",
             )
         except Exception as exc:
-            logger.exception(
+            # Not logger.exception(): the renderer would print the chain
+            # raw, and the telegram network error carries the bot token
+            # in its text and in its __cause__. Same event, same level,
+            # same `exception` key -- redacted (formatters.py).
+            logger.error(
                 "delivery_error",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
+                exception=sanitized_traceback(exc),
             )
             return delivery, _DeliveryOutcome(
-                error=sanitize_error(exc),
+                error=_error_text(exc),
             )
+
+
+# -----------------------------------------------------------------------------
+# The parent's outcome -- THE FOLD (F1.3, spec §5.5)
+# -----------------------------------------------------------------------------
+#
+# A notification is one job with many deliveries; its outcome is the
+# FOLD of theirs. One rule, applied by rollup_notification and by
+# nothing else:
+#
+#   1. SUPPRESSED and RECIPIENT_INACTIVE deliveries are taken out
+#      first: a recipient's decision (a mute) and a product's decision
+#      (deactivated or deleted, F1.4) are neither a delivery nor a
+#      failure. If nothing else is left: SUPPRESSED when any recipient
+#      muted it, otherwise NO_RECIPIENTS -- by send time the product
+#      had removed everyone. Never FAILED.
+#   2. Any delivery still PENDING -> the job stays PROCESSING.
+#   3. Every remaining delivery SENT                 -> SENT.
+#   4. At least one SENT and at least one not sent   -> PARTIAL_SENT.
+#   5. None SENT: any FAILED -> FAILED; else any EXPIRED -> EXPIRED;
+#      else CANCELLED. (A failure is what a product must act on, so it
+#      outranks the two outcomes that were decided on purpose.)
+#   6. No deliveries at all -> NO_RECIPIENTS: the recipients the
+#      deliveries were made for are gone (ON DELETE CASCADE removed
+#      them), so the audience is empty -- the same outcome as an empty
+#      resolve, not an anomaly FAILED.
+#
+# EXPIRY AND CANCELLATION GO THROUGH THE DELIVERIES (close_notifications
+# below): the waiting deliveries get the outcome, then the job is
+# folded by the same rule. A job half of which went out before its
+# expiry is PARTIAL_SENT, not EXPIRED. Only a job with no deliveries
+# yet (PENDING, not resolved) takes EXPIRED / CANCELLED directly.
+#
+# IN FLIGHT: an attempt runs inside the worker's transaction under a
+# row lock on the notification (processor.py, FOR UPDATE). Expiry and
+# cancellation lock the same row (FOR UPDATE, waiting, not skipping),
+# so they apply to the state AFTER the attempt: what was sent stays
+# sent, what is still waiting is closed.
 
 
 async def rollup_notification(
     session: AsyncSession,
     notification: Notification,
 ) -> None:
-    """Update Notification.status based on delivery statuses.
+    """Fold the deliveries' outcomes into the job's (see THE FOLD).
 
-    Only acts on PROCESSING notifications: terminal states set by
-    resolve (SKIPPED for empty/all-muted audiences) or the processor
-    (EXPIRED) must not be overwritten -- without the guard the
-    "no deliveries -> FAILED" branch below would clobber SKIPPED.
-    That branch stays as a safety net: a PROCESSING notification
-    without any deliveries is an anomaly, not a skip.
-
-    SKIPPED deliveries (late mutes, Phase 2.1) are non-events: they
-    are subtracted before the verdict, so they drag the outcome
-    neither toward FAILED nor toward SENT. Matrix:
-      - only skipped              -> notification SKIPPED (late
-        edition of "nobody to deliver to")
-      - skipped + sent            -> sent
-      - skipped + failed          -> failed
-      - skipped + sent + failed   -> partial_sent
-      - skipped + pending         -> stays processing (a gated
-        delivery is still alive; do not finalize early)
-
-    Rules over the remaining statuses (cbshome base, incl.
-    PARTIAL_SENT):
-      - All sent         -> sent
-      - All failed       -> failed
-      - Mix sent+failed  -> partial_sent
-      - Any pending      -> stays processing (not all delivered yet)
+    Acts on PROCESSING only: every other status is either not resolved
+    yet or already an outcome, and an outcome is never re-decided.
 
     Args:
         session: Active DB session (caller commits).
@@ -708,39 +1036,11 @@ async def rollup_notification(
     result = await session.execute(stmt)
     statuses = {row[0] for row in result.all()}
 
-    if not statuses:
-        notification.status = NotificationStatus.FAILED
+    verdict = _fold(statuses)
+    if verdict is None:
         return
-
-    # Skips are non-events -- judge the outcome by the rest.
-    active = statuses - {DeliveryStatus.SKIPPED}
-    if not active:
-        notification.status = NotificationStatus.SKIPPED
-        await session.flush()
-        logger.info(
-            "notification_rollup",
-            notification_id=str(notification.id),
-            status=notification.status,
-        )
-        return
-
-    has_pending = DeliveryStatus.PENDING in active
-    has_sent = DeliveryStatus.SENT in active
-    has_failed = DeliveryStatus.FAILED in active
-
-    if has_pending:
-        # Still processing -- don't change status.
-        return
-
-    if has_sent and not has_failed:
-        notification.status = NotificationStatus.SENT
-    elif has_failed and not has_sent:
-        notification.status = NotificationStatus.FAILED
-    else:
-        notification.status = NotificationStatus.PARTIAL_SENT
-
+    notification.status = verdict
     await session.flush()
-
     logger.info(
         "notification_rollup",
         notification_id=str(notification.id),
@@ -748,13 +1048,140 @@ async def rollup_notification(
     )
 
 
+def _fold(statuses: set[str]) -> NotificationStatus | None:
+    """THE FOLD over the set of delivery statuses; None = still open."""
+    if not statuses:
+        return NotificationStatus.NO_RECIPIENTS
+    active = statuses - {
+        DeliveryStatus.SUPPRESSED, DeliveryStatus.RECIPIENT_INACTIVE,
+    }
+    if not active:
+        if DeliveryStatus.SUPPRESSED in statuses:
+            return NotificationStatus.SUPPRESSED
+        return NotificationStatus.NO_RECIPIENTS
+    if DeliveryStatus.PENDING in active:
+        return None
+    if active == {DeliveryStatus.SENT}:
+        return NotificationStatus.SENT
+    if DeliveryStatus.SENT in active:
+        return NotificationStatus.PARTIAL_SENT
+    if DeliveryStatus.FAILED in active:
+        return NotificationStatus.FAILED
+    if DeliveryStatus.EXPIRED in active:
+        return NotificationStatus.EXPIRED
+    return NotificationStatus.CANCELLED
+
+
+# The two outcomes a job can be CLOSED with from outside the attempt,
+# and the delivery outcome each gives the deliveries still waiting.
+_CLOSING = {
+    NotificationStatus.EXPIRED: DeliveryStatus.EXPIRED,
+    NotificationStatus.CANCELLED: DeliveryStatus.CANCELLED,
+}
+
+_ACTIVE_STATUSES = (NotificationStatus.PENDING, NotificationStatus.PROCESSING)
+
+
+async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
+    """Close a deleted recipient's deliveries (F1.4, forgetting).
+
+    Every delivery of theirs still waiting takes RECIPIENT_INACTIVE
+    (wait fields cleared) and each affected job is folded (THE FOLD).
+    The jobs are locked FOR UPDATE and the lock is WAITED for, like
+    expiry and cancellation: an attempt in flight finishes first. Every
+    delivery of theirs, finished or not, loses its error_message -- a
+    provider's words may quote the address being forgotten.
+
+    Returns the number of deliveries closed.
+    """
+    parents = (
+        await session.execute(
+            select(Notification)
+            .where(
+                Notification.id.in_(
+                    select(NotificationDelivery.notification_id).where(
+                        NotificationDelivery.recipient_id == recipient_id,
+                        NotificationDelivery.status == DeliveryStatus.PENDING,
+                    )
+                ),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    closed = await session.execute(
+        update(NotificationDelivery)
+        .where(
+            NotificationDelivery.recipient_id == recipient_id,
+            NotificationDelivery.status == DeliveryStatus.PENDING,
+        )
+        .values(
+            status=DeliveryStatus.RECIPIENT_INACTIVE,
+            next_retry_at=None,
+            wait_reason=None,
+        )
+    )
+    await session.execute(
+        update(NotificationDelivery)
+        .where(NotificationDelivery.recipient_id == recipient_id)
+        .values(error_message=None)
+    )
+    for notification in parents:
+        await rollup_notification(session, notification)
+    await session.flush()
+    return int(closed.rowcount or 0)  # type: ignore[attr-defined]
+
+
+async def close_notifications(
+    session: AsyncSession,
+    condition: Any,
+    outcome: NotificationStatus,
+) -> int:
+    """Expire or cancel every ACTIVE job matching `condition`.
+
+    The waiting deliveries take the outcome and the job is folded (see
+    THE FOLD); a job with no deliveries yet takes the outcome directly.
+    A job already at an outcome is not touched -- that is the guard,
+    and a second call is a zero-row no-op. Rows are locked FOR UPDATE
+    and the lock is WAITED for: an attempt in flight finishes first.
+
+    Returns the number of jobs closed.
+    """
+    delivery_outcome = _CLOSING[outcome]
+    rows = await session.execute(
+        select(Notification)
+        .where(condition, Notification.status.in_(_ACTIVE_STATUSES))
+        .with_for_update()
+    )
+    notifications = list(rows.scalars().all())
+    for notification in notifications:
+        if notification.status == NotificationStatus.PENDING:
+            # Not resolved: no deliveries exist to carry the outcome.
+            notification.status = outcome
+            continue
+        await session.execute(
+            update(NotificationDelivery)
+            .where(
+                NotificationDelivery.notification_id == notification.id,
+                NotificationDelivery.status == DeliveryStatus.PENDING,
+            )
+            .values(
+                status=delivery_outcome,
+                next_retry_at=None,
+                wait_reason=None,
+            )
+        )
+        await rollup_notification(session, notification)
+    await session.flush()
+    return len(notifications)
+
+
 # ---------------------------------------------------------------------------
 # In-app inbox functions (cbshome Sprint 8.3; HTTP surface is Phase 3)
 # ---------------------------------------------------------------------------
 
 
-# Phase 3a item 5: terminal statuses subject to retention -- ALL five
-# of them. PARTIAL_SENT was missing from the original spec list; the
+# Phase 3a item 5: terminal statuses subject to retention -- ALL of
+# them (seven since F1.3). PARTIAL_SENT was missing from the original spec list; the
 # Phase 3a report flagged it (rows would be immortal: polling never
 # picks them up, rollup never returns to them) and Master-chat ruled
 # it IN (Phase 3a.1): a partial send is no less finished than a full
@@ -764,8 +1191,10 @@ _RETENTION_TERMINAL_STATUSES = (
     NotificationStatus.SENT,
     NotificationStatus.PARTIAL_SENT,
     NotificationStatus.FAILED,
-    NotificationStatus.SKIPPED,
     NotificationStatus.EXPIRED,
+    NotificationStatus.CANCELLED,
+    NotificationStatus.SUPPRESSED,
+    NotificationStatus.NO_RECIPIENTS,
 )
 
 
@@ -838,9 +1267,6 @@ def _navigation_intent(
     return intent
 
 
-# Hard ceiling on the inbox page size -- a page is a UI unit, not an
-# export API; anything bigger belongs to a different endpoint.
-INBOX_MAX_PAGE_SIZE = 100
 
 
 async def list_recipient_deliveries(
@@ -875,7 +1301,8 @@ async def list_recipient_deliveries(
     Args:
         session: Active DB session (read-only).
         recipient_id: Recipient (= product user) id.
-        limit: Page size (clamped to 1..INBOX_MAX_PAGE_SIZE).
+        limit: Page size, already bounded by the route
+            (app/api/paging.py refuses anything outside 1..PAGE_LIMIT_MAX).
         cursor: (sent_at, id) of the last row already seen, or None
             for the first page.
         type_filter: Filter by Notification.type (exact match).
@@ -886,7 +1313,6 @@ async def list_recipient_deliveries(
         next_cursor is the (sent_at, id) pair to request the next page
         with, or None when this page is the last.
     """
-    limit = max(1, min(limit, INBOX_MAX_PAGE_SIZE))
 
     conditions = [
         NotificationDelivery.recipient_id == recipient_id,
@@ -938,7 +1364,6 @@ async def list_recipient_deliveries(
             "title": notification.title,
             "body": notification.body,
             "action_data": _navigation_intent(notification.action_data),
-            "priority": notification.priority,
         })
 
     next_cursor: tuple[datetime, UUID] | None = None

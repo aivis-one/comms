@@ -51,6 +51,7 @@ from app.notifier import notify_new_message
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_t67_telegram_id,
 )
 
@@ -66,7 +67,7 @@ async def _section_thread(
     session: AsyncSession, *, client: UUID, section_id: UUID
 ):
     return await create_or_get_thread(
-        session,
+        session, **intake_fields(),
         client=client,
         operator_kind=OperatorKind.SECTION,
         operator_value=section_id,
@@ -130,7 +131,8 @@ class TestEmptyMembershipIsTodaysBehaviour:
             db_session, client=client, section_id=section.id
         )
         message = await post_message(
-            db_session, thread_id=thread.id, sender=client, body="hello?"
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=client, body="hello?"
         )
 
         created = await notify_new_message(
@@ -225,7 +227,8 @@ class TestDeclaredMembership:
             )
         await db_session.flush()
         message = await post_message(
-            db_session, thread_id=thread.id, sender=client, body="help"
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=client, body="help"
         )
 
         created = await notify_new_message(
@@ -253,7 +256,8 @@ class TestDeclaredMembership:
             )
         await db_session.flush()
         message = await post_message(
-            db_session, thread_id=thread.id, sender=staff, body="mine"
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=staff, body="mine"
         )
 
         created = await notify_new_message(
@@ -282,7 +286,8 @@ class TestDeclaredMembership:
             )
         await db_session.flush()
         message = await post_message(
-            db_session, thread_id=thread.id, sender=client, body="again"
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=client, body="again"
         )
 
         created = await notify_new_message(

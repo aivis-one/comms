@@ -7,6 +7,13 @@
 # as "Authorization: Bearer <token>". This dependency guards every
 # /api/v1 router.
 #
+# THE TRUST MODEL -- the service token is the ONLY thing comms checks.
+# Every actor named in a request (participant, operator, sender,
+# is_supervisor) is taken on trust from the product's proxy, which must
+# derive them from its own session. Written down, with whose
+# responsibility each part is, in ONE place: deploy/INTEGRATION.md,
+# "What comms takes on trust". This module is where that model stops.
+#
 # SECRET HANDLING:
 #   - comparison is constant-time (secrets.compare_digest) -- an
 #     internal API on an isolated network hardly invites timing

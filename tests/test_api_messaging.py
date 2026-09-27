@@ -160,14 +160,14 @@ class TestThreadFeed:
         )
         assert page1.status_code == 200
         body1 = page1.json()
-        assert [m["body"] for m in body1["messages"]] == ["m2", "m1"]
+        assert [m["body"] for m in body1["items"]] == ["m2", "m1"]
         assert body1["next_cursor"] is not None
         page2 = await client.get(
             f"/api/v1/threads/{tid}/messages",
             params={"limit": 2, "cursor": body1["next_cursor"]},
         )
         body2 = page2.json()
-        assert [m["body"] for m in body2["messages"]] == ["m0"]
+        assert [m["body"] for m in body2["items"]] == ["m0"]
         assert body2["next_cursor"] is None
 
     async def test_malformed_cursor_is_422(
@@ -220,7 +220,12 @@ class TestOperatorVerbs:
         second = await client.post(
             f"/api/v1/threads/{tid}/claim", json={"operator": str(op2)}
         )
-        assert second.json()["claimed"] is False
+        # Was 200 {"claimed": false}. F1.4 made the claim idempotent BY
+        # OUTCOME: `claimed` means "the thread is yours now", so the
+        # first operator's repeat is true, and a claim of a thread held
+        # by ANOTHER operator is a 409 conflict, told apart by class.
+        assert second.status_code == 409
+        assert second.json()["error"]["class"] == "conflict"
 
     async def test_set_status_closes(self, client: AsyncClient) -> None:
         client_id, section = await _recipient(), await _section()
@@ -290,7 +295,7 @@ class TestListVisible:
             params={"operator": str(operator), "limit": 50},
         )
         assert resp.status_code == 200
-        seen = {t["id"] for t in resp.json()["threads"]}
+        seen = {t["id"] for t in resp.json()["items"]}
         assert ids <= seen
 
 

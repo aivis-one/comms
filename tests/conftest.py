@@ -87,8 +87,10 @@ os.environ["COMMS_SERVICE_TOKEN"] = "suite-service-token"
 
 import subprocess
 import sys
+import uuid
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -101,7 +103,7 @@ from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.config import settings
 from app.core.database import dispose_engine, get_session_factory
 from app.engine.formatters import reset_formatters
-from app.engine.models import Notification, NotificationDelivery
+from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
 from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.profile.loader import FileProfileSource, install_profile, load_profile
 from app.profile.registry import registry
@@ -216,6 +218,9 @@ async def clean_db(apply_migrations: None) -> AsyncGenerator[None, None]:
         await session.execute(delete(Thread))
         await session.execute(delete(Section))
         await session.execute(delete(NotificationDelivery))
+        # Intake records (F1.2) reference notifications with SET NULL:
+        # deleting the job alone would leave them behind.
+        await session.execute(delete(IntakeOutcome))
         await session.execute(delete(Notification))
         await session.execute(delete(CategoryMute))
         await session.execute(delete(GroupMembership))
@@ -316,7 +321,31 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
 
 @pytest.fixture
 async def client() -> AsyncGenerator[AsyncClient, None]:
-    """AsyncClient driving the FastAPI app via ASGITransport."""
+    """AsyncClient driving the FastAPI app via ASGITransport.
+
+    Every request it sends WITHOUT an Idempotency-Key gets a fresh one
+    (F1.4: the two calls that create require the header). This keeps the
+    suite's many create-and-assert tests about their own subject; the
+    requirement itself, and the replay / conflict rules, are asserted
+    through `bare_client`, which adds nothing.
+    """
+    from app.main import app
+
+    async def _fresh_key(request: Any) -> None:
+        if "idempotency-key" not in request.headers:
+            request.headers["Idempotency-Key"] = f"test:{uuid.uuid4()}"
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://testserver",
+        event_hooks={"request": [_fresh_key]},
+    ) as ac:
+        yield ac
+
+
+@pytest.fixture
+async def bare_client() -> AsyncGenerator[AsyncClient, None]:
+    """The same client with no header added -- for the key's own tests."""
     from app.main import app
 
     transport = ASGITransport(app=app)

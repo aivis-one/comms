@@ -7,7 +7,8 @@
 # service refuses to start without a profile that passes the
 # chat-baseline check (arch doc #15): all three built-in msg.* types
 # declared, each with a non-empty preference category. This file is
-# exactly that -- nothing more.
+# exactly that -- nothing more. Schema version 2: the version is
+# declared, the types live under `types:` (app/profile/loader.py).
 #
 # `deploy install` copies this directory into the instance profile
 # location (PROFILE_DIR) ONLY when that location is empty; the real
@@ -19,16 +20,19 @@
 # external domains (enforced at startup by the profile data fence).
 # =============================================================================
 
-# The three built-in chat types comms emits unconditionally
-# (app/core/constants.py: MSG_TYPE_KEYS). A type without a category
-# would bypass the mute gate, so each carries one. Categories are
-# generic families: muting "msg_chat" gates both message directions;
-# "msg_system" gates the service notices.
-msg.participant_message:
-  category: msg_chat
+version: 2
 
-msg.support_message:
-  category: msg_chat
+types:
+  # The three built-in chat types comms emits unconditionally
+  # (app/core/constants.py: MSG_TYPE_KEYS). A type without a category
+  # would bypass the mute gate, so each carries one. Categories are
+  # generic families: muting "msg_chat" gates both message directions;
+  # "msg_system" gates the service notices.
+  msg.participant_message:
+    category: msg_chat
 
-msg.thread_closed:
-  category: msg_system
+  msg.support_message:
+    category: msg_chat
+
+  msg.thread_closed:
+    category: msg_system

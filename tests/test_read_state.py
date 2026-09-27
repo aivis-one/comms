@@ -22,7 +22,7 @@ from app.engine.service import (
     mark_delivery_read,
     resolve_notification,
 )
-from tests.helpers import create_recipient
+from tests.helpers import create_recipient, intake_fields
 
 
 async def _seed_sent_deliveries(
@@ -42,12 +42,12 @@ async def _seed_sent_deliveries(
     for index in range(count + 1):
         notification = await create_notification(
             session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title=f"Title {index}",
             body=f"Body {index}",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["in_app"],
             action_data={
                 "action": "open_unit",
                 "params": {"unit_id": str(index)},
@@ -129,7 +129,7 @@ class TestListDeliveries:
             assert item["status"] == DeliveryStatus.SENT
             assert item["title"].startswith("Title")
             assert item["body"].startswith("Body")
-            assert item["type"] == "unit_event"
+            assert item["type"] == "unit_event_in_app"
             # Amendment A: only the navigational intent survives --
             # template variables ("extra") and internal keys never
             # leave the service.
@@ -153,12 +153,12 @@ class TestListDeliveries:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["in_app"],
             action_data={"extra": "template variable only"},
         )
         created = await resolve_notification(db_session, notification)

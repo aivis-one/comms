@@ -10,6 +10,7 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
+from httpx import AsyncClient
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +21,7 @@ from app.messaging.threads import create_or_get_thread
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4c_telegram_id,
 )
 
@@ -34,7 +36,7 @@ async def _rid(session: AsyncSession) -> UUID:
 async def _section_thread(session: AsyncSession, client: UUID, i: int) -> UUID:
     section = await create_section(session, key=f"pg-{uuid4().hex[:8]}")
     thread = await create_or_get_thread(
-        session, client=client,
+        session, **intake_fields(), client=client,
         operator_kind=OperatorKind.SECTION, operator_value=section.id,
         kind=ThreadKind.TICKET, subject_type="practice", subject_id=str(i),
     )
@@ -128,16 +130,33 @@ class TestKeysetOrder:
 
 
 class TestClampAndTiebreak:
-    async def test_limit_clamped_to_at_least_one(
+    async def test_limit_at_the_lower_bound_pages(
         self, db_session: AsyncSession
     ) -> None:
+        """Was test_limit_clamped_to_at_least_one: limit=0 was clamped
+        to 1 here, in the service. F1.4 moved the bound to the route and
+        made it a refusal (app/api/paging.py -- a clamp silently changes
+        the request); the refusal is asserted on the route in
+        test_limit_outside_the_bounds_is_refused. What stays true here is
+        the lower bound itself: limit=1 is one row and a cursor."""
         client = await _rid(db_session)
         await _seed(db_session, client, 3)
         page, cursor = await list_visible_threads(
-            db_session, operator=uuid4(), is_supervisor=True, limit=0
+            db_session, operator=uuid4(), is_supervisor=True, limit=1
         )
-        assert len(page) == 1  # 0 -> clamped to 1
+        assert len(page) == 1
         assert cursor is not None
+
+    async def test_limit_outside_the_bounds_is_refused(
+        self, client: AsyncClient,
+    ) -> None:
+        for bad in (0, -5, 101):
+            response = await client.get("/api/v1/threads", params={
+                "operator": str(uuid4()), "is_supervisor": "true",
+                "limit": bad,
+            })
+            assert response.status_code == 422, bad
+            assert response.json()["error"]["class"] == "validation"
 
     async def test_equal_activity_ordered_by_id_desc(
         self, db_session: AsyncSession
@@ -170,7 +189,7 @@ class TestOperatorScopePagination:
         # a foreign user thread (mastered by someone else) stays invisible
         other = await _rid(db_session)
         await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.USER, operator_value=other,
             kind=ThreadKind.DM,
         )

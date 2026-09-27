@@ -83,13 +83,22 @@ class IndexShape:
 # autogenerate -- which is why each one needs muting by name.
 MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
     # -- Uniqueness that is an invariant, not an optimization --
-    # Replay of a stream event collapses onto one notification.
+    # One key, one accepted job (F1.2: plain, the key is NOT NULL).
+    # Replay of a request collapses onto it; other bytes are a conflict.
     "uq_notifications_idempotency_key": IndexShape(
         unique=True,
         definition=(
             "CREATE UNIQUE INDEX uq_notifications_idempotency_key "
-            "ON public.notifications USING btree (idempotency_key) "
-            "WHERE (idempotency_key IS NOT NULL)"
+            "ON public.notifications USING btree (idempotency_key)"
+        ),
+    ),
+    # A replay of the same rejected or conflicting bytes records once.
+    "uq_intake_outcomes_key_fingerprint_outcome": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_intake_outcomes_key_fingerprint_outcome "
+            "ON public.intake_outcomes USING btree "
+            "(idempotency_key, fingerprint, outcome)"
         ),
     ),
     # "One eternal DM per pair" -- partial unique index.
@@ -137,12 +146,28 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "(recipient_id, status, read_at)"
         ),
     ),
-    "ix_notifications_status_scheduled_priority": IndexShape(
+    # The processor's pick order (F1.4: priority left the ordering and
+    # the table; the index was recreated without it).
+    "ix_notifications_status_scheduled": IndexShape(
         unique=False,
         definition=(
-            "CREATE INDEX ix_notifications_status_scheduled_priority "
-            "ON public.notifications USING btree "
-            "(status, scheduled_at, priority)"
+            "CREATE INDEX ix_notifications_status_scheduled "
+            "ON public.notifications USING btree (status, scheduled_at)"
+        ),
+    ),
+    # A repeated resource call answers with the row it created (F1.4).
+    "uq_messages_idempotency_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_messages_idempotency_key "
+            "ON public.messages USING btree (idempotency_key)"
+        ),
+    ),
+    "uq_threads_idempotency_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_threads_idempotency_key "
+            "ON public.threads USING btree (idempotency_key)"
         ),
     ),
     "ix_threads_activity": IndexShape(
@@ -186,6 +211,18 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
 MIGRATION_OWNED_CHECKS = frozenset({
     # A half subject_ref (one column set, the other NULL) is forbidden.
     "ck_threads_subject_ref_both_or_neither",
+    # A failed delivery without a failure class cannot exist (F1.3).
+    "ck_deliveries_failure_class",
+    # A wait reason without a time (or the reverse) cannot exist (F1.3).
+    "ck_deliveries_wait_reason",
+    # "No value" is NULL, never a blank string or a zero (F1.4).
+    "ck_recipients_locale_not_blank",
+    "ck_recipients_email_not_blank",
+    "ck_recipients_timezone_not_blank",
+    "ck_recipients_telegram_id_not_zero",
+    "ck_recipients_version_not_negative",
+    # A tombstone keeps nothing that reaches the person (F1.4).
+    "ck_recipients_tombstone",
 })
 
 # Everything the schema must carry although the metadata never mentions

@@ -17,10 +17,10 @@
 #
 #   POST /api/v1/threads                      -> 200 <thread> + created
 #   GET  /api/v1/threads?operator=&is_supervisor=&limit=&cursor=
-#                                             -> 200 {threads, next_cursor}
+#                                             -> 200 {items, next_cursor}
 #   POST /api/v1/threads/{tid}/messages       -> 200 <message>  (+ notify)
 #   GET  /api/v1/threads/{tid}/messages?limit=&cursor=
-#                                             -> 200 {messages, next_cursor}
+#                                             -> 200 {items, next_cursor}
 #   POST /api/v1/threads/{tid}/read           -> 200 {unread}   (fresh badge)
 #   GET  /api/v1/threads/{tid}/unread-count?participant=
 #                                             -> 200 {unread}
@@ -70,8 +70,8 @@
 #     race. ADDITIVE to the frozen 3b shape (seam T2 / ID-10, precedent
 #     reminder_cancel) -- every pre-existing field is unchanged, and no
 #     OTHER endpoint gained the key;
-#   - limit: 1..100, default 20 (clamped, not rejected); cursor is the
-#     previous page's opaque next_cursor, malformed -> 422;
+#   - limit / cursor: the one paging scheme (app/api/paging.py) -- out
+#     of 1..100 or a malformed cursor -> 422 `validation`;
 #   - a bad status transition / half subject_ref -> 422; an absent
 #     thread on a verb that must exist (post/status/retag/claim) -> 404.
 #
@@ -87,22 +87,36 @@
 # read-only), NOT identity -- it is orthogonal to this trust model.
 # =============================================================================
 
-import base64
-import binascii
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Header, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_service_auth
+from app.api.idempotency import (
+    IDEMPOTENCY_HEADER,
+    request_fingerprint,
+    require_key,
+)
+from app.api.paging import (
+    PAGE_LIMIT_DEFAULT,
+    decode_cursor,
+    encode_cursor,
+    page,
+    page_limit,
+)
+from app.core.constants import PAGE_LIMIT_MAX
 from app.core.database import get_db_reader, get_db_session
 from app.core.exceptions import (
     AuthorizationError,
+    ClaimTakenError,
+    IdempotencyConflictError,
     NotFoundError,
-    ValidationError,
 )
 from app.messaging.constants import (
     MAX_MESSAGE_BODY_LEN,
@@ -173,31 +187,10 @@ participants_router = APIRouter(
 
 
 # One page of a chat list, matched to the list endpoint's own page
-# ceiling (VISIBLE_THREADS_MAX_PAGE_SIZE): the batch exists to serve a
-# rendered list, so it takes exactly as many ids as a list can show.
-UNREAD_COUNTS_MAX_THREAD_IDS = 100
+# ceiling (PAGE_LIMIT_MAX, app/api/paging.py): the batch exists to serve
+# a rendered list, so it takes exactly as many ids as a list can show.
+UNREAD_COUNTS_MAX_THREAD_IDS = PAGE_LIMIT_MAX
 
-
-# ---------------------------------------------------------------------------
-# Cursor codec (opaque; parallel to the inbox codec -- same (datetime,
-# UUID) keyset shape, kept separate so the inbox contract stays frozen)
-# ---------------------------------------------------------------------------
-def _encode_cursor(cursor: tuple[datetime, UUID]) -> str:
-    when, ident = cursor
-    raw = f"{when.isoformat()}|{ident}"
-    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
-
-
-def _decode_cursor(value: str) -> tuple[datetime, UUID]:
-    """Decode a wire cursor; any malformation -> ValidationError (422)."""
-    try:
-        raw = base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
-        when_text, _, id_text = raw.partition("|")
-        if not id_text:
-            raise ValueError("missing separator")
-        return datetime.fromisoformat(when_text), UUID(id_text)
-    except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed thread cursor: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +361,27 @@ class UnreadCountsIn(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints -- threads
 # ---------------------------------------------------------------------------
+async def _replay[M: (Thread, Message)](
+    session: AsyncSession,
+    model: type[M],
+    key: str,
+    fingerprint: str,
+) -> M | None:
+    """The row a key already created, if its request was THIS one.
+
+    None when the key is unused. The same key with another request is a
+    conflict (409) -- never the old row returned as if it were new.
+    """
+    row = await session.scalar(select(model).where(model.idempotency_key == key))
+    if row is None:
+        return None
+    if row.fingerprint != fingerprint:
+        raise IdempotencyConflictError(
+            f"the Idempotency-Key {key!r} was used for another request"
+        )
+    return row
+
+
 async def _require_thread(session: AsyncSession, thread_id: UUID) -> Thread:
     """Load a thread for a write, or 404. Fetched before the authz check
     so a role decision is made against real thread state."""
@@ -379,7 +393,9 @@ async def _require_thread(session: AsyncSession, thread_id: UUID) -> Thread:
 
 @router.post("")
 async def create_thread(
+    request: Request,
     payload: ThreadCreateIn = Body(...),
+    idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Create a thread, or return the existing one per the dedup key.
@@ -396,17 +412,36 @@ async def create_thread(
     is shared with the list / claim / status / retag responses, whose
     shapes are frozen (3b) and must stay byte-for-byte.
     """
-    thread, created = await create_or_get_thread_detailed(
-        session,
-        client=payload.client,
-        operator_kind=payload.operator_kind,
-        operator_value=payload.operator_value,
-        kind=payload.kind,
-        subject_type=payload.subject_type,
-        subject_id=payload.subject_id,
-        title=payload.title,
-        priority=payload.priority,
-    )
+    key = require_key(idempotency_key)
+    fingerprint = await request_fingerprint(request)
+    replayed = await _replay(session, Thread, key, fingerprint)
+    if replayed is not None:
+        # The creating request again (app/api/idempotency.py): the SAME
+        # thread in its CURRENT state. `created` stays true for it --
+        # the flag belongs to the request, and this is that request.
+        return {**_thread_out(replayed), "created": True}
+    try:
+        async with session.begin_nested():
+            thread, created = await create_or_get_thread_detailed(
+                session,
+                client=payload.client,
+                operator_kind=payload.operator_kind,
+                operator_value=payload.operator_value,
+                kind=payload.kind,
+                subject_type=payload.subject_type,
+                subject_id=payload.subject_id,
+                title=payload.title,
+                priority=payload.priority,
+                idempotency_key=key,
+                fingerprint=fingerprint,
+            )
+    except IntegrityError as exc:
+        if "uq_threads_idempotency_key" not in str(exc.orig):
+            raise
+        # A concurrent request with this key won the insert.
+        winner = await _replay(session, Thread, key, fingerprint)
+        assert winner is not None
+        return {**_thread_out(winner), "created": True}
     return {**_thread_out(thread), "created": created}
 
 
@@ -457,7 +492,7 @@ async def list_threads(
     operator: UUID = Query(...),
     is_supervisor: bool = Query(default=False),
     with_unread: bool = Query(default=False),
-    limit: int = Query(default=20),
+    limit: int = Query(default=PAGE_LIMIT_DEFAULT),
     cursor: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_reader),
 ) -> dict[str, Any]:
@@ -491,13 +526,12 @@ async def list_threads(
     "nothing unread here" and be indistinguishable from a thread the
     operator has fully read.
     """
-    decoded = _decode_cursor(cursor) if cursor is not None else None
     threads, next_cursor = await list_visible_threads(
         session,
         operator=operator,
         is_supervisor=is_supervisor,
-        limit=limit,
-        cursor=decoded,
+        limit=page_limit(limit),
+        cursor=decode_cursor(cursor),
     )
     rows = [_thread_out(t) for t in threads]
     if with_unread:
@@ -511,11 +545,10 @@ async def list_threads(
              else row)
             for row, thread in zip(rows, threads, strict=True)
         ]
+    # The one listing shape (app/api/paging.py): `items`, as everywhere.
     return {
-        "threads": rows,
-        "next_cursor": (
-            _encode_cursor(next_cursor) if next_cursor is not None else None
-        ),
+        "items": rows,
+        "next_cursor": encode_cursor(next_cursor) if next_cursor else None,
     }
 
 
@@ -586,23 +619,45 @@ async def unread_counts(
 # ---------------------------------------------------------------------------
 @router.post("/{thread_id}/messages")
 async def post_thread_message(
+    request: Request,
     thread_id: UUID,
     payload: MessageIn = Body(...),
+    idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Append a message AND ping the other side in one transaction."""
+    """Append a message AND ping the other side in one transaction.
+
+    Idempotent under its key (app/api/idempotency.py): a repeat after a
+    lost response returns the same message and pings nobody again.
+    """
+    key = require_key(idempotency_key)
+    fingerprint = await request_fingerprint(request)
+    replayed = await _replay(session, Message, key, fingerprint)
+    if replayed is not None:
+        return _message_out(replayed)
     thread = await _require_thread(session, thread_id)
     if not can_post_message(thread, payload.sender):
         raise AuthorizationError(
             "sender is neither a participant nor the serving operator "
             "of this thread"
         )
-    message = await post_message(
-        session,
-        thread_id=thread_id,
-        sender=payload.sender,
-        body=payload.body,
-    )
+    try:
+        async with session.begin_nested():
+            message = await post_message(
+                session,
+                thread_id=thread_id,
+                sender=payload.sender,
+                body=payload.body,
+                idempotency_key=key,
+                fingerprint=fingerprint,
+            )
+    except IntegrityError as exc:
+        if "uq_messages_idempotency_key" not in str(exc.orig):
+            raise
+        # A concurrent request with this key won: its message, no ping.
+        winner = await _replay(session, Message, key, fingerprint)
+        assert winner is not None
+        return _message_out(winner)
     await notify_new_message(session, thread=thread, message=message)
     return _message_out(message)
 
@@ -610,21 +665,16 @@ async def post_thread_message(
 @router.get("/{thread_id}/messages")
 async def get_thread_feed(
     thread_id: UUID,
-    limit: int = Query(default=20),
+    limit: int = Query(default=PAGE_LIMIT_DEFAULT),
     cursor: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_reader),
 ) -> dict[str, Any]:
     """A thread's messages, newest-first, keyset-paginated."""
-    decoded = _decode_cursor(cursor) if cursor is not None else None
     messages, next_cursor = await list_thread_messages(
-        session, thread_id=thread_id, limit=limit, cursor=decoded,
+        session, thread_id=thread_id, limit=page_limit(limit),
+        cursor=decode_cursor(cursor),
     )
-    return {
-        "messages": [_message_out(m) for m in messages],
-        "next_cursor": (
-            _encode_cursor(next_cursor) if next_cursor is not None else None
-        ),
-    }
+    return page(messages, next_cursor, _message_out)
 
 
 # ---------------------------------------------------------------------------
@@ -698,11 +748,16 @@ async def claim(
         raise AuthorizationError(
             "thread is not claimable (only section threads are claimed)"
         )
-    claimed = await claim_thread(
-        session, thread_id=thread_id, operator=payload.operator
-    )
+    await claim_thread(session, thread_id=thread_id, operator=payload.operator)
     await session.refresh(thread)
-    return {"claimed": claimed, "thread": _thread_out(thread)}
+    # IDEMPOTENT BY OUTCOME (F1.4): `claimed` answers "is the thread
+    # yours now", not "did THIS call write it" -- a claim repeated after
+    # a lost response is still yours. Held by another operator: 409.
+    if thread.assignee != payload.operator:
+        raise ClaimTakenError(
+            f"thread {thread_id} is assigned to another operator"
+        )
+    return {"claimed": True, "thread": _thread_out(thread)}
 
 
 @router.post("/{thread_id}/status")

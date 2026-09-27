@@ -17,11 +17,13 @@
 # =============================================================================
 
 import itertools
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
+from app.audience.sync import apply_snapshot, snapshot_fingerprint
 from app.messaging.models import Section
 
 TELEGRAM_ID_BAND_START = 80000
@@ -258,11 +260,17 @@ async def create_recipient(
     active: bool = True,
 ) -> Recipient:
     """Create a recipient row (id = simulated product user id)."""
+    resolved_tg = telegram_id if telegram_id is not None else next_telegram_id()
     recipient = Recipient(
         id=recipient_id or uuid4(),
-        telegram_id=(
-            telegram_id if telegram_id is not None else next_telegram_id()
+        # A row written straight into the table stands for a snapshot
+        # the product sent at version 1 (F1.4: every row has one).
+        version=1,
+        snapshot_fingerprint=snapshot_fingerprint(
+            telegram_id=resolved_tg, email=email, locale=locale,
+            timezone=None, active=active,
         ),
+        telegram_id=resolved_tg,
         email=email,
         locale=locale,
         active=active,
@@ -298,3 +306,72 @@ async def create_section(
     session.add(section)
     await session.flush()
     return section
+
+
+# -- Intake (F1.2) -------------------------------------------------------------
+# Every job carries an idempotency key and a fingerprint. Tests that
+# create notifications directly (not through intake) get a FRESH key per
+# call -- two direct creates never collide -- and one fixed fingerprint:
+# the key alone decides, the fingerprint only matters to intake tests,
+# which build their own.
+TEST_FINGERPRINT = "f" * 64
+
+
+def intake_fields() -> dict[str, str]:
+    """A fresh idempotency key and the test fingerprint."""
+    return {"idempotency_key": f"test:{uuid4()}", "fingerprint": TEST_FINGERPRINT}
+
+
+def notification_row_fields(channels: list[str] | None = None) -> dict[str, object]:
+    """The NOT NULL intake columns for a Notification built DIRECTLY
+    (tests that construct rows around intake, F1.2). A fresh key, the
+    test fingerprint, the channels the row is for (in_app unless said)
+    and the default expiry layer -- what intake would have written for a
+    type with no declared expiry."""
+    return {
+        **intake_fields(),
+        "channels": channels if channels is not None else ["in_app"],
+        "expiry_layer": "default",
+    }
+
+
+def configure_every_channel(monkeypatch: object) -> None:
+    """Make every external channel LIVE on the suite's settings.
+
+    The suite runs with every external channel's keys blanked
+    (tests/conftest.py), and since F1.1 the startup path refuses a
+    route into a channel the deploy did not configure. The fixture
+    profile routes types to telegram and email (F1.2: the channel is
+    the profile's), so a test that loads it through the STARTUP path
+    must stand on a deploy that has them.
+    """
+    from app.core.config import settings
+
+    for name, value in {
+        "telegram_bot_token": "123456:unit-test-bot-token",
+        "telegram_bot_url": "https://t.me/unit_test_bot",
+        "email_mailgun_api_key": "key-unit-test",
+        "email_mailgun_domain": "mg.unit-test.invalid",
+        "email_from_address": "comms@unit-test.invalid",
+    }.items():
+        monkeypatch.setattr(settings, name, value)  # type: ignore[attr-defined]
+
+
+
+# -- Snapshots (F1.4) ----------------------------------------------------------
+# A snapshot carries the product's monotonic version. Tests that apply a
+# sequence of snapshots to one recipient -- the way a product changes a
+# person over time -- take the next version from one counter, so each
+# call supersedes the one before it, as the product's would.
+_snapshot_versions = itertools.count(1)
+
+
+def next_snapshot_version() -> int:
+    return next(_snapshot_versions)
+
+
+async def upsert_snapshot(session: AsyncSession, **fields: Any) -> Recipient:
+    """apply_snapshot with the next version (see above)."""
+    return await apply_snapshot(
+        session, version=next_snapshot_version(), **fields,
+    )

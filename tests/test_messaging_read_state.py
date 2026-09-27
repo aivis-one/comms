@@ -19,7 +19,7 @@ from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import ThreadReadState
 from app.messaging.read_state import count_unread, mark_read
 from app.messaging.threads import create_or_get_thread, post_message
-from tests.helpers import create_recipient, next_phase4a_telegram_id
+from tests.helpers import create_recipient, intake_fields, next_phase4a_telegram_id
 
 _T0 = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
 _T1 = _T0 + timedelta(minutes=5)
@@ -36,7 +36,7 @@ async def _thread_client_operator(
         session, telegram_id=next_phase4a_telegram_id()
     )
     thread = await create_or_get_thread(
-        session,
+        session, **intake_fields(),
         client=client.id,
         operator_kind=OperatorKind.USER,
         operator_value=operator.id,
@@ -132,21 +132,21 @@ class TestCountUnread:
         )
         # two from the operator, one from the client
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=operator_id,
             body="op-1",
             created_at=_T0,
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=operator_id,
             body="op-2",
             created_at=_T1,
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="me",
@@ -165,14 +165,14 @@ class TestCountUnread:
             db_session
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=operator_id,
             body="op-1",
             created_at=_T0,
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=operator_id,
             body="op-2",
@@ -197,7 +197,7 @@ class TestCountUnread:
             db_session
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=operator_id,
             body="op-1",

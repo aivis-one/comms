@@ -3,13 +3,16 @@
 # =============================================================================
 # Mapping (fork 1): client message -> assignee (support); operator
 # message -> client (participant); sender never pinged; 0..2 notifs.
-# Gated by the SAME Phase 2 pipeline (mute -> SKIPPED). Per-recipient
+# Gated by the SAME Phase 2 pipeline (mute -> SUPPRESSED, SKIPPED before
+# F1.3). Per-recipient
 # idempotency dedups replays. Unclaimed section (assignee None) + client
 # sender -> no push (KNOWN CEILING: pool-push deferred).
 # =============================================================================
 
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.prefs import set_category_muted
 from app.engine.constants import NotificationStatus
 from app.engine.models import Notification
-from app.engine.service import resolve_notification
+from app.engine.service import Intake, accept_notification, resolve_notification
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Message, Thread
 from app.messaging.operators import claim_thread
@@ -25,12 +28,12 @@ from app.messaging.threads import create_or_get_thread, post_message
 from app.notifier import (
     TYPE_PARTICIPANT_MESSAGE,
     TYPE_SUPPORT_MESSAGE,
-    _is_idempotency_violation,
     notify_new_message,
 )
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4c_telegram_id,
     next_seam_t2_telegram_id,
 )
@@ -46,7 +49,7 @@ async def _dm(session: AsyncSession) -> tuple[Thread, UUID, UUID]:
     client = await _rid(session)
     master = await _rid(session)
     thread = await create_or_get_thread(
-        session, client=client,
+        session, **intake_fields(), client=client,
         operator_kind=OperatorKind.USER, operator_value=master,
         kind=ThreadKind.DM,
     )
@@ -57,7 +60,7 @@ async def _section(session: AsyncSession) -> tuple[Thread, UUID]:
     client = await _rid(session)
     section = await create_section(session, key=f"nm-{uuid4().hex[:8]}")
     thread = await create_or_get_thread(
-        session, client=client,
+        session, **intake_fields(), client=client,
         operator_kind=OperatorKind.SECTION, operator_value=section.id,
         kind=ThreadKind.TICKET, subject_type="practice", subject_id="s",
     )
@@ -66,7 +69,7 @@ async def _section(session: AsyncSession) -> tuple[Thread, UUID]:
 
 async def _post(session: AsyncSession, thread: Thread, sender: UUID) -> Message:
     return await post_message(
-        session, thread_id=thread.id, sender=sender, body="hello"
+        session, **intake_fields(), thread_id=thread.id, sender=sender, body="hello"
     )
 
 
@@ -115,7 +118,7 @@ class TestMapping:
 
 
 class TestGating:
-    async def test_muted_support_recipient_skipped(
+    async def test_muted_support_recipient_suppressed(
         self, db_session: AsyncSession
     ) -> None:
         thread, client, master = await _dm(db_session)
@@ -126,7 +129,7 @@ class TestGating:
         )
         deliveries = await resolve_notification(db_session, notif)
         assert deliveries == []
-        assert notif.status == NotificationStatus.SKIPPED
+        assert notif.status == NotificationStatus.SUPPRESSED
 
     async def test_unmuted_recipient_resolves_to_delivery(
         self, db_session: AsyncSession
@@ -208,20 +211,40 @@ class TestSectionOperatorSide:
 
 class TestIdempotencyGuard:
     """4c.1-A: the dedup catch is name-filtered -- the idempotency
-    unique is a duplicate, any other constraint must re-raise."""
+    unique is a duplicate, any other constraint must re-raise.
 
-    def test_idempotency_index_is_recognized(self) -> None:
-        exc = IntegrityError(
-            "INSERT ...",
-            {},
-            Exception(
-                'duplicate key value violates unique constraint '
-                '"uq_notifications_idempotency_key"'
-            ),
+    The guard lived in app/notifier.py as _is_idempotency_violation and
+    was tested as a predicate over a hand-built IntegrityError. F1.2
+    moved it into app/engine/service.py accept_notification, the one
+    intake every producer now shares; the property is asserted there,
+    through the real path, in both directions."""
+
+    async def test_idempotency_index_is_recognized(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """A second intake under a taken key is answered, not raised."""
+        fields = {
+            "type": TYPE_PARTICIPANT_MESSAGE,
+            "title": "T",
+            "body": "B",
+            "target_type": "all",
+            "target_value": "*",
+        }
+        first = await accept_notification(
+            db_session, idempotency_key="guard:k", fingerprint="a" * 64,
+            **fields,
         )
-        assert _is_idempotency_violation(exc) is True
+        second = await accept_notification(
+            db_session, idempotency_key="guard:k", fingerprint="a" * 64,
+            **fields,
+        )
+        assert first.outcome is Intake.ACCEPTED
+        assert second.outcome is Intake.DUPLICATE
+        assert second.notification.id == first.notification.id
 
-    def test_other_constraint_is_not_swallowed(self) -> None:
+    async def test_other_constraint_is_not_swallowed(
+        self, db_session: AsyncSession,
+    ) -> None:
         exc = IntegrityError(
             "INSERT ...",
             {},
@@ -230,4 +253,14 @@ class TestIdempotencyGuard:
                 '"notifications_some_future_fkey"'
             ),
         )
-        assert _is_idempotency_violation(exc) is False
+        with (
+            patch(
+                "app.engine.service.create_notification", side_effect=exc,
+            ),
+            pytest.raises(IntegrityError, match="some_future_fkey"),
+        ):
+            await accept_notification(
+                db_session, idempotency_key="guard:x", fingerprint="a" * 64,
+                type=TYPE_PARTICIPANT_MESSAGE, title="T", body="B",
+                target_type="all", target_value="*",
+            )

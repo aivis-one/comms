@@ -36,11 +36,13 @@ set -uo pipefail
 #
 # THREE LIFECYCLE VERBS, THREE DIFFERENT WIDTHS -- the difference is
 # deliberate and easy to erase by "unifying" them later:
-#   restart  bounces the THREE app containers only, and waits for
-#            health. Narrow because its job is re-reading data the
-#            service only loads at startup (the profile); the
-#            datastores hold state and bouncing them for an
-#            application-level change is gratuitous risk.
+#   restart  RECREATES the THREE app containers only, and waits for
+#            health. Narrow because its job is delivering what the
+#            service only reads when a container starts -- the profile
+#            AND the environment (see cmd_restart for why a signal
+#            cannot deliver the second); the datastores hold state and
+#            bouncing them for an application-level change is
+#            gratuitous risk.
 #   stop     takes the WHOLE stack down, postgres and redis included.
 #            It is the switch you throw when the machine goes off, not
 #            an application-level operation.
@@ -278,13 +280,44 @@ wait_for_app() {
         sleep 2
     done
     echo -e "${RED}✗ comms-app did not become healthy${NC}"
-    # The reason is in the container log -- a refused start prints a
-    # readable message naming the broken keys. Show it here, where the
-    # person running the install is looking, instead of pointing away.
-    echo "Last lines of comms-app:"
-    $COMPOSE_CMD logs --no-color --tail=20 comms-app 2>&1 | sed 's/^/  /'
-    echo "Full logs: $0 logs comms-app"
+    show_app_log_tail
     return 1
+}
+
+# Print the last lines of comms-app and where the full log is.
+#
+# The reason for a refused start is in the container log -- comms-app
+# prints a readable message naming the broken keys. Shown where the
+# person running the command is looking, instead of pointing away.
+# ONE copy, called from every place a start can fail: wait_for_app, and
+# each `compose up` whose failure exits before wait_for_app runs --
+# there compose's own last word is "dependency failed to start", which
+# names the container but not the reason.
+#
+# When comms-app has printed NOTHING -- it was created but never
+# started because a datastore it depends on did not become healthy --
+# its empty tail is a dead end, so the datastores' tails follow. Only
+# then: on an ordinary refused start the output is what it always was.
+show_app_log_tail() {
+    local app_tail service service_tail
+    app_tail=$($COMPOSE_CMD logs --no-color --tail=20 comms-app 2>&1)
+    echo "Last lines of comms-app:"
+    if [ -n "${app_tail//[[:space:]]/}" ]; then
+        echo "$app_tail" | sed 's/^/  /'
+        echo "Full logs: $0 logs comms-app"
+        return 0
+    fi
+    echo "  (no output -- comms-app never ran; its dependencies follow)"
+    for service in comms-postgres comms-redis; do
+        service_tail=$($COMPOSE_CMD logs --no-color --tail=20 "$service" 2>&1)
+        echo "Last lines of $service:"
+        if [ -n "${service_tail//[[:space:]]/}" ]; then
+            echo "$service_tail" | sed 's/^/  /'
+        else
+            echo "  (no output)"
+        fi
+    done
+    echo "Full logs: $0 logs <service>"
 }
 
 # ------------------------------------------------------------------------------
@@ -303,6 +336,7 @@ cmd_install() {
     echo "Building and starting the comms stack..."
     if ! $COMPOSE_CMD up -d --build; then
         echo -e "${RED}✗ compose up failed${NC}"
+        show_app_log_tail
         exit 1
     fi
     if ! wait_for_app; then
@@ -331,8 +365,18 @@ cmd_update() {
     fi
     # Recreated comms-app re-runs `alembic upgrade head` in its
     # command before serving -- the migration IS the restart path.
-    if ! $COMPOSE_CMD up -d; then
+    # The three app containers are recreated ALWAYS, by name. Whether
+    # plain `up -d` notices an edited .env depends on how the installed
+    # compose version hashes a service, and this path must not depend
+    # on it: an undetected environment change costs an hour, a
+    # recreate costs seconds (cmd_restart says why a signal is not
+    # enough either).
+    # postgres and redis are NOT named, so compose applies its default
+    # to them -- recreated only when their own definition changed --
+    # which is what `up -d` did before.
+    if ! $COMPOSE_CMD up -d --force-recreate comms-app comms-worker comms-consumer; then
         echo -e "${RED}✗ compose up failed${NC}"
+        show_app_log_tail
         exit 1
     fi
     if ! wait_for_app; then
@@ -341,32 +385,44 @@ cmd_update() {
     echo -e "${GREEN}✓ comms updated (pulled, rebuilt, migrated)${NC}"
 }
 
-# Restart the three application containers -- API, worker, consumer --
+# Recreate the three application containers -- API, worker, consumer --
 # and wait for the API to be healthy again.
 #
-# NOT a hot reload. The name says restart because that is all it is:
-# the processes read their profile once, at startup, so a profile that
-# changed on the bind-mounted path reaches them by being restarted.
-# Naming it after the profile would promise a reload endpoint that is
-# deliberately not built.
+# NOT a hot reload. The processes read their profile and their
+# environment once, when the container starts; restart delivers both by
+# starting new containers. Naming it after the profile would promise a
+# reload endpoint that is deliberately not built.
+#
+# RECREATE, NOT SIGNAL. `compose restart` stops and starts the SAME
+# container, and a container's environment is fixed when it is
+# CREATED: env_file (deploy/.env) is read at creation, not at start. A
+# signalled restart therefore re-reads the profile from its bind mount
+# but runs on the OLD environment -- an operator who fixed .env and ran
+# restart would get the old process back without a word. `up
+# --force-recreate` creates the containers anew and so reads .env
+# again.
 #
 # postgres and redis are left alone on purpose: they hold the data, and
 # bouncing them for an application-level change is gratuitous risk.
+# --no-deps is what guarantees it: without it compose also converges
+# the datastores, recreating them if their definition changed since
+# they were created.
 cmd_restart() {
     echo -e "${CYAN}== comms restart ==${NC}"
     cd_compose
-    if ! $COMPOSE_CMD restart comms-app comms-worker comms-consumer; then
+    if ! $COMPOSE_CMD up -d --force-recreate --no-deps comms-app comms-worker comms-consumer; then
         echo -e "${RED}✗ restart failed${NC}"
+        show_app_log_tail
         exit 1
     fi
-    # `compose restart` returns as soon as it has signalled the
-    # containers -- it says nothing about what happened next. comms-app
-    # validates its profile during startup and dies on a bad one, which
-    # is a health failure a few seconds later, not a non-zero exit here.
+    # `up -d` can return before comms-app has finished starting: it
+    # validates its profile and environment during startup and dies on
+    # a bad one, which may be a health failure a few seconds later
+    # rather than a non-zero exit here.
     if ! wait_for_app; then
         exit 1
     fi
-    echo -e "${GREEN}✓ comms-app / comms-worker / comms-consumer restarted${NC}"
+    echo -e "${GREEN}✓ comms-app / comms-worker / comms-consumer recreated${NC}"
 }
 
 # Bring the whole stack up and wait until it is actually serving.
@@ -398,6 +454,7 @@ cmd_start() {
     ensure_network
     if ! $COMPOSE_CMD up -d; then
         echo -e "${RED}✗ start failed${NC}"
+        show_app_log_tail
         exit 1
     fi
     if ! wait_for_app; then
@@ -486,6 +543,177 @@ cmd_db() {
     esac
 }
 
+# Drain the rows migration 0013 refuses on (F1.5) -- the exit of the
+# protocol update window (deploy/INTEGRATION.md, "The protocol update
+# window"). ONE source for the breakdown: the queries are migration
+# 0013's own, _BLOCKING_KINDS to count and _DRAIN_DELETES to delete, run
+# by a one-off container of the image `update` built -- the same file
+# the refusing migration reads, so a kind added there is never missing
+# here (tests/test_drain_source.py).
+#
+#   drain           CHECK: counts per kind, deletes nothing, stops
+#                   nothing. It only reads; if it touches a table while
+#                   the migration runs it waits, it does not break --
+#                   so do not stop comms-app here "for symmetry".
+#   drain --apply   DELETE, in this order and in no other:
+#                   1. check -- nothing to delete -> exit, nothing
+#                      stopped;
+#                   2. confirm: the operator types `yes` (no flag skips
+#                      it -- a deletion is seen by a person). BEFORE the
+#                      stop on purpose: an operator who declines must
+#                      find the stack exactly as it was, not with
+#                      comms-app stopped for a deletion that never
+#                      happened;
+#                   3. stop comms-app -- its restart loop re-runs the
+#                      migration, whose ALTER TABLE would race the
+#                      deletion; stopped, the race cannot exist. Not
+#                      stopped -> nothing is deleted (code 2);
+#                   4. dump the database -- AFTER the stop, so the dump
+#                      is not of a base the migration may still touch.
+#                      No dump -> nothing is deleted (code 2);
+#                   5. delete every kind in ONE transaction -- an
+#                      interruption rolls it all back;
+#                   6. check again and report before -> after, with the
+#                      dump's path and the next command: `start`.
+#
+# Exit codes: 0 clean, 1 rows to delete (or the deletion was declined),
+# 2 cannot check (database down, no schema, revision at or past 0013,
+# an image without migration 0013, a failed stop or dump).
+cmd_drain() {
+    cd_compose
+    load_env
+    local apply=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --apply) apply=1 ;;
+            *)
+                echo -e "${RED}Usage: $0 drain [--apply]${NC}"
+                exit 2
+                ;;
+        esac
+    done
+
+    if ! $COMPOSE_CMD ps --status running --services 2>/dev/null \
+            | grep -qx comms-postgres; then
+        echo -e "${RED}✗ comms-postgres is not running -- start the database first${NC}"
+        exit 2
+    fi
+
+    local rc=0
+    drain_driver check || rc=$?
+    if [ "$apply" -eq 0 ] || [ "$rc" -ne 1 ]; then
+        exit "$rc"
+    fi
+
+    echo -e "${YELLOW}This stops comms-app, dumps the database and DELETES the rows above.${NC}"
+    read -r -p "Type 'yes' to proceed: " answer
+    if [ "$answer" != "yes" ]; then
+        echo "Aborted -- nothing stopped, nothing deleted."
+        exit 1
+    fi
+
+    if ! $COMPOSE_CMD stop comms-app; then
+        echo -e "${RED}✗ could not stop comms-app -- nothing deleted${NC}"
+        exit 2
+    fi
+    echo -e "${CYAN}comms-app stopped.${NC}"
+
+    mkdir -p "$BACKUP_DIR"
+    local dump
+    dump="$BACKUP_DIR/comms-predrain-$(date -u +%Y%m%d-%H%M%S).sql"
+    if ! $COMPOSE_CMD exec -T comms-postgres \
+            pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$dump"; then
+        rm -f "$dump"
+        echo -e "${RED}✗ pg_dump failed -- nothing deleted (comms-app stays stopped)${NC}"
+        exit 2
+    fi
+    echo -e "${GREEN}✓ Dumped to $dump${NC}"
+
+    rc=0
+    drain_driver apply || rc=$?
+    echo "Dump taken before the deletion: $dump"
+    echo -e "${YELLOW}comms-app is STOPPED. Next: $0 start${NC}"
+    exit "$rc"
+}
+
+# The driver: one-off container of the built image, python on stdin.
+# Prints its own report; its exit code is cmd_drain's (see above).
+drain_driver() {
+    $COMPOSE_CMD run --rm --no-deps -T --entrypoint python comms-app - "$1" <<'PY'
+import asyncio
+import importlib.util
+import os
+import re
+import sys
+from pathlib import Path
+
+VERSIONS = Path("migrations/versions")
+
+
+def fail(message: str) -> None:
+    print(f"✗ {message}")
+    sys.exit(2)
+
+
+def migration_0013():
+    found = sorted(VERSIONS.glob("*_0013_*.py"))
+    if not found:
+        fail("the built image has no migration 0013 -- run update first")
+    spec = importlib.util.spec_from_file_location("m0013", found[0])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def known_revisions() -> set[str]:
+    pattern = re.compile(r'^revision: str = "([^"]+)"', re.M)
+    return {
+        m.group(1)
+        for path in VERSIONS.glob("*.py")
+        if (m := pattern.search(path.read_text(encoding="utf-8")))
+    }
+
+
+async def counts(conn, kinds: dict[str, str]) -> dict[str, int]:
+    return {kind: await conn.fetchval(query) for kind, query in kinds.items()}
+
+
+async def main(mode: str) -> int:
+    import asyncpg
+
+    module = migration_0013()
+    url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+    conn = await asyncpg.connect(url)
+    try:
+        if await conn.fetchval("SELECT to_regclass('alembic_version')") is None:
+            fail("no schema here (no alembic_version) -- nothing to drain")
+        revision = await conn.fetchval("SELECT version_num FROM alembic_version")
+        if revision not in known_revisions():
+            fail(f"revision {revision!r} is not in this image's migration chain")
+        if int(revision.split("_", 1)[0]) >= 13:
+            fail(f"the schema is at {revision}, at or past 0013 -- nothing to drain")
+        before = await counts(conn, module._BLOCKING_KINDS)
+        if mode == "check":
+            print(f"schema at {revision}; rows migration 0013 refuses on:")
+            for kind, count in before.items():
+                print(f"  {kind}={count}")
+            return 0 if not any(before.values()) else 1
+        async with conn.transaction():
+            for kind in module._BLOCKING_KINDS:
+                await conn.execute(module._DRAIN_DELETES[kind])
+        after = await counts(conn, module._BLOCKING_KINDS)
+        print("deleted, per kind (before -> after):")
+        for kind in before:
+            print(f"  {kind}: {before[kind]} -> {after[kind]}")
+        return 0 if not any(after.values()) else 1
+    finally:
+        await conn.close()
+
+
+sys.exit(asyncio.run(main(sys.argv[1])))
+PY
+}
+
 # Run the suite on THIS box, against an isolated database.
 #
 # WHY A BOX RUN EXISTS AT ALL, next to a CI that already runs the same
@@ -570,7 +798,10 @@ cmd_status() {
 # `db`, not verbs of the service, and are correctly not seen. Keep new
 # lifecycle verbs here, in this block: a verb added anywhere else is
 # invisible to the product, and the product will keep reporting that
-# this service cannot do it.
+# this service cannot do it. Products parse these labels with a regular
+# expression: the verbs are the case at column zero, and EVERY nested
+# case in this file is indented (cmd_db, cmd_drain) so its labels are
+# never read as verbs.
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;
     update)  shift; cmd_update "$@" ;;
@@ -581,8 +812,9 @@ case "${1:-}" in
     db)      shift; cmd_db "$@" ;;
     test)    shift; cmd_test "$@" ;;
     status)  shift; cmd_status "$@" ;;
+    drain)   shift; cmd_drain "$@" ;;
     *)
-        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|test|status}"
+        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|test|status|drain [--apply]}"
         exit 1
         ;;
 esac

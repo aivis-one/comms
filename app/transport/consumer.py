@@ -26,9 +26,23 @@
 #   retryable  (NotFoundError: group_changed before its user_upserted;
 #              OperationalError: transient DB hiccup) -> bounded
 #              inline backoff, then DLQ + XACK.
-#   duplicate  (idempotency_key collision) -> XACK only: a replay is
-#              the at-least-once contract working, not an error.
-#   unexpected (any other exception) -> log with traceback + DLQ +
+#   duplicate  (same key, same bytes) -> XACK only: a replay is the
+#              at-least-once contract working, not an error.
+#   rejected / conflict (a notification request not accepted, F1.2)
+#              -> XACK only: the refusal is RECORDED under the request's
+#              key in the same transaction; the DLQ would be a second
+#              copy of the same fact.
+#
+# DURABILITY OF INTAKE -- the order is COMMIT, THEN XACK, and it must
+# never be swapped (spec §5.4: a receipt without a record is a promise
+# that disappears on a crash). The entry is acknowledged only after
+# the transaction that wrote the job -- or the record of its refusal --
+# has committed. A crash between the two leaves the entry pending; the
+# next start replays it (_drain_pending), and the replay is collapsed
+# by the key: same bytes -> duplicate, nothing created twice. An ack
+# before the commit would lose the job on a crash in between; batching
+# acks or acknowledging on read would do exactly that.
+#   unexpected (any other exception) -> log with a redacted traceback + DLQ +
 #              XACK: an unknown bug in ONE event must not wedge the
 #              whole stream (poison-pill rule) -- the DLQ preserves
 #              the evidence.
@@ -60,7 +74,13 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.database import get_session_factory
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+    conflict_class,
+)
+from app.engine.formatters import sanitize_text, sanitized_traceback
 from app.transport.events import parse_event
 from app.transport.handlers import HandleResult, handle_event
 
@@ -192,11 +212,18 @@ class StreamConsumer:
             try:
                 async with self._session_factory() as session:
                     result = await handle_event(session, event)
+                    # COMMIT BEFORE XACK -- see DURABILITY OF INTAKE.
                     await session.commit()
                 if result is HandleResult.DUPLICATE:
                     logger.info(
                         "event_duplicate_acked",
                         entry_id=_id_str(entry_id),
+                    )
+                elif result in (HandleResult.REJECTED, HandleResult.CONFLICT):
+                    logger.info(
+                        "event_not_accepted_recorded",
+                        entry_id=_id_str(entry_id),
+                        result=result.value,
                     )
                 else:
                     logger.info(
@@ -207,6 +234,19 @@ class StreamConsumer:
                         event_type=type(event).__name__,
                         attempt=attempt,
                     )
+                await self._ack(entry_id)
+                return
+            except ConflictError as exc:
+                # Late or repeated, not broken (F1.4): the event cannot
+                # change what is recorded, and replaying it never will.
+                # Refused by CLASS, acknowledged, no dead letter.
+                logger.warning(
+                    "event_refused",
+                    entry_id=_id_str(entry_id),
+                    event_type=type(event).__name__,
+                    refusal_class=conflict_class(exc),
+                    reason=sanitize_text(str(exc)),
+                )
                 await self._ack(entry_id)
                 return
             except ValidationError as exc:
@@ -226,7 +266,7 @@ class StreamConsumer:
                         "event_retries_exhausted",
                         entry_id=_id_str(entry_id),
                         attempts=attempt,
-                        error=str(exc),
+                        error=sanitize_text(str(exc)),
                     )
                     await self._to_dlq(
                         entry_id, fields,
@@ -241,15 +281,20 @@ class StreamConsumer:
                     entry_id=_id_str(entry_id),
                     attempt=attempt,
                     delay=delay,
-                    error=str(exc),
+                    error=sanitize_text(str(exc)),
                 )
                 await asyncio.sleep(delay)
             except Exception as exc:
                 # Unknown bug in ONE event must not wedge the stream
                 # (poison-pill rule): preserve the evidence, move on.
-                logger.exception(
+                # Not logger.exception(): the renderer would print the
+                # chain raw -- an OperationalError's text is its SQL and
+                # bound parameters. Same event, level and `exception`
+                # key, redacted (app/engine/formatters.py).
+                logger.error(
                     "event_unexpected_error",
                     entry_id=_id_str(entry_id),
+                    exception=sanitized_traceback(exc),
                 )
                 await self._to_dlq(
                     entry_id, fields,
@@ -283,7 +328,14 @@ class StreamConsumer:
         prefix also self-documents which fields the CONSUMER added.
         The stream is capped (approximate MAXLEN) so a misbehaving
         producer cannot grow it without bound.
+
+        The reason is redacted HERE, the one point every dead-letter
+        path passes: the DLQ is a stream in the shared redis, and a
+        reason is an exception's text (an OperationalError's is its SQL
+        and bound parameters). The envelope fields are the producer's
+        own and stay verbatim.
         """
+        reason = sanitize_text(reason)
         # redis-py's FieldT alias is invariant in dict params, so a
         # plain dict[str, str] does not satisfy it; alias it exactly.
         payload: dict[FieldT, EncodableT] = {

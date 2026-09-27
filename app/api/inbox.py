@@ -19,7 +19,6 @@
 #              "type": "<notification type key>",
 #              "title": "...", "body": "...",
 #              "action_data": {"action": "...", "params": {...}} | null,
-#              "priority": 0,
 #              "sent_at": "<iso8601>",
 #              "read_at": "<iso8601>" | null,
 #              "created_at": "<iso8601>"
@@ -28,9 +27,8 @@
 #          "next_cursor": "<opaque>" | null,
 #          "unread": <int>              # badge in the same round-trip
 #        }
-#     - limit: 1..100, default 20 (clamped, not rejected);
-#     - cursor: opaque string from the previous page's next_cursor;
-#       a malformed cursor -> 422;
+#     - limit / cursor: the one paging scheme (app/api/paging.py) --
+#       out of 1..100 or a malformed cursor -> 422 `validation`;
 #     - action_data is the NAVIGATIONAL INTENT ONLY (amendment A):
 #       template variables never leave the service.
 #
@@ -65,9 +63,6 @@
 # own authenticated session, never accept it from the client.
 # =============================================================================
 
-import base64
-import binascii
-from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -75,8 +70,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_service_auth
+from app.api.paging import PAGE_LIMIT_DEFAULT, decode_cursor, page, page_limit
 from app.core.database import get_db_reader, get_db_session
-from app.core.exceptions import ValidationError
 from app.engine.constants import DeliveryChannel
 from app.engine.service import (
     get_unread_count,
@@ -95,40 +90,15 @@ router = APIRouter(
 # ---------------------------------------------------------------------------
 # Cursor codec
 # ---------------------------------------------------------------------------
-# The wire cursor is OPAQUE by contract -- clients must echo it back,
-# never parse it (the encoding may change without notice as long as a
-# cursor round-trips within one page sequence). Internally it is
-# base64url("{sent_at.isoformat()}|{delivery_id}") over the keyset key
-# (sent_at DESC, id DESC) -- see list_recipient_deliveries.
-
-
-def _encode_cursor(cursor: tuple[datetime, UUID]) -> str:
-    sent_at, delivery_id = cursor
-    raw = f"{sent_at.isoformat()}|{delivery_id}"
-    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
-
-
-def _decode_cursor(value: str) -> tuple[datetime, UUID]:
-    """Decode a wire cursor; any malformation -> ValidationError (422)."""
-    try:
-        raw = base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
-        sent_at_text, _, id_text = raw.partition("|")
-        if not id_text:
-            raise ValueError("missing separator")
-        return datetime.fromisoformat(sent_at_text), UUID(id_text)
-    except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed inbox cursor: {exc}") from exc
-
-
 def _serialize_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Wire form of one inbox item (frozen contract, see header)."""
+    """Wire form of one inbox item (see header). `priority` left the
+    item in F1.4: after F1.2 it was always 5 and meant nothing."""
     return {
         "id": str(item["id"]),
         "type": item["type"],
         "title": item["title"],
         "body": item["body"],
         "action_data": item["action_data"],
-        "priority": item["priority"],
         "sent_at": item["sent_at"].isoformat(),
         "read_at": (
             item["read_at"].isoformat()
@@ -147,29 +117,22 @@ def _serialize_item(item: dict[str, Any]) -> dict[str, Any]:
 @router.get("")
 async def get_inbox(
     recipient_id: UUID,
-    limit: int = Query(default=20),
+    limit: int = Query(default=PAGE_LIMIT_DEFAULT),
     cursor: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_reader),
 ) -> dict[str, Any]:
-    """The bell feed: unread-first? No -- newest-first, plus the badge."""
-    decoded = _decode_cursor(cursor) if cursor is not None else None
+    """The bell feed: newest-first, plus the badge (app/api/paging.py)."""
     items, next_cursor = await list_recipient_deliveries(
         session,
         recipient_id,
-        limit=limit,
-        cursor=decoded,
+        limit=page_limit(limit),
+        cursor=decode_cursor(cursor),
         channel_filter=DeliveryChannel.IN_APP,
     )
     unread = await get_unread_count(
         session, recipient_id, channel=DeliveryChannel.IN_APP
     )
-    return {
-        "items": [_serialize_item(item) for item in items],
-        "next_cursor": (
-            _encode_cursor(next_cursor) if next_cursor is not None else None
-        ),
-        "unread": unread,
-    }
+    return {**page(items, next_cursor, _serialize_item), "unread": unread}
 
 
 @router.get("/unread-count")

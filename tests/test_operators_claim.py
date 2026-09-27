@@ -24,6 +24,7 @@ from app.messaging.threads import create_or_get_thread
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4b_telegram_id,
 )
 
@@ -38,7 +39,7 @@ async def _section_thread(session: AsyncSession) -> UUID:
     client_id = await _recipient(session)
     section = await create_section(session, key=f"sec-{uuid4().hex[:8]}")
     thread = await create_or_get_thread(
-        session,
+        session, **intake_fields(),
         client=client_id,
         operator_kind=OperatorKind.SECTION,
         operator_value=section.id,
@@ -77,7 +78,7 @@ class TestUserThreadPreAssign:
         client_id = await _recipient(db_session)
         master_id = await _recipient(db_session)
         thread = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=master_id,
@@ -128,7 +129,7 @@ class TestClaim:
         client_id = await _recipient(db_session)
         master_id = await _recipient(db_session)
         thread = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=master_id,
@@ -167,7 +168,7 @@ class TestConcurrentClaim:
                 )
             section = await create_section(session, key="race-sec")
             thread = await create_or_get_thread(
-                session,
+                session, **intake_fields(),
                 client=client_id,
                 operator_kind=OperatorKind.SECTION,
                 operator_value=section.id,

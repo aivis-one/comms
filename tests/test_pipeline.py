@@ -24,17 +24,18 @@ from app.core.config import settings
 from app.core.database import get_session_factory
 from app.engine.constants import (
     DeliveryStatus,
+    FailureClass,
     NotificationStatus,
     TargetType,
 )
-from app.engine.formatters import PermanentDeliveryError
+from app.engine.formatters import MessageRejectedError
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import (
     cleanup_expired_notifications,
     process_pending_notifications,
 )
 from app.engine.service import create_notification, resolve_notification
-from tests.helpers import create_recipient
+from tests.helpers import create_recipient, intake_fields
 
 
 async def _fetch_notification(notification_id: UUID) -> Notification:
@@ -83,10 +84,14 @@ class _FailingFormatter:
 
 
 class _PermanentFormatter:
-    """Formatter that always fails permanently."""
+    """Formatter that always fails permanently.
+
+    Raises MessageRejectedError: since F1.3 MessageRejectedError is
+    abstract and a channel raises the subclass that IS its failure
+    class (a blocked bot -> this message rejected)."""
 
     async def deliver(self, *args: Any, **kwargs: Any) -> bool:
-        raise PermanentDeliveryError("bot was blocked by the user")
+        raise MessageRejectedError("bot was blocked by the user")
 
 
 class TestResolveStage:
@@ -100,12 +105,12 @@ class TestResolveStage:
         bravo = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_telegram_in_app",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram", "in_app"],
         )
         deliveries = await resolve_notification(db_session, notification)
 
@@ -121,12 +126,12 @@ class TestResolveStage:
         await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram"],
         )
         first = await resolve_notification(db_session, notification)
         second = await resolve_notification(db_session, notification)
@@ -135,36 +140,47 @@ class TestResolveStage:
         assert len(second) == 1
         assert first[0].id == second[0].id
 
-    async def test_no_targets_marks_skipped(
+    async def test_no_targets_marks_no_recipients(
         self, db_session: AsyncSession,
     ) -> None:
-        """Empty audience -> SKIPPED (Phase 2; was FAILED in Phase 1).
+        """Empty audience -> NO_RECIPIENTS (F1.3; SKIPPED since Phase 2,
+        FAILED in Phase 1).
 
         Nothing broke -- there was simply nobody to deliver to. FAILED
-        is reserved for real faults so it keeps alerting value.
+        is reserved for real faults so it keeps alerting value. Was
+        SKIPPED, which also meant "everyone muted"; the two are separate
+        outcomes now, because they call for different actions (fix the
+        sync / nothing to fix).
         """
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.GROUP,
             target_value="empty_group",
-            channels=["telegram"],
         )
         deliveries = await resolve_notification(db_session, notification)
 
         assert deliveries == []
-        assert notification.status == NotificationStatus.SKIPPED
+        assert notification.status == NotificationStatus.NO_RECIPIENTS
 
     async def test_default_channel_is_in_app(
         self, db_session: AsyncSession,
     ) -> None:
-        """channels=None defaults to a single in_app delivery."""
+        """A type routed to in_app gives a single in_app delivery.
+
+        Was "channels=None defaults to in_app" -- the default lived in
+        create_notification. Since F1.2 the channel is the profile's:
+        the default is the comms default of the `channels` field
+        (tests/test_intake.py test_type_without_channels_takes_the_default),
+        and this test pins the resolve side."""
         await create_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.ALL,
@@ -193,12 +209,12 @@ class TestDeliverAndRollup:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="Hello",
             body="World",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["in_app"],
         )
         await db_session.commit()
 
@@ -220,12 +236,12 @@ class TestDeliverAndRollup:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -262,16 +278,16 @@ class TestDeliverAndRollup:
     async def test_permanent_failure_no_attempt_increment(
         self, db_session: AsyncSession,
     ) -> None:
-        """PermanentDeliveryError -> FAILED immediately, attempts stay 0."""
+        """MessageRejectedError -> FAILED immediately, attempts stay 0."""
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -283,6 +299,7 @@ class TestDeliverAndRollup:
 
         (delivery,) = await _fetch_deliveries(notification.id)
         assert delivery.status == DeliveryStatus.FAILED
+        assert delivery.failure_class == FailureClass.MESSAGE_REJECTED
         assert delivery.attempts == 0
         assert delivery.next_retry_at is None
         assert delivery.error_message is not None
@@ -311,12 +328,12 @@ class TestDeliverAndRollup:
         )
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
             action_data={
                 "action": "open_practice",
                 "params": {"practice_id": "p1", "slot_id": "s1"},
@@ -362,12 +379,12 @@ class TestDeliverAndRollup:
         healthy = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -381,7 +398,7 @@ class TestDeliverAndRollup:
                 recipient: Any,
             ) -> bool:
                 if recipient.id == blocked.id:
-                    raise PermanentDeliveryError("chat not found")
+                    raise MessageRejectedError("chat not found")
                 return True
 
         with patch(
@@ -397,6 +414,9 @@ class TestDeliverAndRollup:
         by_recipient = {d.recipient_id: d for d in deliveries}
         assert by_recipient[healthy.id].status == DeliveryStatus.SENT
         assert by_recipient[blocked.id].status == DeliveryStatus.FAILED
+        assert by_recipient[blocked.id].failure_class == (
+            FailureClass.MESSAGE_REJECTED
+        )
 
 
 class TestRetryBackoff:
@@ -415,12 +435,12 @@ class TestRetryBackoff:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -463,12 +483,12 @@ class TestRetryBackoff:
         recipient = await create_recipient(db_session)
         gated = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -491,12 +511,12 @@ class TestRetryBackoff:
             # A fresh notification still flows while the first is gated.
             fresh = await create_notification(
                 db_session,
+                **intake_fields(),
                 type="unit_event",
                 title="F",
                 body="B",
                 target_type=TargetType.USER,
                 target_value=str(recipient.id),
-                channels=["telegram"],
             )
             await db_session.commit()
             assert await process_pending_notifications() == 1
@@ -526,12 +546,12 @@ class TestRetryBackoff:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -564,18 +584,39 @@ class TestBatchLimit:
         for index in range(3):
             await create_notification(
                 db_session,
+                **intake_fields(),
                 type="unit_event",
                 title=f"T{index}",
                 body="B",
                 target_type=TargetType.USER,
                 target_value=str(recipient.id),
-                channels=["telegram"],
             )
         await db_session.commit()
 
         assert await process_pending_notifications() == 2
         assert await process_pending_notifications() == 1
         assert await process_pending_notifications() == 0
+
+
+async def _accepted_then_overdue(
+    session: AsyncSession, recipient_id: UUID,
+) -> Notification:
+    """A job accepted with a future expiry, then overtaken by time."""
+    now = datetime.now(UTC)
+    notification = await create_notification(
+        session,
+        **intake_fields(),
+        type="unit_event",
+        title="T",
+        body="B",
+        target_type=TargetType.USER,
+        target_value=str(recipient_id),
+        scheduled_at=now - timedelta(hours=2),
+        expiry_at=now + timedelta(hours=1),
+    )
+    notification.expiry_at = now - timedelta(hours=1)
+    await session.commit()
+    return notification
 
 
 class TestSchedulingAndExpiry:
@@ -588,12 +629,12 @@ class TestSchedulingAndExpiry:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
             scheduled_at=datetime.now(UTC) + timedelta(hours=1),
         )
         await db_session.commit()
@@ -608,20 +649,17 @@ class TestSchedulingAndExpiry:
     async def test_overdue_notification_expires(
         self, db_session: AsyncSession,
     ) -> None:
-        """expiry_at in the past -> EXPIRED before any delivery."""
+        """expiry_at in the past -> EXPIRED before any delivery.
+
+        The job is accepted with an expiry in the FUTURE and then the
+        time passes (expiry_at is pipeline-mutable; only title/body are
+        locked). Before F1.2 the test created the job with an expiry
+        already in the past -- a state intake now refuses
+        (rejected_at_intake), so the sweep's subject is reached the way
+        it is reached in production: by time passing after acceptance.
+        """
         recipient = await create_recipient(db_session)
-        notification = await create_notification(
-            db_session,
-            type="unit_event",
-            title="T",
-            body="B",
-            target_type=TargetType.USER,
-            target_value=str(recipient.id),
-            channels=["telegram"],
-            scheduled_at=datetime.now(UTC) - timedelta(hours=2),
-            expiry_at=datetime.now(UTC) - timedelta(hours=1),
-        )
-        await db_session.commit()
+        notification = await _accepted_then_overdue(db_session, recipient.id)
 
         await process_pending_notifications()
 
@@ -632,20 +670,12 @@ class TestSchedulingAndExpiry:
     async def test_cleanup_deletes_expired_delivered(
         self, db_session: AsyncSession,
     ) -> None:
-        """cleanup removes terminal notifications past expiry_at."""
+        """cleanup removes terminal notifications past expiry_at.
+
+        Reaches the overdue state by time passing after acceptance, as
+        test_overdue_notification_expires explains."""
         recipient = await create_recipient(db_session)
-        notification = await create_notification(
-            db_session,
-            type="unit_event",
-            title="T",
-            body="B",
-            target_type=TargetType.USER,
-            target_value=str(recipient.id),
-            channels=["telegram"],
-            scheduled_at=datetime.now(UTC) - timedelta(hours=2),
-            expiry_at=datetime.now(UTC) - timedelta(hours=1),
-        )
-        await db_session.commit()
+        notification = await _accepted_then_overdue(db_session, recipient.id)
 
         # First batch expires it; cleanup then deletes it.
         await process_pending_notifications()

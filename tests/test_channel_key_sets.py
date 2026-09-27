@@ -66,7 +66,7 @@ from app.engine.formatters import (
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import process_pending_notifications
 from app.engine.service import create_notification
-from tests.helpers import create_recipient
+from tests.helpers import create_recipient, intake_fields
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -471,12 +471,12 @@ class TestRequestedButUnconfigured:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -502,12 +502,12 @@ class TestRequestedButUnconfigured:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_telegram_in_app",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["in_app", "telegram"],
         )
         await db_session.commit()
 
@@ -532,12 +532,12 @@ class TestRequestedButUnconfigured:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 
@@ -556,12 +556,12 @@ class TestRequestedButUnconfigured:
         recipient = await create_recipient(db_session)
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_telegram_email",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram", "email"],
         )
         await db_session.commit()
 
@@ -587,12 +587,12 @@ class TestRequestedButUnconfigured:
         )
         notification = await create_notification(
             db_session,
+            **intake_fields(),
             type="unit_event",
             title="T",
             body="B",
             target_type=TargetType.USER,
             target_value=str(recipient.id),
-            channels=["telegram"],
         )
         await db_session.commit()
 

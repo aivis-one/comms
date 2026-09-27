@@ -169,15 +169,20 @@ The declared keys of every implemented channel live in one place,
 `app/core/channels.py`. That file is the answer to "which keys does
 this channel need"; this document does not duplicate the list.
 
-**A requested channel that the product does not have is a LOUD
-failure.** Asking for a channel whose key set is empty produces a
-delivery with status `failed`, immediately and without retries: the
-channel will not become configured between attempts. It is never
-reported as a success. The two situations that used to look identical
-are now distinguishable: a channel nobody requests is simply absent and
-costs nothing, while a channel that is requested but not configured is
-a lost notification and says so in the log
-(`delivery_channel_unavailable`) and in the delivery row.
+**A request never names a channel.** The profile routes each type to
+its channels (`types.<type>.channels`), and the startup refuses a
+profile that routes a type into a channel whose key set is empty on
+this deploy -- so a running service cannot be asked for a channel it
+does not have. A request that still carries `channels` (or any other
+unknown field) is rejected at intake and recorded under its key.
+
+**One case still reaches a missing channel at delivery, and it is
+LOUD.** A job snapshots its channels when it is accepted. If a restart
+then removes a channel from both the profile and the deploy, jobs
+accepted before the restart still carry it: their delivery on that
+channel fails immediately, without retries, and says so in the log
+(`delivery_channel_unavailable`) and in the delivery row. It is never
+reported as a success.
 
 **Startup refusals are readable.** The configuration is built before
 logging is set up, so a refusal prints a message -- naming the channel
@@ -235,8 +240,9 @@ that is blank, to the type key, because an empty subject is filed as
 spam. The body falls back to the stored body and never to another
 channel's template, whose markup would arrive as raw characters.
 Declaring email templates does not make a notification use the channel:
-the channel list comes from the request that created it, and from
-nowhere else.
+the channel list comes from the type's record in the profile
+(`channels`), taken when the request is accepted, and from nowhere
+else.
 
 **One delivery path.** There is no SMTP fallback, deliberately: a
 second path no deploy exercises rots from the first day. The
@@ -275,6 +281,251 @@ velo repo:
 None of that is wired here; this file only accounts for the network
 path, the credentials and the profile being in place before that code
 runs.
+
+## 5. The resource protocol (F1.4)
+
+Every resource route -- recipients, threads, messages, sections, read
+pointers, preferences, the inbox -- speaks the same language as a job.
+
+**One form of refusal.** Every error response of every route has one
+body, with a class a program can branch on:
+
+    {"error": {"class": "<class>", "message": "<text>", "fields": [...]}}
+
+| status | class | when |
+|---|---|---|
+| 401 | `unauthorized` | the service token is missing or wrong |
+| 403 | `forbidden` | the actor has no role in this thread |
+| 404 | `not_found` | the entity or the route does not exist |
+| 405 | `method_not_allowed` | the route exists, the method does not |
+| 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator |
+| 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
+| 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
+| 422 | `validation` | the input is wrong; `fields` names each input |
+| 500 | `internal` | our defect; the text carries nothing from it |
+
+The message is for a human; the class is the contract.
+
+**One way to page.** Every listing -- the inbox, the visible threads, a
+thread's messages -- takes `limit` (1..100, default 20) and `cursor`
+(the previous page's `next_cursor`, opaque) and answers
+`{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
+`unread` badge beside them. A `limit` outside 1..100 is **refused**
+(422), not clamped, and so is a malformed cursor.
+
+**Repeating a call.** A call that creates takes a required
+`Idempotency-Key` header (1..200 characters):
+`POST /api/v1/threads` and `POST /api/v1/threads/{id}/messages`. The
+same key with the same request -- method, path with its query, body
+bytes -- answers with the SAME thread or message in its current state,
+and pings nobody again; the same key with another request is a 409
+`conflict`. Every other mutating call is safe to repeat by
+construction, so it takes no key:
+
+| call | why a repeat is safe |
+|---|---|
+| `PUT /recipients/{id}` | a versioned snapshot: the version is its key |
+| `DELETE /recipients/{id}` | forgetting twice is forgetting once |
+| `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
+| `POST /threads/{id}/status` | sets a value; the same status is a no-op |
+| `POST /threads/{id}/retag` | sets a value |
+| `POST /threads/{id}/read` | the pointer only moves forward |
+| `POST /sections` | create-or-find by key |
+| `POST /inbox/{delivery_id}/read`, `POST /inbox/read-all` | set a value |
+| `PATCH /preferences` | sets values |
+
+`POST /threads/unread-counts` is a read that takes a body.
+
+**The recipient snapshot has a version.** Both write paths -- `PUT
+/api/v1/recipients/{id}` and the `user_upserted` event -- carry
+`version`, an integer the product increases with every change of the
+person (a counter or an updated-at in milliseconds). comms applies a
+snapshot only when its version is higher than the stored one: an event
+that arrives late cannot roll the address book back. The stored version
+with other content is a conflict. "No value" is an explicit `null` for
+`telegram_id`, `email`, `locale` and `timezone` -- a blank string or a
+telegram id of 0 is refused on both paths.
+
+**Deleting a person.** `DELETE /api/v1/recipients/{id}` with
+`{"version": N}`, or the `user_deleted` event `{v, recipient_id,
+version}`. comms forgets every way to reach them -- chat, address,
+language, time zone, schedule, groups, mutes, sections, read pointers --
+and closes their waiting deliveries as `recipient_inactive`. The row
+stays as a tombstone with the id alone, because the threads and messages
+they were part of stay: a conversation belongs to both sides, and what
+happens to message bodies is the product's decision. A deletion is
+final -- a person who returns gets a new id in the product. A
+recipient deactivated or deleted after a job was resolved is not sent
+to either: their delivery ends `recipient_inactive`, which is neither a
+failure nor a mute.
+
+**A group is read when the job is delivered.** A notification to a
+group reaches the members the group has when the job is resolved, at
+delivery time -- not when it was sent. A `group_changed` that arrives
+later is not seen by that job, in either direction: a member added
+after resolve does not receive it, a member removed after resolve
+still does. Send the membership before the job when the order matters.
+
+### What comms takes on trust
+
+comms checks ONE thing: the service token (`Authorization: Bearer`).
+Every actor a request names -- `participant`, `operator`, `sender`,
+`is_supervisor` -- is taken on trust. **Deriving them from the signed-in
+user is the product proxy's job**: a proxy that forwards an actor from
+its client lets a user read or write someone else's conversation, and
+the defect is the proxy's. comms enforces what a role in a thread
+allows (a participant posts in their thread, an operator in the threads
+their section serves) -- never who the caller really is. This is the
+one frozen part of the protocol; it is written down here, and
+`app/api/deps.py` points at this paragraph.
+
+## 6. Preferences
+
+One object per recipient for a settings screen: the category toggles,
+the delivery schedule and the recipient's time zone. Two routes,
+`GET` and `PATCH` on `/api/v1/recipients/{recipient_id}/preferences`;
+errors and trust are the protocol's (section 5). This section is the
+whole contract -- `app/api/prefs.py` points here.
+
+**The schedule is a list of ALLOWED periods.** A period says when comms
+MAY deliver, not when it must stay quiet. One period covers one day and
+never crosses midnight: an evening allowance that runs into the night
+is two periods, one per day. A screen built as "quiet hours" must
+convert to this form before it writes -- sending its quiet window as-is
+would store the opposite of what the person chose.
+
+`GET` answers:
+
+```json
+{
+  "categories": {"billing": true, "reminders": false},
+  "schedule": [
+    {"day": "mon", "from": "09:00", "to": "21:00"},
+    {"day": "sat", "from": "10:00", "to": "24:00"}
+  ],
+  "timezone": "Europe/Berlin"
+}
+```
+
+- `categories` -- one key per category the loaded profile declares,
+  alphabetical; `true` = enabled (not muted).
+- `schedule` -- the periods, or `null`: no schedule, deliver at any hour.
+- `timezone` -- read-only, the product's own snapshot field; periods are
+  read in this zone (the deploy default when `null`).
+- `404` for a recipient comms has never been sent.
+
+`PATCH` takes any of the two writable parts and answers with the full
+`GET` form -- writing then reading is a fixed point:
+
+```json
+{
+  "categories": {"reminders": true},
+  "schedule": [{"day": "tue", "from": "08:30", "to": "12:00"}]
+}
+```
+
+- `categories` -- PARTIAL: only the listed toggles change. An unknown
+  category is a 422, and the whole PATCH is one transaction.
+- `schedule` -- FULL REPLACE when present; `null` clears it; omitted,
+  it is left untouched.
+- An unknown key -- `timezone` included -- is a 422, never ignored.
+
+A period:
+
+| field | form | rule |
+|---|---|---|
+| `day` | `mon` `tue` `wed` `thu` `fri` `sat` `sun` | one day per period |
+| `from` | `HH:MM`, `00:00`..`23:59` | the start |
+| `to` | `HH:MM`, up to `24:00` | after `from` on the same day; `24:00` = end of the day |
+
+A list is refused (422) when it is empty -- send `null` to clear --
+or when two periods of one day overlap or touch: one stretch is one
+period.
+
+## Operating the comms stack
+
+What an operator needs on the box, collected here because every item
+below has already cost an hour of searching once. The script named
+below is `/opt/comms/repo/deploy/comms-deploy.sh`.
+
+**Where the environment lives.** The real file is `/opt/comms/.env`,
+outside the checkout, so `update` (a `git pull`) never touches secrets.
+`deploy/.env` is a symbolic link to it; compose reads the link. Edit
+`/opt/comms/.env` -- editing through the link edits the same file, and
+there is no second copy.
+
+**How an edited environment reaches the processes.** By recreating the
+containers, never by a signal: a container's environment is fixed when
+the container is created, and `docker compose restart` starts the same
+container again with the old one. Both lifecycle verbs of the script
+recreate:
+
+- `comms-deploy.sh restart` recreates `comms-app`, `comms-worker` and
+  `comms-consumer`, leaves `comms-postgres` and `comms-redis` untouched,
+  and waits for `comms-app` to be healthy. This is the verb for an
+  edited `.env` or profile.
+- `comms-deploy.sh update` pulls, rebuilds, and recreates the same three
+  containers; the datastores are recreated only when their own compose
+  definition changed.
+
+**Is it healthy.** The API has no host port, so health is read from the
+inside. Docker's own verdict, which is what the script waits on:
+
+    docker inspect --format '{{.State.Health.Status}}' comms-app
+
+The readiness answer itself, from inside the container:
+
+    docker exec comms-app python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/ready').read().decode())"
+
+**Why it did not start.** comms refuses to start on a broken
+configuration or profile and says why in its own log. `install`,
+`update`, `start` and `restart` print the last lines of it when a start
+fails; to read more:
+
+    docker logs --tail 40 comms-app
+
+**Where email will go.** The provider address is derived from the
+region setting, not written in the environment. Read what the running
+process actually uses:
+
+    docker exec comms-app python -c "from app.core.config import settings; print(settings.email_api_base_url)"
+
+## The protocol update window
+
+The protocol lands on a box in ONE window: comms and the product move
+together. Migration 0013 (the lifecycle and outcome taxonomy) translates
+only the rows whose meaning the row itself states; on a row it cannot
+translate without a guess it **refuses**, `comms-app` does not start,
+and `docker logs comms-app` names each kind with its count. The kinds,
+and why each cannot be translated, are in the migration's docstring
+(`migrations/versions/2026_09_24_0013_lifecycle_outcomes.py`).
+
+The window, from comms' side -- every step is a verb of
+`deploy/comms-deploy.sh`, which the product's own CLI wraps:
+
+1. **`update`** -- pulls, builds and recreates the stack. On a box with
+   old rows the migration refuses: a red start, and `update` exits 1.
+   All migrations run in one transaction, so the database stays at the
+   revision it had before (0011 on a box that ran `main`).
+2. **`drain`** -- checks. Prints the count of every kind, under the
+   names the refusal uses, and deletes nothing. The kinds overlap -- one
+   row can count in more than one -- so the sum is not the number of
+   rows. Exit 0 = clean, 1 = rows
+   to delete, 2 = it cannot check (the database is down, there is no
+   schema, the schema is already at or past 0013).
+3. **`drain --apply`** -- deletes. It stops `comms-app`, dumps the
+   database (the path is printed before and after), asks you to type
+   `yes`, and deletes every kind in one transaction -- the whole
+   notifications, their deliveries by cascade. **Every active job goes,
+   not only the old ones**: in a red start the worker and the consumer
+   do not run, so the queue cannot drain by waiting. The product's
+   events wait in the stream and are read after the window; jobs the
+   product still wants, it sends again. Sent history and the inbox stay.
+4. **`start`** -- brings the stack up: the migration passes, the
+   worker and the consumer start.
+
+What the product wraps: `update`, `drain`, `drain --apply` and `start`,
+in that order, with the operator at the terminal for step 3.
 
 ## How long comms keeps things
 

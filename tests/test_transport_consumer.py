@@ -21,18 +21,28 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID, uuid4
 
+import aiohttp
 import pytest
 from fakeredis import aioredis as fakeaioredis
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 import app.transport.consumer as consumer_module
 from app.audience.models import GroupMembership, Recipient
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.core.exceptions import ValidationError
+from app.engine.constants import IntakeOutcomeClass
 from app.engine.models import Notification
+from app.engine.service import intake_outcomes_for
 from app.transport.consumer import StreamConsumer
-from tests.helpers import create_recipient, next_phase3c_telegram_id
+from tests.helpers import (
+    create_recipient,
+    next_phase3c_telegram_id,
+    next_snapshot_version,
+)
 
 _WAIT_TIMEOUT = 5.0
 
@@ -99,6 +109,7 @@ def _user_upserted_data(recipient_id: UUID, **overrides: Any) -> dict[str, Any]:
     data: dict[str, Any] = {
         "v": 1,
         "recipient_id": str(recipient_id),
+        "version": next_snapshot_version(),
         "telegram_id": next_phase3c_telegram_id(),
         "email": None,
         "locale": "en",
@@ -213,7 +224,6 @@ class TestEndToEnd:
         data = _request_data(
             action_data={"action": "open_unit",
                          "params": {"unit_id": "42"}, "amount": 100},
-            channels=["in_app"],
         )
         await _xadd(redis, stream, "notification_request", data)
 
@@ -234,10 +244,12 @@ class TestEndToEnd:
         )).scalar_one()
         assert row.type == "unit_event"
         assert row.title == "T"
-        # The pipeline's channel stash merged in by create_notification.
-        assert row.action_data is not None
-        assert row.action_data["_channels"] == ["in_app"]
-        assert row.action_data["amount"] == 100
+        # The channels are the PROFILE's record of the type, snapshotted
+        # at intake (F1.2). Before, the request named ["in_app"] and it
+        # was stashed in action_data["_channels"]; that key is gone and
+        # the letter comes back exactly as sent.
+        assert row.channels == ["telegram"]
+        assert row.action_data == data["action_data"]
 
 
 class TestIdempotency:
@@ -381,15 +393,19 @@ class TestPoisonPill:
         stream: str,
         db_session: AsyncSession,
     ) -> None:
-        """Item 6b: broken JSON, unknown event and an unsupported
-        version each land in the DLQ; the valid event BEHIND them is
-        still processed."""
+        """Item 6b: broken JSON and an unknown event land in the DLQ; an
+        unsupported version with a READABLE key is recorded under that
+        key (F1.2 -- it used to land in the DLQ too: the refusal is the
+        same, it now has an address the product can use); the valid
+        event BEHIND them is still processed."""
         rid = uuid4()
         await redis.xadd(stream, {"event": "notification_request",
                                   "data": "{broken"})
-        await _xadd(redis, stream, "user_deleted", {"v": 1})
-        await _xadd(redis, stream, "notification_request",
-                    _request_data(v=2))
+        # "user_deleted" is a real event since F1.4 (forgetting); the
+        # unknown name must be one comms truly lacks.
+        await _xadd(redis, stream, "user_renamed", {"v": 1})
+        versioned = _request_data(v=2)
+        await _xadd(redis, stream, "notification_request", versioned)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(rid))
 
         async def tail_processed_and_acked() -> bool:
@@ -400,14 +416,21 @@ class TestPoisonPill:
 
         await _run_until(StreamConsumer(redis), tail_processed_and_acked)
 
-        assert await redis.xlen(settings.dlq_stream) == 3
+        assert await redis.xlen(settings.dlq_stream) == 2
         reasons = [
             {k.decode(): v.decode() for k, v in fields.items()}["_dlq_error"]
             for _id, fields in await redis.xrange(settings.dlq_stream)
         ]
         assert any("not valid JSON" in r for r in reasons)
         assert any("unknown event" in r for r in reasons)
-        assert any("unsupported schema version" in r for r in reasons)
+        assert not any("unsupported schema version" in r for r in reasons)
+        outcomes = await intake_outcomes_for(
+            db_session, versioned["idempotency_key"],
+        )
+        assert [o.outcome for o in outcomes] == [
+            IntakeOutcomeClass.REJECTED_AT_INTAKE,
+        ]
+        assert "unsupported schema version" in outcomes[0].reason
 
     async def test_unregistered_type_is_terminal(
         self,
@@ -416,24 +439,30 @@ class TestPoisonPill:
         db_session: AsyncSession,
     ) -> None:
         """A ValidationError from the SERVICE layer (unregistered
-        type) is terminal too: DLQ, no retry burn."""
-        await _xadd(redis, stream, "notification_request",
-                    _request_data(type="not_in_profile"))
+        type) is terminal too: no retry burn. Since F1.2 it is recorded
+        under the request's key as rejected_at_intake instead of being
+        dead-lettered -- one copy of the fact, where the product can
+        find it (the DLQ verbatim-envelope promise is pinned by the
+        unreadable-key cases above)."""
+        data = _request_data(type="not_in_profile")
+        await _xadd(redis, stream, "notification_request", data)
 
-        async def dead_lettered() -> bool:
-            length: int = await redis.xlen(settings.dlq_stream)
-            return length == 1
+        async def recorded() -> bool:
+            db_session.expire_all()
+            return bool(await intake_outcomes_for(
+                db_session, data["idempotency_key"],
+            )) and await _no_pending(redis, stream)
 
-        await _run_until(StreamConsumer(redis), dead_lettered)
-        entries = await redis.xrange(settings.dlq_stream)
-        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
-        assert "Unregistered notification type" in fields["_dlq_error"]
-        # Original envelope preserved verbatim for re-ingestion; the
-        # consumer's diagnostics live under the _dlq_ prefix and can
-        # never shadow producer fields (review 3c.1).
-        assert fields["event"] == "notification_request"
-        assert "not_in_profile" in fields["data"]
-        assert fields["_dlq_source_entry_id"]
+        await _run_until(StreamConsumer(redis), recorded)
+        (outcome,) = await intake_outcomes_for(
+            db_session, data["idempotency_key"],
+        )
+        assert outcome.outcome == IntakeOutcomeClass.REJECTED_AT_INTAKE
+        assert "Unregistered notification type" in outcome.reason
+        assert await redis.xlen(settings.dlq_stream) == 0
+        assert await _notification_count(
+            db_session, data["idempotency_key"],
+        ) == 0
 
 
 class TestEntrypoint:
@@ -448,9 +477,10 @@ class TestEntrypoint:
 
 
 class TestReminderCancel:
-    """Phase 6/T1 additive event, e2e over the stream: a reminder is
-    a notification_request with a FUTURE scheduled_at; reminder_cancel
-    expires the PENDING matches by correlation. Recipients are not
+    """Phase 6/T1 event, e2e over the stream: a reminder is a
+    notification_request with a FUTURE scheduled_at; reminder_cancel
+    cancels the active matches by their ENVELOPE correlation (F1.3:
+    before, it read a key out of action_data and wrote EXPIRED). Recipients are not
     needed on either path (resolve happens at due time), so the issued
     T1 band 92000-92099 stays untouched here."""
 
@@ -465,10 +495,10 @@ class TestReminderCancel:
             type=type_,
             scheduled_at=(anchor - timedelta(hours=1)).isoformat(),
             expiry_at=anchor.isoformat(),
-            action_data={"booking_id": correlation_value},
+            correlation=correlation_value,
         )
 
-    async def test_cancel_expires_pending_reminders(
+    async def test_cancel_cancels_pending_reminders(
         self,
         redis: fakeaioredis.FakeRedis,
         stream: str,
@@ -486,8 +516,7 @@ class TestReminderCancel:
         await _xadd(redis, stream, "reminder_cancel", {
             "v": 1,
             "types": ["unit_rem_24h", "unit_rem_1h", "unit_rem_10m"],
-            "correlation_key": "booking_id",
-            "correlation_value": booking_id,
+            "correlation": booking_id,
         })
 
         async def all_acked() -> bool:
@@ -508,11 +537,11 @@ class TestReminderCancel:
             by_key[data["idempotency_key"]] = row
         assert (
             by_key[first["idempotency_key"]].status
-            == NotificationStatus.EXPIRED
+            == NotificationStatus.CANCELLED
         )
         assert (
             by_key[second["idempotency_key"]].status
-            == NotificationStatus.EXPIRED
+            == NotificationStatus.CANCELLED
         )
         # A different correlation value stays scheduled.
         assert (
@@ -532,8 +561,7 @@ class TestReminderCancel:
         await _xadd(redis, stream, "reminder_cancel", {
             "v": 1,
             "types": ["unit_rem_1h"],
-            "correlation_key": "booking_id",
-            "correlation_value": str(uuid4()),
+            "correlation": str(uuid4()),
         })
 
         async def acked() -> bool:
@@ -542,3 +570,175 @@ class TestReminderCancel:
 
         await _run_until(StreamConsumer(redis), acked)
         assert await redis.exists(settings.dlq_stream) == 0
+
+
+# -- F0.1-comms item 4: the consumer's logs and DLQ carry no secret ---------
+
+# Built, never written whole (push protection reads literals).
+_TG_SECRET = "AAH" + "sentinel" * 4
+_TG_URL = "https://api.telegram.org/bot8123456789:" + _TG_SECRET + "/sendMessage"
+_REDIS_PASS = "4d0c" * 12
+
+
+def _chained(cause: BaseException, outer: BaseException) -> BaseException:
+    """`outer` raised from `cause`, with real tracebacks."""
+    try:
+        try:
+            raise cause
+        except BaseException as inner:
+            raise outer from inner
+    except BaseException as exc:
+        return exc
+
+
+def _operational_error() -> OperationalError:
+    """SQLAlchemy's text is the failed SQL plus its bound parameters; a
+    parameter here carries the secret."""
+    return OperationalError(
+        "INSERT INTO recipients (locale, note) VALUES ($1, $2)",
+        ("en", f"redis://:{_REDIS_PASS}@comms-redis:6379/0"),
+        Exception("connection refused"),
+    )
+
+
+# (id, the exception handle_event raises, the secret, what the DLQ
+# reason must still say, the log event that carries the text, its key).
+_CONSUMER_FAILURES = [
+    (
+        "unexpected_secret_only_in_cause",
+        lambda: _chained(aiohttp.InvalidURL(_TG_URL),
+                         RuntimeError("send failed")),
+        _TG_SECRET,
+        "unexpected: RuntimeError: send failed",
+        "event_unexpected_error", "exception",
+    ),
+    (
+        "unexpected_secret_in_text_and_cause",
+        lambda: _chained(aiohttp.InvalidURL(_TG_URL),
+                         RuntimeError(f"send failed {_TG_URL}")),
+        _TG_SECRET,
+        "unexpected: RuntimeError: send failed",
+        "event_unexpected_error", "exception",
+    ),
+    (
+        "operational_error_sql_and_params",
+        _operational_error,
+        _REDIS_PASS,
+        "retries exhausted: (builtins.Exception) connection refused",
+        "event_retries_exhausted", "error",
+    ),
+    (
+        "terminal_validation_error",
+        lambda: ValidationError(f"bad channel url {_TG_URL}"),
+        _TG_SECRET,
+        "bad channel url https://api.telegram.org/[redacted]/sendMessage",
+        "event_dead_lettered", "reason",
+    ),
+]
+
+
+class TestConsumerRedactsItsFailures:
+    """The DLQ is a stream in the shared redis; its reason and every
+    consumer log line pass through sanitize_text / sanitized_traceback.
+    Checked on the full path: a real event, the real loop, the DLQ
+    entry as redis holds it, every captured log field."""
+
+    @pytest.mark.parametrize(
+        ("make_error", "secret", "reason_says", "log_event", "log_key"),
+        [case[1:] for case in _CONSUMER_FAILURES],
+        ids=[case[0] for case in _CONSUMER_FAILURES],
+    )
+    async def test_no_secret_and_the_reason_stays(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        fast_backoff: None,
+        monkeypatch: pytest.MonkeyPatch,
+        make_error: Callable[[], BaseException],
+        secret: str,
+        reason_says: str,
+        log_event: str,
+        log_key: str,
+    ) -> None:
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise make_error()
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
+
+        async def dead_lettered_and_acked() -> bool:
+            length: int = await redis.xlen(settings.dlq_stream)
+            return length == 1 and await _no_pending(redis, stream)
+
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), dead_lettered_and_acked)
+
+        entries = await redis.xrange(settings.dlq_stream)
+        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
+        for value in fields.values():
+            assert secret not in value
+        assert fields["_dlq_error"].startswith(reason_says)
+
+        for entry in logs:
+            assert "exc_info" not in entry
+            for value in entry.values():
+                assert secret not in str(value)
+        carriers = [e[log_key] for e in logs if e["event"] == log_event]
+        assert carriers and all(carriers)
+
+    async def test_the_traceback_keeps_the_whole_chain(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise _chained(aiohttp.InvalidURL(_TG_URL), RuntimeError("x"))
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
+
+        async def dead_lettered() -> bool:
+            length: int = await redis.xlen(settings.dlq_stream)
+            return length == 1
+
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), dead_lettered)
+
+        (entry,) = [e for e in logs if e["event"] == "event_unexpected_error"]
+        assert entry["log_level"] == "error"
+        assert "InvalidURL" in entry["exception"]
+        assert "The above exception was the direct cause" in entry["exception"]
+        assert "api.telegram.org/[redacted]/sendMessage" in entry["exception"]
+
+    async def test_every_retry_log_is_redacted(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        fast_backoff: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same secret on every attempt: each of the four retry
+        lines is redacted, and each still names the failure."""
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise _operational_error()
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
+
+        async def dead_lettered() -> bool:
+            length: int = await redis.xlen(settings.dlq_stream)
+            return length == 1
+
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), dead_lettered)
+
+        retries = [e for e in logs if e["event"] == "event_retry_scheduled"]
+        assert len(retries) == 4
+        for entry in retries:
+            assert _REDIS_PASS not in entry["error"]
+            assert "INSERT INTO recipients" in entry["error"]
+

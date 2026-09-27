@@ -16,6 +16,7 @@ from app.messaging.threads import create_or_get_thread
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4b_telegram_id,
 )
 
@@ -45,30 +46,30 @@ class TestVisibility:
 
         # user threads -- pre-assigned to their master
         t_user_a = await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.USER, operator_value=a,
             kind=ThreadKind.DM,
         )
         t_user_b = await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.USER, operator_value=b,
             kind=ThreadKind.DM,
         )
 
         # section threads
         t_sec_free = await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.SECTION, operator_value=section.id,
             kind=ThreadKind.TICKET, subject_type="practice", subject_id="free",
         )
         t_sec_a = await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.SECTION, operator_value=section.id,
             kind=ThreadKind.TICKET, subject_type="practice", subject_id="a",
         )
         await claim_thread(db_session, thread_id=t_sec_a.id, operator=a)
         t_sec_b = await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.SECTION, operator_value=section.id,
             kind=ThreadKind.TICKET, subject_type="practice", subject_id="b",
         )
@@ -105,12 +106,12 @@ class TestVisibility:
         section = await create_section(db_session, key="vis-sec2")
 
         await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.USER, operator_value=master,
             kind=ThreadKind.DM,
         )
         t_free = await create_or_get_thread(
-            db_session, client=client,
+            db_session, **intake_fields(), client=client,
             operator_kind=OperatorKind.SECTION, operator_value=section.id,
             kind=ThreadKind.TICKET, subject_type="practice", subject_id="f2",
         )

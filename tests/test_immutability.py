@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.engine.constants import TargetType
 from app.engine.models import Notification
 from app.engine.service import create_notification
+from tests.helpers import intake_fields
 
 
 class TestTitleBodyImmutability:
@@ -20,7 +21,8 @@ class TestTitleBodyImmutability:
         """Once persisted (create_notification flushes), title/body lock."""
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="Original",
             body="Body",
             target_type=TargetType.ALL,
@@ -40,7 +42,8 @@ class TestTitleBodyImmutability:
     ) -> None:
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="Original",
             body="Body",
             target_type=TargetType.ALL,
@@ -70,7 +73,8 @@ class TestTitleBodyImmutability:
         """The pipeline still owns status transitions."""
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.ALL,

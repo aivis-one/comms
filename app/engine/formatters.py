@@ -57,6 +57,7 @@
 # =============================================================================
 
 import re
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html import escape
@@ -78,11 +79,39 @@ logger = structlog.get_logger()
 
 
 class PermanentDeliveryError(Exception):
-    """Raised when delivery fails permanently and should not be retried.
+    """A delivery failed permanently and must not be retried.
 
-    Examples: bot blocked by user, chat not found, recipient has no
-    telegram_id.
+    ABSTRACT (F1.3): a channel raises one of the three subclasses below,
+    never this class -- the subclass IS the failure class (spec §5.6),
+    and app/engine/service.py _deliver_single maps it to a FailureClass
+    in one place. Raising the base directly is refused at construction,
+    so a new raise site cannot silently drop the class.
     """
+
+    def __init__(self, *args: object) -> None:
+        if type(self) is PermanentDeliveryError:
+            raise TypeError(
+                "PermanentDeliveryError is abstract: raise "
+                "ConfigurationError, MessageRejectedError or NoAddressError"
+            )
+        super().__init__(*args)
+
+
+class ConfigurationError(PermanentDeliveryError):
+    """The channel is dead on this deploy: every message will die the
+    same way until the deploy changes (bad credentials, a channel that
+    is not configured, an account without rights). Logged LOUDLY."""
+
+
+class MessageRejectedError(PermanentDeliveryError):
+    """This message will not arrive; the channel is alive and other
+    messages go (the recipient closed the channel, the letter is
+    malformed for this channel, the provider refused this message)."""
+
+
+class NoAddressError(PermanentDeliveryError):
+    """The recipient has no usable address in this channel -- the
+    product's sync, not the channel, is what to fix."""
 
 
 class RateLimitedError(Exception):
@@ -94,9 +123,13 @@ class RateLimitedError(Exception):
     as the delivery schedule), up to a deferral budget (Phase 2.2).
     """
 
-    def __init__(self, retry_after: float) -> None:
+    def __init__(self, retry_after: float, reason_tail: str = "") -> None:
+        """reason_tail is appended verbatim: a channel that read the
+        provider's own words passes them already sanitized and cut (see
+        _reason_tail); a channel that has none passes nothing."""
         super().__init__(
             f"rate limited by channel: retry after {retry_after}s"
+            f"{reason_tail}"
         )
         self.retry_after = retry_after
 
@@ -191,7 +224,7 @@ class UnavailableChannelFormatter:
             channel=self._channel,
             reason=self._reason,
         )
-        raise PermanentDeliveryError(
+        raise ConfigurationError(
             f"channel '{self._channel}' is not available on this "
             f"deploy: {self._reason}"
         )
@@ -296,7 +329,7 @@ class TelegramFormatter:
 
         params = action_data.get("params") or {}
         if len(params) > 1:
-            raise PermanentDeliveryError(
+            raise MessageRejectedError(
                 f"deep link: action {action!r} carries {len(params)} "
                 f"parameters ({sorted(params)}); the startapp encoding "
                 f"fits at most ONE. Put composite targets behind an "
@@ -310,13 +343,13 @@ class TelegramFormatter:
             startapp = str(action)
 
         if len(startapp) > _STARTAPP_MAX_LEN:
-            raise PermanentDeliveryError(
+            raise MessageRejectedError(
                 f"deep link: startapp value is {len(startapp)} chars, "
                 f"the Telegram limit is {_STARTAPP_MAX_LEN}: "
                 f"{startapp[:80]!r}"
             )
         if not _STARTAPP_ALLOWED_RE.fullmatch(startapp):
-            raise PermanentDeliveryError(
+            raise MessageRejectedError(
                 f"deep link: startapp value contains characters outside "
                 f"[A-Za-z0-9_-]: {startapp!r}"
             )
@@ -353,12 +386,18 @@ class TelegramFormatter:
                 the deep link cannot be encoded (item 3), or the
                 Telegram API reports a permanent failure.
         """
-        if not recipient.telegram_id:
-            raise PermanentDeliveryError("Recipient has no telegram_id")
+        # NULL is "no chat" (F1.4); a 0 can no longer arrive
+        # (ck_recipients_telegram_id_not_zero).
+        if recipient.telegram_id is None:
+            raise NoAddressError("Recipient has no telegram_id")
 
         # Lazy import: aiogram types only needed on the real send path.
         from aiogram.enums import ParseMode
-        from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+        from aiogram.exceptions import (
+            TelegramAPIError,
+            TelegramRetryAfter,
+            TelegramUnauthorizedError,
+        )
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         # Trust boundary (review 1.1): the TEMPLATE is trusted and may
@@ -368,7 +407,13 @@ class TelegramFormatter:
         # (see the button block below).
         raw_variables = build_variables(notification)
         variables = _escape_html_variables(raw_variables)
-        locale = recipient.locale or settings.default_locale
+        # NULL is "no language" (F1.4) -- the one way to say it; a blank
+        # string can no longer arrive (ck_recipients_locale_not_blank).
+        locale = (
+            recipient.locale
+            if recipient.locale is not None
+            else settings.default_locale
+        )
 
         rendered_title = render(
             notification_type=notification.type,
@@ -477,11 +522,27 @@ class TelegramFormatter:
             # the service defers via next_retry_at instead of burning
             # an attempt (Phase 2.2).
             if isinstance(exc, TelegramRetryAfter):
-                raise RateLimitedError(float(exc.retry_after)) from exc
+                # exc.message is aiogram's own frame ("Flood control
+                # exceeded ... Retry in N seconds.") followed by
+                # Telegram's description, so it is never empty: the
+                # tail always carries words, never the empty marker.
+                raise RateLimitedError(
+                    float(exc.retry_after),
+                    _reason_tail(_clean_reason(exc.message), 200),
+                ) from exc
+            # A rejected bot token: the channel is dead for EVERY message
+            # until the deploy changes. Before F1.3 this fell through to
+            # the transient path and burned the whole attempt budget,
+            # ending as "transient attempts exhausted" -- a dead channel
+            # disguised as weather.
+            if isinstance(exc, TelegramUnauthorizedError):
+                raise ConfigurationError(
+                    f"Telegram rejected the bot token: {exc}"
+                ) from exc
             error_msg = str(exc).lower()
             for perm_error in _PERMANENT_ERRORS:
                 if perm_error in error_msg:
-                    raise PermanentDeliveryError(
+                    raise MessageRejectedError(
                         f"Telegram permanent failure: {exc}"
                     ) from exc
             # Transient error -- service layer retries.
@@ -579,7 +640,7 @@ class EmailFormatter:
             # delivery-time budget of the recipients who do have one. An
             # address that appears later is a reason for a NEW
             # notification from the product, not for reviving this one.
-            raise PermanentDeliveryError(
+            raise NoAddressError(
                 "recipient has no usable email address "
                 f"({_address_defect(recipient.email)})"
             )
@@ -622,7 +683,13 @@ class EmailFormatter:
         """Subject and body for this notification, in the recipient's
         locale, with the fallbacks the channel needs."""
         variables = build_variables(notification)
-        locale = recipient.locale or settings.default_locale
+        # NULL is "no language" (F1.4) -- the one way to say it; a blank
+        # string can no longer arrive (ck_recipients_locale_not_blank).
+        locale = (
+            recipient.locale
+            if recipient.locale is not None
+            else settings.default_locale
+        )
 
         rendered_subject = render(
             notification_type=notification.type,
@@ -699,7 +766,16 @@ class EmailFormatter:
             )
             return True
 
+        # TWO TEXTS, ON PURPOSE. `message` CLASSIFIES and is read from
+        # the JSON body only, exactly as before: the sender-fault
+        # markers are substrings, and a proxy's HTML page that happens
+        # to say "sandbox" must not declare a live channel dead.
+        # `reason` REPORTS: the provider's own words on ANY body shape,
+        # sanitized where it enters -- the service layer's logs print
+        # the exception text without sanitizing it -- or None when the
+        # provider sent nothing to read.
         message = str(payload.get("message") or payload.get("text") or "")
+        reason = _provider_reason(response, payload)
 
         if status == 429:
             # The provider's own wait, honored through the existing
@@ -708,19 +784,21 @@ class EmailFormatter:
             # degrades to an ordinary transient failure.
             retry_after = _retry_after_seconds(response)
             if retry_after is not None:
-                raise RateLimitedError(retry_after)
+                raise RateLimitedError(
+                    retry_after, _reason_tail(reason, 200),
+                )
             raise EmailTransientError(
-                f"provider rate limit (429): {message[:200]}"
+                f"provider rate limit (429){_reason_tail(reason, 200)}"
             )
 
         if status in _EMAIL_CONFIG_STATUSES or (
             status == 400 and _looks_like_sender_fault(message)
         ):
-            self._fail_configured(status, message, notification, delivery)
+            self._fail_configured(status, reason, notification, delivery)
 
         if status >= 500:
             raise EmailTransientError(
-                f"provider error ({status}): {message[:200]}"
+                f"provider error ({status}){_reason_tail(reason, 200)}"
             )
 
         # Everything else -- a 400 on the recipient, and any 4xx whose
@@ -736,16 +814,17 @@ class EmailFormatter:
             recipient_id=str(delivery.recipient_id),
             status=status,
             provider_message_id=payload.get("id"),
-            provider_message=message[:300],
+            provider_message=_reason_for_log(reason),
         )
-        raise PermanentDeliveryError(
-            f"provider rejected the message ({status}): {message[:200]}"
+        raise MessageRejectedError(
+            f"provider rejected the message ({status})"
+            f"{_reason_tail(reason, 200)}"
         )
 
     def _fail_configured(
         self,
         status: int,
-        message: str,
+        reason: str | None,
         notification: Notification,
         delivery: NotificationDelivery,
     ) -> NoReturn:
@@ -761,7 +840,7 @@ class EmailFormatter:
                 "email_channel_not_viable",
                 channel=DeliveryChannel.EMAIL,
                 status=status,
-                provider_message=message[:300],
+                provider_message=_reason_for_log(reason),
                 detail=(
                     "the provider refused on configuration, not on this "
                     "message: every email will fail the same way until "
@@ -774,10 +853,11 @@ class EmailFormatter:
             delivery_id=str(delivery.id),
             recipient_id=str(delivery.recipient_id),
             status=status,
-            provider_message=message[:300],
+            provider_message=_reason_for_log(reason),
         )
-        raise PermanentDeliveryError(
-            f"provider refused on configuration ({status}): {message[:200]}"
+        raise ConfigurationError(
+            f"provider refused on configuration ({status})"
+            f"{_reason_tail(reason, 200)}"
         )
 
 
@@ -820,9 +900,9 @@ def _usable_email_address(value: str | None) -> str | None:
     """
     if value is None:
         return None
+    # A blank address cannot arrive (F1.4: ck_recipients_email_not_blank,
+    # refused on both write paths); the strip only trims the edges.
     address = value.strip()
-    if not address:
-        return None
     if "@" not in address or address.startswith("@") or address.endswith("@"):
         return None
     if any(ch in address for ch in ("\r", "\n")) or " " in address:
@@ -836,8 +916,6 @@ def _address_defect(value: str | None) -> str:
     """Name the defect WITHOUT echoing the address (no PII in logs)."""
     if value is None:
         return "no address in the recipient snapshot"
-    if not value.strip():
-        return "the address is blank"
     return "the address is not a usable mailbox"
 
 
@@ -865,6 +943,61 @@ def _response_payload(response: Any) -> dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _provider_reason(response: Any, payload: dict[str, Any]) -> str | None:
+    """What the provider said about a failure, on any body shape.
+
+    The JSON `message`, else the JSON `text`, else the RAW body -- so a
+    non-JSON page (Mailgun answers 401/403 with a plain "Forbidden"), a
+    JSON value that is not a mapping, and a mapping with neither key all
+    still name their reason. A key that holds only whitespace counts as
+    absent. Sanitized over the WHOLE text before anything cuts it, then
+    whitespace-collapsed so an HTML page stays one readable line.
+    Collapsing never joins two tokens, so it cannot assemble a secret
+    the patterns did not see. None: the provider sent nothing readable.
+    """
+    for key in ("message", "text"):
+        value = payload.get(key)
+        if value and str(value).strip():
+            text = str(value)
+            break
+    else:
+        text = response.text
+    return _clean_reason(text)
+
+
+def _clean_reason(text: str) -> str | None:
+    """A provider's words made safe to record, or None if there are none.
+
+    Sanitized over the WHOLE text first, then whitespace-collapsed so a
+    multi-line page or message stays one readable line. Collapsing
+    never joins two tokens, so it cannot assemble a secret the patterns
+    did not see. Shared by every channel that reads a provider's words,
+    so they are cleaned by one piece of code.
+    """
+    collapsed = " ".join(sanitize_text(text).split())
+    return collapsed or None
+
+
+def _reason_tail(reason: str | None, limit: int) -> str:
+    """The tail a failure text carries after its status.
+
+    ": <provider's words>" or ", empty body". The empty case is told by
+    its SEPARATOR, not by its words: a provider whose body literally
+    reads "empty body" still arrives after a colon, so no body can pass
+    for the marker. The marker never reaches classification, which
+    reads the JSON message only.
+    """
+    if reason is None:
+        return ", empty body"
+    return f": {reason[:limit]}"
+
+
+def _reason_for_log(reason: str | None) -> str | None:
+    """provider_message for a log line: None when the body was empty,
+    which no provider text can be mistaken for."""
+    return None if reason is None else reason[:300]
 
 
 def _retry_after_seconds(response: Any) -> float | None:
@@ -913,30 +1046,117 @@ def _request_may_have_arrived(exc: Exception) -> bool:
 
 
 
-# Secret-redaction patterns (review 1.1). The Phase 1 version truncated
-# AFTER a keyword, leaking secrets that precede it, and missed DSNs
-# (no "password" substring in postgresql://user:pass@host).
-# Order matters: bearer first, so "Authorization: Bearer x" is not
-# half-eaten by the key=value pattern.
+# Secret-redaction patterns (review 1.1, widened in F0-comms item 2).
+#
+# THE LIST IS DRIVEN BY THE SECRETS THIS SERVICE ACTUALLY HOLDS, in the
+# form each takes where it can surface in an error text -- not by what a
+# secret "usually" looks like. The secrets (app/core/config.py) and the
+# form each is checked in:
+#   DATABASE_URL        postgresql+asyncpg://comms:<pw>@host/db   userinfo
+#   REDIS_URL           redis://:<pw>@host:6379/0 (EMPTY user --
+#                       the form deploy/comms-deploy.sh writes)    userinfo
+#   COMMS_SERVICE_TOKEN Authorization: Bearer <t>; bare hex         header,
+#                                                                  bearer, hex
+#   TELEGRAM_BOT_TOKEN  .../bot<id>:<secret>/sendMessage inside an
+#                       aiohttp error text (aiogram wraps it as
+#                       "<ClientError class>: <error>")            telegram
+#   EMAIL_MAILGUN_API_KEY bare <32hex>-<8hex>-<8hex> or key-<32hex>;
+#                       Authorization: Basic <b64 of api:key>     mailgun,
+#                                                                  header
+# Generated passwords and the service token (openssl rand -hex 24/32 in
+# comms-deploy.sh) are also caught BARE by the long-hex pattern.
+#
+# ORDER MATTERS, and every pattern is IDEMPOTENT on its own output --
+# the email path sanitizes the provider's text where it enters, and the
+# service layer sanitizes the exception again when it writes the
+# record, so every text goes through this twice:
+#   1. the Authorization header, scheme included -- before bearer, so
+#      "Authorization: Basic x" loses its credentials and not just the
+#      word "Basic";
+#   2. bearer on its own (a token with no header name in front);
+#   3. userinfo in a URL/DSN, EMPTY user allowed, and the password runs
+#      to the LAST @ of the authority (a raw @ in a password must not
+#      leave its tail behind);
+#   4. token-shaped values with no keyword next to them;
+#   5. key=value / key: value for credential keywords.
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)\b(authorization)\b\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+"
+)
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
-_URL_USERINFO_RE = re.compile(r"(://[^/\s:@]+:)[^@/\s]+(@)")
+_URL_USERINFO_RE = re.compile(r"(://[^/\s:@]*:)[^/\s]*(@)")
+_TELEGRAM_TOKEN_RE = re.compile(r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}")
+_MAILGUN_KEY_RE = re.compile(
+    r"(?i)\b(?:key-[0-9a-f]{32}|[0-9a-f]{32}-[0-9a-f]{8}-[0-9a-f]{8})\b"
+)
+# KNOWN CEILING -- bare secrets the operator chose by hand.
+#   1. Mechanics: this pattern catches a secret with no keyword, header
+#      or URL around it ONLY in the shape comms-deploy.sh mints (48+ hex
+#      characters). A password, token or key the operator typed in
+#      another shape, surfacing bare in an error text, passes through
+#      every pattern here unchanged.
+#   2. Status: acknowledged by design.
+#   3. Task: none -- no secret outside the minted shapes exists in any
+#      deploy we know of, and the shape of a hand-typed value cannot be
+#      recognised by any pattern without also eating ordinary text.
+#   4. Unfreeze trigger: a secret appears in a deploy's configuration
+#      that was NOT written by comms-deploy.sh generate_env and is not
+#      one of the provider credentials matched above.
+#   5. Agreed fix: redact by VALUE, not by shape -- read the configured
+#      secrets from settings once and replace their literal occurrences.
+#   6. Rejected: widening the shape patterns to "any long token" (eats
+#      message ids, digests and ordinary identifiers, and still misses a
+#      short password); refusing non-hex secrets at startup (not ours to
+#      demand of a provider credential, and a red start on a valid
+#      configuration).
+_LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{48,}\b")
 _KEYVAL_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key|apikey"
     r"|authorization)\b\s*[=:]\s*\S+"
 )
 
 
-def sanitize_error(exc: Exception) -> str:
-    """Sanitize exception message to remove potential secrets.
+def sanitize_text(text: str) -> str:
+    """Remove every secret form listed above from a text. Not truncated.
 
-    Covers: bearer tokens, userinfo in URLs/DSNs, key=value / key: value
-    shapes for common credential keywords. Plain messages pass through.
+    Idempotent: sanitize_text(sanitize_text(x)) == sanitize_text(x).
+    Callers cut AFTER calling this, never before: a cut through the
+    middle of a secret can leave a prefix no pattern recognises. The
+    one gap in coverage is the KNOWN CEILING on _LONG_HEX_RE.
     """
-    msg = str(exc)
-    msg = _BEARER_RE.sub("bearer [redacted]", msg)
-    msg = _URL_USERINFO_RE.sub(r"\1[redacted]\2", msg)
-    msg = _KEYVAL_RE.sub(lambda m: f"{m.group(1)}=[redacted]", msg)
-    return msg[:2000]
+    text = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _BEARER_RE.sub("bearer [redacted]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[redacted]\2", text)
+    text = _TELEGRAM_TOKEN_RE.sub("[redacted]", text)
+    text = _MAILGUN_KEY_RE.sub("[redacted]", text)
+    text = _LONG_HEX_RE.sub("[redacted]", text)
+    return _KEYVAL_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+
+
+def sanitize_error(exc: Exception) -> str:
+    """An exception's text with secrets removed, cut to the record size."""
+    return sanitize_text(str(exc))[:2000]
+
+
+def sanitized_traceback(exc: BaseException) -> str:
+    """The traceback structlog's format_exc_info would render, redacted.
+
+    For a log line that must keep the stack but cannot let the renderer
+    print it raw: log it as `exception=sanitized_traceback(exc)` instead
+    of logger.exception(). The key and the text are what format_exc_info
+    produces, so the record keeps its shape.
+
+    Redacted as ONE text, never cut: traceback.format_exception prints
+    str() of every exception in the chain (__cause__, __context__), the
+    notes and the members of an exception group, and a secret can sit in
+    any of them -- the aiogram network error carries the bot's URL both
+    in its own text and in its __cause__. Frame locals are not printed
+    by this formatter, so they are not a path. What the patterns cannot
+    recognise is the KNOWN CEILING on _LONG_HEX_RE; this is another
+    caller of sanitize_text, not another sanitizer.
+    """
+    rendered = "".join(traceback.format_exception(exc))
+    # format_exc_info drops the one trailing newline; so does this.
+    return sanitize_text(rendered.removesuffix("\n"))
 
 
 def _escape_html_variables(variables: dict[str, Any]) -> dict[str, Any]:
@@ -966,10 +1186,10 @@ def build_variables(notification: Notification) -> dict[str, Any]:
     """
     variables: dict[str, Any] = {}
     if notification.action_data:
-        for key, value in notification.action_data.items():
-            # Skip internal keys (prefixed with underscore).
-            if not key.startswith("_"):
-                variables[key] = value
+        # Every key is a template variable: the letter carries no
+        # internal keys since F1.2 (the channel left action_data), and
+        # the underscore reservation that guarded them is gone (F1.3).
+        variables.update(notification.action_data)
     # Core fields always win over action_data.
     variables["title"] = notification.title
     variables["body"] = notification.body

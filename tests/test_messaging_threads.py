@@ -17,7 +17,7 @@ from app.core.exceptions import NotFoundError
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Message, Thread
 from app.messaging.threads import create_or_get_thread, post_message
-from tests.helpers import create_recipient, next_phase4a_telegram_id
+from tests.helpers import create_recipient, intake_fields, next_phase4a_telegram_id
 
 _T0 = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
 
@@ -30,7 +30,7 @@ async def _dm_thread(session: AsyncSession) -> tuple[UUID, UUID]:
         session, telegram_id=next_phase4a_telegram_id()
     )
     thread = await create_or_get_thread(
-        session,
+        session, **intake_fields(),
         client=client.id,
         operator_kind=OperatorKind.USER,
         operator_value=operator.id,
@@ -45,7 +45,7 @@ class TestPostMessage:
     ) -> None:
         thread_id, client_id = await _dm_thread(db_session)
         message = await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="hello",
@@ -63,7 +63,7 @@ class TestPostMessage:
         )
         with pytest.raises(NotFoundError):
             await post_message(
-                db_session,
+                db_session, **intake_fields(),
                 thread_id=uuid4(),
                 sender=sender.id,
                 body="nowhere",
@@ -80,7 +80,7 @@ class TestLastMessageAt:
         assert thread.last_message_at is None
 
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="first",
@@ -91,7 +91,7 @@ class TestLastMessageAt:
 
         # a later message advances the marker
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="later",
@@ -102,7 +102,7 @@ class TestLastMessageAt:
 
         # a backfilled earlier message must NOT pull the marker back
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="backfill",
@@ -119,21 +119,21 @@ class TestOrderedRead:
         thread_id, client_id = await _dm_thread(db_session)
         # insert out of chronological order
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="second",
             created_at=_T0 + timedelta(minutes=1),
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="first",
             created_at=_T0,
         )
         await post_message(
-            db_session,
+            db_session, **intake_fields(),
             thread_id=thread_id,
             sender=client_id,
             body="third",

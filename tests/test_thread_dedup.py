@@ -25,6 +25,7 @@ from app.messaging.threads import create_or_get_thread
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4a_telegram_id,
 )
 
@@ -49,14 +50,14 @@ class TestSubjectlessDedup:
     ) -> None:
         client_id, op_id = await _client_and_operator(db_session)
         first = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
             kind=ThreadKind.DM,
         )
         second = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -70,14 +71,14 @@ class TestSubjectlessDedup:
     ) -> None:
         client_id, op_id = await _client_and_operator(db_session)
         first = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
             kind=ThreadKind.TICKET,
         )
         second = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -95,7 +96,7 @@ class TestSubjectDedup:
         key excludes kind)."""
         client_id, op_id = await _client_and_operator(db_session)
         as_ticket = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -104,7 +105,7 @@ class TestSubjectDedup:
             subject_id="42",
         )
         as_dm = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -120,7 +121,7 @@ class TestSubjectDedup:
     ) -> None:
         client_id, op_id = await _client_and_operator(db_session)
         a = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -129,7 +130,7 @@ class TestSubjectDedup:
             subject_id="1",
         )
         b = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -153,7 +154,7 @@ class TestOperatorReferentValidation:
         )
         with pytest.raises(NotFoundError):
             await create_or_get_thread(
-                db_session,
+                db_session, **intake_fields(),
                 client=client.id,
                 operator_kind=OperatorKind.USER,
                 operator_value=uuid4(),  # no such recipient
@@ -169,7 +170,7 @@ class TestOperatorReferentValidation:
         )
         with pytest.raises(NotFoundError):
             await create_or_get_thread(
-                db_session,
+                db_session, **intake_fields(),
                 client=client.id,
                 operator_kind=OperatorKind.SECTION,
                 operator_value=uuid4(),  # no such section
@@ -182,7 +183,7 @@ class TestOperatorReferentValidation:
     ) -> None:
         client_id, op_id = await _client_and_operator(db_session)
         thread = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client_id,
             operator_kind=OperatorKind.USER,
             operator_value=op_id,
@@ -198,7 +199,7 @@ class TestOperatorReferentValidation:
         )
         section = await create_section(db_session, key="support")
         thread = await create_or_get_thread(
-            db_session,
+            db_session, **intake_fields(),
             client=client.id,
             operator_kind=OperatorKind.SECTION,
             operator_value=section.id,
@@ -215,7 +216,7 @@ class TestSubjectRefValidation:
         client_id, op_id = await _client_and_operator(db_session)
         with pytest.raises(ValidationError):
             await create_or_get_thread(
-                db_session,
+                db_session, **intake_fields(),
                 client=client_id,
                 operator_kind=OperatorKind.USER,
                 operator_value=op_id,
@@ -249,7 +250,7 @@ class TestConcurrentCreate:
         async def worker() -> str:
             async with factory() as session:
                 thread = await create_or_get_thread(
-                    session,
+                    session, **intake_fields(),
                     client=client_id,
                     operator_kind=OperatorKind.USER,
                     operator_value=op_id,

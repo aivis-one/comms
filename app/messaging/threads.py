@@ -39,7 +39,12 @@ from sqlalchemy import column, exists, select, table, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.constants import PAGE_LIMIT_DEFAULT
+from app.core.exceptions import (
+    NotFoundError,
+    RecipientDeletedError,
+    ValidationError,
+)
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Message, Section, Thread
 from app.messaging.status import apply_client_message_reopen
@@ -49,7 +54,7 @@ logger = structlog.get_logger()
 # Lightweight, by-name reference to the audience-owned recipients table.
 # Lets the USER-form operator referent be verified without importing an
 # app.audience model (package DAG: core <- messaging).
-_recipients = table("recipients", column("id"))
+_recipients = table("recipients", column("id"), column("deleted_at"))
 
 # Names of the two dedup indexes (migration 0006). Matched against the
 # IntegrityError so ONLY a dedup collision is treated as "already
@@ -58,12 +63,27 @@ _DEDUP_INDEX_NAMES = ("uq_threads_dedup_subject", "uq_threads_dedup_dm")
 
 
 async def _recipient_exists(session: AsyncSession, recipient_id: UUID) -> bool:
-    """True if a recipient row with this id exists (by-name probe)."""
-    return bool(
+    """True if a LIVE recipient row with this id exists (by-name probe).
+
+    A tombstone (deleted_at set, F1.4) is not a live referent: a write
+    that names a forgotten person -- a thread, a message, a claim, a
+    section role, a read pointer -- raises RecipientDeletedError (409),
+    because the tombstone is terminal and nothing re-attaches to it. An
+    absent id still returns False, and the caller's clean 404 stands.
+    """
+    deleted_at = await session.scalar(
+        select(_recipients.c.deleted_at).where(_recipients.c.id == recipient_id)
+    )
+    row_exists = deleted_at is not None or bool(
         await session.scalar(
             select(exists().where(_recipients.c.id == recipient_id))
         )
     )
+    if deleted_at is not None:
+        raise RecipientDeletedError(
+            f"recipient {recipient_id} was deleted; nothing re-attaches to it"
+        )
+    return row_exists
 
 
 async def _require_operator_referent(
@@ -98,6 +118,8 @@ def _build_thread(
     subject_id: str | None,
     title: str | None,
     priority: int | None,
+    idempotency_key: str,
+    fingerprint: str,
 ) -> Thread:
     """Construct an unsaved Thread (status defaults to open in the ORM).
 
@@ -114,6 +136,8 @@ def _build_thread(
         assignee = operator_value
         assigned_at = datetime.now(UTC)
     return Thread(
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
         client=client,
         operator_kind=operator_kind,
         operator_value=operator_value,
@@ -178,6 +202,8 @@ async def create_or_get_thread_detailed(
     subject_id: str | None = None,
     title: str | None = None,
     priority: int | None = None,
+    idempotency_key: str,
+    fingerprint: str,
 ) -> tuple[Thread, bool]:
     """Create a thread, or return the existing one per the dedup key.
 
@@ -222,6 +248,8 @@ async def create_or_get_thread_detailed(
             subject_id=subject_id,
             title=title,
             priority=priority,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
         )
         session.add(thread)
         await session.flush()
@@ -253,6 +281,8 @@ async def create_or_get_thread_detailed(
         subject_id=subject_id,
         title=title,
         priority=priority,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
     )
     try:
         async with session.begin_nested():
@@ -299,6 +329,8 @@ async def create_or_get_thread(
     subject_id: str | None = None,
     title: str | None = None,
     priority: int | None = None,
+    idempotency_key: str,
+    fingerprint: str,
 ) -> Thread:
     """Thin test-compat wrapper over create_or_get_thread_detailed.
 
@@ -324,6 +356,8 @@ async def create_or_get_thread(
         subject_id=subject_id,
         title=title,
         priority=priority,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
     )
     return thread
 
@@ -334,6 +368,8 @@ async def post_message(
     thread_id: UUID,
     sender: UUID,
     body: str,
+    idempotency_key: str,
+    fingerprint: str,
     created_at: datetime | None = None,
 ) -> Message:
     """Append a message to an existing thread and bump its activity.
@@ -349,12 +385,19 @@ async def post_message(
     thread = await session.get(Thread, thread_id)
     if thread is None:
         raise NotFoundError(f"thread {thread_id} does not exist")
+    # The sender must be a LIVE recipient (F1.4): a forgotten person
+    # writes nothing -- RecipientDeletedError from the probe -- and an
+    # unknown one is a clean 404 rather than a foreign-key 500.
+    if not await _recipient_exists(session, sender):
+        raise NotFoundError(f"sender recipient {sender} does not exist")
 
     when = created_at if created_at is not None else datetime.now(UTC)
     message = Message(
         thread_id=thread_id,
         sender=sender,
         body=body,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
         created_at=when,
     )
     session.add(message)
@@ -377,30 +420,24 @@ async def post_message(
     return message
 
 
-# Thread-feed keyset bounds (Phase 4c) -- mirror the inbox: clamp, do
-# not reject. Kept local (threads.py must not import operators.py --
-# operators imports threads, so a shared constant there would cycle).
-MESSAGE_FEED_MAX_PAGE_SIZE = 100
-MESSAGE_FEED_DEFAULT_PAGE_SIZE = 20
 
 
 async def list_thread_messages(
     session: AsyncSession,
     *,
     thread_id: UUID,
-    limit: int = MESSAGE_FEED_DEFAULT_PAGE_SIZE,
+    limit: int = PAGE_LIMIT_DEFAULT,
     cursor: tuple[datetime, UUID] | None = None,
 ) -> tuple[Sequence[Message], tuple[datetime, UUID] | None]:
     """Thread feed: a thread's messages, NEWEST-first, keyset-paginated
     by (created_at, id) -- the same cursor shape as the inbox and the
-    visible-threads list. `limit` clamps to 1..100 (default 20);
+    visible-threads list. `limit` is bounded by the route (app/api/paging.py);
     `cursor` is the (created_at, id) of the last row already seen and
     the next page is WHERE (created_at, id) < cursor. An absent thread
     yields an empty feed (the trust-model "empty is the honest answer").
     Returns (messages, next_cursor); next_cursor is None on the last
     page. The opaque wire cursor lives at the API edge.
     """
-    limit = max(1, min(limit, MESSAGE_FEED_MAX_PAGE_SIZE))
     stmt = select(Message).where(Message.thread_id == thread_id)
     if cursor is not None:
         stmt = stmt.where(tuple_(Message.created_at, Message.id) < cursor)

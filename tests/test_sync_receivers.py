@@ -24,11 +24,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from app.audience.models import GroupMembership, Recipient
-from app.audience.sync import group_changed, user_upserted
+from app.audience.sync import group_changed
 from app.core.exceptions import NotFoundError
 from app.engine.constants import TargetType
 from app.engine.resolver import resolve_targets
-from tests.helpers import next_phase2_telegram_id
+from tests.helpers import next_phase2_telegram_id, upsert_snapshot
 
 
 async def _recipient_count(session: AsyncSession) -> int:
@@ -45,7 +45,7 @@ class TestUserUpserted:
         """First event for an id creates the projection row."""
         recipient_id = uuid4()
         tg = next_phase2_telegram_id()
-        recipient = await user_upserted(
+        recipient = await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=tg,
@@ -66,7 +66,7 @@ class TestUserUpserted:
     ) -> None:
         """A repeat event updates the same row; count stays 1."""
         recipient_id = uuid4()
-        await user_upserted(
+        await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=next_phase2_telegram_id(),
@@ -76,7 +76,7 @@ class TestUserUpserted:
             active=True,
         )
         new_tg = next_phase2_telegram_id()
-        updated = await user_upserted(
+        updated = await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=new_tg,
@@ -97,7 +97,7 @@ class TestUserUpserted:
     ) -> None:
         """Ownership split: timezone is synced, quiet_* survive."""
         recipient_id = uuid4()
-        recipient = await user_upserted(
+        recipient = await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=next_phase2_telegram_id(),
@@ -113,7 +113,7 @@ class TestUserUpserted:
         recipient.quiet_days = [5, 6]
         await db_session.flush()
 
-        await user_upserted(
+        await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=next_phase2_telegram_id(),
@@ -139,7 +139,7 @@ class TestUserUpserted:
         snapshot contract; DEFAULT_TIMEZONE picks up at computation.
         """
         recipient_id = uuid4()
-        recipient = await user_upserted(
+        recipient = await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=next_phase2_telegram_id(),
@@ -148,7 +148,7 @@ class TestUserUpserted:
             timezone="Europe/Berlin",
             active=True,
         )
-        await user_upserted(
+        await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=next_phase2_telegram_id(),
@@ -166,7 +166,7 @@ class TestUserUpserted:
         store as-is, degrade to the default at computation time."""
         recipient_id = uuid4()
         with capture_logs() as logs:
-            recipient = await user_upserted(
+            recipient = await upsert_snapshot(
                 db_session,
                 recipient_id=recipient_id,
                 telegram_id=next_phase2_telegram_id(),
@@ -187,7 +187,7 @@ class TestUserUpserted:
     ) -> None:
         """active=False from the product hides the recipient."""
         recipient_id = uuid4()
-        await user_upserted(
+        await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=next_phase2_telegram_id(),
@@ -200,7 +200,7 @@ class TestUserUpserted:
             db_session, TargetType.USER, str(recipient_id),
         ) == [recipient_id]
 
-        await user_upserted(
+        await upsert_snapshot(
             db_session,
             recipient_id=recipient_id,
             telegram_id=next_phase2_telegram_id(),
@@ -218,7 +218,7 @@ class TestGroupChanged:
     """Membership sync: idempotent add/remove, ordering guard."""
 
     async def _synced_recipient(self, session: AsyncSession) -> Recipient:
-        return await user_upserted(
+        return await upsert_snapshot(
             session,
             recipient_id=uuid4(),
             telegram_id=next_phase2_telegram_id(),
@@ -287,7 +287,7 @@ class TestResolverSeesSyncedData:
         self, db_session: AsyncSession,
     ) -> None:
         """One synced flow feeds all three resolver paths."""
-        alpha = await user_upserted(
+        alpha = await upsert_snapshot(
             db_session,
             recipient_id=uuid4(),
             telegram_id=next_phase2_telegram_id(),
@@ -296,7 +296,7 @@ class TestResolverSeesSyncedData:
             timezone=None,
             active=True,
         )
-        bravo = await user_upserted(
+        bravo = await upsert_snapshot(
             db_session,
             recipient_id=uuid4(),
             telegram_id=next_phase2_telegram_id(),

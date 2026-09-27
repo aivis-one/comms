@@ -13,6 +13,7 @@ from app.engine.constants import TargetType
 from app.engine.service import create_notification
 from app.engine.template_engine import SafeDict, render
 from app.profile.registry import registry
+from tests.helpers import intake_fields
 
 
 class TestRegistry:
@@ -25,6 +26,7 @@ class TestRegistry:
         with pytest.raises(ValidationError):
             await create_notification(
                 db_session,
+                **intake_fields(),
                 type="not_registered_anywhere",
                 title="T",
                 body="B",
@@ -38,13 +40,14 @@ class TestRegistry:
         """A stub-profile type passes validation."""
         notification = await create_notification(
             db_session,
-            type="unit_event",
+            **intake_fields(),
+            type="unit_event_in_app",
             title="T",
             body="B",
             target_type=TargetType.ALL,
             target_value="*",
         )
-        assert notification.type == "unit_event"
+        assert notification.type == "unit_event_in_app"
 
     def test_registered_types_snapshot(self) -> None:
         """Registry reports the stub profile's dictionary."""

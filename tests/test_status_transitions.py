@@ -23,6 +23,7 @@ from app.messaging.threads import create_or_get_thread, post_message
 from tests.helpers import (
     create_recipient,
     create_section,
+    intake_fields,
     next_phase4b_telegram_id,
 )
 
@@ -37,7 +38,7 @@ async def _dm_thread(session: AsyncSession) -> tuple[Thread, UUID]:
     client = await _rid(session)
     master = await _rid(session)
     thread = await create_or_get_thread(
-        session, client=client,
+        session, **intake_fields(), client=client,
         operator_kind=OperatorKind.USER, operator_value=master,
         kind=ThreadKind.DM,
     )
@@ -49,7 +50,7 @@ async def _section_thread(session: AsyncSession) -> tuple[Thread, UUID]:
     client = await _rid(session)
     section = await create_section(session, key=f"st-{uuid4().hex[:8]}")
     thread = await create_or_get_thread(
-        session, client=client,
+        session, **intake_fields(), client=client,
         operator_kind=OperatorKind.SECTION, operator_value=section.id,
         kind=ThreadKind.TICKET, subject_type="practice", subject_id="s",
     )
@@ -187,7 +188,8 @@ class TestClientAutoReopen:
             db_session, thread_id=thread.id, target=ThreadStatus.RESOLVED
         )
         await post_message(
-            db_session, thread_id=thread.id, sender=client, body="hi again"
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=client, body="hi again"
         )
         assert await _status_of(db_session, thread.id) == "open"
 
@@ -200,7 +202,8 @@ class TestClientAutoReopen:
         )
         assert await _marker_of(db_session, thread.id) is not None
         await post_message(
-            db_session, thread_id=thread.id, sender=client, body="reopen pls"
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=client, body="reopen pls"
         )
         assert await _status_of(db_session, thread.id) == "open"
         assert await _marker_of(db_session, thread.id) is None
@@ -214,7 +217,8 @@ class TestClientAutoReopen:
             db_session, thread_id=thread.id, target=ThreadStatus.RESOLVED
         )
         await post_message(
-            db_session, thread_id=thread.id, sender=agent, body="agent note"
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=agent, body="agent note"
         )
         assert await _status_of(db_session, thread.id) == "resolved"
 
@@ -223,7 +227,8 @@ class TestClientAutoReopen:
     ) -> None:
         thread, client = await _dm_thread(db_session)
         await post_message(
-            db_session, thread_id=thread.id, sender=client, body="hello",
+            db_session,
+                **intake_fields(), thread_id=thread.id, sender=client, body="hello",
             created_at=datetime.now(UTC),
         )
         assert await _status_of(db_session, thread.id) == "open"

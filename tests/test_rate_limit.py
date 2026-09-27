@@ -38,7 +38,7 @@ from app.engine.formatters import RateLimitedError
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import process_pending_notifications
 from app.engine.service import create_notification
-from tests.helpers import create_recipient, next_phase2_telegram_id
+from tests.helpers import create_recipient, intake_fields, next_phase2_telegram_id
 
 
 async def _fetch_delivery(notification_id: UUID) -> NotificationDelivery:
@@ -112,12 +112,12 @@ async def _rate_limited_setup(
     )
     notification = await create_notification(
         db_session,
+        **intake_fields(),
         type="unit_event",
         title="T",
         body="B",
         target_type=TargetType.USER,
         target_value=str(recipient.id),
-        channels=["telegram"],
         expiry_at=expiry_at,
     )
     await db_session.commit()
