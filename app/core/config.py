@@ -22,6 +22,8 @@
 #   (recipient locale -> default_locale -> stored title/body).
 # =============================================================================
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -73,6 +75,113 @@ _EMAIL_API_BASE_URLS = {
     "eu": "https://api.eu.mailgun.net",
     "us": "https://api.mailgun.net",
 }
+
+
+@dataclass(frozen=True)
+class Bound:
+    """The closed range a numeric setting may take, and why."""
+
+    lo: int
+    hi: int
+    why: str
+
+
+# THE ONE TABLE OF NUMERIC BOUNDS (D1 / R3). Every int field of
+# Settings has a row -- a test walks the fields against this table, so
+# a new knob without a bound fails the suite. A value outside its row
+# refuses startup naming the variable: a service that came up on a
+# wrong number is worse than one that refused and said which (spec
+# §17.7). No clamping, no warning-instead, no default-instead.
+NUMERIC_BOUNDS: dict[str, Bound] = {
+    "consumer_batch_size": Bound(
+        1, 1000, "XREADGROUP COUNT: 0 reads nothing; above 1000 one read "
+        "holds that many envelopes in memory at once",
+    ),
+    "consumer_block_ms": Bound(
+        1, 60_000, "XREADGROUP BLOCK: 0 blocks FOREVER, so the consumer "
+        "never wakes to see a shutdown; above a minute it answers one late",
+    ),
+    "dlq_maxlen": Bound(
+        1, 10_000_000, "XADD MAXLEN: 0 trims every entry -- a dead-letter "
+        "queue that keeps nothing",
+    ),
+    "notification_poll_interval_seconds": Bound(
+        1, 3600, "0 is a busy loop on the database; above an hour a "
+        "scheduled_at is honored an hour late",
+    ),
+    "notification_max_backoff_seconds": Bound(
+        1, 3600, "the idle worker's longest sleep; not below the poll "
+        "interval (checked below)",
+    ),
+    "notification_max_delivery_attempts": Bound(
+        1, 100, "0 attempts sends nothing and never fails; the profile's "
+        "retry_max_attempts refuses below 1 for the same reason",
+    ),
+    "notification_max_pipeline_attempts": Bound(
+        1, 100, "0 would close a job without one attempt; T12",
+    ),
+    "notification_batch_size": Bound(
+        1, 1000, "0 selects nothing -- delivery stops; above 1000 one tick "
+        "holds that many row locks",
+    ),
+    "notification_retry_backoff_base_seconds": Bound(
+        0, 86_400, "0 = no idle wait between attempts (the profile's "
+        "retry_backoff_seconds allows 0 too); above a day a retry "
+        "outlives any letter",
+    ),
+    "notification_retry_backoff_max_seconds": Bound(
+        0, 86_400, "the backoff cap; not below the base (checked below)",
+    ),
+    "notification_max_retry_after_seconds": Bound(
+        1, 86_400, "0 turns every 429 deferral into an immediate re-poll",
+    ),
+    "notification_max_rate_limit_deferrals": Bound(
+        0, 1000, "0 = every 429 is a regular transient failure",
+    ),
+    "notification_retention_days": Bound(
+        0, 3650, "0 DISABLES retention -- never 'delete everything'; a "
+        "negative number has no meaning",
+    ),
+    "notification_retention_interval_seconds": Bound(
+        1, 86_400, "0 does NOT mean 'every tick'; 'off' is "
+        "NOTIFICATION_RETENTION_DAYS=0",
+    ),
+    "thread_auto_close_days": Bound(
+        0, 3650, "0 DISABLES auto-close -- never a mass close; a negative "
+        "number has no meaning",
+    ),
+    "thread_auto_close_interval_seconds": Bound(
+        1, 86_400, "0 does NOT mean 'every tick'; 'off' is "
+        "THREAD_AUTO_CLOSE_DAYS=0",
+    ),
+}
+
+# Pairs where one setting must not fall below another: (low, high).
+_ORDERED_PAIRS: tuple[tuple[str, str], ...] = (
+    ("notification_poll_interval_seconds", "notification_max_backoff_seconds"),
+    (
+        "notification_retry_backoff_base_seconds",
+        "notification_retry_backoff_max_seconds",
+    ),
+)
+
+
+def numeric_problems(values: Mapping[str, int]) -> list[str]:
+    """Every bound and order violated by `values`, each naming its
+    variable -- collected, so a deploy fixes all of them in one pass."""
+    problems = [
+        f"{name.upper()}={values[name]} is outside {bound.lo}..{bound.hi}: "
+        f"{bound.why}."
+        for name, bound in NUMERIC_BOUNDS.items()
+        if not bound.lo <= values[name] <= bound.hi
+    ]
+    problems.extend(
+        f"{high.upper()}={values[high]} is below "
+        f"{low.upper()}={values[low]}."
+        for low, high in _ORDERED_PAIRS
+        if values[high] < values[low]
+    )
+    return problems
 
 
 class Settings(BaseSettings):
@@ -183,6 +292,15 @@ class Settings(BaseSettings):
     notification_poll_interval_seconds: int = 5
     notification_max_backoff_seconds: int = 60
     notification_max_delivery_attempts: int = 3
+    # T12: how many attempts of the PIPELINE (resolve / deliver /
+    # rollup, not a channel call) may end in an exception of comms' own
+    # before the job gets its outcome -- FAILED, its waiting deliveries
+    # closed with failure class `pipeline`. Between attempts the job
+    # waits behind the same backoff as a delivery
+    # (NOTIFICATION_RETRY_BACKOFF_*), so it never starves the healthy
+    # jobs behind it. A separate knob from the delivery attempts: the
+    # channel being down and comms being broken are different facts.
+    notification_max_pipeline_attempts: int = 3
     # Max notifications picked per worker batch; the tail is picked up
     # on the next tick (review 1.1: unbounded backlog fetch).
     notification_batch_size: int = 50
@@ -224,7 +342,7 @@ class Settings(BaseSettings):
     # than this are deleted
     # in batches by the worker's retention pass, deliveries follow by
     # FK cascade. Age is measured on created_at.
-    # SEMANTICS (fix I): <= 0 means retention is DISABLED -- never
+    # SEMANTICS (fix I): 0 means retention is DISABLED -- never
     # "delete everything now". A stray RETENTION_DAYS=0 in env must
     # not become an irreversible wipe of the whole history; disabling
     # is loud (worker startup log).
@@ -237,7 +355,7 @@ class Settings(BaseSettings):
     # gate in app/engine/worker.py. Strictly > 0 (fix I): 0 is a
     # config error at startup, NOT "every tick" -- someone writing 0
     # to mean "off" must not get the hottest possible cadence; "off"
-    # is NOTIFICATION_RETENTION_DAYS <= 0.
+    # is NOTIFICATION_RETENTION_DAYS=0.
     notification_retention_interval_seconds: int = 3600
 
     # Phase 4b item 6: auto-close of idle THREADS. A thread that has
@@ -246,7 +364,7 @@ class Settings(BaseSettings):
     # thread revives on the next client message). Silence is measured
     # on COALESCE(last_message_at, created_at), so a thread that never
     # got a message ages from creation.
-    # SEMANTICS (mirrors retention, fix I): <= 0 means auto-close is
+    # SEMANTICS (mirrors retention, fix I): 0 means auto-close is
     # DISABLED -- never a mass close. Disabling is loud (worker startup
     # log). Default 30.
     thread_auto_close_days: int = 30
@@ -377,36 +495,12 @@ class Settings(BaseSettings):
                 f"'Europe/Berlin')."
             ) from exc
 
-        if self.notification_max_rate_limit_deferrals < 0:
-            raise ValueError(
-                "NOTIFICATION_MAX_RATE_LIMIT_DEFERRALS must be >= 0 "
-                "(0 disables 429 deferrals: every 429 is a regular "
-                "transient failure)."
-            )
-
-        if self.notification_max_retry_after_seconds <= 0:
-            raise ValueError(
-                "NOTIFICATION_MAX_RETRY_AFTER_SECONDS must be > 0 "
-                "(it bounds how long a channel-named 429 wait is "
-                "honored; 0 would turn every deferral into an "
-                "immediate re-poll)."
-            )
-
-        if self.notification_retention_interval_seconds <= 0:
-            raise ValueError(
-                "NOTIFICATION_RETENTION_INTERVAL_SECONDS must be > 0. "
-                "To disable retention set "
-                "NOTIFICATION_RETENTION_DAYS to 0 or a negative "
-                "value; interval 0 does NOT mean 'every tick'."
-            )
-
-        if self.thread_auto_close_interval_seconds <= 0:
-            raise ValueError(
-                "THREAD_AUTO_CLOSE_INTERVAL_SECONDS must be > 0. "
-                "To disable auto-close set THREAD_AUTO_CLOSE_DAYS to 0 "
-                "or a negative value; interval 0 does NOT mean "
-                "'every tick'."
-            )
+        # Numeric bounds: the one table above (D1 / R3).
+        numeric = numeric_problems(
+            {name: getattr(self, name) for name in NUMERIC_BOUNDS}
+        )
+        if numeric:
+            raise ValueError("\n".join(numeric))
 
         return self
 

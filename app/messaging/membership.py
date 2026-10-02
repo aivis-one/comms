@@ -42,7 +42,7 @@ from sqlalchemy.orm import InstrumentedAttribute
 from app.core.exceptions import NotFoundError
 from app.messaging.models import SectionMember
 from app.messaging.sections import get_or_create_section
-from app.messaging.threads import _recipient_exists
+from app.messaging.threads import recipient_exists
 
 logger = structlog.get_logger()
 
@@ -158,7 +158,7 @@ async def set_membership(
     if member:
         if existing is not None:
             return
-        if not await _recipient_exists(session, operator_id):
+        if not await recipient_exists(session, operator_id):
             raise NotFoundError(
                 f"Cannot add unknown recipient {operator_id} to section "
                 f"{section_key!r}: the identity sync must precede the "

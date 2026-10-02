@@ -53,6 +53,7 @@ from app.core.exceptions import (
     ValidationError,
     conflict_class,
 )
+from app.engine.formatters import sanitized_traceback
 
 logger = structlog.get_logger()
 
@@ -174,15 +175,17 @@ def register_error_handlers(app: FastAPI) -> None:
         AND IT IS LOGGED WITH THE TRACEBACK. A net that swallows
         quietly is worse than no net: the response would be clean, the
         service would look healthy, and the defect would be invisible
-        until someone happened to reproduce it. exc_info carries the
-        original error -- SQL, parameters and all -- to the one place
-        that is ours, while the body carries none of it.
+        until someone happened to reproduce it. The traceback carries
+        the original error -- SQL, parameters and all -- to the one place
+        that is ours, while the body carries none of it. Redacted
+        (sanitized_traceback): a driver error can print the connection
+        URL, password included.
         """
         logger.error(
             "database_error_at_api_edge",
             path=request.url.path,
             method=request.method,
             error_type=type(exc).__name__,
-            exc_info=exc,
+            exception=sanitized_traceback(exc),
         )
         return error_response(500, ErrorClass.INTERNAL, _DB_FAILURE_DETAIL)

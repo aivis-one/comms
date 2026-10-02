@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute, Recipient
 from app.audience.schedule import MINUTES_PER_DAY
+from app.audience.sync import once_more_on_insert_race
 from app.core.exceptions import NotFoundError, ValidationError
 from app.profile.registry import registry
 
@@ -77,36 +78,65 @@ def _validate_category(category: str) -> None:
         )
 
 
+async def _mute_of(
+    session: AsyncSession, recipient_id: UUID, category: str,
+) -> CategoryMute | None:
+    mute: CategoryMute | None = await session.scalar(
+        select(CategoryMute).where(
+            CategoryMute.recipient_id == recipient_id,
+            CategoryMute.category == category,
+        )
+    )
+    return mute
+
+
+async def _mute_once(
+    session: AsyncSession, recipient_id: UUID, category: str,
+) -> None:
+    """One attempt of the mute: read, and insert only if absent. Run a
+    second time after a lost race, the read finds the winner's row and
+    the attempt is a no-op."""
+    if await _mute_of(session, recipient_id, category) is not None:
+        return
+    session.add(CategoryMute(recipient_id=recipient_id, category=category))
+    await session.flush()
+    logger.info(
+        "category_muted",
+        recipient_id=str(recipient_id),
+        category=category,
+    )
+
+
 async def set_category_muted(
     session: AsyncSession,
     recipient_id: UUID,
     category: str,
     muted: bool,
 ) -> None:
-    """Mute or unmute one category for one recipient. Idempotent."""
+    """Mute or unmute one category for one recipient. Idempotent.
+
+    A MUTE INSERTS A KEY TWO WRITERS CAN REACH: two concurrent PATCHes
+    muting one category both read "not muted" and both insert. The mute
+    goes through the insert-race rule (app/audience/sync.py,
+    once_more_on_insert_race): the loser's INSERT fails inside a
+    SAVEPOINT, the rule runs once more and finds the winner's row. Before
+    D1-3 the loser answered 500 and its transaction -- every other toggle
+    of the same PATCH -- was rolled back.
+    """
     _validate_category(category)
     await _get_recipient(session, recipient_id)
 
-    existing = await session.scalar(
-        select(CategoryMute).where(
-            CategoryMute.recipient_id == recipient_id,
-            CategoryMute.category == category,
-        )
-    )
     if muted:
-        if existing is not None:
-            return
-        session.add(
-            CategoryMute(recipient_id=recipient_id, category=category)
-        )
-        await session.flush()
-        logger.info(
-            "category_muted",
+        await once_more_on_insert_race(
+            session,
+            lambda: _mute_once(session, recipient_id, category),
+            event="category_mute_raced",
             recipient_id=str(recipient_id),
             category=category,
         )
         return
 
+    existing = await _mute_of(session, recipient_id, category)
     if existing is None:
         return
     await session.delete(existing)

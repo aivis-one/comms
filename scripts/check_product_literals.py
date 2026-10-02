@@ -38,6 +38,18 @@
 #     operator (docstrings/comments) and would be pure noise;
 #   - "feedback": a generic English word with legitimate future uses.
 #
+# ROOTS -- app/ (AST), deploy/ (lines), and the FILES AT THE REPOSITORY
+# ROOT (lines, the deploy/ rules; D1 / R9): .env.example, Dockerfile,
+# pyproject.toml, alembic.ini ... are behavior of the service too. Not
+# recursive -- the directories at the root are other trees (.github/,
+# scripts/, migrations/, tests/), outside this fence. Full-line comments
+# stay free at the root exactly as in deploy/: the root's comments carry
+# heritage notes today (Dockerfile, pyproject.toml, alembic.ini), the
+# same notes the AST scan leaves alone in app/.
+#
+# A ROOT THAT YIELDS NO FILE FAILS THE GATE: a fence that scanned
+# nothing reports "clean" on any tree.
+#
 # Exit code 0 = clean, 1 = violations (printed as file:line: snippet).
 # Unit-tested in tests/test_product_literal_fence.py, which also scans
 # the real tree -- a violation fails locally before it fails CI.
@@ -178,9 +190,49 @@ def scan_deploy_tree(deploy_dir: Path = DEPLOY_DIR) -> list[str]:
     return findings
 
 
+def root_files(repo_root: Path = REPO_ROOT) -> list[Path]:
+    """The files directly at the repository root, documentation aside."""
+    return sorted(
+        path for path in repo_root.iterdir()
+        if path.is_file() and path.suffix != ".md"
+    )
+
+
+def scan_root_files(repo_root: Path = REPO_ROOT) -> list[str]:
+    """Scan the files at the repository root by the deploy/ line rules;
+    return human-readable violation lines."""
+    findings: list[str] = []
+    for path in root_files(repo_root):
+        source = path.read_text(encoding="utf-8")
+        for lineno, snippet in scan_deploy_text(source):
+            findings.append(f"{path.name}:{lineno}: {snippet}")
+    return findings
+
+
+def scanned_counts(repo_root: Path = REPO_ROOT) -> dict[str, int]:
+    """How many files each root hands the fence -- the gate's own check."""
+    app_dir, deploy_dir = repo_root / "app", repo_root / "deploy"
+    return {
+        "app/": len(list(app_dir.rglob("*.py"))) if app_dir.is_dir() else 0,
+        "deploy/": len([
+            path for path in deploy_dir.rglob("*")
+            if path.is_file() and path.suffix != ".md"
+        ]) if deploy_dir.is_dir() else 0,
+        "the repository root": len(root_files(repo_root)),
+    }
+
+
 def main() -> int:
     """CI entry point."""
-    findings = scan_tree() + scan_deploy_tree()
+    empty = [root for root, count in scanned_counts().items() if count == 0]
+    if empty:
+        print(
+            "product-literal fence: no file to scan in "
+            + ", ".join(empty)
+            + " -- a fence that scanned nothing would report clean"
+        )
+        return 1
+    findings = scan_tree() + scan_deploy_tree() + scan_root_files()
     if findings:
         print(
             "Product literals in app/ behavior or deploy/ (arch doc "
@@ -191,7 +243,7 @@ def main() -> int:
         for finding in findings:
             print(f"  {finding}")
         return 1
-    print("product-literal fence: clean (app/ + deploy/)")
+    print("product-literal fence: clean (app/ + deploy/ + root files)")
     return 0
 
 

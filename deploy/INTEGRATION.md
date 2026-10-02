@@ -1,4 +1,4 @@
-# COMMS x VELO -- product-side integration checklist (Phase 5 scope)
+# COMMS -- product-side integration checklist
 
 This file documents how the product side is wired to the comms stack:
 what the product installer does, and what the product repo must carry
@@ -328,13 +328,29 @@ construction, so it takes no key:
 | `DELETE /recipients/{id}` | forgetting twice is forgetting once |
 | `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
 | `POST /threads/{id}/status` | sets a value; the same status is a no-op |
-| `POST /threads/{id}/retag` | sets a value |
+| `POST /threads/{id}/retag` | sets values; a repeat finds the thread already moved and back in the pool |
 | `POST /threads/{id}/read` | the pointer only moves forward |
 | `POST /sections` | create-or-find by key |
 | `POST /inbox/{delivery_id}/read`, `POST /inbox/read-all` | set a value |
 | `PATCH /preferences` | sets values |
 
 `POST /threads/unread-counts` is a read that takes a body.
+
+**Retag reads the subject by presence.** `POST /threads/{id}/retag`
+takes `operator`, `section` and, optionally, the pair `subject_type` /
+`subject_id`:
+
+| the pair in the body | the thread's subject |
+|---|---|
+| both absent | kept -- the thread only moves to the section |
+| both present, both `null` | cleared |
+| both present, both set | set to them |
+| one absent, or one `null` and one set | 422 `validation` -- half a reference names nothing |
+
+In every form the thread returns to the section's pool (the assignee is
+reset). A retag that would give the thread what another thread of the
+same client in that section already has -- the same subject, or, for a
+DM, the same absence of one -- is refused: threads are never merged.
 
 **The recipient snapshot has a version.** Both write paths -- `PUT
 /api/v1/recipients/{id}` and the `user_upserted` event -- carry
@@ -442,6 +458,180 @@ A list is refused (422) when it is empty -- send `null` to clear --
 or when two periods of one day overlap or touch: one stretch is one
 period.
 
+## 7. The event protocol
+
+Everything a product sends into the comms stream. This section is the
+contract; the schema comments in `app/transport/events.py` follow it.
+
+### The frame
+
+One stream entry is `{event, data}`: `event` names the kind, `data` is
+a UTF-8 JSON document. The frame never changes; everything evolves
+inside `data`, which always carries an integer `v` (supported: `1`).
+The field set of every event is **closed** -- `notification_request`,
+`reminder_cancel`, `user_upserted`, `user_deleted`, `group_changed` and
+`section_membership_changed`: an unknown field refuses the event, naming
+the field -- a producer still sending a field comms no longer
+takes learns it at once instead of believing it chose something.
+
+Delivery is at-least-once. comms acknowledges an entry after it has
+been processed, so any event may arrive more than once; the rules
+below make every replay harmless.
+
+### `notification_request` -- a job
+
+A job is an **envelope** comms reads, plus a **letter** it carries and
+never interprets.
+
+| field | | envelope / letter | rule |
+|---|---|---|---|
+| `v` | required | frame | `1` |
+| `idempotency_key` | required | envelope | string, 1..200 -- names the request (see below) |
+| `type` | required | envelope | declared by the profile; the profile routes it to its channels |
+| `target_type` | required | envelope | `user` \| `group` \| `all` |
+| `target_value` | required | envelope | a recipient uuid, a group key, or `*`, matching `target_type` |
+| `scheduled_at` | optional | envelope | ISO 8601 with a zone -- "not before" |
+| `expiry_at` | optional | envelope | ISO 8601 with a zone; in the future and after `scheduled_at`; wins over the profile's `expires_after` |
+| `correlation` | optional | envelope | string, 1..200 -- the product's own reference, stored untouched (see below) |
+| `title` | required | letter | 1..500 -- the stored fallback; templates override it at delivery |
+| `body` | required | letter | 1..5000 |
+| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable |
+
+There is no channel and no priority on a request. The channel is the
+profile's (section 3a).
+
+**What intake answers.** A request is decided the moment it is read:
+
+- **accepted** -- a new job under its key;
+- **duplicate** -- the same key with the same bytes: the existing job, nothing new;
+- **conflict** -- the same key with other bytes: recorded under the key, the existing job untouched;
+- **rejected at intake** -- the key is readable but the request cannot be accepted (an undeclared type, a malformed address, an expiry already past, an unknown field): recorded under the key; the key is **not** taken, so a corrected request with the same key is accepted.
+
+A request whose key cannot be read at all goes to the dead-letter
+stream: there is nothing to record the rejection under.
+
+### The idempotency key names the request, not its subject
+
+The key answers one question: **is this the same request again?** The
+same key is the same job, for as long as comms keeps the job.
+
+- A retry of the same request carries the same key -- that is what
+  makes a replay harmless.
+- A new intention is a new request and carries a new key, even when it
+  concerns the same subject. Sending again after a cancellation, or
+  scheduling again after a change of time, is a new request.
+- A job that finished, expired or was cancelled **keeps its key**. The
+  key is released only when the job itself is removed by retention
+  (see "How long comms keeps things"). A key is never reused while its
+  job exists: releasing it on cancellation would make "the same key"
+  mean different things depending on the job's state.
+
+How a product derives its keys from its own facts is the product's
+decision. comms only compares them.
+
+### `correlation` is opaque and compared by equality
+
+`correlation` is how a product later finds its jobs again -- today, to
+cancel them. comms stores it as given and matches it by **exact
+equality** of the whole string. It never parses it, matches a prefix or
+a part, or reads the letter to find a job. One job carries one
+correlation; what it means is the product's.
+
+### `reminder_cancel` -- cancel jobs by correlation
+
+| field | | rule |
+|---|---|---|
+| `v` | required | `1` |
+| `types` | required | a non-empty list of type keys |
+| `correlation` | required | string, 1..200 -- equal to the `correlation` the jobs were sent with |
+| `target_type` | optional | with `target_value`, both or neither; the same forms as in `notification_request` |
+| `target_value` | optional | with `target_type`, both or neither |
+
+Every job of one of `types` with that exact `correlation` (and that
+target, when given) that has not reached an outcome is closed with the
+outcome **cancelled**; its waiting deliveries are cancelled too, what
+was already sent stays sent. A cancel that matches nothing is a
+zero-row update, not an error, so a replay is harmless. A job being
+delivered at that moment is cancelled after the attempt finishes.
+
+### `user_upserted` -- the address book
+
+comms keeps the product's recipients as **snapshots**. Every field is
+required; "no value" is an explicit `null`, never an empty string and
+never a telegram id of `0`.
+
+| field | rule |
+|---|---|
+| `v` | `1` |
+| `recipient_id` | the product's user uuid |
+| `version` | integer `>= 1`, monotonic per user |
+| `telegram_id` | integer, non-zero, or `null` |
+| `email` | non-blank string or `null` |
+| `locale` | non-blank string or `null` |
+| `timezone` | IANA zone name or `null` |
+| `active` | boolean |
+
+### `user_deleted` -- forgetting
+
+comms forgets how to reach the person and keeps only an id-bearing
+tombstone.
+
+| field | rule |
+|---|---|
+| `v` | `1` |
+| `recipient_id` | the product's user uuid |
+| `version` | integer `>= 1`, in the same order as `user_upserted` |
+
+**The version orders the snapshots.** Older than the stored version --
+refused as stale; equal with the same bytes -- a replay; equal with
+other bytes -- a conflict; newer -- applied. The same rule orders a
+deletion against snapshots, and a snapshot after a deletion is refused
+at any version. The synchronous `PUT` / `DELETE
+/api/v1/recipients/{id}` follow the same rule (section 5).
+
+**Send a snapshot on every change**, not only on creation: a change of
+language, zone or address, a deactivation, a block. comms re-checks
+`active` right before a send -- against the snapshot it holds.
+
+An event refused as stale is acknowledged and logged with its class;
+it has no key to be recorded under.
+
+### `group_changed` -- membership
+
+| field | rule |
+|---|---|
+| `v` | `1` |
+| `group_key` | string, 1..200, opaque to comms |
+| `recipient_id` | the product's user uuid; `user_upserted` comes first |
+| `member` | `true` ensures the membership, `false` removes it |
+
+Idempotent both ways. A group is read when the job is delivered
+(section 5), so a membership that arrives later is not seen by a job
+already delivered.
+
+### `section_membership_changed` -- who serves a section
+
+| field | rule |
+|---|---|
+| `v` | `1` |
+| `section_key` | string, 1..100 -- the section, created if comms has not seen it |
+| `section_label` | string, 1..200 -- used only when the section is created; an existing section keeps its label |
+| `operator_id` | the operator's user uuid; `user_upserted` comes first |
+| `member` | `true` adds the operator to the section, `false` removes them |
+
+Idempotent both ways. The section may arrive before any thread is
+opened in it: operators are hired before anybody writes in. An operator
+comms has not been told about yet is retried, the same lag
+`group_changed` has.
+
+### Ordering the producer relies on
+
+- `user_upserted` for a new user precedes `group_changed` for them; a
+  momentary inversion is retried by comms with a bounded backoff, a
+  persistent one ends in the dead-letter stream.
+- Sync events are safe to replay any number of times.
+- `notification_request` replays collapse on the key.
+
 ## Operating the comms stack
 
 What an operator needs on the box, collected here because every item
@@ -510,17 +700,22 @@ The window, from comms' side -- every step is a verb of
 2. **`drain`** -- checks. Prints the count of every kind, under the
    names the refusal uses, and deletes nothing. The kinds overlap -- one
    row can count in more than one -- so the sum is not the number of
-   rows. Exit 0 = clean, 1 = rows
-   to delete, 2 = it cannot check (the database is down, there is no
-   schema, the schema is already at or past 0013).
-3. **`drain --apply`** -- deletes. It stops `comms-app`, dumps the
-   database (the path is printed before and after), asks you to type
-   `yes`, and deletes every kind in one transaction -- the whole
+   rows. Exit **0** = nothing to delete (clean, or the schema is already
+   at or past 0013); **1** = rows to delete; **2** = it cannot check --
+   the database is down, there is no schema (not the comms database),
+   the revision is not in the image's chain, or the image has no 0013.
+   Every code 2 prints the command to run next.
+3. **`drain --apply`** -- deletes. It asks you to type `yes`, stops
+   `comms-app`, dumps the database (the path is printed before and
+   after), and deletes every kind in one transaction -- the whole
    notifications, their deliveries by cascade. **Every active job goes,
    not only the old ones**: in a red start the worker and the consumer
    do not run, so the queue cannot drain by waiting. The product's
    events wait in the stream and are read after the window; jobs the
    product still wants, it sends again. Sent history and the inbox stay.
+   The newest **three** pre-drain dumps (`comms-predrain-*.sql`) are
+   kept; an older one is removed only after a new dump has succeeded.
+   A code 2 here prints the next command too.
 4. **`start`** -- brings the stack up: the migration passes, the
    worker and the consumer start.
 
@@ -531,8 +726,8 @@ in that order, with the operator at the terminal for step 3.
 
 Two questions every product asks once, answered here so the answer is
 not a trip through our source. Both are deploy-side settings with
-defaults; both are days-granular, and both treat a value of zero or
-less as "never".
+defaults; both are days-granular, and both treat zero as "never" (a
+negative value refuses the start, naming the variable).
 
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is

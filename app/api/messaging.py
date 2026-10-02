@@ -92,7 +92,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Header, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -133,6 +133,9 @@ from app.messaging.constants import (
 )
 from app.messaging.models import Message, Section, Thread
 from app.messaging.operators import (
+    KEEP,
+    KeepSubject,
+    SubjectRef,
     can_claim,
     can_operate,
     can_post_message,
@@ -327,6 +330,11 @@ class StatusIn(BaseModel):
 
 
 class RetagIn(BaseModel):
+    """The subject is read by PRESENCE (D1 / R1): both fields absent --
+    keep the thread's subject; both present and null -- clear it; both
+    present with values -- set it. Any other combination is a 422: half
+    a reference names nothing."""
+
     model_config = ConfigDict(extra="forbid")
 
     operator: UUID
@@ -337,6 +345,29 @@ class RetagIn(BaseModel):
     subject_id: str | None = Field(
         default=None, max_length=MAX_SUBJECT_ID_LEN,
     )
+
+    @model_validator(mode="after")
+    def _both_or_neither(self) -> "RetagIn":
+        present = {"subject_type", "subject_id"} & self.model_fields_set
+        if len(present) == 1:
+            raise ValueError(
+                "subject_type and subject_id are sent together or not at "
+                f"all; got only {present.pop()}"
+            )
+        if present and (self.subject_type is None) != (self.subject_id is None):
+            raise ValueError(
+                "subject_type and subject_id are both null (clear) or both "
+                "set; got one of each"
+            )
+        return self
+
+    def subject(self) -> SubjectRef | KeepSubject | None:
+        """The three states, for retag_thread."""
+        if "subject_type" not in self.model_fields_set:
+            return KEEP
+        if self.subject_type is None or self.subject_id is None:
+            return None
+        return SubjectRef(self.subject_type, self.subject_id)
 
 
 class ReadIn(BaseModel):
@@ -794,8 +825,7 @@ async def retag(
         session,
         thread_id=thread_id,
         section=payload.section,
-        subject_type=payload.subject_type,
-        subject_id=payload.subject_id,
+        subject=payload.subject(),
     )
     return _thread_out(thread)
 

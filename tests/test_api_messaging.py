@@ -688,6 +688,15 @@ class TestDatabaseFailureNet:
         A net that swallowed quietly would leave a clean response, a
         healthy-looking service and an invisible defect -- worse than
         no net at all.
+
+        The traceback used to travel as `exc_info` (the exception
+        object, rendered RAW by structlog's format_exc_info). That was
+        right about the need -- the stack must be in the log -- and
+        wrong about the form: a driver error can print the connection
+        URL. D1 / R6 logs it as `exception=sanitized_traceback(exc)`, so
+        the assertion is now on the rendered, redacted text, and it is
+        stricter: it pins the class in the stack, not just the type of
+        an object the renderer would have printed.
         """
         client_id, master = await _recipient(), await _recipient()
         tid = await _dm(client, client_id, master)
@@ -707,6 +716,9 @@ class TestDatabaseFailureNet:
         assert entry["log_level"] == "error"
         assert entry["error_type"] == "DBAPIError"
         assert entry["path"].endswith("/messages")
-        # The traceback itself: without exc_info the entry would name
-        # the failure and lose every means of finding it.
-        assert isinstance(entry["exc_info"], DBAPIError)
+        # The traceback itself: without it the entry would name the
+        # failure and lose every means of finding it.
+        assert "exc_info" not in entry
+        rendered = entry["exception"]
+        assert rendered.startswith("Traceback (most recent call last):")
+        assert "DBAPIError" in rendered

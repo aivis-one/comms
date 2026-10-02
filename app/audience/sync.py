@@ -43,12 +43,14 @@
 
 import hashlib
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
@@ -180,7 +182,7 @@ def _order(recipient: Recipient, version: int, fingerprint: str) -> bool:
     return True
 
 
-async def apply_snapshot(
+async def _apply_snapshot_once(
     session: AsyncSession,
     *,
     recipient_id: UUID,
@@ -263,7 +265,7 @@ async def apply_snapshot(
     return recipient
 
 
-async def tombstone(
+async def _tombstone_once(
     session: AsyncSession, *, recipient_id: UUID, version: int,
 ) -> tuple[Recipient, bool]:
     """Turn the recipient into a tombstone by the snapshot rule's order.
@@ -322,7 +324,7 @@ async def tombstone(
 _TOMBSTONE_FINGERPRINT = "tombstone".ljust(64, "-")
 
 
-async def group_changed(
+async def _group_changed_once(
     session: AsyncSession,
     *,
     group_key: str,
@@ -384,3 +386,119 @@ async def group_changed(
         group_key=group_key,
         recipient_id=str(recipient_id),
     )
+
+
+# -- The insert race (D1 / R2) ------------------------------------------------
+#
+# Each of the three writes below reads the row, finds nothing and
+# inserts it. Two writers on a brand-new id -- the PUT route and the
+# stream, two product replicas, two events of one burst -- can both find
+# nothing; the loser's INSERT then fails on the primary key. Before D1
+# only the PUT route survived that (it held its own SAVEPOINT); on the
+# stream the IntegrityError reached the consumer's catch-all and the
+# event went to the dead-letter stream. The rule now lives here, once,
+# for every caller -- and for every write that inserts a key two
+# writers can reach, not only a new recipient id: the category mute of
+# app/audience/prefs.py is the fourth (D1-3).
+
+async def once_more_on_insert_race[T](
+    session: AsyncSession,
+    apply: Callable[[], Awaitable[T]],
+    *,
+    event: str,
+    **fields: str,
+) -> T:
+    """Run `apply` under a SAVEPOINT; on an IntegrityError run it once
+    more, outside one.
+
+    The SAVEPOINT keeps the caller's transaction usable after the
+    loser's INSERT fails. The winner has committed by then (the loser's
+    INSERT waited on its lock), so the SAME rule run again finds the
+    winner's row and decides against it: a replay, a stale or a newer
+    version -- exactly as without the race. Once: a second collision
+    would mean the row both exists and does not, and it is raised. Any
+    IntegrityError is retried, not only the key's: one that is not the
+    race fails the second run the same way and is raised then.
+
+    WHY THE NAME IS PUBLIC: the rule is one for every writer of the
+    kind, and a second module needs it (app/audience/prefs.py,
+    set_category_muted). A private name imported across modules is what
+    D1 / R7 forbids (tests/test_hygiene_r7.py); the precedent there is
+    to make the name public where it lives, not to copy the rule or to
+    move it to a module of its own.
+    """
+    try:
+        async with session.begin_nested():
+            return await apply()
+    except IntegrityError:
+        logger.info(event, **fields)
+        return await apply()
+
+
+async def apply_snapshot(
+    session: AsyncSession,
+    *,
+    recipient_id: UUID,
+    version: int,
+    telegram_id: int | None,
+    email: str | None,
+    locale: str | None,
+    timezone: str | None,
+    active: bool,
+) -> Recipient:
+    """Apply one recipient snapshot (_apply_snapshot_once), surviving
+    the insert race."""
+    return await once_more_on_insert_race(
+        session,
+        lambda: _apply_snapshot_once(
+            session,
+            recipient_id=recipient_id,
+            version=version,
+            telegram_id=telegram_id,
+            email=email,
+            locale=locale,
+            timezone=timezone,
+            active=active,
+        ),
+        # The event name the PUT route logged before D1: kept, it is an
+        # operational contract.
+        event="recipient_upsert_raced",
+        recipient_id=str(recipient_id),
+    )
+
+
+async def tombstone(
+    session: AsyncSession, *, recipient_id: UUID, version: int,
+) -> tuple[Recipient, bool]:
+    """Tombstone a recipient (_tombstone_once), surviving the insert
+    race -- a deletion of an id comms never saw inserts its tombstone."""
+    return await once_more_on_insert_race(
+        session,
+        lambda: _tombstone_once(
+            session, recipient_id=recipient_id, version=version,
+        ),
+        event="recipient_tombstone_raced",
+        recipient_id=str(recipient_id),
+    )
+
+
+async def group_changed(
+    session: AsyncSession,
+    *,
+    group_key: str,
+    recipient_id: UUID,
+    member: bool,
+) -> None:
+    """Apply a membership change (_group_changed_once), surviving the
+    insert race of two `member: true` for one pair."""
+    await once_more_on_insert_race(
+        session,
+        lambda: _group_changed_once(
+            session, group_key=group_key, recipient_id=recipient_id,
+            member=member,
+        ),
+        event="group_member_add_raced",
+        group_key=group_key,
+        recipient_id=str(recipient_id),
+    )
+

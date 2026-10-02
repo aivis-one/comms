@@ -596,12 +596,16 @@ cmd_drain() {
     if ! $COMPOSE_CMD ps --status running --services 2>/dev/null \
             | grep -qx comms-postgres; then
         echo -e "${RED}✗ comms-postgres is not running -- start the database first${NC}"
+        echo "  Next: $COMPOSE_CMD up -d comms-postgres"
         exit 2
     fi
 
     local rc=0
     drain_driver check || rc=$?
     if [ "$apply" -eq 0 ] || [ "$rc" -ne 1 ]; then
+        if [ "$rc" -eq 1 ]; then
+            echo "  Next: $0 drain --apply"
+        fi
         exit "$rc"
     fi
 
@@ -614,6 +618,7 @@ cmd_drain() {
 
     if ! $COMPOSE_CMD stop comms-app; then
         echo -e "${RED}✗ could not stop comms-app -- nothing deleted${NC}"
+        echo "  Next: $0 status"
         exit 2
     fi
     echo -e "${CYAN}comms-app stopped.${NC}"
@@ -625,9 +630,11 @@ cmd_drain() {
             pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$dump"; then
         rm -f "$dump"
         echo -e "${RED}✗ pg_dump failed -- nothing deleted (comms-app stays stopped)${NC}"
+        echo "  Next: $0 start (back in service), or free space in $BACKUP_DIR and $0 drain --apply"
         exit 2
     fi
     echo -e "${GREEN}✓ Dumped to $dump${NC}"
+    rotate_predrain_dumps "$BACKUP_DIR" 3
 
     rc=0
     drain_driver apply || rc=$?
@@ -636,10 +643,24 @@ cmd_drain() {
     exit "$rc"
 }
 
+# Keep the newest <keep> pre-drain dumps in <dir>, delete the older
+# ones (D1 / R8): every --apply leaves one, and nothing else removes
+# them. Called ONLY after a successful dump, so a failed one never
+# costs a good one. The names sort by time (UTC, fixed width).
+rotate_predrain_dumps() {
+    local dir="$1" keep="$2" old
+    # shellcheck disable=SC2012 -- the names are ours, no spaces
+    ls -1 "$dir"/comms-predrain-*.sql 2>/dev/null | sort -r | tail -n +"$((keep + 1))" \
+        | while read -r old; do
+            rm -f "$old"
+            echo "  removed an older pre-drain dump: $old"
+        done
+}
+
 # The driver: one-off container of the built image, python on stdin.
 # Prints its own report; its exit code is cmd_drain's (see above).
 drain_driver() {
-    $COMPOSE_CMD run --rm --no-deps -T --entrypoint python comms-app - "$1" <<'PY'
+    $COMPOSE_CMD run --rm --no-deps -T --entrypoint python comms-app - "$1" "$0" <<'PY'
 import asyncio
 import importlib.util
 import os
@@ -648,17 +669,22 @@ import sys
 from pathlib import Path
 
 VERSIONS = Path("migrations/versions")
+# The script that runs this driver, so that every refusal names the
+# command to run next (D1 / R8).
+SELF = sys.argv[2]
 
 
-def fail(message: str) -> None:
+def fail(message: str, next_step: str) -> None:
+    """Code 2: cannot check -- and what to do about it."""
     print(f"✗ {message}")
+    print(f"  Next: {next_step}")
     sys.exit(2)
 
 
 def migration_0013():
     found = sorted(VERSIONS.glob("*_0013_*.py"))
     if not found:
-        fail("the built image has no migration 0013 -- run update first")
+        fail("the built image has no migration 0013", f"{SELF} update")
     spec = importlib.util.spec_from_file_location("m0013", found[0])
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -686,12 +712,24 @@ async def main(mode: str) -> int:
     conn = await asyncpg.connect(url)
     try:
         if await conn.fetchval("SELECT to_regclass('alembic_version')") is None:
-            fail("no schema here (no alembic_version) -- nothing to drain")
+            # Not "nothing to delete": a comms database always has its
+            # schema, so this is the wrong database (D1 gate) -- code 2.
+            fail(
+                "no schema here (no alembic_version) -- this is not the "
+                "comms database",
+                f"check POSTGRES_DB in .env, then {SELF} drain",
+            )
         revision = await conn.fetchval("SELECT version_num FROM alembic_version")
         if revision not in known_revisions():
-            fail(f"revision {revision!r} is not in this image's migration chain")
+            fail(
+                f"revision {revision!r} is not in this image's migration chain",
+                f"{SELF} update",
+            )
         if int(revision.split("_", 1)[0]) >= 13:
-            fail(f"the schema is at {revision}, at or past 0013 -- nothing to drain")
+            # Checked, and there is nothing to delete: migration 0013 has
+            # already run. A clean answer, code 0 -- not "cannot check".
+            print(f"✓ schema at {revision}, at or past 0013 -- nothing to drain")
+            return 0
         before = await counts(conn, module._BLOCKING_KINDS)
         if mode == "check":
             print(f"schema at {revision}; rows migration 0013 refuses on:")

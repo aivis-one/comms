@@ -17,7 +17,7 @@ from app.core.database import get_session_factory
 from app.core.exceptions import NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Message, Thread
-from app.messaging.operators import claim_thread, retag_thread
+from app.messaging.operators import SubjectRef, claim_thread, retag_thread
 from app.messaging.threads import create_or_get_thread, post_message
 from tests.helpers import (
     create_recipient,
@@ -64,8 +64,7 @@ class TestRetagSection:
             db_session,
             thread_id=thread.id,
             section=section.id,
-            subject_type="practice",
-            subject_id="new",
+            subject=SubjectRef("practice", "new"),
         )
         assert retagged.id == original_id
         assert retagged.subject_id == "new"
@@ -84,8 +83,7 @@ class TestRetagSection:
             db_session,
             thread_id=thread.id,
             section=sec_b.id,
-            subject_type="practice",
-            subject_id="x",
+            subject=SubjectRef("practice", "x"),
         )
         assert retagged.operator_value == sec_b.id
 
@@ -106,8 +104,7 @@ class TestRetagSection:
             db_session,
             thread_id=thread.id,
             section=section.id,
-            subject_type="practice",
-            subject_id="s2",
+            subject=SubjectRef("practice", "s2"),
         )
         assert await db_session.scalar(
             select(Thread.assignee).where(Thread.id == thread.id)
@@ -132,8 +129,7 @@ class TestRetagSection:
             db_session,
             thread_id=thread.id,
             section=section.id,
-            subject_type="practice",
-            subject_id="h2",
+            subject=SubjectRef("practice", "h2"),
         )
         msg_count = await db_session.scalar(
             select(func.count())
@@ -160,28 +156,26 @@ class TestRetagFrozen:
                 db_session,
                 thread_id=user_thread.id,
                 section=section.id,
-                subject_type="practice",
-                subject_id="nope",
+                subject=SubjectRef("practice", "nope"),
             )
 
 
 class TestRetagValidation:
-    async def test_half_subject_rejected(
-        self, db_session: AsyncSession
-    ) -> None:
-        client = await _rid(db_session)
-        section = await create_section(db_session, key="rt-half")
-        thread = await _make_section_thread(
-            db_session, section_id=section.id, subject_id="s", client_id=client
-        )
-        with pytest.raises(ValidationError):
-            await retag_thread(
-                db_session,
-                thread_id=thread.id,
-                section=section.id,
-                subject_type="practice",
-                subject_id=None,
-            )
+    def test_half_subject_rejected(self) -> None:
+        """A half subject_ref cannot reach the operation any more.
+
+        This test used to hand retag_thread subject_type without
+        subject_id and expect its both-or-neither refusal. That was
+        right about the property -- no half reference is ever stored --
+        and D1 / R1 moved where it is held: retag_thread takes ONE
+        subject value (SubjectRef | KEEP | None), so a half reference
+        cannot be passed at all, and the refusal of a half one sent over
+        HTTP is the route's 422 (tests/test_retag_subject.py). What is
+        asserted now is the type itself: a SubjectRef without both
+        halves cannot be constructed.
+        """
+        with pytest.raises(TypeError):
+            SubjectRef("practice")  # type: ignore[call-arg]
 
     async def test_unknown_section_rejected(
         self, db_session: AsyncSession
@@ -196,8 +190,7 @@ class TestRetagValidation:
                 db_session,
                 thread_id=thread.id,
                 section=uuid4(),
-                subject_type="practice",
-                subject_id="s",
+                subject=SubjectRef("practice", "s"),
             )
 
     async def test_unknown_thread_rejected(
@@ -243,8 +236,7 @@ class TestRetagCollision:
                     session,
                     thread_id=b_id,
                     section=section_id,
-                    subject_type="practice",
-                    subject_id="X",  # collides with thread A
+                    subject=SubjectRef("practice", "X"),  # collides with thread A
                 )
 
         # B is unchanged (still Y), A still X -> two distinct threads

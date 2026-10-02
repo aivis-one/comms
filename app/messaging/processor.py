@@ -29,6 +29,24 @@ logger = structlog.get_logger()
 _AUTO_CLOSE_BATCH_SIZE = 1000
 
 
+class AutoClosePassError(Exception):
+    """A pass that failed after closing `closed` threads in the batches
+    it had already committed.
+
+    WHY RAISED AND NOT LOGGED HERE: the log line of a failure carries
+    its traceback, and the traceback must be redacted -- a database
+    error can print the connection URL. The redactor is the engine's
+    (app/engine/formatters.py, sanitized_traceback), and this module
+    is engine-free by rule. So the pass rolls back and raises; the
+    neutral layer that schedules it (app/worker.py) logs the failure,
+    redacted, under the same event as before.
+    """
+
+    def __init__(self, closed: int) -> None:
+        super().__init__(f"thread auto-close pass failed after closing {closed}")
+        self.closed = closed
+
+
 async def auto_close_idle_threads(
     *,
     days: int | None = None,
@@ -42,13 +60,14 @@ async def auto_close_idle_threads(
     so a large backlog never becomes one long transaction -- and drains
     until a batch comes back short.
 
-    DISABLED: settings.thread_auto_close_days <= 0 means auto-close is
-    OFF -- return 0 without touching anything ("close everything" must
-    never fall out of the cutoff arithmetic; the worker startup log
-    names the disabled state loudly). The guard lives HERE, not only
-    behind the worker's cadence gate, because tests call this directly.
-    `days` / `when` are injectable for deterministic tests; both default
-    to settings / now.
+    DISABLED: settings.thread_auto_close_days == 0 (or days=0) means
+    auto-close is OFF (a negative setting refuses startup -- D1 / R3) --
+    return 0 without touching anything ("close everything" must never
+    fall out of the cutoff arithmetic; the worker startup log names the
+    disabled state loudly). The guard lives HERE, not only behind the
+    worker's cadence gate, because tests call this directly. `days` /
+    `when` are injectable for deterministic tests; both default to
+    settings / now.
 
     Idle is measured on COALESCE(last_message_at, created_at) (D8): an
     empty thread ages from created_at. Every pass logs its duration --
@@ -94,10 +113,9 @@ async def auto_close_idle_threads(
                 total += closed
                 if closed < _AUTO_CLOSE_BATCH_SIZE:
                     break
-        except Exception:
+        except Exception as exc:
             await session.rollback()
-            logger.exception("thread_auto_close_pass_error", closed=total)
-            return total
+            raise AutoClosePassError(total) from exc
 
     # Logged EVERY pass, empty ones included: a slow empty scan is
     # exactly the promotion-trigger signal.

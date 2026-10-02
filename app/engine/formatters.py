@@ -1420,8 +1420,10 @@ async def close_formatters() -> None:
             try:
                 await close()
                 logger.info("channel_resource_closed", resource=name)
-            except Exception:
-                logger.exception(
-                    "channel_resource_close_failed", resource=name,
+            except Exception as exc:
+                logger.error(
+                    "channel_resource_close_failed",
+                    resource=name,
+                    exception=sanitized_traceback(exc),
                 )
     reset_formatters()

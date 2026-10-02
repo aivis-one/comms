@@ -106,11 +106,12 @@ class DeliveryStatus(enum.StrEnum):
 
 
 class FailureClass(enum.StrEnum):
-    """Why a delivery failed -- four outcomes, four actions (spec §5.6).
+    """Why a delivery failed -- five outcomes, five actions (spec §5.6).
 
-    Set together with DeliveryStatus.FAILED and only then; one channel
-    exception maps to exactly one class, in one place
-    (app/engine/service.py _deliver_single).
+    Set together with DeliveryStatus.FAILED and only then. The four
+    channel classes: one channel exception maps to exactly one class, in
+    one place (app/engine/service.py _deliver_single). The fifth,
+    PIPELINE, is comms' own defect (app/engine/processor.py).
     """
 
     # The channel was unavailable for the whole attempt budget.
@@ -122,6 +123,25 @@ class FailureClass(enum.StrEnum):
     CONFIGURATION = "configuration"
     # The recipient has no address in this channel -- fix the sync.
     NO_ADDRESS = "no_address"
+    # A defect of comms itself (T12): the job's pipeline raised on
+    # every one of its attempts, so its waiting deliveries are closed
+    # with this class. Not the channel, not the letter -- fix comms.
+    # Set in one place: app/engine/processor.py _record_pipeline_failure.
+    PIPELINE = "pipeline"
+
+
+class PipelineStep(enum.StrEnum):
+    """Where an attempt of the pipeline tore (notifications.pipeline_step,
+    T12). The order is the order of the attempt in
+    app/engine/processor.py."""
+
+    # Taking the row lock / re-reading its status.
+    LOCK = "lock"
+    RESOLVE = "resolve"
+    DELIVER = "deliver"
+    ROLLUP = "rollup"
+    # The attempt's own commit.
+    COMMIT = "commit"
 
 
 class WaitReason(enum.StrEnum):

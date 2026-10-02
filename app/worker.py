@@ -32,10 +32,14 @@ import structlog
 from app.core.config import settings
 from app.core.database import dispose_engine
 from app.core.logging import setup_logging
-from app.engine.formatters import close_formatters, init_formatters
+from app.engine.formatters import (
+    close_formatters,
+    init_formatters,
+    sanitized_traceback,
+)
 from app.engine.processor import cleanup_terminal_notifications
 from app.engine.worker import run_notification_batch
-from app.messaging.processor import auto_close_idle_threads
+from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
 from app.notifier import consume_close_notifications
 from app.profile.loader import install_profile_from_settings
 
@@ -104,7 +108,18 @@ async def run_worker_batch() -> int:
             or now - _last_auto_close_at >= interval
         ):
             _last_auto_close_at = now
-            await auto_close_idle_threads()
+            try:
+                await auto_close_idle_threads()
+            except AutoClosePassError as exc:
+                # Logged here, not in the pass: messaging cannot import
+                # the redactor (app/messaging/processor.py,
+                # AutoClosePassError). A failed pass does not stop the
+                # tick -- it never did.
+                logger.error(
+                    "thread_auto_close_pass_error",
+                    closed=exc.closed,
+                    exception=sanitized_traceback(exc),
+                )
 
     return processed
 
@@ -160,8 +175,11 @@ async def run_worker_loop() -> None:
         except asyncio.CancelledError:
             logger.info("notification_worker_stopped")
             return
-        except Exception:
-            logger.exception("notification_worker_error")
+        except Exception as exc:
+            logger.error(
+                "notification_worker_error",
+                exception=sanitized_traceback(exc),
+            )
             interval = max_backoff
 
         try:
