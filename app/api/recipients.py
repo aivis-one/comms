@@ -143,7 +143,7 @@ async def upsert_recipient(
 
     # The insert race of a brand-new id (this route against the stream,
     # or two product replicas) is survived inside the snapshot rule
-    # itself -- app/audience/sync.py, _once_more_on_insert_race -- for
+    # itself -- app/audience/sync.py, once_more_on_insert_race -- for
     # every caller, not here (D1 / R2).
     recipient = await sync.apply_snapshot(
         session,

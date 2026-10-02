@@ -1,4 +1,4 @@
-# COMMS -- product-side integration checklist (Phase 5 scope)
+# COMMS -- product-side integration checklist
 
 This file documents how the product side is wired to the comms stack:
 what the product installer does, and what the product repo must carry

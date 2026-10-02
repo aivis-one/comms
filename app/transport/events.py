@@ -339,8 +339,8 @@ def validate_action_data(
     the `action_data` row of `notification_request`).
 
     The early line of defense (item 5): everything here would
-    otherwise fail LATER and WORSE -- an underscore key would take a
-    name reserved for comms, a list variable would render as
+    otherwise fail LATER and WORSE -- an empty key would name no
+    variable and no parameter, a list variable would render as
     "['a', 'b']" in a user-facing message, a non-scalar param would
     blow up deep-link encoding at delivery after burning a resolve.
     """

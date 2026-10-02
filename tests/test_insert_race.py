@@ -1,6 +1,12 @@
 # =============================================================================
-# D1 / R2 -- the insert race of a brand-new id survives on every path.
+# D1 / R2, D1-3 -- the insert race survives on every path.
 # =============================================================================
+#
+# THE RULE IS WIDER THAN A NEW ID: any write that reads, finds nothing
+# and inserts a key two writers can reach is a race -- a recipient id
+# (apply_snapshot, tombstone), a membership pair (group_changed), a
+# category mute (set_category_muted, D1-3). Every such insert goes
+# through app/audience/sync.py once_more_on_insert_race.
 #
 # Two real sessions, no mocks: session A runs the write and holds its
 # INSERT uncommitted; session B, in a task, reads (finds nothing, A has
@@ -18,6 +24,8 @@
 #   M12 the helper without its SAVEPOINT -> every race test (the retry
 #       runs inside an aborted transaction)
 #   M13 the PUT route keeps its own begin_nested -> test_put_has_no_copy
+#   M23 the helper without its SAVEPOINT -> TestTheCategoryMuteRace too
+#   M24 the mute inserting past the helper -> TestTheCategoryMuteRace
 # =============================================================================
 
 import ast
@@ -33,7 +41,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from app.audience.models import GroupMembership, Recipient
+from app.api.prefs import PreferencesPatch, patch_preferences_form
+from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.database import get_session_factory
 from app.core.exceptions import StaleSnapshotError
 from app.transport.events import parse_event
@@ -170,3 +179,41 @@ def test_put_has_no_copy_of_the_mechanism() -> None:
     }
     assert "begin_nested" not in attributes
     assert "apply_snapshot" in attributes
+
+
+class TestTheCategoryMuteRace:
+    """D1-3 done-when (1). Before: the loser of two concurrent mutes of
+    one category got an IntegrityError on category_mutes_pkey -- a 500,
+    and its transaction rolled back WITH every other toggle of the same
+    PATCH. Both PATCHes run the route function exactly as a request
+    does: get_db_session commits after the handler returns
+    (app/core/database.py), and here each session commits in its turn."""
+
+    async def test_two_patches_both_succeed_and_no_toggle_is_lost(self) -> None:
+        rid = uuid4()
+        async with get_session_factory()() as s:
+            await create_recipient(s, recipient_id=rid)
+            await s.commit()
+        a = PreferencesPatch(categories={"unit_updates": False})
+        b = PreferencesPatch(
+            categories={"unit_updates": False, "unit_reminder": False},
+        )
+        with capture_logs() as logs:
+            form_b = await _race(
+                lambda s: patch_preferences_form(rid, a, s),
+                lambda s: patch_preferences_form(rid, b, s),
+            )
+        # B answered with the form (a 200), not an exception (a 500) ...
+        assert form_b["categories"]["unit_updates"] is False
+        assert form_b["categories"]["unit_reminder"] is False
+        # ... one row for the contested category, and B's other toggle
+        # survived the race.
+        assert await _count(
+            CategoryMute, recipient_id=rid, category="unit_updates",
+        ) == 1
+        assert await _count(
+            CategoryMute, recipient_id=rid, category="unit_reminder",
+        ) == 1
+        # The race happened -- proven by the retry's log line, not timing.
+        assert [log for log in logs if log["event"] == "category_mute_raced"]
+

@@ -132,9 +132,13 @@ async def handle_event(
         return HandleResult.PROCESSED
     if isinstance(event, SectionMembershipChanged):
         # The section is created if absent (a roster may be declared
-        # before anyone writes in); an operator comms has not been told
-        # about yet fails the recipient FK, which the consumer
-        # classifies RETRYABLE -- the same lag group_changed has.
+        # before anyone writes in). Adding an operator (member: true)
+        # checks the person BEFORE any insert (set_membership,
+        # recipient_exists): one comms has not been told about yet is a
+        # NotFoundError, which the consumer classifies RETRYABLE -- the
+        # same lag group_changed has; a forgotten one is a
+        # RecipientDeletedError, a ConflictError the consumer refuses by
+        # class and acknowledges. No foreign key is reached.
         await set_membership(
             session,
             section_key=event.section_key,

@@ -397,9 +397,11 @@ async def _group_changed_once(
 # only the PUT route survived that (it held its own SAVEPOINT); on the
 # stream the IntegrityError reached the consumer's catch-all and the
 # event went to the dead-letter stream. The rule now lives here, once,
-# for every caller.
+# for every caller -- and for every write that inserts a key two
+# writers can reach, not only a new recipient id: the category mute of
+# app/audience/prefs.py is the fourth (D1-3).
 
-async def _once_more_on_insert_race[T](
+async def once_more_on_insert_race[T](
     session: AsyncSession,
     apply: Callable[[], Awaitable[T]],
     *,
@@ -417,6 +419,13 @@ async def _once_more_on_insert_race[T](
     would mean the row both exists and does not, and it is raised. Any
     IntegrityError is retried, not only the key's: one that is not the
     race fails the second run the same way and is raised then.
+
+    WHY THE NAME IS PUBLIC: the rule is one for every writer of the
+    kind, and a second module needs it (app/audience/prefs.py,
+    set_category_muted). A private name imported across modules is what
+    D1 / R7 forbids (tests/test_hygiene_r7.py); the precedent there is
+    to make the name public where it lives, not to copy the rule or to
+    move it to a module of its own.
     """
     try:
         async with session.begin_nested():
@@ -439,7 +448,7 @@ async def apply_snapshot(
 ) -> Recipient:
     """Apply one recipient snapshot (_apply_snapshot_once), surviving
     the insert race."""
-    return await _once_more_on_insert_race(
+    return await once_more_on_insert_race(
         session,
         lambda: _apply_snapshot_once(
             session,
@@ -463,7 +472,7 @@ async def tombstone(
 ) -> tuple[Recipient, bool]:
     """Tombstone a recipient (_tombstone_once), surviving the insert
     race -- a deletion of an id comms never saw inserts its tombstone."""
-    return await _once_more_on_insert_race(
+    return await once_more_on_insert_race(
         session,
         lambda: _tombstone_once(
             session, recipient_id=recipient_id, version=version,
@@ -482,7 +491,7 @@ async def group_changed(
 ) -> None:
     """Apply a membership change (_group_changed_once), surviving the
     insert race of two `member: true` for one pair."""
-    await _once_more_on_insert_race(
+    await once_more_on_insert_race(
         session,
         lambda: _group_changed_once(
             session, group_key=group_key, recipient_id=recipient_id,
