@@ -83,7 +83,8 @@
 #     recipient_id "<uuid>"    -- required
 #     version      int >= 1    -- required
 #
-#   group_changed (naturally idempotent both ways):
+#   group_changed (naturally idempotent both ways; the field set is
+#   CLOSED, like section_membership_changed -- D1 / R4):
 #     v            1           -- required
 #     group_key    str 1..200  -- required, opaque to comms
 #     recipient_id "<uuid>"    -- required
@@ -744,6 +745,14 @@ _USER_UPSERTED_FIELDS = frozenset({
     "timezone", "active",
 })
 _USER_DELETED_FIELDS = frozenset({"v", "recipient_id", "version"})
+# The membership events are closed like every other (D1 / R4): an
+# unknown field refuses the event naming the field, so a producer
+# sending a field comms ignores learns it at once instead of believing
+# it was read.
+_GROUP_CHANGED_FIELDS = frozenset({"v", "group_key", "recipient_id", "member"})
+_SECTION_MEMBERSHIP_CHANGED_FIELDS = frozenset({
+    "v", "section_key", "section_label", "operator_id", "member",
+})
 
 
 def _closed(data: dict[str, Any], allowed: frozenset[str], event: str) -> None:
@@ -822,6 +831,7 @@ def _parse_user_deleted(data: dict[str, Any]) -> UserDeleted:
 
 def _parse_group_changed(data: dict[str, Any]) -> GroupChanged:
     event = EVENT_GROUP_CHANGED
+    _closed(data, _GROUP_CHANGED_FIELDS, event)
 
     group_key = _string(
         _require(data, "group_key", event), "group_key", event,
@@ -843,6 +853,7 @@ def _parse_section_membership_changed(
     data: dict[str, Any],
 ) -> SectionMembershipChanged:
     event = EVENT_SECTION_MEMBERSHIP_CHANGED
+    _closed(data, _SECTION_MEMBERSHIP_CHANGED_FIELDS, event)
 
     section_key = _string(
         _require(data, "section_key", event), "section_key", event,

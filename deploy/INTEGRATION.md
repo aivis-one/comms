@@ -452,9 +452,10 @@ contract; the schema comments in `app/transport/events.py` follow it.
 One stream entry is `{event, data}`: `event` names the kind, `data` is
 a UTF-8 JSON document. The frame never changes; everything evolves
 inside `data`, which always carries an integer `v` (supported: `1`).
-The field sets of `notification_request`, `reminder_cancel`,
-`user_upserted` and `user_deleted` are **closed**: an unknown field
-refuses the event -- a producer still sending a field comms no longer
+The field set of every event is **closed** -- `notification_request`,
+`reminder_cancel`, `user_upserted`, `user_deleted`, `group_changed` and
+`section_membership_changed`: an unknown field refuses the event, naming
+the field -- a producer still sending a field comms no longer
 takes learns it at once instead of believing it chose something.
 
 Delivery is at-least-once. comms acknowledges an entry after it has

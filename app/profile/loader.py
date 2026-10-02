@@ -145,7 +145,7 @@ from app.core.channels import (
     channel_env_keys,
     evaluate_channels,
 )
-from app.core.config import settings
+from app.core.config import NUMERIC_BOUNDS, settings
 from app.core.constants import (
     DOMAIN_LITERAL_PATTERNS,
     MAX_BODY_LEN,
@@ -529,7 +529,12 @@ _FIELDS: dict[str, _Field] = {
     ),
     # Transport retry ceiling -- a number, never a condition (spec §9.7).
     "retry_max_attempts": _Field(
-        check=_int_in_range(1),
+        # The lower bound is the setting's own (app/core/config.py,
+        # NUMERIC_BOUNDS), so the default layer can never hand out a
+        # value a declared field would be refused for (D1 / R3).
+        check=_int_in_range(
+            NUMERIC_BOUNDS["notification_max_delivery_attempts"].lo,
+        ),
         default=lambda: (
             settings.notification_max_delivery_attempts,
             "settings: NOTIFICATION_MAX_DELIVERY_ATTEMPTS",
@@ -537,7 +542,9 @@ _FIELDS: dict[str, _Field] = {
     ),
     # Transport retry backoff base, in seconds; 0 = no idle wait.
     "retry_backoff_seconds": _Field(
-        check=_int_in_range(0),
+        check=_int_in_range(
+            NUMERIC_BOUNDS["notification_retry_backoff_base_seconds"].lo,
+        ),
         default=lambda: (
             settings.notification_retry_backoff_base_seconds,
             "settings: NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS",

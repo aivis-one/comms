@@ -218,6 +218,35 @@ class Notification(UUIDMixin, Base):
         server_default=func.now(),
     )
 
+    # -- The pipeline's own failures (T12, migration 0015) --
+    # How many attempts of the pipeline ended in an exception of comms'
+    # own (not a channel answer -- those are the deliveries' business).
+    # At settings.notification_max_pipeline_attempts the job gets its
+    # outcome (app/engine/processor.py, _record_pipeline_failure).
+    pipeline_attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    # The gate: until then the row is not selected, so a failing job
+    # neither starves the healthy ones nor is starved by them.
+    pipeline_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # Where it tore: a PipelineStep value.
+    pipeline_step: Mapped[str | None] = mapped_column(
+        String(10),
+        nullable=True,
+    )
+    # The exception's CLASS and PLACE (module:line) -- never its text,
+    # which may carry the letter's variables (spec §6.4).
+    pipeline_error: Mapped[str | None] = mapped_column(
+        String(300),
+        nullable=True,
+    )
+
     @validates("title", "body")
     def _forbid_mutation(self, key: str, value: str) -> str:
         """Enforce title/body immutability after creation.

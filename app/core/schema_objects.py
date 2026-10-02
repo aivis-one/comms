@@ -223,6 +223,10 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_recipients_version_not_negative",
     # A tombstone keeps nothing that reaches the person (F1.4).
     "ck_recipients_tombstone",
+    # A pipeline failure is recorded whole -- count, step and place --
+    # or not at all; a gate stands only behind a recorded one (T12).
+    "ck_notifications_pipeline",
+    "ck_notifications_pipeline_gate",
 })
 
 # Everything the schema must carry although the metadata never mentions

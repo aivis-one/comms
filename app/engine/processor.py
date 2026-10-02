@@ -41,17 +41,40 @@
 #
 # EXPIRE LOGIC:
 #   Expires both PENDING and PROCESSING notifications past expiry_at.
+#
+# A PIPELINE DEFECT IS AN OUTCOME (T12):
+#   An exception of comms' own in an attempt (channel answers never get
+#   here -- _deliver_single turns every one of them into an outcome)
+#   rolls the attempt back, and then, in a SEPARATE transaction, the
+#   failure is written onto the job: attempts + 1, the step, the
+#   exception's class and place (never its text). Below the ceiling
+#   (settings.notification_max_pipeline_attempts) the job waits behind
+#   a gate, pipeline_retry_at, and the selection skips it until then:
+#   oldest-first stays the order, the gate is what keeps a failing job
+#   from starving the healthy ones and keeps the healthy ones from
+#   starving it. At the ceiling the job is closed: waiting deliveries
+#   FAILED with class `pipeline`, the job folded (or FAILED outright
+#   when it has no deliveries -- resolve was the step that tore).
 # =============================================================================
 
 import time
+import traceback
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, or_, select, update
 
 from app.core.config import settings
 from app.core.database import get_session_factory
-from app.engine.constants import DeliveryStatus, NotificationStatus
+from app.engine.constants import (
+    DeliveryStatus,
+    FailureClass,
+    NotificationStatus,
+    PipelineStep,
+)
+from app.engine.formatters import sanitized_traceback
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
     close_notifications,
@@ -94,9 +117,12 @@ async def process_pending_notifications() -> int:
             if expired_count:
                 logger.info("notifications_expired", count=expired_count)
             await session.commit()
-        except Exception:
+        except Exception as exc:
             await session.rollback()
-            logger.exception("notification_expire_error")
+            logger.error(
+                "notification_expire_error",
+                exception=sanitized_traceback(exc),
+            )
 
     # -- Step 1: Collect IDs of notifications to process --
     # Review 1.2: PENDING rows are always ready (not yet resolved).
@@ -129,6 +155,11 @@ async def process_pending_notifications() -> int:
                     ),
                 ),
                 Notification.scheduled_at <= now,
+                # T12: a job whose pipeline failed waits behind its gate.
+                or_(
+                    Notification.pipeline_retry_at.is_(None),
+                    Notification.pipeline_retry_at <= now,
+                ),
             )
             # Oldest due first. Priority left the ordering with the
             # column (F1.4); isolation is the job of lanes (phase 4).
@@ -146,6 +177,7 @@ async def process_pending_notifications() -> int:
     # -- Step 2: Process each notification in its own session --
     processed = 0
     for notif_id in notification_ids:
+        step = PipelineStep.LOCK
         async with factory() as session:
             try:
                 # Lock the notification row (skip if another worker has it).
@@ -169,23 +201,34 @@ async def process_pending_notifications() -> int:
                     continue
 
                 # resolve (idempotent -- skips if deliveries exist)
+                step = PipelineStep.RESOLVE
                 await resolve_notification(session, notification)
 
                 # deliver
+                step = PipelineStep.DELIVER
                 await deliver_notification(session, notification)
 
                 # rollup
+                step = PipelineStep.ROLLUP
                 await rollup_notification(session, notification)
 
+                # A gate that let this attempt through has done its job;
+                # the failure record (attempts, step, error) stays.
+                notification.pipeline_retry_at = None
+
+                step = PipelineStep.COMMIT
                 await session.commit()
                 processed += 1
 
-            except Exception:
+            except Exception as exc:
                 await session.rollback()
-                logger.exception(
+                logger.error(
                     "notification_pipeline_error",
                     notification_id=str(notif_id),
+                    step=step.value,
+                    exception=sanitized_traceback(exc),
                 )
+                await _record_pipeline_failure(notif_id, step, exc)
 
     logger.info(
         "notifications_processed",
@@ -193,6 +236,155 @@ async def process_pending_notifications() -> int:
         processed=processed,
     )
     return processed
+
+
+# The package whose frames name the place of a pipeline failure: the
+# innermost frame inside comms' own code is where comms broke, a frame
+# inside a library is where the library was called from comms.
+_APP_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = _APP_ROOT.parent
+# notifications.pipeline_error is varchar(300) (migration 0015).
+_PIPELINE_ERROR_MAX = 300
+
+
+def pipeline_error_of(exc: BaseException) -> str:
+    """What notifications.pipeline_error records: the exception's CLASS
+    and the PLACE in comms where it was raised (module:line).
+
+    NEVER the exception's text, sanitized or not. Sanitizing removes
+    secrets, not content: a text raised from a template or a formatter
+    can carry the letter's variables, and a record of comms holds no
+    letter content (spec §6.4). The class and the place say where it
+    tore; the redacted traceback in the log says the rest.
+    """
+    name = f"{type(exc).__module__}.{type(exc).__qualname__}"
+    frames = traceback.extract_tb(exc.__traceback__)
+    place = "no traceback"
+    for frame in reversed(frames):
+        path = Path(frame.filename).resolve()
+        if path.is_relative_to(_APP_ROOT):
+            place = f"{path.relative_to(_REPO_ROOT).as_posix()}:{frame.lineno}"
+            break
+    else:
+        if frames:
+            place = f"{Path(frames[-1].filename).name}:{frames[-1].lineno}"
+    return f"{name} at {place}"[:_PIPELINE_ERROR_MAX]
+
+
+def _pipeline_backoff(attempts: int) -> timedelta:
+    """The gate after the attempts-th failure: the delivery backoff
+    (base * 2**(attempts-1), capped) -- comms' one transient policy."""
+    seconds = min(
+        settings.notification_retry_backoff_base_seconds
+        * 2 ** (attempts - 1),
+        settings.notification_retry_backoff_max_seconds,
+    )
+    return timedelta(seconds=seconds)
+
+
+async def _record_pipeline_failure(
+    notif_id: UUID, step: PipelineStep, exc: BaseException,
+) -> None:
+    """Write one pipeline failure onto the job, in its own transaction
+    (the attempt's own was rolled back). Below the ceiling: gate the
+    job. At the ceiling: close it (see the module header).
+
+    KNOWN CEILING (acknowledged by design -- T12, D1 gate):
+      1. Mechanics: when deliver has already handed letters to the
+         channel and the attempt then raises (the flush, the rollup,
+         the commit), the rollback erases the SENT marks; the next
+         attempt sends those letters again. Bounded by
+         NOTIFICATION_MAX_PIPELINE_ATTEMPTS -- before T12 it repeated
+         on every tick, forever.
+      2. Status: acknowledged by design.
+      3. Backlog ref: none -- no task is opened; this marker is the
+         record until the trigger below is observed.
+      4. Promotion trigger (observable): a job with pipeline_step
+         deliver / rollup / commit whose deliveries show sent_at, or
+         a recipient reporting the same letter twice.
+      5. Agreed fix: none agreed yet -- the shape is decided when the
+         trigger fires.
+      6. Rejected: committing each delivery's outcome right after its
+         channel call (splits the attempt across transactions and
+         breaks the one-lock-per-attempt rule the expiry and the
+         cancellation rely on -- app/engine/service.py, IN FLIGHT);
+         dropping the retry of the pipeline altogether (a transient
+         database hiccup would then close jobs that would have gone
+         out).
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            notification = (
+                await session.execute(
+                    select(Notification)
+                    .where(Notification.id == notif_id)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalar_one_or_none()
+            if notification is None or notification.status not in (
+                NotificationStatus.PENDING,
+                NotificationStatus.PROCESSING,
+            ):
+                # Taken by another worker, or closed meanwhile (expiry,
+                # cancellation): nothing to record on.
+                return
+            notification.pipeline_attempts += 1
+            notification.pipeline_step = step.value
+            notification.pipeline_error = pipeline_error_of(exc)
+            attempts = notification.pipeline_attempts
+            ceiling = settings.notification_max_pipeline_attempts
+            if attempts < ceiling:
+                notification.pipeline_retry_at = (
+                    datetime.now(UTC) + _pipeline_backoff(attempts)
+                )
+                await session.commit()
+                logger.warning(
+                    "notification_pipeline_retry",
+                    notification_id=str(notif_id),
+                    step=step.value,
+                    attempts=attempts,
+                    ceiling=ceiling,
+                )
+                return
+            notification.pipeline_retry_at = None
+            closed = (
+                await session.execute(
+                    update(NotificationDelivery)
+                    .where(
+                        NotificationDelivery.notification_id == notif_id,
+                        NotificationDelivery.status == DeliveryStatus.PENDING,
+                    )
+                    .values(
+                        status=DeliveryStatus.FAILED,
+                        failure_class=FailureClass.PIPELINE,
+                        next_retry_at=None,
+                        wait_reason=None,
+                    )
+                )
+            ).rowcount  # type: ignore[attr-defined]
+            if notification.status == NotificationStatus.PROCESSING:
+                await rollup_notification(session, notification)
+            else:
+                # PENDING: resolve never committed, there are no
+                # deliveries to fold.
+                notification.status = NotificationStatus.FAILED
+            await session.commit()
+            logger.error(
+                "notification_pipeline_failed",
+                notification_id=str(notif_id),
+                step=step.value,
+                attempts=attempts,
+                deliveries_closed=closed,
+                status=notification.status,
+            )
+        except Exception as record_exc:
+            await session.rollback()
+            logger.error(
+                "notification_pipeline_record_error",
+                notification_id=str(notif_id),
+                exception=sanitized_traceback(record_exc),
+            )
 
 
 async def cleanup_expired_notifications() -> int:
@@ -242,9 +434,12 @@ async def cleanup_expired_notifications() -> int:
             await session.commit()
             return deleted
 
-        except Exception:
+        except Exception as exc:
             await session.rollback()
-            logger.exception("notification_cleanup_error")
+            logger.error(
+                "notification_cleanup_error",
+                exception=sanitized_traceback(exc),
+            )
             return 0
 
 
@@ -264,12 +459,12 @@ async def cleanup_terminal_notifications() -> int:
     commits -- one per batch, so a 90-day backlog never becomes one
     long transaction -- and drains until a batch comes back short.
 
-    DISABLED (fix I): settings.notification_retention_days <= 0 means
-    retention is OFF -- return 0 without touching anything ("delete
-    everything" must never fall out of the cutoff arithmetic; the
-    worker startup log names the disabled state loudly). The guard
-    lives HERE, not only behind the worker's cadence gate, because
-    tests call this function directly.
+    DISABLED (fix I): settings.notification_retention_days == 0 means
+    retention is OFF (a negative value refuses startup -- D1 / R3) --
+    return 0 without touching anything ("delete everything" must never
+    fall out of the cutoff arithmetic; the worker startup log names the
+    disabled state loudly). The guard lives HERE, not only behind the
+    worker's cadence gate, because tests call this function directly.
 
     Scheduling lives in app/engine/worker.py (fix H): the pass runs on
     its own slow cadence (NOTIFICATION_RETENTION_INTERVAL_SECONDS),
@@ -327,9 +522,13 @@ async def cleanup_terminal_notifications() -> int:
                 session, cutoff=cutoff,
             )
             await session.commit()
-        except Exception:
+        except Exception as exc:
             await session.rollback()
-            logger.exception("retention_pass_error", deleted=total)
+            logger.error(
+                "retention_pass_error",
+                deleted=total,
+                exception=sanitized_traceback(exc),
+            )
             return total
 
     # Logged EVERY pass, empty ones included: a slow empty scan is
