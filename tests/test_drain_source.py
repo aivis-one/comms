@@ -198,9 +198,14 @@ def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+# What cmd_drain passes the driver as its $0: every refusal names the
+# next command with it (D1 / R8).
+_SELF = "./comms-deploy.sh"
+
+
 def _drive(mode: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-", mode],
+        [sys.executable, "-", mode, _SELF],
         input=_driver_source(),
         cwd=cwd,
         capture_output=True,
@@ -312,10 +317,16 @@ async def test_drain_on_0011_then_the_update_passes(
     assert status == "sent"
 
 
-async def test_drain_refuses_past_0013() -> None:
-    refused = _drive("check")
-    assert refused.returncode == 2
-    assert "at or past 0013" in refused.stdout
+async def test_drain_past_0013_has_nothing_to_drain() -> None:
+    """Was test_drain_refuses_past_0013, asserting code 2. That was
+    right about the fact -- past 0013 there is nothing to delete -- and
+    wrong about its class: code 2 says "cannot check", and here the
+    check ran and found nothing. D1-2 (R8, gate) makes it a clean code
+    0. The pair: no "Next:" -- a clean answer asks for nothing."""
+    checked = _drive("check")
+    assert checked.returncode == 0
+    assert "at or past 0013 -- nothing to drain" in checked.stdout
+    assert "Next:" not in checked.stdout
 
 
 def test_drain_refuses_an_image_without_0013(tmp_path: Path) -> None:
@@ -323,3 +334,40 @@ def test_drain_refuses_an_image_without_0013(tmp_path: Path) -> None:
     refused = _drive("check", cwd=tmp_path)
     assert refused.returncode == 2
     assert "no migration 0013" in refused.stdout
+    # D1 / R8: a code 2 names the command to run next.
+    assert f"Next: {_SELF} update" in refused.stdout
+
+
+# -- The two refusals that need a database in another state (D1-2, R8) -------
+
+
+async def test_drain_with_no_schema_cannot_check_and_says_what_next() -> None:
+    """"No schema" stays code 2 -- it is the wrong database, not a clean
+    one (D1-2 RULE ZERO) -- and names the next step. The schema is made
+    to look absent by renaming alembic_version for the run, and put back
+    whatever happens."""
+    await _sql("ALTER TABLE alembic_version RENAME TO alembic_version_aside")
+    try:
+        refused = _drive("check")
+    finally:
+        await _sql("ALTER TABLE alembic_version_aside RENAME TO alembic_version")
+    assert refused.returncode == 2
+    assert "no schema here (no alembic_version)" in refused.stdout
+    assert f"Next: check POSTGRES_DB in .env, then {_SELF} drain" in refused.stdout
+
+
+async def test_drain_on_a_foreign_revision_cannot_check_and_says_what_next() -> None:
+    """A revision the image does not know (the database is newer than the
+    image, or another service's): code 2, next -- update."""
+    async with get_session_factory()() as session:
+        revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
+    await _sql("UPDATE alembic_version SET version_num = 'zz_not_ours'")
+    try:
+        refused = _drive("check")
+    finally:
+        await _sql(
+            "UPDATE alembic_version SET version_num = :r", r=revision,
+        )
+    assert refused.returncode == 2
+    assert "'zz_not_ours' is not in this image's migration chain" in refused.stdout
+    assert f"Next: {_SELF} update" in refused.stdout

@@ -40,9 +40,41 @@ from app.core.exceptions import NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind
 from app.messaging.membership import section_serves_clause, serves_section
 from app.messaging.models import Section, Thread
-from app.messaging.threads import _is_dedup_violation, _recipient_exists
+from app.messaging.threads import is_dedup_violation, recipient_exists
 
 logger = structlog.get_logger()
+
+@dataclass(frozen=True)
+class SubjectRef:
+    """A thread's subject reference: both halves, always together.
+
+    The type is what makes "both or neither" impossible to break inside
+    comms: a half reference cannot be constructed, only refused at the
+    edge that parses one (app/api/messaging.py, RetagIn)."""
+
+    subject_type: str
+    subject_id: str
+
+
+class KeepSubject:
+    """The third state of a retag's subject: leave it as it is."""
+
+    _instance: "KeepSubject | None" = None
+
+    def __new__(cls) -> "KeepSubject":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "KEEP"
+
+
+# retag without a subject keeps the thread's subject (D1 / R1). Before,
+# a retag that named only the section wrote NULL into both columns and
+# silently detached the thread from its entity.
+KEEP = KeepSubject()
+
 
 @dataclass(frozen=True)
 class OperatorScope:
@@ -173,7 +205,7 @@ async def claim_thread(
     # would otherwise surface a raw IntegrityError -> 500 on a bad
     # operator; a missing referent is a clean 404 (symmetric with how
     # create_or_get_thread validates its client / operator referents).
-    if not await _recipient_exists(session, operator):
+    if not await recipient_exists(session, operator):
         raise NotFoundError(f"operator recipient {operator} does not exist")
 
     now = when if when is not None else datetime.now(UTC)
@@ -337,10 +369,13 @@ async def retag_thread(
     *,
     thread_id: UUID,
     section: UUID,
-    subject_type: str | None = None,
-    subject_id: str | None = None,
+    subject: SubjectRef | KeepSubject | None = KEEP,
 ) -> Thread:
     """Retag a SECTION thread to a new section and/or subject_ref.
+
+    THE SUBJECT HAS THREE STATES (D1 / R1): KEEP leaves it as it is (a
+    retag that only moves the thread between sections), None clears it,
+    a SubjectRef sets it.
 
     Mutability by operator form (arch doc §2.4): a `user` thread's axes
     are FROZEN (retag rejected); a `section` thread is retag-capable.
@@ -380,19 +415,18 @@ async def retag_thread(
             "user thread axes are frozen; retag is only allowed on "
             "section threads"
         )
-    if (subject_type is None) != (subject_id is None):
-        raise ValidationError(
-            "subject_ref must be both-or-neither: "
-            f"subject_type={subject_type!r} subject_id={subject_id!r}"
-        )
     if await session.get(Section, section) is None:
         raise NotFoundError(f"section {section} does not exist")
 
     # Apply the new tag; re-resolve the operator, reset assignee.
     new_scope = resolve_operator(OperatorKind.SECTION, section)
     thread.operator_value = new_scope.value
-    thread.subject_type = subject_type
-    thread.subject_id = subject_id
+    if subject is None:
+        thread.subject_type = None
+        thread.subject_id = None
+    elif isinstance(subject, SubjectRef):
+        thread.subject_type = subject.subject_type
+        thread.subject_id = subject.subject_id
     thread.assignee = None
     thread.assigned_at = None
     try:
@@ -401,7 +435,7 @@ async def retag_thread(
         async with session.begin_nested():
             await session.flush()
     except IntegrityError as exc:
-        if not _is_dedup_violation(exc):
+        if not is_dedup_violation(exc):
             raise
         raise ValidationError(
             "retag would duplicate an existing thread for this entity "

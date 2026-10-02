@@ -46,10 +46,8 @@
 from typing import Any
 from uuid import UUID
 
-import structlog
 from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_service_auth
@@ -65,8 +63,6 @@ from app.core.constants import (
 )
 from app.core.database import get_db_session
 from app.forgetting import forget_recipient
-
-logger = structlog.get_logger()
 
 router = APIRouter(
     prefix="/api/v1/recipients",
@@ -145,37 +141,20 @@ async def upsert_recipient(
     `recipient_deleted` (app/api/errors.py).
     """
 
-    async def _apply() -> Recipient:
-        """The one mapping from body to the snapshot rule."""
-        return await sync.apply_snapshot(
-            session,
-            recipient_id=recipient_id,
-            version=snapshot.version,
-            telegram_id=snapshot.telegram_id,
-            email=snapshot.email,
-            locale=snapshot.locale,
-            timezone=snapshot.timezone,
-            active=snapshot.active,
-        )
-
-    try:
-        # SAVEPOINT, not bare call: two writers racing on a brand-new id
-        # (this route and the stream consumer, or two product replicas)
-        # can both see nothing and both insert. The loser gets an
-        # IntegrityError on the primary key; the savepoint keeps the
-        # request's transaction usable.
-        async with session.begin_nested():
-            recipient = await _apply()
-    except IntegrityError:
-        # The winner has committed by now. Calling the SAME rule again
-        # finds its row and compares versions against it. Retried once:
-        # a second collision would mean the row both exists and does
-        # not.
-        logger.info(
-            "recipient_upsert_raced",
-            recipient_id=str(recipient_id),
-        )
-        recipient = await _apply()
+    # The insert race of a brand-new id (this route against the stream,
+    # or two product replicas) is survived inside the snapshot rule
+    # itself -- app/audience/sync.py, _once_more_on_insert_race -- for
+    # every caller, not here (D1 / R2).
+    recipient = await sync.apply_snapshot(
+        session,
+        recipient_id=recipient_id,
+        version=snapshot.version,
+        telegram_id=snapshot.telegram_id,
+        email=snapshot.email,
+        locale=snapshot.locale,
+        timezone=snapshot.timezone,
+        active=snapshot.active,
+    )
 
     return _wire(recipient)
 

@@ -297,13 +297,16 @@ async def _record_pipeline_failure(
          NOTIFICATION_MAX_PIPELINE_ATTEMPTS -- before T12 it repeated
          on every tick, forever.
       2. Status: acknowledged by design.
-      3. Backlog ref: none -- no task is opened; this marker is the
-         record until the trigger below is observed.
+      3. Backlog ref: phase 2 of the spec -- the transition journal
+         (§6.4: every transition leaves an append-only record), the
+         release that carries the fix below.
       4. Promotion trigger (observable): a job with pipeline_step
          deliver / rollup / commit whose deliveries show sent_at, or
          a recipient reporting the same letter twice.
-      5. Agreed fix: none agreed yet -- the shape is decided when the
-         trigger fires.
+      5. Agreed fix (D1-2 gate): a phase-2 journal record "the channel
+         accepted the letter", written in its own transaction right
+         after the channel answers; the next attempt closes such a
+         delivery SENT without sending it again.
       6. Rejected: committing each delivery's outcome right after its
          channel call (splits the attempt across transactions and
          breaks the one-lock-per-attempt rule the expiry and the

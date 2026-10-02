@@ -51,7 +51,7 @@ from sqlalchemy.sql.selectable import LateralFromClause
 from app.core.exceptions import NotFoundError
 from app.messaging.models import Message, Thread, ThreadReadState
 from app.messaging.operators import participation_clause
-from app.messaging.threads import _recipient_exists
+from app.messaging.threads import recipient_exists
 
 logger = structlog.get_logger()
 
@@ -83,7 +83,7 @@ async def mark_read(
     caller (app/api/messaging.py), with the same helper every other
     thread write uses.
     """
-    if not await _recipient_exists(session, participant):
+    if not await recipient_exists(session, participant):
         raise NotFoundError(
             f"participant recipient {participant} does not exist"
         )

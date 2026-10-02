@@ -4,11 +4,14 @@
 #
 # The contract the product's outbox relay (Phase 6) writes against.
 #
-# ENVELOPE (one Redis Stream entry, XADD <stream> * ...):
+# THE FIELDS OF EVERY EVENT ARE WRITTEN ONCE, in deploy/INTEGRATION.md
+# section 7 -- one table per event -- and held to the parsers below by
+# tests/test_event_contract.py: the table of each event equals the
+# allowed set in EVENT_FIELDS, both ways (D1 / R5). Not repeated here: a
+# second full copy is the copy the next change forgets.
 #
-#   event: "notification_request" | "user_upserted" | "group_changed"
-#          | "reminder_cancel"
-#   data:  <UTF-8 JSON document>
+# THE FRAME: one Redis Stream entry is {event, data}; `event` names the
+# kind (KNOWN_EVENTS), `data` is a UTF-8 JSON document.
 #
 # VERSIONING (frozen decision, review 3c part B): the ENVELOPE
 # {event, data} is frozen FOREVER -- all evolution happens INSIDE
@@ -16,119 +19,6 @@
 # validates "v" on every event (review 3c amendment A): a missing or
 # unsupported version is a TERMINAL error -> DLQ, never a silent parse
 # under old semantics. Currently supported: v=1.
-#
-# SCHEMAS (data), all fields validated here:
-#
-#   notification_request -- an ENVELOPE plus an opaque LETTER (F1.2).
-#   The field set is CLOSED: any other field refuses the request, so a
-#   producer still sending `channels` or `priority` learns it is not
-#   choosing anything (the channel is the profile's, spec §5.2).
-#
-#     v                1                      -- required (protocol
-#                                                framing, not the job)
-#   envelope -- what comms reads, because without it comms cannot
-#   deliver:
-#     idempotency_key  str 1..200             -- required; the same key
-#                                                is the same job
-#     type             str                    -- required; must be
-#                                                declared by the
-#                                                profile, which routes
-#                                                it to its channels
-#     target_type      "user"|"group"|"all"   -- required (the address)
-#     target_value     "<uuid>"|"<group_key>"|"*"  -- required; form
-#                                                checked per target_type
-#     scheduled_at     iso8601 WITH tz        -- optional, "not before"
-#     expiry_at        iso8601 WITH tz        -- optional; must lie in
-#                                                the future and after
-#                                                scheduled_at; wins over
-#                                                the profile's
-#                                                expires_after
-#     correlation      str 1..200             -- optional; the
-#                                                product's reference,
-#                                                stored untouched
-#   letter -- carried, never interpreted:
-#     title            str 1..500             -- required (stored
-#                                                fallback; templates
-#                                                override at delivery)
-#     body             str 1..5000            -- required
-#     action_data      {..}                   -- optional, see below
-#
-#   INTAKE (handlers.py): same key + same bytes -> the existing job;
-#   same key + other bytes -> conflict, recorded under the key. A
-#   request whose KEY is readable but which cannot be accepted (any
-#   rule below, an undeclared type, an expiry already passed) is
-#   REJECTED AT INTAKE and recorded under its key -- never the DLQ.
-#   Only a request whose key cannot be read goes to the DLQ: there is
-#   nothing to attach the rejection to.
-#
-#   user_upserted (a VERSIONED snapshot, F1.4; snapshot discipline:
-#   ALL fields required, "no value" is an explicit null -- never a
-#   blank string, never a telegram id of 0; the field set is CLOSED):
-#     v            1           -- required
-#     recipient_id "<uuid>"    -- required (product user id)
-#     version      int >= 1    -- required; the product's monotonic
-#                                 snapshot version. Older than stored ->
-#                                 refused and acknowledged, its class
-#                                 in the log (audience/sync.py)
-#     telegram_id  int | null  -- required key, non-zero
-#     email        str | null  -- required key, non-blank
-#     locale       str | null  -- required key, non-blank
-#     timezone     str | null  -- required key (IANA name), non-blank
-#     active       bool        -- required
-#
-#   user_deleted (F1.4, spec §10.4): the product deleted the person;
-#   comms forgets how to reach them (app/forgetting.py). Ordered against
-#   snapshots by the same version rule; a repeat is a no-op:
-#     v            1           -- required
-#     recipient_id "<uuid>"    -- required
-#     version      int >= 1    -- required
-#
-#   group_changed (naturally idempotent both ways; the field set is
-#   CLOSED, like section_membership_changed -- D1 / R4):
-#     v            1           -- required
-#     group_key    str 1..200  -- required, opaque to comms
-#     recipient_id "<uuid>"    -- required
-#     member       bool        -- required (true=ensure, false=remove)
-#
-#   reminder_cancel -- cancels jobs by their ENVELOPE correlation
-#   (F1.3). Naturally idempotent: an already finished or never
-#   scheduled match set is a zero-row update. The field set is CLOSED.
-#   Cancelled jobs take the outcome CANCELLED (their waiting deliveries
-#   too), never EXPIRED:
-#     v              1          -- required
-#     types          [str]      -- required, non-empty list of type
-#                                  keys to cancel
-#     correlation    str 1..200 -- required; equal to the
-#                                  `correlation` the jobs were sent
-#                                  with (an equality test on an opaque
-#                                  string -- comms never reads the
-#                                  letter to find them)
-#     target_type    str | null -- optional filter; both target
-#     target_value   str | null    fields together or neither (a bare
-#                                  target_value is ambiguous); form
-#                                  checked per target_type as in
-#                                  notification_request
-#
-# action_data rules (Phase 3c item 5, early line of defense; the
-# per-channel checks at delivery -- deep-link charset/64 from 3a --
-# remain the second line):
-#   - a JSON object;
-#   - keys are non-empty strings (no prefix is reserved: F1.3 removed
-#     the underscore reservation with its last consumer);
-#   - "action" (optional): non-empty string -- the deep-link intent;
-#   - "params" (optional): object of SCALAR values -- deep-link params;
-#   - every OTHER key is a template variable and must be a SCALAR
-#     (str / int / float / bool / null): lists and nested objects do
-#     not survive str.format_map rendering meaningfully and are
-#     rejected here, not at delivery time.
-#
-# ORDERING / DELIVERY EXPECTATIONS (for the producer):
-#   - at-least-once; consumers ack after processing;
-#   - user_upserted precedes group_changed for a new user; a momentary
-#     inversion is retried by comms (bounded backoff), a persistent
-#     one lands in the DLQ;
-#   - sync events are safe to replay any number of times;
-#   - notification_request replays are collapsed by idempotency_key.
 #
 # Validation failures raise ValidationError -- classified TERMINAL by the
 # consumer (log + DLQ + XACK), per the poison-pill rule. The one
@@ -445,7 +335,8 @@ def _is_scalar(value: Any) -> bool:
 def validate_action_data(
     action_data: Any, *, event: str = EVENT_NOTIFICATION_REQUEST
 ) -> dict[str, Any]:
-    """Enforce the action_data rules (see module header).
+    """Enforce the action_data rules (deploy/INTEGRATION.md section 7,
+    the `action_data` row of `notification_request`).
 
     The early line of defense (item 5): everything here would
     otherwise fail LATER and WORSE -- an underscore key would take a
@@ -943,3 +834,17 @@ def _parse_reminder_cancel(data: dict[str, Any]) -> ReminderCancel:
         target_type=target_type,
         target_value=target_value,
     )
+
+
+# The closed field set of every event, by event name -- the parsers'
+# own sets, not copies. deploy/INTEGRATION.md section 7 is held to this
+# mapping by tests/test_event_contract.py (D1 / R5).
+EVENT_FIELDS: dict[str, frozenset[str]] = {
+    EVENT_NOTIFICATION_REQUEST: _NOTIFICATION_REQUEST_FIELDS,
+    EVENT_USER_UPSERTED: _USER_UPSERTED_FIELDS,
+    EVENT_USER_DELETED: _USER_DELETED_FIELDS,
+    EVENT_GROUP_CHANGED: _GROUP_CHANGED_FIELDS,
+    EVENT_REMINDER_CANCEL: _REMINDER_CANCEL_FIELDS,
+    EVENT_SECTION_MEMBERSHIP_CHANGED: _SECTION_MEMBERSHIP_CHANGED_FIELDS,
+}
+

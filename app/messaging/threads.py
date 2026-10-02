@@ -62,7 +62,7 @@ _recipients = table("recipients", column("id"), column("deleted_at"))
 _DEDUP_INDEX_NAMES = ("uq_threads_dedup_subject", "uq_threads_dedup_dm")
 
 
-async def _recipient_exists(session: AsyncSession, recipient_id: UUID) -> bool:
+async def recipient_exists(session: AsyncSession, recipient_id: UUID) -> bool:
     """True if a LIVE recipient row with this id exists (by-name probe).
 
     A tombstone (deleted_at set, F1.4) is not a live referent: a write
@@ -102,7 +102,7 @@ async def _require_operator_referent(
                 f"operator section {operator_value} does not exist"
             )
         return
-    if not await _recipient_exists(session, operator_value):
+    if not await recipient_exists(session, operator_value):
         raise NotFoundError(
             f"operator recipient {operator_value} does not exist"
         )
@@ -185,7 +185,7 @@ async def _select_by_dedup_key(
     return result
 
 
-def _is_dedup_violation(exc: IntegrityError) -> bool:
+def is_dedup_violation(exc: IntegrityError) -> bool:
     """True iff the IntegrityError is one of OUR dedup indexes firing."""
     message = str(exc.orig)
     return any(name in message for name in _DEDUP_INDEX_NAMES)
@@ -231,7 +231,7 @@ async def create_or_get_thread_detailed(
     # Validate the client referent in code (symmetric with the operator
     # check below): the client FK would otherwise surface a raw
     # IntegrityError -> 500; a missing referent is a clean 404.
-    if not await _recipient_exists(session, client):
+    if not await recipient_exists(session, client):
         raise NotFoundError(f"client recipient {client} does not exist")
 
     await _require_operator_referent(session, operator_kind, operator_value)
@@ -289,7 +289,7 @@ async def create_or_get_thread_detailed(
             session.add(thread)
             await session.flush()
     except IntegrityError as exc:
-        if not _is_dedup_violation(exc):
+        if not is_dedup_violation(exc):
             raise
         # A concurrent creator won the race; its row is now visible.
         existing = await _select_by_dedup_key(
@@ -388,7 +388,7 @@ async def post_message(
     # The sender must be a LIVE recipient (F1.4): a forgotten person
     # writes nothing -- RecipientDeletedError from the probe -- and an
     # unknown one is a clean 404 rather than a foreign-key 500.
-    if not await _recipient_exists(session, sender):
+    if not await recipient_exists(session, sender):
         raise NotFoundError(f"sender recipient {sender} does not exist")
 
     when = created_at if created_at is not None else datetime.now(UTC)

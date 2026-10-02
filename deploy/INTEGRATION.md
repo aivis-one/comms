@@ -1,4 +1,4 @@
-# COMMS x VELO -- product-side integration checklist (Phase 5 scope)
+# COMMS -- product-side integration checklist (Phase 5 scope)
 
 This file documents how the product side is wired to the comms stack:
 what the product installer does, and what the product repo must carry
@@ -328,13 +328,29 @@ construction, so it takes no key:
 | `DELETE /recipients/{id}` | forgetting twice is forgetting once |
 | `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
 | `POST /threads/{id}/status` | sets a value; the same status is a no-op |
-| `POST /threads/{id}/retag` | sets a value |
+| `POST /threads/{id}/retag` | sets values; a repeat finds the thread already moved and back in the pool |
 | `POST /threads/{id}/read` | the pointer only moves forward |
 | `POST /sections` | create-or-find by key |
 | `POST /inbox/{delivery_id}/read`, `POST /inbox/read-all` | set a value |
 | `PATCH /preferences` | sets values |
 
 `POST /threads/unread-counts` is a read that takes a body.
+
+**Retag reads the subject by presence.** `POST /threads/{id}/retag`
+takes `operator`, `section` and, optionally, the pair `subject_type` /
+`subject_id`:
+
+| the pair in the body | the thread's subject |
+|---|---|
+| both absent | kept -- the thread only moves to the section |
+| both present, both `null` | cleared |
+| both present, both set | set to them |
+| one absent, or one `null` and one set | 422 `validation` -- half a reference names nothing |
+
+In every form the thread returns to the section's pool (the assignee is
+reset). A retag that would give the thread what another thread of the
+same client in that section already has -- the same subject, or, for a
+DM, the same absence of one -- is refused: threads are never merged.
 
 **The recipient snapshot has a version.** Both write paths -- `PUT
 /api/v1/recipients/{id}` and the `user_upserted` event -- carry
@@ -528,7 +544,8 @@ correlation; what it means is the product's.
 | `v` | required | `1` |
 | `types` | required | a non-empty list of type keys |
 | `correlation` | required | string, 1..200 -- equal to the `correlation` the jobs were sent with |
-| `target_type`, `target_value` | optional | both or neither; the same forms as in `notification_request` |
+| `target_type` | optional | with `target_value`, both or neither; the same forms as in `notification_request` |
+| `target_value` | optional | with `target_type`, both or neither |
 
 Every job of one of `types` with that exact `correlation` (and that
 target, when given) that has not reached an outcome is closed with the
@@ -537,13 +554,11 @@ was already sent stays sent. A cancel that matches nothing is a
 zero-row update, not an error, so a replay is harmless. A job being
 delivered at that moment is cancelled after the attempt finishes.
 
-### `user_upserted` and `user_deleted` -- the address book
+### `user_upserted` -- the address book
 
 comms keeps the product's recipients as **snapshots**. Every field is
 required; "no value" is an explicit `null`, never an empty string and
 never a telegram id of `0`.
-
-`user_upserted`:
 
 | field | rule |
 |---|---|
@@ -556,8 +571,16 @@ never a telegram id of `0`.
 | `timezone` | IANA zone name or `null` |
 | `active` | boolean |
 
-`user_deleted`: `v`, `recipient_id`, `version` -- comms forgets how to
-reach the person and keeps only an id-bearing tombstone.
+### `user_deleted` -- forgetting
+
+comms forgets how to reach the person and keeps only an id-bearing
+tombstone.
+
+| field | rule |
+|---|---|
+| `v` | `1` |
+| `recipient_id` | the product's user uuid |
+| `version` | integer `>= 1`, in the same order as `user_upserted` |
 
 **The version orders the snapshots.** Older than the stored version --
 refused as stale; equal with the same bytes -- a replay; equal with
@@ -575,10 +598,31 @@ it has no key to be recorded under.
 
 ### `group_changed` -- membership
 
-`v`, `group_key` (1..200, opaque), `recipient_id`, `member` (`true`
-ensures, `false` removes). Idempotent both ways. A group is read when
-the job is delivered (section 5), so a membership that arrives later is
-not seen by a job already delivered.
+| field | rule |
+|---|---|
+| `v` | `1` |
+| `group_key` | string, 1..200, opaque to comms |
+| `recipient_id` | the product's user uuid; `user_upserted` comes first |
+| `member` | `true` ensures the membership, `false` removes it |
+
+Idempotent both ways. A group is read when the job is delivered
+(section 5), so a membership that arrives later is not seen by a job
+already delivered.
+
+### `section_membership_changed` -- who serves a section
+
+| field | rule |
+|---|---|
+| `v` | `1` |
+| `section_key` | string, 1..100 -- the section, created if comms has not seen it |
+| `section_label` | string, 1..200 -- used only when the section is created; an existing section keeps its label |
+| `operator_id` | the operator's user uuid; `user_upserted` comes first |
+| `member` | `true` adds the operator to the section, `false` removes them |
+
+Idempotent both ways. The section may arrive before any thread is
+opened in it: operators are hired before anybody writes in. An operator
+comms has not been told about yet is retried, the same lag
+`group_changed` has.
 
 ### Ordering the producer relies on
 
@@ -656,17 +700,22 @@ The window, from comms' side -- every step is a verb of
 2. **`drain`** -- checks. Prints the count of every kind, under the
    names the refusal uses, and deletes nothing. The kinds overlap -- one
    row can count in more than one -- so the sum is not the number of
-   rows. Exit 0 = clean, 1 = rows
-   to delete, 2 = it cannot check (the database is down, there is no
-   schema, the schema is already at or past 0013).
-3. **`drain --apply`** -- deletes. It stops `comms-app`, dumps the
-   database (the path is printed before and after), asks you to type
-   `yes`, and deletes every kind in one transaction -- the whole
+   rows. Exit **0** = nothing to delete (clean, or the schema is already
+   at or past 0013); **1** = rows to delete; **2** = it cannot check --
+   the database is down, there is no schema (not the comms database),
+   the revision is not in the image's chain, or the image has no 0013.
+   Every code 2 prints the command to run next.
+3. **`drain --apply`** -- deletes. It asks you to type `yes`, stops
+   `comms-app`, dumps the database (the path is printed before and
+   after), and deletes every kind in one transaction -- the whole
    notifications, their deliveries by cascade. **Every active job goes,
    not only the old ones**: in a red start the worker and the consumer
    do not run, so the queue cannot drain by waiting. The product's
    events wait in the stream and are read after the window; jobs the
    product still wants, it sends again. Sent history and the inbox stay.
+   The newest **three** pre-drain dumps (`comms-predrain-*.sql`) are
+   kept; an older one is removed only after a new dump has succeeded.
+   A code 2 here prints the next command too.
 4. **`start`** -- brings the stack up: the migration passes, the
    worker and the consumer start.
 
@@ -677,8 +726,8 @@ in that order, with the operator at the terminal for step 3.
 
 Two questions every product asks once, answered here so the answer is
 not a trip through our source. Both are deploy-side settings with
-defaults; both are days-granular, and both treat a value of zero or
-less as "never".
+defaults; both are days-granular, and both treat zero as "never" (a
+negative value refuses the start, naming the variable).
 
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is

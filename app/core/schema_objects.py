@@ -101,6 +101,18 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "(idempotency_key, fingerprint, outcome)"
         ),
     ),
+    # The inbox keyset (D1 / R7, migration 0016): a page is an index
+    # range scan in the keyset's own order, sent rows only. The badge
+    # count stays on ix_notification_deliveries_inbox (read_at keyed).
+    "ix_deliveries_inbox_keyset": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_deliveries_inbox_keyset "
+            "ON public.notification_deliveries USING btree "
+            "(recipient_id, channel, sent_at DESC, id DESC) "
+            "WHERE ((status)::text = 'sent'::text)"
+        ),
+    ),
     # "One eternal DM per pair" -- partial unique index.
     "uq_threads_dedup_dm": IndexShape(
         unique=True,
