@@ -202,7 +202,9 @@ purpose, so that a leftover variable in a shared env file cannot refuse
 a working deploy) leaves the key set empty and therefore reads as "no
 such channel". The map shows `not_configured` where the installer
 expected `live`; the in-code marker (`KNOWN CEILING` in
-`app/core/channels.py`) records the case and its agreed fix.
+`app/core/channels.py`) records the case and its agreed fix. The map
+says what a deploy HAS; what its channels DID is the second answer,
+"Channel health" in section 5.
 
 **Email, concretely.** The channel is decided by its key set like any
 other, and its keys are declared in `app/core/channels.py`. Three of
@@ -308,7 +310,8 @@ body, with a class a program can branch on:
 The message is for a human; the class is the contract.
 
 **One way to page.** Every listing -- the inbox, the visible threads, a
-thread's messages, a job's deliveries and its path -- takes `limit` (1..100, default 20) and `cursor`
+thread's messages, a job's deliveries and its path, the address book --
+takes `limit` (1..100, default 20) and `cursor`
 (the previous page's `next_cursor`, opaque) and answers
 `{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
 `unread` badge beside them. A `limit` outside 1..100 is **refused**
@@ -382,6 +385,93 @@ delivery time -- not when it was sent. A `group_changed` that arrives
 later is not seen by that job, in either direction: a member added
 after resolve does not receive it, a member removed after resolve
 still does. Send the membership before the job when the order matters.
+
+### Channel health
+
+`GET /health` says what a deploy has -- a channel's keys are set -- and
+that is not the same as working: at one install it said `email: live`
+while every letter died on a provider `401`. The second answer is what
+each channel answered over a recent window:
+
+    GET /api/v1/channels/health?window_minutes=60
+
+`window_minutes` is 1..1440, default 60; outside that range it is
+**refused** (422 `validation`), not clamped. The window is measured by
+comms' database clock and closed at both ends. Behind the service token
+like every `/api/v1` route; `GET /health` itself is unchanged.
+
+```json
+{
+  "window": {"minutes": 60, "from": "2026-10-03T11:00:00+00:00", "to": "2026-10-03T12:00:00+00:00"},
+  "channels": {
+    "email": {
+      "state": "live",
+      "answers": 12,
+      "by_outcome": {"accepted": 0, "refused": 12, "rate_limited": 0, "transient": 0, "timeout": 0, "error": 0},
+      "refused_by_class": {"configuration": 12, "message_rejected": 0, "no_address": 0},
+      "configuration_share": 1.0
+    }
+  }
+}
+```
+
+Every channel of the service is listed (`in_app`, `telegram`, `email`,
+`push`), each with every key, zeros included -- an absent key never
+means zero.
+
+| field | meaning |
+|---|---|
+| `state` | the same channel map as `GET /health`: `live` / `not_configured` / `not_implemented` |
+| `answers` | every answer the channel gave in the window -- one per call, so the retries of one letter count once each |
+| `by_outcome` | the answers by what the channel said: took it, refused it, asked to wait (429), failed transiently, did not answer in time, or comms itself failed around the call |
+| `refused_by_class` | the refusals by class: `configuration` -- the channel is dead on this deploy, fix the deploy; `message_rejected` -- this letter will not arrive, others go; `no_address` -- the recipient has no address in this channel, fix the sync |
+| `configuration_share` | refusals of class `configuration` / `answers` -- the headline figure. **`null` when there were no answers**: nothing happened, which is neither healthy nor dead |
+
+`live` with a `configuration_share` near 1 is the case this exists for:
+the keys are there and the provider refuses them -- fix the deploy.
+Suppressed recipients and scheduled waits are not channel answers and
+are not counted. Answers are counted from comms' own transition record;
+nothing is stored as "health", and comms acts on none of it.
+
+### Reconciling the address book
+
+The book is synced eventually: an event that is lost or dead-lettered
+leaves comms' copy behind the product's, silently. To compare, page
+through what comms has recorded:
+
+    GET /api/v1/recipients?limit=100&cursor=<next_cursor>
+
+```json
+{
+  "items": [
+    {"recipient_id": "8d0f6c1e-2b7a-4f0e-9a51-3c2d1e0f4b6a", "version": 1712345678901, "active": true, "deleted": false}
+  ],
+  "next_cursor": null
+}
+```
+
+| field | meaning |
+|---|---|
+| `recipient_id` | the product's user id |
+| `version` | the version of the snapshot comms holds; `0` -- written before snapshots had versions |
+| `active` | as the snapshot set it; `false` for a deleted person |
+| `deleted` | the person was forgotten: the row is a tombstone, nothing reaches them |
+
+No address is listed, for anyone: comms refuses an equal version with
+other content, so an equal version IS an equal snapshot -- compare
+versions. Every recipient comms ever heard of is listed, tombstones
+included. The order is oldest first, so a recipient created while you
+page is reached on a later page -- unless its write was already under
+way when you read the page before; a row that changes after its page
+was read shows its old state. Either way the next pass sees it:
+reconcile periodically, not once.
+
+**The product decides; comms changes nothing on this read.** A version
+behind yours: send the snapshot again (`PUT /recipients/{id}`). A person
+missing: send them. A person you deleted who is not `deleted` here: send
+the deletion. A tombstone you still have: that person cannot be revived
+-- they need a new id. Group memberships and section rosters are not in
+this listing.
 
 ### What comms takes on trust
 

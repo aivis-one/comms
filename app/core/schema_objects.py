@@ -218,6 +218,25 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "(recipient_id) WHERE (provider_text IS NOT NULL)"
         ),
     ),
+    # Channel health over a window (P2-4, migration 0018): channel rows
+    # only, a range over `at`, the grouped columns carried in the index.
+    "ix_transitions_channel_window": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_transitions_channel_window "
+            "ON public.notification_transitions USING btree (at) "
+            "INCLUDE (channel, outcome, failure_class) "
+            "WHERE ((subject)::text = 'channel'::text)"
+        ),
+    ),
+    # The address book listing's keyset order (P2-4, migration 0018).
+    "ix_recipients_book": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_recipients_book ON public.recipients "
+            "USING btree (created_at, id)"
+        ),
+    ),
     "ix_threads_operator_user": IndexShape(
         unique=False,
         definition=(

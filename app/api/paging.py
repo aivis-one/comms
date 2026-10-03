@@ -3,7 +3,8 @@
 # =============================================================================
 #
 # Every listing route -- the inbox, the visible threads, a thread's
-# messages, a job's deliveries and its path -- pages the same way:
+# messages, a job's deliveries and its path, the address book -- pages
+# the same way:
 #
 #   request   ?limit=<1..PAGE_LIMIT_MAX, default PAGE_LIMIT_DEFAULT>
 #             &cursor=<the previous page's next_cursor, opaque>
@@ -19,7 +20,8 @@
 # THE CURSOR IS OPAQUE by contract -- clients echo it back and never
 # parse it. ONE CODEC PER KIND OF KEY, both base64url:
 #   (timestamp, uuid) -- "{timestamp}|{uuid}": the inbox, the threads,
-#       the messages, a job's deliveries (each listing its own order);
+#       the messages, a job's deliveries, the address book (each
+#       listing its own order);
 #   a monotone sequence -- "seq:{n}": a job's path, ordered by the
 #       journal's identity (P2-2; timestamps tie inside a transaction).
 # Each decoder refuses the other's cursor (422): a cursor carried from

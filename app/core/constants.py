@@ -81,6 +81,15 @@ MAX_IDEMPOTENCY_KEY_LEN = 200
 PAGE_LIMIT_MAX = 100
 PAGE_LIMIT_DEFAULT = 20
 
+# The window of the channel health answer, in minutes (P2-4, spec §6.7,
+# app/engine/health.py): out of 1..HEALTH_WINDOW_MAX_MINUTES is refused,
+# never clamped. The ceiling is one day -- the shortest retention a
+# deploy can have (NOTIFICATION_RETENTION_DAYS >= 1, or 0 = off), so the
+# window is never longer than the retention period. What retention can
+# still take out of a window: app/engine/health.py, KNOWN CEILING.
+HEALTH_WINDOW_MAX_MINUTES = 1440
+HEALTH_WINDOW_DEFAULT_MINUTES = 60
+
 # recipients.version is a BigInteger: the snapshot version's ceiling is
 # the column's (F1.4). The floor is 1 -- 0 marks rows written before
 # versions existed (migration 0014).
