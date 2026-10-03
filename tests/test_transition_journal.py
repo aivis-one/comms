@@ -983,6 +983,7 @@ _POINTS: dict[tuple[str, str], str] = {
     ("app/engine/service.py", "close_notifications"): _RECORDS,
     ("app/engine/service.py", "close_waiting_deliveries"): _RECORDS,
     ("app/engine/processor.py", "_record_pipeline_failure"): _RECORDS,
+    ("app/engine/processor.py", "_close_at_ceiling"): _RECORDS,
     # Helpers whose every caller records right after them.
     ("app/engine/service.py", "_close_accepted"): (
         "by caller: deliver_notification, close_waiting_deliveries"
@@ -1206,45 +1207,24 @@ class TestAcceptedSurvives:
         ]
         await _assert_consistent(nid)
 
-    async def test_the_ceiling_of_a_first_attempt_keeps_only_the_answer(
-        self,
-        db_session: AsyncSession,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """REPORTED, NOT DECIDED (P2-1 report): the attempt that tears
-        is the job's FIRST, so its rollback also takes the deliveries
-        resolve created; at the ceiling the job is PENDING without
-        deliveries and closes FAILED, although the channel took the
-        in_app letter. The journal keeps that answer -- the path is
-        true -- while the job's status is not. Pinned as the behavior
-        of this delivery, so that a decision changes it knowingly."""
-        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 1)
-        recipient = await create_recipient(db_session)
-        nid = await _intake(db_session, recipient.id)
-        with (
-            _channel(_Spy()),
-            patch.object(processor, "rollup_notification", _poisoned_rollup),
-        ):
-            await process_pending_notifications()
-        assert (await _job(nid)).status == NotificationStatus.FAILED
-        assert await _deliveries(nid) == []
-        assert _of(
-            await _rows(nid),
-            subject=JournalSubject.CHANNEL,
-            outcome=ChannelAnswer.ACCEPTED,
-        )
-
     async def test_the_ceiling_of_an_unresolved_job(
         self,
         db_session: AsyncSession,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """The resolve fails again in the closing savepoint: FAILED with no
+        deliveries -- branch (a) of the KNOWN CEILING on
+        app/engine/processor.py _close_at_ceiling. The savepoint's
+        rollback keeps the failure record: pipeline_* on the job and
+        its journal row under the step that tore."""
         monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 1)
         recipient = await create_recipient(db_session)
         nid = await _intake(db_session, recipient.id)
 
-        async def broken_resolve(*args: Any) -> None:
-            raise _PlantedDefectError("resolve")
+        async def broken_resolve(session: AsyncSession, *args: Any) -> None:
+            # A DATABASE error, not a Python one: it aborts the
+            # transaction, which is what the savepoint must survive.
+            await session.execute(text("SELECT * FROM no_such_table_p2_1"))
 
         with patch.object(processor, "resolve_notification", broken_resolve):
             await process_pending_notifications()
@@ -1255,7 +1235,189 @@ class TestAcceptedSurvives:
             (JournalStep.CEILING, NotificationStatus.FAILED),
         ]
         assert rows[1].error is not None and rows[1].wait_until is None
+        job = await _job(nid)
+        assert (job.pipeline_attempts, job.pipeline_step) == (1, "resolve")
+        assert job.pipeline_error == rows[1].error
+        assert await _deliveries(nid) == []
         await _assert_consistent(nid)
+
+    async def _tear_every_attempt(
+        self,
+        spy: _Spy,
+        attempts: int,
+    ) -> None:
+        """Run `attempts` passes, each tearing on its own rollup."""
+        with (
+            _channel(spy),
+            patch.object(
+                processor,
+                "rollup_notification",
+                _poisoned_rollup,
+            ),
+        ):
+            for _ in range(attempts):
+                await process_pending_notifications()
+                await _open_gates()
+
+    async def test_first_attempt_accepted_every_attempt_torn_closes_sent(
+        self,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No attempt ever commits its deliveries; the channel took the
+        letter on the first. The ceiling materializes the delivery, closes
+        it SENT from the journal, and the fold makes the job SENT -- with
+        one channel call over the job's whole life."""
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 3)
+        recipient = await create_recipient(db_session)
+        nid = await _intake(db_session, recipient.id)
+        spy = _Spy()
+        await self._tear_every_attempt(spy, 3)
+        assert spy.calls == ["in_app"]
+        (delivery,) = await _deliveries(nid)
+        assert delivery.status == DeliveryStatus.SENT
+        job = await _job(nid)
+        assert (job.status, job.pipeline_attempts) == (NotificationStatus.SENT, 3)
+        rows = _of(await _rows(nid), step=JournalStep.CEILING)
+        assert [(r.subject, r.outcome) for r in rows] == [
+            (JournalSubject.DELIVERY, DeliveryStatus.SENT),
+            (JournalSubject.JOB, NotificationStatus.SENT),
+        ]
+        await _assert_consistent(nid)
+
+    async def test_first_attempt_partly_accepted_closes_partial(
+        self,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """in_app accepted once; telegram answers transient on every
+        attempt (a legitimate call each time). At the ceiling: in_app
+        SENT, telegram FAILED / pipeline, the job PARTIAL_SENT."""
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 3)
+        recipient = await create_recipient(db_session)
+        nid = await _intake(db_session, recipient.id, type="unit_event_telegram_in_app")
+        spy = _Spy({"telegram": EmailTransientError("provider error (503)")})
+        await self._tear_every_attempt(spy, 3)
+        assert spy.calls.count("in_app") == 1
+        assert spy.calls.count("telegram") == 3
+        by_channel = {d.channel: d for d in await _deliveries(nid)}
+        assert by_channel["in_app"].status == DeliveryStatus.SENT
+        assert (
+            by_channel["telegram"].status,
+            by_channel["telegram"].failure_class,
+        ) == (
+            DeliveryStatus.FAILED,
+            FailureClass.PIPELINE,
+        )
+        assert (await _job(nid)).status == NotificationStatus.PARTIAL_SENT
+        await _assert_consistent(nid)
+
+    async def test_first_attempt_nothing_accepted_folds_failed(
+        self,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 2)
+        recipient = await create_recipient(db_session)
+        nid = await _intake(db_session, recipient.id)
+        spy = _Spy({"in_app": EmailTransientError("provider error (503)")})
+        await self._tear_every_attempt(spy, 2)
+        (delivery,) = await _deliveries(nid)
+        assert (delivery.status, delivery.failure_class) == (
+            DeliveryStatus.FAILED,
+            FailureClass.PIPELINE,
+        )
+        job_rows = _of(
+            await _rows(nid), step=JournalStep.CEILING, subject=JournalSubject.JOB
+        )
+        assert [r.outcome for r in job_rows] == [NotificationStatus.FAILED]
+        await _assert_consistent(nid)
+
+    async def test_accepted_but_the_audience_is_gone_at_the_ceiling(
+        self,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Branch (b) of the KNOWN CEILING on
+        app/engine/processor.py _close_at_ceiling: the letter was
+        accepted, the recipient is deactivated before the ceiling, the
+        resolve there finds nobody -- NO_RECIPIENTS, the status resolve
+        gives. The journal keeps the accepted answer (the trigger)."""
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 2)
+        recipient = await create_recipient(db_session)
+        nid = await _intake(db_session, recipient.id)
+        spy = _Spy()
+        await self._tear_every_attempt(spy, 1)
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(Recipient)
+                .where(Recipient.id == recipient.id)
+                .values(active=False)
+            )
+            await session.commit()
+        await self._tear_every_attempt(spy, 1)
+        assert (await _job(nid)).status == NotificationStatus.NO_RECIPIENTS
+        assert _of(
+            await _rows(nid),
+            subject=JournalSubject.CHANNEL,
+            outcome=ChannelAnswer.ACCEPTED,
+        )
+        await _assert_consistent(nid)
+
+    def test_the_ceiling_sets_a_status_only_where_there_is_nothing_to_fold(
+        self,
+    ) -> None:
+        """_close_at_ceiling assigns the job's status once: in the branch
+        where the resolve failed. Every other outcome is the fold's."""
+        tree = ast.parse((_APP / "engine" / "processor.py").read_text())
+        (function,) = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "_close_at_ceiling"
+        ]
+        assigned = []
+        for branch in ast.walk(function):
+            if not isinstance(branch, ast.If):
+                continue
+            for node in ast.walk(branch):
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Attribute) and t.attr == "status"
+                    for t in node.targets
+                ):
+                    assigned.append((ast.unparse(branch.test), ast.unparse(node.value)))
+        everywhere = [
+            n
+            for n in ast.walk(function)
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Attribute) and t.attr == "status" for t in n.targets
+            )
+        ]
+        assert len(everywhere) == 1
+        assert ("not resolved", "NotificationStatus.FAILED") in assigned
+        assert "rollup_notification" in ast.unparse(function)  # the pair
+
+    def test_one_marker_names_every_branch(self) -> None:
+        tag = "KNOWN CEILING (acknowledged by design -- P2-1, ceiling without"
+        hits = [
+            (path, text)
+            for path in sorted(_APP.rglob("*.py"))
+            for text in [path.read_text()]
+            if tag in text
+        ]
+        assert [p.name for p, _ in hits] == ["processor.py"]
+        ((_, text),) = hits
+        assert text.count(tag) == 1
+        marker = text[text.index(tag) :]
+        marker = marker[: marker.index('"""')]
+        for point in range(1, 7):
+            assert f"      {point}. " in marker
+        for branch in (
+            "(a) the resolve in the savepoint fails",
+            "(b) the resolve finds nobody",
+            "(c) a recipient whose letter was",
+        ):
+            assert branch in marker
 
     async def test_expiry_after_a_torn_attempt_closes_the_accepted_sent(
         self,
@@ -1340,19 +1502,22 @@ def _lock_timeout(ms: int) -> Iterator[None]:
         event.remove(sync_engine, "checkout", on_checkout)
 
 
-class TestLockRule:
-    """Every connection in these tests waits at most 2 s for a lock, so
-    a lock conflict FAILS a test instead of hanging the suite -- for
-    every pass of the pipeline in the test, not only the one under
-    scrutiny."""
+@pytest.fixture(autouse=True)
+async def bounded_lock_waits() -> Any:
+    """Every connection in EVERY test of this module waits at most 2 s
+    for a lock: a lock conflict -- a channel answer journaled while the
+    attempt holds FOR UPDATE, a channel called from a closing
+    transaction -- FAILS a test instead of hanging the suite."""
+    try:
+        with _lock_timeout(2000):
+            yield
+    finally:
+        await dispose_engine()  # drop connections carrying the setting
 
-    @pytest.fixture(autouse=True)
-    async def bounded_lock_waits(self) -> Any:
-        try:
-            with _lock_timeout(2000):
-                yield
-        finally:
-            await dispose_engine()  # drop connections carrying the setting
+
+class TestLockRule:
+    """Lock waits are bounded module-wide (bounded_lock_waits): a lock
+    conflict fails these tests instead of hanging the suite."""
 
     async def test_the_answer_is_written_while_the_attempt_holds_its_lock(
         self,
@@ -1368,6 +1533,25 @@ class TestLockRule:
             outcome=ChannelAnswer.ACCEPTED,
         )
         assert (await _job(nid)).status == NotificationStatus.SENT
+
+    async def test_the_ceiling_resolve_does_not_wait_on_its_own_lock(
+        self,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The closing transaction holds the job FOR UPDATE and runs the
+        resolve under it: nothing in it waits on that lock (a wait would
+        fail here by lock_timeout, not hang)."""
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 1)
+        recipient = await create_recipient(db_session)
+        nid = await _intake(db_session, recipient.id)
+        with (
+            _channel(_Spy()),
+            patch.object(processor, "rollup_notification", _poisoned_rollup),
+        ):
+            await process_pending_notifications()
+        assert (await _job(nid)).status == NotificationStatus.SENT
+        assert len(await _deliveries(nid)) == 1
 
     async def test_expiry_waits_for_the_attempt(
         self,

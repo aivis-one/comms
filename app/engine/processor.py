@@ -53,10 +53,12 @@
 #   a gate, pipeline_retry_at, and the selection skips it until then:
 #   oldest-first stays the order, the gate is what keeps a failing job
 #   from starving the healthy ones and keeps the healthy ones from
-#   starving it. At the ceiling the job is closed: waiting deliveries
-#   FAILED with class `pipeline` (SENT, where the channel already
-#   accepted the letter), the job folded (or FAILED outright when it
-#   has no deliveries -- resolve was the step that tore).
+#   starving it. At the ceiling the job is closed (_close_at_ceiling):
+#   a job whose deliveries were never committed is resolved first, in
+#   the closing transaction; then waiting deliveries are FAILED with
+#   class `pipeline` (SENT, where the channel already accepted the
+#   letter) and the job is folded. FAILED outright only when that
+#   resolve itself fails.
 #
 # A LETTER THE CHANNEL TOOK IS NOT SENT TWICE (the T12 resend, closed
 # in P2-1): every channel answer is journaled in its own transaction
@@ -75,6 +77,7 @@ from uuid import UUID
 
 import structlog
 from sqlalchemy import and_, delete, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_session_factory
@@ -340,22 +343,7 @@ async def _record_pipeline_failure(
                 session, notification, torn,
                 error=notification.pipeline_error,
             )
-            closed = await close_waiting_deliveries(
-                session,
-                notif_id,
-                DeliveryStatus.FAILED,
-                JournalStep.CEILING,
-                failure_class=FailureClass.PIPELINE,
-            )
-            if notification.status == NotificationStatus.PROCESSING:
-                await rollup_notification(
-                    session, notification, JournalStep.CEILING,
-                )
-            else:
-                # PENDING: resolve never committed, there are no
-                # deliveries to fold.
-                notification.status = NotificationStatus.FAILED
-                journal.record_job(session, notification, JournalStep.CEILING)
+            closed = await _close_at_ceiling(session, notification)
             await session.commit()
             logger.error(
                 "notification_pipeline_failed",
@@ -372,6 +360,97 @@ async def _record_pipeline_failure(
                 notification_id=str(notif_id),
                 exception=sanitized_traceback(record_exc),
             )
+
+
+async def _close_at_ceiling(
+    session: AsyncSession, notification: Notification,
+) -> int:
+    """Close a job whose pipeline exhausted its attempts. Returns the
+    number of deliveries closed.
+
+    The job's status is never set here except in the one branch below
+    where there is nothing to fold: every other outcome is THE FOLD's
+    (app/engine/service.py), the rule every closing path uses.
+
+    A job still PENDING has no committed deliveries -- each attempt's
+    resolve went with its rollback -- yet the channel may have accepted
+    letters in those attempts (journal: CHANNEL rows, `accepted`). So
+    the deliveries are materialized first, by the same resolve the
+    attempt runs, in a SAVEPOINT of this closing transaction; then the
+    waiting ones close like any job's at the ceiling: SENT where the
+    channel accepted, FAILED / pipeline otherwise; then the fold. The
+    channel is never called here.
+
+    The savepoint is what keeps a resolve that fails again from taking
+    the failure record with it: the record (pipeline_* and the job row)
+    is flushed before the savepoint opens, and only the savepoint rolls
+    back -- without it the closing transaction would roll back whole,
+    the job would stay active with its count unchanged, and come back
+    to the ceiling forever.
+
+    KNOWN CEILING (acknowledged by design -- P2-1, ceiling without
+    deliveries):
+      1. Mechanics: a letter the channel accepted is not reflected in
+         the job's status when the deliveries cannot carry it at the
+         ceiling: (a) the resolve in the savepoint fails -- the job
+         closes FAILED with no deliveries; (b) the resolve finds nobody
+         or everyone muted -- the job is NO_RECIPIENTS / SUPPRESSED,
+         the status resolve gives; (c) a recipient whose letter was
+         accepted fell out of the audience since (deactivated, muted,
+         left the group) -- no delivery is made for them and the fold
+         does not count their letter. The journal keeps the accepted
+         answer in all three: the path is true, the status is not.
+      2. Status: acknowledged by design.
+      3. Backlog ref: none -- the branches need a failing resolve or a
+         changed audience between a torn attempt and the ceiling;
+         nothing has been observed to file.
+      4. Promotion trigger (observable): a CHANNEL row `accepted` in the
+         journal of a job whose status does not reflect a send (FAILED,
+         NO_RECIPIENTS or SUPPRESSED, or a fold without that triple's
+         SENT delivery).
+      5. Agreed fix: materialize, for every accepted triple without a
+         delivery after the resolve, a SENT delivery from the journal
+         row itself, and hand all of them to THE FOLD.
+      6. Rejected: closing the job from the journal past the fold
+         (setting SENT / PARTIAL_SENT directly) -- the fold is the one
+         rule of a job's outcome, and a second one would decide
+         differently on the same deliveries.
+    """
+    if notification.status == NotificationStatus.PENDING:
+        resolved = await _resolve_at_ceiling(session, notification)
+        if not resolved:
+            # Nothing to fold: the resolve failed (branch (a) above).
+            notification.status = NotificationStatus.FAILED
+            journal.record_job(session, notification, JournalStep.CEILING)
+            return 0
+    closed = await close_waiting_deliveries(
+        session,
+        notification.id,
+        DeliveryStatus.FAILED,
+        JournalStep.CEILING,
+        failure_class=FailureClass.PIPELINE,
+    )
+    await rollup_notification(session, notification, JournalStep.CEILING)
+    return closed
+
+
+async def _resolve_at_ceiling(
+    session: AsyncSession, notification: Notification,
+) -> bool:
+    """Resolve inside a savepoint; False when it fails (rolled back to
+    the savepoint, the job re-read). See _close_at_ceiling."""
+    try:
+        async with session.begin_nested():
+            await resolve_notification(session, notification)
+    except Exception as exc:
+        logger.error(
+            "notification_ceiling_resolve_error",
+            notification_id=str(notification.id),
+            exception=sanitized_traceback(exc),
+        )
+        await session.refresh(notification)
+        return False
+    return True
 
 
 async def cleanup_expired_notifications() -> int:
