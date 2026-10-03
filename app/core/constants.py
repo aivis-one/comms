@@ -90,6 +90,14 @@ PAGE_LIMIT_DEFAULT = 20
 HEALTH_WINDOW_MAX_MINUTES = 1440
 HEALTH_WINDOW_DEFAULT_MINUTES = 60
 
+# How many journal rows one page of the changes feed may scan (P2-3,
+# app/engine/changes.py). A page stops at `limit` distinct jobs or at
+# this many rows, whichever comes first: a broadcast that wrote ten
+# thousand rows in one transaction is walked in pages of this size, its
+# key repeated once per page -- a bounded repeat, never an unbounded
+# scan.
+CHANGES_SCAN_ROWS = 5000
+
 # recipients.version is a BigInteger: the snapshot version's ceiling is
 # the column's (F1.4). The floor is 1 -- 0 marks rows written before
 # versions existed (migration 0014).

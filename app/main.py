@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from app.api.changes import router as changes_router
 from app.api.channels import router as channels_router
 from app.api.errors import register_error_handlers
 from app.api.inbox import router as inbox_router
@@ -120,6 +121,7 @@ app = FastAPI(
 register_error_handlers(app)
 app.include_router(inbox_router)
 app.include_router(jobs_router)
+app.include_router(changes_router)
 app.include_router(prefs_router)
 app.include_router(messaging_router)
 app.include_router(sections_router)

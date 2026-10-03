@@ -229,6 +229,15 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "WHERE ((subject)::text = 'channel'::text)"
         ),
     ),
+    # The changes feed's order from a cursor (P2-3, migration 0019).
+    "ix_transitions_changes": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_transitions_changes "
+            "ON public.notification_transitions USING btree (xact_id, id) "
+            "INCLUDE (notification_id)"
+        ),
+    ),
     # The address book listing's keyset order (P2-4, migration 0018).
     "ix_recipients_book": IndexShape(
         unique=False,

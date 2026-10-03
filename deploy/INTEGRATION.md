@@ -304,17 +304,19 @@ body, with a class a program can branch on:
 | 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator |
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
+| 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 422 | `validation` | the input is wrong; `fields` names each input |
 | 500 | `internal` | our defect; the text carries nothing from it |
 
 The message is for a human; the class is the contract.
 
 **One way to page.** Every listing -- the inbox, the visible threads, a
-thread's messages, a job's deliveries and its path, the address book --
-takes `limit` (1..100, default 20) and `cursor`
+thread's messages, a job's deliveries and its path, the address book,
+the changes feed -- takes `limit` (1..100, default 20) and `cursor`
 (the previous page's `next_cursor`, opaque) and answers
 `{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
-`unread` badge beside them. A `limit` outside 1..100 is **refused**
+`unread` badge beside them, and the changes feed's `next_cursor` is
+never `null` (section 9). A `limit` outside 1..100 is **refused**
 (422), not clamped, and so is a malformed cursor.
 
 **Repeating a call.** A call that creates takes a required
@@ -862,6 +864,87 @@ One row per transition, in order.
 | `category` | the category a mute gate decided by, or `null` |
 | `error` | an exception of comms' own: class and place, never its text; or `null` |
 | `provider_text` | the provider's answer, sanitized; `null` when it said nothing or its recipient was forgotten |
+
+## 9. What changed since a cursor
+
+A push from comms is a hint; the read by key (section 8) is the truth.
+A product that was down -- longer than the stream keeps its pushes, or
+at all -- asks which of its jobs changed while it was not listening, and
+reads each of them by its key.
+
+    GET /api/v1/notifications/changes?limit=20&cursor=<next_cursor>
+
+```json
+{
+  "items": [
+    {"idempotency_key": "order-42:paid"}
+  ],
+  "next_cursor": "<opaque>"
+}
+```
+
+| field | value |
+|---|---|
+| `idempotency_key` | the key of a job that changed after the cursor -- the key the product sent; read the job by it |
+
+That is all an item says: no status, no channel, never the letter. What
+changed is in the read.
+
+**The cursor.** Opaque; send back the `next_cursor` of the last page,
+and keep it where your own state is kept. **It is never `null`**: a page
+with nothing new still answers with a cursor to continue from, and
+`items: []` means "nothing newer than this, for now". **Without a
+cursor** the feed starts at the beginning of what comms keeps (section
+"How long comms keeps things") -- the first call of a new product, and
+the call of one that lost its cursor. Starting over repeats keys you
+have seen; reading a key twice is harmless.
+
+**Repeats are bounded, losses are not allowed.** A key appears once on
+a page. It appears again on a later page only when its job changed
+again -- or when one job wrote more than one page's worth of steps at
+once (a broadcast): then its key heads the following page too. Repeating
+the same cursor answers the same items (the `next_cursor` differs only
+in when it was read).
+
+**The feed is late, not lossy.** A change shows up only once comms is
+sure nothing written before it can still appear: the feed waits for
+every transaction that was running when it was read. The longest
+transaction in comms is a delivery attempt calling a channel, up to that
+call's timeout -- so the feed can lag by that long, and by any longer
+transaction open on comms' database. Nothing is skipped; the next read
+brings it.
+
+**A cursor older than the retention period is refused**: 410
+`cursor_expired`. What changed after it may already be deleted, and
+continuing would hide that. A product that polls never meets it -- every
+read, an empty one too, refreshes the cursor. One that was down for
+longer: read each key it still holds as unfinished by key (section 8),
+then start the feed again without a cursor. With retention switched off
+(0) a cursor never expires. One residue is not caught: a job older than
+the retention period that changed after your cursor may be deleted
+before you read it -- its read by key answers 404.
+
+**Answers.** The same service token as every route (401 without it).
+`limit` outside 1..100 -> 422 `validation`; a malformed cursor, one from
+another listing, or one comms could not have issued (from the future)
+-> 422 `validation`. The feed reads only.
+
+**Recovering after downtime.**
+
+    1. Keep the last next_cursor with your own state, after you have
+       acted on its page -- never before.
+    2. Start: read the feed from the kept cursor (none -> from the start).
+    3. For each item: read the job by its key (section 8) and update
+       your record from the read.
+    4. Store the page's next_cursor; repeat from 2 until a page comes
+       back with items: [].
+    5. Keep polling at your own pace; a push, when it comes, only says
+       "go read" sooner.
+    6. 410 cursor_expired: read every key you hold as unfinished by key,
+       then start again at 2 without a cursor.
+
+Jobs only: a request refused at intake is not a job and is not in the
+feed -- the read by key of your own key shows it (section 8).
 
 ## Operating the comms stack
 
