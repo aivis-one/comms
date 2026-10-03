@@ -177,6 +177,18 @@ class Notification(UUIDMixin, Base):
         nullable=True,
     )
 
+    # What the type pushes back to the product, AT INTAKE (P3-1, spec
+    # §7.4): an app/profile/registry.py PushOn value, snapshotted like
+    # `channels` and `category`, so a restart with another profile
+    # never changes what an accepted job pushes. Read by
+    # app/engine/journal.py push_due; the CHECK ck_notifications_push_on
+    # is in migration 0020. Width 24: the longest value,
+    # "outcome_and_deferral", is 20.
+    push_on: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+    )
+
     # The product's own reference from the envelope (F1.2). Stored and
     # handed back untouched; comms never interprets it. Cancellation
     # matches it by EQUALITY -- a comparison, not a reading (F1.3).
@@ -538,5 +550,39 @@ class NotificationTransition(Base):
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("clock_timestamp()"),
+        nullable=False,
+    )
+
+
+class PushOutbox(Base):
+    """A push owed to the product: "the job changed, go read it" (P3-1,
+    spec §7.6). The reverse transactional outbox.
+
+    WRITTEN in the transaction of the transition that owes it, by the
+    one writer of transitions (app/engine/journal.py), so a rolled-back
+    transition owes nothing. PUBLISHED after the commit by the relay
+    (app/transport/push_relay.py), which XADDs the job's idempotency
+    key and then DELETES the row: a published row has no reader, so
+    deleting it is the mark. A relay that dies between the two
+    publishes the key again -- a duplicate, harmless (spec §7.2).
+
+    ONLY THE JOB: no status, no channel, never the letter -- the key is
+    looked up at publish time. Rows go with their job (ON DELETE
+    CASCADE); the index on notification_id is the cascade's lookup
+    (migration 0020, app/core/schema_objects.py).
+    """
+
+    __tablename__ = "push_outbox"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=True), primary_key=True,
+    )
+    notification_id: Mapped[UUID] = mapped_column(
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
         nullable=False,
     )

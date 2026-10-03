@@ -867,7 +867,8 @@ One row per transition, in order.
 
 ## 9. What changed since a cursor
 
-A push from comms is a hint; the read by key (section 8) is the truth.
+A push from comms (section 10) is a hint; the read by key (section 8)
+is the truth.
 A product that was down -- longer than the stream keeps its pushes, or
 at all -- asks which of its jobs changed while it was not listening, and
 reads each of them by its key.
@@ -938,13 +939,98 @@ another listing, or one comms could not have issued (from the future)
        your record from the read.
     4. Store the page's next_cursor; repeat from 2 until a page comes
        back with items: [].
-    5. Keep polling at your own pace; a push, when it comes, only says
-       "go read" sooner.
+    5. Keep polling at your own pace; a push (section 10), when it
+       comes, only says "go read" sooner.
     6. 410 cursor_expired: read every key you hold as unfinished by key,
        then start again at 2 without a cursor.
 
 Jobs only: a request refused at intake is not a job and is not in the
 feed -- the read by key of your own key shows it (section 8).
+
+## 10. The push stream
+
+A push says "this job changed -- go read it". It is a hint: the read by
+key (section 8) is the truth, and a product that never listens loses
+nothing but speed -- it reads by key and by the changes feed (section
+9). comms never calls the product: it writes pushes into its own redis
+(`COMMS_REDIS_URL`), and the product listens, the way comms listens to
+the product's events.
+
+**The stream.** `<COMMS_EVENTS_STREAM>:changes` -- with the default
+event stream, `comms:events:changes`. comms creates it with its first
+push. It is capped at `CHANGES_STREAM_MAXLEN` entries (default 100000,
+approximate trimming): the oldest pushes are dropped, never the jobs.
+
+**An entry.** Plain stream fields, nothing else:
+
+| field | value |
+|---|---|
+| `v` | the push format version, `1`; a listener that meets another value stops and reconciles by the changes feed (section 9) |
+| `idempotency_key` | the key of a job that changed -- the key the product sent; read the job by it (section 8) |
+
+That is all a push says: no status, no channel, never the letter. What
+changed is in the read.
+
+**What pushes** is declared per type in the profile, `push_on`, and
+taken at intake: a job keeps the value its type had when it was
+accepted.
+
+| `push_on` | a push comes when |
+|---|---|
+| `outcome` | the job reaches its outcome -- any status other than `pending` and `processing` |
+| `outcome_and_deferral` | the job reaches its outcome, and each time the job or one of its deliveries is put behind a timed wait: the recipient's schedule, the provider's rate limit, comms' own backoff after a transient failure, the pipeline's retry gate |
+| `none` | never -- the default, for a type that does not declare it |
+
+Accepted, queued and in flight are not pushed: that is noise, and the
+read shows them. A delivery that ends while the job goes on is not
+pushed either; the job's outcome is.
+
+**After the commit, at least once, in any order.** A push is published
+only once the change it announces has committed, so the read always
+finds it. A push may come twice, and two pushes of one job may come in
+either order: both lead to the same read of the current job, so a
+listener needs no ordering and no deduplication. A burst of changes of
+one job may come as one push.
+
+**A push can be lost; a result cannot.** Pushes written while the
+product was not listening stay in the stream until it is trimmed. A
+listener that starts -- the first time or after any stop -- first reads
+the changes feed from its kept cursor (section 9), then follows the
+stream; that is the whole recovery, and it covers a trimmed stream too.
+
+**A listener**, whole -- `redis` is an asyncio client on
+`COMMS_REDIS_URL`; `read_job` is your read by key (section 8) and your
+own update from it; `reconcile` is the recovery of section 9:
+
+```python
+STREAM = f"{COMMS_EVENTS_STREAM}:changes"
+GROUP, NAME = "product", "listener-1"   # your group; a stable name
+
+
+async def listen(redis, read_job, reconcile):
+    try:
+        await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
+    except ResponseError as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
+    await reconcile()                   # what changed while you were away
+    start = "0"                         # your own unacked entries first
+    while True:
+        reply = await redis.xreadgroup(
+            GROUP, NAME, {STREAM: start}, count=100, block=5000,
+        )
+        entries = reply[0][1] if reply else []
+        if start == "0" and not entries:
+            start = ">"                 # then the new ones
+        for entry_id, fields in entries:
+            if fields[b"v"] != b"1":
+                raise RuntimeError("unknown push format: reconcile")
+            await read_job(fields[b"idempotency_key"].decode())
+            await redis.xack(STREAM, GROUP, entry_id)
+```
+
+Read, then acknowledge -- never the reverse: an entry acknowledged
+before its read is lost if the listener dies in between.
 
 ## Operating the comms stack
 

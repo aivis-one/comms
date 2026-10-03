@@ -67,6 +67,23 @@ class Layer(StrEnum):
     DEFAULT = "default"
 
 
+class PushOn(StrEnum):
+    """What a type pushes back to the product (spec §7.4): the values of
+    the profile field `push_on`, in the order the schema publishes them
+    (app/profile/loader.py PUSH_ON). A job keeps the value it was
+    accepted with (notifications.push_on); which transition each value
+    pushes is decided in one place, app/engine/journal.py push_due.
+    """
+
+    # The job's outcome only (a terminal status).
+    OUTCOME = "outcome"
+    # The outcome, and every transition that puts the job or one of its
+    # deliveries behind a timed gate (a journal row with wait_until).
+    OUTCOME_AND_DEFERRAL = "outcome_and_deferral"
+    # Nothing: the product reads (the default).
+    NONE = "none"
+
+
 @dataclass(frozen=True)
 class Decided:
     """One field of one type: the value and who decided it.

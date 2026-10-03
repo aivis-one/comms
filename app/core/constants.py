@@ -98,6 +98,14 @@ HEALTH_WINDOW_DEFAULT_MINUTES = 60
 # scan.
 CHANGES_SCAN_ROWS = 5000
 
+# The push relay (P3-1, app/transport/push_relay.py): how often it looks
+# at the outbox, and how many outbox rows one tick reads. Constants, not
+# settings: neither is a decision a deploy has to make -- a push is a
+# hint that only makes the product read sooner, and the worker's own
+# idle wait (up to a minute) dwarfs a one-second tick.
+PUSH_RELAY_INTERVAL_SECONDS = 1.0
+PUSH_RELAY_BATCH = 500
+
 # recipients.version is a BigInteger: the snapshot version's ceiling is
 # the column's (F1.4). The floor is 1 -- 0 marks rows written before
 # versions existed (migration 0014).

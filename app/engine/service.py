@@ -485,7 +485,8 @@ async def create_notification(
         session: Active DB session (caller commits).
         type: A notification type key declared by the product profile.
             The type's CHANNELS come from its profile record and are
-            snapshotted onto the row -- the caller never names one.
+            snapshotted onto the row -- the caller never names one; so
+            are its category and its push_on (what it pushes back).
         title: Stored fallback title (the letter).
         body: Stored fallback body (the letter).
         target_type: TargetType value (user, group, all).
@@ -552,6 +553,7 @@ async def create_notification(
 
     channels = list(record.value("channels"))
     category = record.value("category")
+    push_on = record.value("push_on")
 
     notification = Notification(
         type=type,
@@ -562,6 +564,7 @@ async def create_notification(
         action_data=action_data,
         channels=channels,
         category=category,
+        push_on=push_on,
         correlation=correlation,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
@@ -703,7 +706,9 @@ async def resolve_notification(
             )
             session.add(delivery)
             deliveries.append(delivery)
-            journal.record_delivery(session, delivery, JournalStep.RESOLVE)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.RESOLVE,
+            )
 
     notification.status = NotificationStatus.PROCESSING
     journal.record_job(session, notification, JournalStep.RESOLVE)
@@ -856,7 +861,9 @@ async def deliver_notification(
         )
         if accepted_at is not None:
             _close_accepted(delivery, accepted_at)
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
             logger.info(
                 "delivery_closed_from_journal",
                 delivery_id=str(delivery.id),
@@ -869,7 +876,9 @@ async def deliver_notification(
         # person the product removed is not asked about their mutes. --
         if not recipient.active:
             delivery.status = DeliveryStatus.RECIPIENT_INACTIVE
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
             logger.info(
                 "delivery_recipient_inactive",
                 delivery_id=str(delivery.id),
@@ -881,7 +890,8 @@ async def deliver_notification(
         if delivery.recipient_id in muted:
             delivery.status = DeliveryStatus.SUPPRESSED
             journal.record_delivery(
-                session, delivery, JournalStep.DELIVER, category=category,
+                session, notification, delivery, JournalStep.DELIVER,
+                category=category,
             )
             logger.info(
                 "delivery_muted_skipped",
@@ -899,7 +909,9 @@ async def deliver_notification(
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
             delivery.wait_reason = WaitReason.RECIPIENT_SCHEDULE
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
             # Causality flag: the deferral pushes the delivery past
             # the notification's expiry -> step-0 will EXPIRE it
             # before it ever sends. Deliberate (a reminder deferred
@@ -1020,7 +1032,9 @@ async def deliver_notification(
                 delivery.sent_at = datetime.now(UTC)
             else:
                 _apply_transient_failure(delivery, outcome.error)
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
 
     await session.flush()
 
@@ -1360,7 +1374,7 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     for notification in parents:
         closed += await close_waiting_deliveries(
             session,
-            notification.id,
+            notification,
             DeliveryStatus.RECIPIENT_INACTIVE,
             JournalStep.WITHDRAW,
             NotificationDelivery.recipient_id == recipient_id,
@@ -1424,7 +1438,7 @@ async def close_notifications(
             journal.record_job(session, notification, step)
             continue
         await close_waiting_deliveries(
-            session, notification.id, delivery_outcome, step,
+            session, notification, delivery_outcome, step,
         )
         await rollup_notification(session, notification, step)
     await session.flush()
@@ -1433,7 +1447,7 @@ async def close_notifications(
 
 async def close_waiting_deliveries(
     session: AsyncSession,
-    notification_id: UUID,
+    notification: Notification,
     outcome: DeliveryStatus,
     step: JournalStep,
     *conditions: Any,
@@ -1454,6 +1468,7 @@ async def close_waiting_deliveries(
     The caller holds the job's row lock and folds the job afterwards.
     Returns the number of deliveries closed.
     """
+    notification_id = notification.id
     waiting = (
         NotificationDelivery.notification_id == notification_id,
         NotificationDelivery.status == DeliveryStatus.PENDING,
@@ -1472,7 +1487,7 @@ async def close_waiting_deliveries(
             if accepted_at is None:
                 continue
             _close_accepted(delivery, accepted_at)
-            journal.record_delivery(session, delivery, step)
+            journal.record_delivery(session, notification, delivery, step)
             closed += 1
         await session.flush()
     rows = await session.execute(

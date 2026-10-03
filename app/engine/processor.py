@@ -425,7 +425,7 @@ async def _close_at_ceiling(
             return 0
     closed = await close_waiting_deliveries(
         session,
-        notification.id,
+        notification,
         DeliveryStatus.FAILED,
         JournalStep.CEILING,
         failure_class=FailureClass.PIPELINE,

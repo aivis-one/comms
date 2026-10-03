@@ -13,18 +13,25 @@
 # only process that needs Redis (API and worker are DB-only), so an
 # empty REDIS_URL must kill the CONSUMER at boot -- and only it.
 #
+# TWO LOOPS, ONE PROCESS (P3-1): the stream consumer reads the product's
+# events; the push relay (app/transport/push_relay.py) publishes the
+# pushes comms owes the product into comms' own redis. The relay lives
+# here because this is the process that already holds redis. It never
+# ends on its own -- a failed tick is retried -- so a loop that ends
+# is the consumer's: its exception, as before, ends the process (the
+# container restarts it), and the relay is cancelled with it.
+#
 # The profile is installed at startup: ingest validates notification
 # types against the registry (via create_notification), so a consumer
 # without a profile would dead-letter every request.
 #
-# Handles SIGTERM/SIGINT by cancelling the loop task. An entry caught
+# Handles SIGTERM/SIGINT by cancelling both loop tasks. An entry caught
 # mid-flight rolls back UNACKED (cancellation interrupts inner
 # awaits); the next start's pending drain replays it -- at-least-once
 # holds by replay, not by graceful completion (review 3c.1).
 # =============================================================================
 
 import asyncio
-import contextlib
 import signal
 
 import structlog
@@ -34,26 +41,40 @@ from app.core.database import dispose_engine
 from app.core.logging import setup_logging
 from app.profile.loader import install_profile_from_settings
 from app.transport.consumer import run_consumer_loop
+from app.transport.push_relay import run_push_relay_loop
 
 logger = structlog.get_logger()
 
 
 async def _main() -> None:
-    """Run the consumer loop with graceful shutdown on signals."""
+    """Run the consumer loop and the push relay with graceful shutdown
+    on signals; the first loop to end ends both, and its exception is
+    raised once the other is cancelled and the engine disposed."""
     loop = asyncio.get_running_loop()
-    task = asyncio.ensure_future(run_consumer_loop())
+    tasks = (
+        asyncio.ensure_future(run_consumer_loop()),
+        asyncio.ensure_future(run_push_relay_loop()),
+    )
 
     def _request_shutdown() -> None:
         logger.info("consumer_shutdown_requested")
-        task.cancel()
+        for task in tasks:
+            task.cancel()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _request_shutdown)
 
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in tasks:
+        task.cancel()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     await dispose_engine()
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(
+            result, asyncio.CancelledError,
+        ):
+            raise result
 
 
 def main() -> None:

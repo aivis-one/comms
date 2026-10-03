@@ -26,6 +26,12 @@ from tests.helpers import create_recipient
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _BEFORE = "0012_envelope_intake"
+# The revision under test. The steps below went to "head" while head's
+# notifications had the column list _job inserts with; 0020 (P3-1) made
+# push_on NOT NULL, and a row inserted at head without it is refused --
+# a fact about 0020, not about 0013. The test now stops at its own
+# revision; the fixture still returns the schema to head afterwards.
+_SUBJECT = "0013_lifecycle_outcomes"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
@@ -134,7 +140,7 @@ async def test_migration_0013(at_head_afterwards: None) -> None:
         ("with_failed_delivery", with_failed),
     ):
         await make()
-        stderr = await _migrate("upgrade", "head", expect_ok=False)
+        stderr = await _migrate("upgrade", _SUBJECT, expect_ok=False)
         assert f"{kind}=1" in stderr, (kind, stderr[-600:])
         # The refusal names the command that drains it (F1.5; before, it
         # pointed at a section of raw queries in the document, which an
@@ -158,7 +164,7 @@ async def test_migration_0013(at_head_afterwards: None) -> None:
     sent_child = await _delivery(sent, rid, "sent", gated=True)
     late_muted = await _delivery(sent, rid, "skipped")
 
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _SUBJECT)
     assert await _status("notifications", muted) == "suppressed"
     for child in muted_children:
         assert await _status("notification_deliveries", child) == "suppressed"
@@ -193,6 +199,6 @@ async def test_migration_0013(at_head_afterwards: None) -> None:
     # -- and up again, after the drain the downgrade made necessary ---------
     await _sql("DELETE FROM notifications WHERE id IN (:a, :b, :c)",
                a=cancelled, b=nobody, c=expired_parent)
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _SUBJECT)
     assert await _status("notifications", muted) == "suppressed"
     assert await _status("notifications", sent) == "sent"

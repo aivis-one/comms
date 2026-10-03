@@ -158,6 +158,7 @@ from app.profile.registry import (
     Decided,
     Layer,
     ProfileRegistry,
+    PushOn,
     TemplateTree,
     TypeRecord,
     registry,
@@ -208,9 +209,12 @@ _DEFAULT_LANE = "normal"
 # What to push to the product (spec §7.4): one of three declarations --
 # the outcome only, the outcome and deferrals, or nothing. A closed
 # set of three, not a free subset: {deferral} alone is not a
-# declaration §7.4 offers, so it must not be writable.
-PUSH_ON: tuple[str, ...] = ("outcome", "outcome_and_deferral", "none")
-_DEFAULT_PUSH_ON = "none"
+# declaration §7.4 offers, so it must not be writable. The values are
+# the registry's PushOn: the job keeps the one it was accepted with
+# (notifications.push_on), and app/engine/journal.py push_due decides
+# what each pushes.
+PUSH_ON: tuple[str, ...] = tuple(value.value for value in PushOn)
+_DEFAULT_PUSH_ON = PushOn.NONE.value
 
 # Duration literal: a positive integer and one unit letter. No
 # fractions, no compound forms ("1h30m"), no bare numbers -- a bare

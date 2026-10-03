@@ -325,13 +325,15 @@ def intake_fields() -> dict[str, str]:
 def notification_row_fields(channels: list[str] | None = None) -> dict[str, object]:
     """The NOT NULL intake columns for a Notification built DIRECTLY
     (tests that construct rows around intake, F1.2). A fresh key, the
-    test fingerprint, the channels the row is for (in_app unless said)
-    and the default expiry layer -- what intake would have written for a
-    type with no declared expiry."""
+    test fingerprint, the channels the row is for (in_app unless said),
+    the default expiry layer and the default push_on -- what intake
+    would have written for a type with no declared expiry and no
+    declared push_on (P3-1)."""
     return {
         **intake_fields(),
         "channels": channels if channels is not None else ["in_app"],
         "expiry_layer": "default",
+        "push_on": "none",
     }
 
 

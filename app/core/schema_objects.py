@@ -238,6 +238,15 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "INCLUDE (notification_id)"
         ),
     ),
+    # The lookup of the ON DELETE CASCADE from notifications into the
+    # reverse outbox (P3-1, migration 0020).
+    "ix_push_outbox_notification": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_push_outbox_notification "
+            "ON public.push_outbox USING btree (notification_id)"
+        ),
+    ),
     # The address book listing's keyset order (P2-4, migration 0018).
     "ix_recipients_book": IndexShape(
         unique=False,
@@ -296,6 +305,9 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_transitions_provider_text",
     "ck_transitions_error_not_blank",
     "ck_transitions_attempt_not_negative",
+    # What a job pushes is one of the three PushOn values, never NULL
+    # (P3-1, migration 0020).
+    "ck_notifications_push_on",
 })
 
 # Everything the schema must carry although the metadata never mentions

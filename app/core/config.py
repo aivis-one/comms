@@ -112,6 +112,10 @@ NUMERIC_BOUNDS: dict[str, Bound] = {
         1, 10_000_000, "XADD MAXLEN: 0 trims every entry -- a dead-letter "
         "queue that keeps nothing",
     ),
+    "changes_stream_maxlen": Bound(
+        1, 10_000_000, "XADD MAXLEN of the push stream: 0 trims every "
+        "push as it is written -- a stream no listener can read",
+    ),
     "notification_poll_interval_seconds": Bound(
         1, 3600, "0 is a busy loop on the database; above an hour a "
         "scheduled_at is honored an hour late",
@@ -228,6 +232,24 @@ class Settings(BaseSettings):
     def dlq_stream(self) -> str:
         """Dead-letter stream name, derived from the main stream."""
         return f"{self.comms_events_stream}:dlq"
+
+    # -- Event transport, the reverse direction (P3-1, spec §7) --
+    # comms XADDs the key of a job that changed into this stream of its
+    # own redis (the relay in the consumer process,
+    # app/transport/push_relay.py); the product listens. The NAME is
+    # derived from the inbound stream, like the DLQ's -- it can be
+    # neither the inbound stream nor the DLQ, so comms never reads its
+    # own pushes -- and is FROZEN CONTRACT surface (deploy/INTEGRATION.md
+    # section 10). The cap is approximate MAXLEN trimming: a product
+    # away for longer than the stream holds reconciles by the changes
+    # feed (section 9), which is why a push may be lost and a result
+    # may not.
+    changes_stream_maxlen: int = 100_000
+
+    @property
+    def changes_stream(self) -> str:
+        """The push stream's name, derived from the inbound stream."""
+        return f"{self.comms_events_stream}:changes"
 
     # -- Service-to-service authorization (Phase 3b item 1) --
     # The comms API is INTERNAL (arch decision 14): only the product

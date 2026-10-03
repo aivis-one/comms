@@ -301,6 +301,7 @@ class TestKeyAndFingerprint:
             type="unit_event", title="T", body="B",
             target_type="all", target_value="*",
             fingerprint="a" * 64, channels=["in_app"], expiry_layer="default",
+            push_on="none",
         ))
         with pytest.raises(IntegrityError, match="idempotency_key"):
             await db_session.flush()
@@ -313,6 +314,7 @@ class TestKeyAndFingerprint:
             type="unit_event", title="T", body="B",
             target_type="all", target_value="*", idempotency_key="k",
             fingerprint="a" * 64, channels=["in_app"], expiry_layer="default",
+            push_on="none",
         ))
         await db_session.flush()
 

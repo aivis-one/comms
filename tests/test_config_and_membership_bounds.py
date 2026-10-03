@@ -69,13 +69,16 @@ def _at(name: str, value: int) -> dict[str, int]:
 class TestTheTable:
     def test_every_int_field_has_a_bound(self) -> None:
         """No numeric knob without a bound -- and no row for a knob that
-        does not exist. M7. The pair: the set is not empty."""
+        does not exist. M7. The pair: the set is not empty. 17 since
+        P3-1 added the push stream's cap (changes_stream_maxlen)."""
         ints = {
             name
             for name, field in Settings.model_fields.items()
             if field.annotation is int
         }
-        assert len(ints) == 16, "16 numeric parameters on D1 (15 + T12's)"
+        assert len(ints) == 17, (
+            "17 numeric parameters: D1's 15, T12's, P3-1's"
+        )
         assert ints == set(NUMERIC_BOUNDS)
 
     def test_the_ranges_are_the_published_ones(self) -> None:
@@ -89,6 +92,7 @@ class TestTheTable:
             "consumer_batch_size": (1, 1000),
             "consumer_block_ms": (1, 60_000),
             "dlq_maxlen": (1, 10_000_000),
+            "changes_stream_maxlen": (1, 10_000_000),
             "notification_poll_interval_seconds": (1, 3600),
             "notification_max_backoff_seconds": (1, 3600),
             "notification_max_delivery_attempts": (1, 100),
