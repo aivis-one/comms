@@ -45,16 +45,22 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     ForeignKey,
+    Identity,
     Integer,
     SmallInteger,
     String,
+    Uuid,
     func,
     inspect,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql.base import ischema_names
 from sqlalchemy.orm import Mapped, mapped_column, validates
+from sqlalchemy.types import UserDefinedType
 
 from app.core.constants import (
     FINGERPRINT_LEN,
@@ -446,5 +452,91 @@ class IntakeOutcome(UUIDMixin, Base):
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+        nullable=False,
+    )
+
+
+class XID8(UserDefinedType):  # type: ignore[type-arg]
+    """Postgres xid8 -- the id of the transaction that wrote a row.
+
+    The dialect has no type for it; registered for reflection below so
+    that `alembic check` compares the column instead of warning that it
+    does not recognize it.
+    """
+
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
+        return "xid8"
+
+
+ischema_names["xid8"] = XID8
+
+
+class NotificationTransition(Base):
+    """One transition of a job or a delivery -- the journal (spec §6.4).
+
+    APPEND-ONLY. app/engine/journal.py is the one writer; a test walks
+    app/ for any UPDATE or DELETE of this table. The single edit is
+    forgetting (service.withdraw_recipient clears provider_text of the
+    forgotten recipient's rows -- the same clearing F1.4 does on the
+    deliveries). Rows go only with their job: ON DELETE CASCADE.
+
+    NEVER the letter: no title, body, action_data, variables; never the
+    text of a comms exception (only its class and place, in `error`).
+    A provider's answer is kept sanitized, in `provider_text`.
+
+    The CHECKs, the order index and the forgetting index live in
+    migration 0017 (app/core/schema_objects.py).
+    """
+
+    __tablename__ = "notification_transitions"
+
+    # THE ORDER: unique inside one transaction, where timestamps tie.
+    id: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=True), primary_key=True,
+    )
+    # The writing transaction: commit visibility for a "changed since"
+    # cursor, which the allocation order of id does not give.
+    xact_id: Mapped[str] = mapped_column(
+        XID8(),
+        server_default=text("pg_current_xact_id()"),
+        nullable=False,
+    )
+    notification_id: Mapped[UUID] = mapped_column(
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # No foreign key: a recipient is a tombstone, never deleted, and a
+    # second deletion path is what the journal must not have.
+    recipient_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
+    channel: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # A JournalSubject value.
+    subject: Mapped[str] = mapped_column(String(10), nullable=False)
+    # A JournalStep value.
+    step: Mapped[str] = mapped_column(String(20), nullable=False)
+    # The status after the transition (job, delivery), a ChannelAnswer
+    # (channel), DeliveryStatus.SUPPRESSED (gate).
+    outcome: Mapped[str] = mapped_column(String(30), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    wait_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    wait_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    failure_class: Mapped[str | None] = mapped_column(
+        String(30), nullable=True,
+    )
+    category: Mapped[str | None] = mapped_column(
+        String(MAX_CATEGORY_LEN), nullable=True,
+    )
+    # A comms exception's class and place -- never its text.
+    error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # The provider's answer, sanitized before it is cut.
+    provider_text: Mapped[str | None] = mapped_column(
+        String(2000), nullable=True,
+    )
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=text("clock_timestamp()"),
         nullable=False,
     )

@@ -162,6 +162,67 @@ class WaitReason(enum.StrEnum):
     TRANSIENT_BACKOFF = "transient_backoff"
 
 
+class JobWaitReason(enum.StrEnum):
+    """Why an active JOB waits -- a journal value only (the job's own
+    gate is pipeline_retry_at, which needs no reason column)."""
+
+    # Behind the gate after a pipeline failure (T12).
+    PIPELINE_RETRY = "pipeline_retry"
+
+
+class JournalSubject(enum.StrEnum):
+    """What a row of the transition journal is about (spec §6.4).
+
+    JOB and DELIVERY rows are written in the transaction of the change
+    they record, so a rolled-back attempt leaves none of them. CHANNEL
+    rows are written in their OWN transaction right after the channel
+    answered: what a provider said is a fact whether or not the attempt
+    commits. GATE rows name a recipient a gate dropped before a
+    delivery existed for them.
+    """
+
+    JOB = "job"
+    DELIVERY = "delivery"
+    CHANNEL = "channel"
+    GATE = "gate"
+
+
+class JournalStep(enum.StrEnum):
+    """Where a transition happened. The five pipeline steps are the
+    PipelineStep values: a pipeline failure is recorded under the step
+    that tore."""
+
+    INTAKE = "intake"
+    LOCK = PipelineStep.LOCK.value
+    RESOLVE = PipelineStep.RESOLVE.value
+    DELIVER = PipelineStep.DELIVER.value
+    ROLLUP = PipelineStep.ROLLUP.value
+    COMMIT = PipelineStep.COMMIT.value
+    EXPIRE = "expire"
+    CANCEL = "cancel"
+    WITHDRAW = "withdraw"
+    # The pipeline exhausted its attempts (T12) and closed the job.
+    CEILING = "ceiling"
+
+
+class ChannelAnswer(enum.StrEnum):
+    """The outcome column of a CHANNEL row: what the channel said."""
+
+    # The channel took the letter. The record the next attempt and
+    # every closing path read: such a delivery is SENT, not re-sent.
+    ACCEPTED = "accepted"
+    # A permanent refusal (with its FailureClass).
+    REFUSED = "refused"
+    # HTTP 429: come back later.
+    RATE_LIMITED = "rate_limited"
+    # A provider-side transient failure.
+    TRANSIENT = "transient"
+    # No answer within the call's timeout.
+    TIMEOUT = "timeout"
+    # An exception of comms' own around the call: class and place only.
+    ERROR = "error"
+
+
 class DeliveryChannel(enum.StrEnum):
     """Supported delivery channels (infrastructure, not domain).
 

@@ -26,8 +26,9 @@
 #   Failure on one notification does not roll back others.
 #
 # CONCURRENCY:
-#   SELECT ... FOR UPDATE SKIP LOCKED prevents double-processing when
-#   multiple worker instances run concurrently.
+#   SELECT ... FOR NO KEY UPDATE SKIP LOCKED prevents double-processing
+#   when multiple worker instances run concurrently (the lock rule is
+#   written at the lock itself, in process_pending_notifications).
 #
 # RETRY:
 #   Selects both PENDING and PROCESSING notifications. PROCESSING
@@ -53,31 +54,44 @@
 #   oldest-first stays the order, the gate is what keeps a failing job
 #   from starving the healthy ones and keeps the healthy ones from
 #   starving it. At the ceiling the job is closed: waiting deliveries
-#   FAILED with class `pipeline`, the job folded (or FAILED outright
-#   when it has no deliveries -- resolve was the step that tore).
+#   FAILED with class `pipeline` (SENT, where the channel already
+#   accepted the letter), the job folded (or FAILED outright when it
+#   has no deliveries -- resolve was the step that tore).
+#
+# A LETTER THE CHANNEL TOOK IS NOT SENT TWICE (the T12 resend, closed
+# in P2-1): every channel answer is journaled in its own transaction
+# the moment it comes (app/engine/journal.py), so a rollback of the
+# attempt erases the SENT mark but not the record that the channel
+# accepted the letter. The next attempt closes such a delivery SENT
+# without calling the channel; expiry, cancellation, forgetting and the
+# ceiling close it SENT too. What remains is the window between the
+# channel's answer and that record's commit -- the KNOWN CEILING on
+# journal.record_channel_answer.
 # =============================================================================
 
 import time
-import traceback
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select
 
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.engine import journal
 from app.engine.constants import (
     DeliveryStatus,
     FailureClass,
+    JournalStep,
     NotificationStatus,
     PipelineStep,
 )
 from app.engine.formatters import sanitized_traceback
+from app.engine.journal import pipeline_error_of
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
     close_notifications,
+    close_waiting_deliveries,
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
@@ -180,11 +194,25 @@ async def process_pending_notifications() -> int:
         step = PipelineStep.LOCK
         async with factory() as session:
             try:
-                # Lock the notification row (skip if another worker has it).
+                # THE LOCK RULE. The attempt holds the job's row FOR NO KEY
+                # UPDATE for its whole transaction (resolve -> deliver ->
+                # rollup -> commit), skipping a row another worker holds.
+                # NOT FOR UPDATE: every channel answer is journaled from a
+                # SECOND session while this lock is held, and that
+                # insert's foreign key takes FOR KEY SHARE on this row.
+                # FOR UPDATE conflicts with KEY SHARE -- the journal
+                # session would wait for the attempt and the attempt, in
+                # its await, for the journal session; Postgres sees no
+                # deadlock across the two connections and the worker
+                # hangs. FOR NO KEY UPDATE does not conflict with KEY
+                # SHARE and still conflicts with FOR UPDATE, which is
+                # what expiry, cancellation and forgetting take
+                # (app/engine/service.py, IN FLIGHT): they stay mutually
+                # exclusive with the attempt.
                 lock_stmt = (
                     select(Notification)
                     .where(Notification.id == notif_id)
-                    .with_for_update(skip_locked=True)
+                    .with_for_update(skip_locked=True, key_share=True)
                 )
                 lock_result = await session.execute(lock_stmt)
                 notification = lock_result.scalar_one_or_none()
@@ -238,39 +266,6 @@ async def process_pending_notifications() -> int:
     return processed
 
 
-# The package whose frames name the place of a pipeline failure: the
-# innermost frame inside comms' own code is where comms broke, a frame
-# inside a library is where the library was called from comms.
-_APP_ROOT = Path(__file__).resolve().parents[1]
-_REPO_ROOT = _APP_ROOT.parent
-# notifications.pipeline_error is varchar(300) (migration 0015).
-_PIPELINE_ERROR_MAX = 300
-
-
-def pipeline_error_of(exc: BaseException) -> str:
-    """What notifications.pipeline_error records: the exception's CLASS
-    and the PLACE in comms where it was raised (module:line).
-
-    NEVER the exception's text, sanitized or not. Sanitizing removes
-    secrets, not content: a text raised from a template or a formatter
-    can carry the letter's variables, and a record of comms holds no
-    letter content (spec §6.4). The class and the place say where it
-    tore; the redacted traceback in the log says the rest.
-    """
-    name = f"{type(exc).__module__}.{type(exc).__qualname__}"
-    frames = traceback.extract_tb(exc.__traceback__)
-    place = "no traceback"
-    for frame in reversed(frames):
-        path = Path(frame.filename).resolve()
-        if path.is_relative_to(_APP_ROOT):
-            place = f"{path.relative_to(_REPO_ROOT).as_posix()}:{frame.lineno}"
-            break
-    else:
-        if frames:
-            place = f"{Path(frames[-1].filename).name}:{frames[-1].lineno}"
-    return f"{name} at {place}"[:_PIPELINE_ERROR_MAX]
-
-
 def _pipeline_backoff(attempts: int) -> timedelta:
     """The gate after the attempts-th failure: the delivery backoff
     (base * 2**(attempts-1), capped) -- comms' one transient policy."""
@@ -289,31 +284,13 @@ async def _record_pipeline_failure(
     (the attempt's own was rolled back). Below the ceiling: gate the
     job. At the ceiling: close it (see the module header).
 
-    KNOWN CEILING (acknowledged by design -- T12, D1 gate):
-      1. Mechanics: when deliver has already handed letters to the
-         channel and the attempt then raises (the flush, the rollup,
-         the commit), the rollback erases the SENT marks; the next
-         attempt sends those letters again. Bounded by
-         NOTIFICATION_MAX_PIPELINE_ATTEMPTS -- before T12 it repeated
-         on every tick, forever.
-      2. Status: acknowledged by design.
-      3. Backlog ref: phase 2 of the spec -- the transition journal
-         (§6.4: every transition leaves an append-only record), the
-         release that carries the fix below.
-      4. Promotion trigger (observable): a job with pipeline_step
-         deliver / rollup / commit whose deliveries show sent_at, or
-         a recipient reporting the same letter twice.
-      5. Agreed fix (D1-2 gate): a phase-2 journal record "the channel
-         accepted the letter", written in its own transaction right
-         after the channel answers; the next attempt closes such a
-         delivery SENT without sending it again.
-      6. Rejected: committing each delivery's outcome right after its
-         channel call (splits the attempt across transactions and
-         breaks the one-lock-per-attempt rule the expiry and the
-         cancellation rely on -- app/engine/service.py, IN FLIGHT);
-         dropping the retry of the pipeline altogether (a transient
-         database hiccup would then close jobs that would have gone
-         out).
+    The failure is a journal row of the job under the step that tore,
+    with the exception's class and place; below the ceiling it carries
+    the gate. The rollback has already taken the attempt's own rows
+    with it; the channel's answers, journaled in their own
+    transactions, stay -- so a letter the channel accepted before the
+    attempt tore is closed SENT here at the ceiling, and SENT without
+    a second send by the next attempt below it.
     """
     factory = get_session_factory()
     async with factory() as session:
@@ -337,9 +314,15 @@ async def _record_pipeline_failure(
             notification.pipeline_error = pipeline_error_of(exc)
             attempts = notification.pipeline_attempts
             ceiling = settings.notification_max_pipeline_attempts
+            torn = JournalStep(step.value)
             if attempts < ceiling:
                 notification.pipeline_retry_at = (
                     datetime.now(UTC) + _pipeline_backoff(attempts)
+                )
+                journal.record_job(
+                    session, notification, torn,
+                    error=notification.pipeline_error,
+                    wait_until=notification.pipeline_retry_at,
                 )
                 await session.commit()
                 logger.warning(
@@ -351,27 +334,28 @@ async def _record_pipeline_failure(
                 )
                 return
             notification.pipeline_retry_at = None
-            closed = (
-                await session.execute(
-                    update(NotificationDelivery)
-                    .where(
-                        NotificationDelivery.notification_id == notif_id,
-                        NotificationDelivery.status == DeliveryStatus.PENDING,
-                    )
-                    .values(
-                        status=DeliveryStatus.FAILED,
-                        failure_class=FailureClass.PIPELINE,
-                        next_retry_at=None,
-                        wait_reason=None,
-                    )
-                )
-            ).rowcount  # type: ignore[attr-defined]
+            # The last failure itself, under the step that tore, then
+            # the closing rows under the ceiling.
+            journal.record_job(
+                session, notification, torn,
+                error=notification.pipeline_error,
+            )
+            closed = await close_waiting_deliveries(
+                session,
+                notif_id,
+                DeliveryStatus.FAILED,
+                JournalStep.CEILING,
+                failure_class=FailureClass.PIPELINE,
+            )
             if notification.status == NotificationStatus.PROCESSING:
-                await rollup_notification(session, notification)
+                await rollup_notification(
+                    session, notification, JournalStep.CEILING,
+                )
             else:
                 # PENDING: resolve never committed, there are no
                 # deliveries to fold.
                 notification.status = NotificationStatus.FAILED
+                journal.record_job(session, notification, JournalStep.CEILING)
             await session.commit()
             logger.error(
                 "notification_pipeline_failed",

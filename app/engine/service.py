@@ -63,10 +63,13 @@ from app.audience.prefs import muted_recipient_ids
 from app.audience.schedule import recipient_deferred_until
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
+from app.engine import journal
 from app.engine.constants import (
+    ChannelAnswer,
     DeliveryStatus,
     FailureClass,
     IntakeOutcomeClass,
+    JournalStep,
     NotificationStatus,
     TargetType,
     WaitReason,
@@ -83,7 +86,12 @@ from app.engine.formatters import (
     sanitize_text,
     sanitized_traceback,
 )
-from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
+from app.engine.models import (
+    IntakeOutcome,
+    Notification,
+    NotificationDelivery,
+    NotificationTransition,
+)
 from app.engine.resolver import resolve_targets
 from app.profile.registry import Decided, Layer, registry
 
@@ -414,6 +422,10 @@ async def create_notification(
     )
     session.add(notification)
     await session.flush()
+    # The birth of the job (null -> pending) is its first transition;
+    # inside accept_notification's savepoint, so a key collision leaves
+    # no row.
+    journal.record_job(session, notification, JournalStep.INTAKE)
 
     logger.info(
         "notification_created",
@@ -481,6 +493,7 @@ async def resolve_notification(
         # Nobody to deliver to: the product's sync, not comms, is what
         # to look at -- and not the recipients' choice either.
         notification.status = NotificationStatus.NO_RECIPIENTS
+        journal.record_job(session, notification, JournalStep.RESOLVE)
         logger.warning(
             "notification_no_targets",
             notification_id=str(notification.id),
@@ -498,6 +511,14 @@ async def resolve_notification(
     if category is not None:
         muted = await muted_recipient_ids(session, category, recipient_ids)
         if muted:
+            # Each dropped recipient is a gate row (spec §6.4: "suppressed
+            # by preferences, by this category"): no delivery will exist
+            # to carry the answer to "why did R not get it".
+            for recipient_id in recipient_ids:
+                if recipient_id in muted:
+                    journal.record_gate(
+                        session, notification, recipient_id, category,
+                    )
             recipient_ids = [r for r in recipient_ids if r not in muted]
             logger.info(
                 "recipients_muted_category",
@@ -509,6 +530,7 @@ async def resolve_notification(
         if not recipient_ids:
             # Every recipient muted it: their decision, not a failure.
             notification.status = NotificationStatus.SUPPRESSED
+            journal.record_job(session, notification, JournalStep.RESOLVE)
             logger.info(
                 "notification_all_muted",
                 notification_id=str(notification.id),
@@ -531,8 +553,10 @@ async def resolve_notification(
             )
             session.add(delivery)
             deliveries.append(delivery)
+            journal.record_delivery(session, delivery, JournalStep.RESOLVE)
 
     notification.status = NotificationStatus.PROCESSING
+    journal.record_job(session, notification, JournalStep.RESOLVE)
     await session.flush()
 
     logger.info(
@@ -639,6 +663,10 @@ async def deliver_notification(
         r.id: r for r in recipient_result.scalars().all()
     }
 
+    # -- Accepted by the channel in an attempt that did not commit: the
+    # letter is out. Read once per pass, by (recipient, channel). --
+    accepted = await journal.accepted_answers(session, [notification.id])
+
     # -- Late-mute re-check: one batched probe per pass, over the
     # category snapshotted at intake (F1.3) --
     category = notification.category
@@ -666,11 +694,32 @@ async def deliver_notification(
         delivery.next_retry_at = None
         delivery.wait_reason = None
 
+        # -- Already accepted (KNOWN CEILING T12 closed): an attempt
+        # handed this letter to the channel and then tore before its
+        # commit. The channel's answer was journaled in its own
+        # transaction; the delivery is closed SENT at the moment the
+        # channel took it, and the channel is NOT called again. Checked
+        # before every gate: a letter that went out is not un-sent by a
+        # deactivation, a mute or a schedule that came after it. --
+        accepted_at = accepted.get(
+            (notification.id, delivery.recipient_id, delivery.channel),
+        )
+        if accepted_at is not None:
+            _close_accepted(delivery, accepted_at)
+            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            logger.info(
+                "delivery_closed_from_journal",
+                delivery_id=str(delivery.id),
+                accepted_at=accepted_at.isoformat(),
+            )
+            continue
+
         # -- Late activity gate (F1.4): deactivated or deleted by the
         # product after resolve -> close out, no send. Checked first: a
         # person the product removed is not asked about their mutes. --
         if not recipient.active:
             delivery.status = DeliveryStatus.RECIPIENT_INACTIVE
+            journal.record_delivery(session, delivery, JournalStep.DELIVER)
             logger.info(
                 "delivery_recipient_inactive",
                 delivery_id=str(delivery.id),
@@ -681,6 +730,9 @@ async def deliver_notification(
         # -- Late-mute gate: muted while gated -> close out, no send --
         if delivery.recipient_id in muted:
             delivery.status = DeliveryStatus.SUPPRESSED
+            journal.record_delivery(
+                session, delivery, JournalStep.DELIVER, category=category,
+            )
             logger.info(
                 "delivery_muted_skipped",
                 delivery_id=str(delivery.id),
@@ -697,6 +749,7 @@ async def deliver_notification(
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
             delivery.wait_reason = WaitReason.RECIPIENT_SCHEDULE
+            journal.record_delivery(session, delivery, JournalStep.DELIVER)
             # Causality flag: the deferral pushes the delivery past
             # the notification's expiry -> step-0 will EXPIRE it
             # before it ever sends. Deliberate (a reminder deferred
@@ -817,8 +870,20 @@ async def deliver_notification(
                 delivery.sent_at = datetime.now(UTC)
             else:
                 _apply_transient_failure(delivery, outcome.error)
+            journal.record_delivery(session, delivery, JournalStep.DELIVER)
 
     await session.flush()
+
+
+def _close_accepted(delivery: NotificationDelivery, accepted_at: datetime) -> None:
+    """Close a waiting delivery the channel already accepted: SENT at
+    the moment it was accepted, counted as the attempt that sent it --
+    the state the rolled-back attempt would have committed."""
+    delivery.next_retry_at = None
+    delivery.wait_reason = None
+    delivery.attempts += 1
+    delivery.status = DeliveryStatus.SENT
+    delivery.sent_at = accepted_at
 
 
 def _apply_transient_failure(
@@ -904,9 +969,12 @@ async def _deliver_single(
 ) -> tuple[NotificationDelivery, _DeliveryOutcome]:
     """Deliver a single notification with concurrency control.
 
-    Runs formatter.deliver() under semaphore with timeout.
-    Does NOT touch the SQLAlchemy session -- only external API calls.
-    Returns (delivery, outcome) for the caller to apply to the session.
+    Runs formatter.deliver() under semaphore with timeout. Does NOT
+    touch the attempt's SQLAlchemy session -- only the external call and
+    the journal: whatever the channel answered is written in its OWN
+    transaction right here, before the attempt goes on
+    (journal.record_channel_answer). Returns (delivery, outcome) for the
+    caller to apply to the attempt's session.
     """
     async with semaphore:
         try:
@@ -914,7 +982,6 @@ async def _deliver_single(
                 formatter.deliver(notification, delivery, recipient),
                 timeout=_DELIVER_TIMEOUT_SECONDS,
             )
-            return delivery, _DeliveryOutcome(success=success)
         except PermanentDeliveryError as exc:
             # THE one place a channel exception becomes a failure class:
             # the exception's type is the class (formatters raise only
@@ -934,28 +1001,31 @@ async def _deliver_single(
                 failure_class=failure_class.value,
                 error=sanitize_text(str(exc))[:200],
             )
-            return delivery, _DeliveryOutcome(
+            outcome = _DeliveryOutcome(
                 failure_class=failure_class, error=_error_text(exc),
             )
+            answer = journal.answer_of(exc, failure_class)
         except RateLimitedError as exc:
             # Deliberately no log here: whether this becomes a deferral
             # or degrades to a transient failure is decided in the
             # apply loop (it owns the budget counter) -- that decision
             # log is the valuable one, and doubling it would be noise.
-            return delivery, _DeliveryOutcome(
+            outcome = _DeliveryOutcome(
                 error=_error_text(exc),
                 retry_after=exc.retry_after,
             )
-        except TimeoutError:
+            answer = journal.answer_of(exc)
+        except TimeoutError as exc:
             logger.warning(
                 "delivery_timeout",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
                 timeout=_DELIVER_TIMEOUT_SECONDS,
             )
-            return delivery, _DeliveryOutcome(
+            outcome = _DeliveryOutcome(
                 error=f"Timeout after {_DELIVER_TIMEOUT_SECONDS}s",
             )
+            answer = journal.answer_of(exc)
         except Exception as exc:
             # Not logger.exception(): the renderer would print the chain
             # raw, and the telegram network error carries the bot token
@@ -967,9 +1037,19 @@ async def _deliver_single(
                 channel=delivery.channel,
                 exception=sanitized_traceback(exc),
             )
-            return delivery, _DeliveryOutcome(
+            outcome = _DeliveryOutcome(
                 error=_error_text(exc),
             )
+            answer = journal.answer_of(exc)
+        else:
+            outcome = _DeliveryOutcome(success=success)
+            answer = (
+                journal.ACCEPTED
+                if success
+                else journal.Answer(outcome=ChannelAnswer.TRANSIENT)
+            )
+        await journal.record_channel_answer(delivery, answer)
+        return delivery, outcome
 
 
 # -----------------------------------------------------------------------------
@@ -998,21 +1078,27 @@ async def _deliver_single(
 #      resolve, not an anomaly FAILED.
 #
 # EXPIRY AND CANCELLATION GO THROUGH THE DELIVERIES (close_notifications
-# below): the waiting deliveries get the outcome, then the job is
-# folded by the same rule. A job half of which went out before its
+# below): the waiting deliveries get the outcome (or SENT, when the
+# channel already accepted them), then the job is folded by the same
+# rule. A job half of which went out before its
 # expiry is PARTIAL_SENT, not EXPIRED. Only a job with no deliveries
 # yet (PENDING, not resolved) takes EXPIRED / CANCELLED directly.
 #
 # IN FLIGHT: an attempt runs inside the worker's transaction under a
-# row lock on the notification (processor.py, FOR UPDATE). Expiry and
-# cancellation lock the same row (FOR UPDATE, waiting, not skipping),
-# so they apply to the state AFTER the attempt: what was sent stays
-# sent, what is still waiting is closed.
+# row lock on the notification (processor.py, FOR NO KEY UPDATE -- the
+# lock rule is written at the selection). Expiry, cancellation and
+# forgetting lock the same row FOR UPDATE, waiting, not skipping; the
+# two modes conflict, so these apply to the state AFTER the attempt:
+# what was sent stays sent, what is still waiting is closed -- and a
+# waiting delivery the channel already accepted is closed SENT, not
+# with the closing outcome (journal.accepted_answers), because the
+# letter went out.
 
 
 async def rollup_notification(
     session: AsyncSession,
     notification: Notification,
+    step: JournalStep = JournalStep.ROLLUP,
 ) -> None:
     """Fold the deliveries' outcomes into the job's (see THE FOLD).
 
@@ -1022,6 +1108,8 @@ async def rollup_notification(
     Args:
         session: Active DB session (caller commits).
         notification: The notification to roll up.
+        step: The journal step the fold is recorded under -- the
+            pipeline's rollup, or the closing path that called it.
     """
     if notification.status != NotificationStatus.PROCESSING:
         return
@@ -1040,6 +1128,7 @@ async def rollup_notification(
     if verdict is None:
         return
     notification.status = verdict
+    journal.record_job(session, notification, step)
     await session.flush()
     logger.info(
         "notification_rollup",
@@ -1079,6 +1168,12 @@ _CLOSING = {
     NotificationStatus.CANCELLED: DeliveryStatus.CANCELLED,
 }
 
+# The journal step each closing outcome is recorded under.
+_CLOSING_STEP = {
+    NotificationStatus.EXPIRED: JournalStep.EXPIRE,
+    NotificationStatus.CANCELLED: JournalStep.CANCEL,
+}
+
 _ACTIVE_STATUSES = (NotificationStatus.PENDING, NotificationStatus.PROCESSING)
 
 
@@ -1086,11 +1181,14 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     """Close a deleted recipient's deliveries (F1.4, forgetting).
 
     Every delivery of theirs still waiting takes RECIPIENT_INACTIVE
-    (wait fields cleared) and each affected job is folded (THE FOLD).
+    (wait fields cleared) -- or SENT, when the channel already accepted
+    it (close_waiting_deliveries) -- and each affected job is folded
+    (THE FOLD).
     The jobs are locked FOR UPDATE and the lock is WAITED for, like
     expiry and cancellation: an attempt in flight finishes first. Every
     delivery of theirs, finished or not, loses its error_message -- a
-    provider's words may quote the address being forgotten.
+    provider's words may quote the address being forgotten -- and every
+    journal row of theirs loses its provider_text, for the same reason.
 
     Returns the number of deliveries closed.
     """
@@ -1108,27 +1206,40 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
             .with_for_update()
         )
     ).scalars().all()
-    closed = await session.execute(
-        update(NotificationDelivery)
-        .where(
+    closed = 0
+    for notification in parents:
+        closed += await close_waiting_deliveries(
+            session,
+            notification.id,
+            DeliveryStatus.RECIPIENT_INACTIVE,
+            JournalStep.WITHDRAW,
             NotificationDelivery.recipient_id == recipient_id,
-            NotificationDelivery.status == DeliveryStatus.PENDING,
         )
-        .values(
-            status=DeliveryStatus.RECIPIENT_INACTIVE,
-            next_retry_at=None,
-            wait_reason=None,
-        )
-    )
     await session.execute(
         update(NotificationDelivery)
         .where(NotificationDelivery.recipient_id == recipient_id)
         .values(error_message=None)
     )
+    # THE ONE EDIT OF THE JOURNAL, and why it is allowed: forgetting
+    # outweighs append-only. Append-only is a property of the design;
+    # forgetting is an obligation to a person (spec §10.4). A provider's
+    # words may quote the address being forgotten -- the reason
+    # error_message is cleared just above -- and the journal keeps the
+    # same words for the same recipient. Only that column, only this
+    # recipient; every other field of the row stays, and so does the
+    # path. The fence test names this function as the single exception.
+    await session.execute(
+        update(NotificationTransition)
+        .where(
+            NotificationTransition.recipient_id == recipient_id,
+            NotificationTransition.provider_text.is_not(None),
+        )
+        .values(provider_text=None)
+    )
     for notification in parents:
-        await rollup_notification(session, notification)
+        await rollup_notification(session, notification, JournalStep.WITHDRAW)
     await session.flush()
-    return int(closed.rowcount or 0)  # type: ignore[attr-defined]
+    return closed
 
 
 async def close_notifications(
@@ -1138,8 +1249,10 @@ async def close_notifications(
 ) -> int:
     """Expire or cancel every ACTIVE job matching `condition`.
 
-    The waiting deliveries take the outcome and the job is folded (see
-    THE FOLD); a job with no deliveries yet takes the outcome directly.
+    The waiting deliveries take the outcome (one the channel already
+    accepted is closed SENT -- close_waiting_deliveries) and the job is
+    folded (see THE FOLD); a job with no deliveries yet takes the
+    outcome directly.
     A job already at an outcome is not touched -- that is the guard,
     and a second call is a zero-row no-op. Rows are locked FOR UPDATE
     and the lock is WAITED for: an attempt in flight finishes first.
@@ -1147,6 +1260,7 @@ async def close_notifications(
     Returns the number of jobs closed.
     """
     delivery_outcome = _CLOSING[outcome]
+    step = _CLOSING_STEP[outcome]
     rows = await session.execute(
         select(Notification)
         .where(condition, Notification.status.in_(_ACTIVE_STATUSES))
@@ -1157,22 +1271,79 @@ async def close_notifications(
         if notification.status == NotificationStatus.PENDING:
             # Not resolved: no deliveries exist to carry the outcome.
             notification.status = outcome
+            journal.record_job(session, notification, step)
             continue
-        await session.execute(
-            update(NotificationDelivery)
-            .where(
-                NotificationDelivery.notification_id == notification.id,
-                NotificationDelivery.status == DeliveryStatus.PENDING,
-            )
-            .values(
-                status=delivery_outcome,
-                next_retry_at=None,
-                wait_reason=None,
-            )
+        await close_waiting_deliveries(
+            session, notification.id, delivery_outcome, step,
         )
-        await rollup_notification(session, notification)
+        await rollup_notification(session, notification, step)
     await session.flush()
     return len(notifications)
+
+
+async def close_waiting_deliveries(
+    session: AsyncSession,
+    notification_id: UUID,
+    outcome: DeliveryStatus,
+    step: JournalStep,
+    *conditions: Any,
+    failure_class: FailureClass | None = None,
+) -> int:
+    """Close the job's waiting deliveries (optionally narrowed by
+    `conditions`) with `outcome` -- one journal row per delivery.
+
+    Shared by every path that closes deliveries from outside an attempt:
+    expiry, cancellation, forgetting, and the pipeline's ceiling
+    (app/engine/processor.py). A waiting delivery the channel already
+    accepted -- in an attempt that tore before its commit -- is closed
+    SENT instead: the letter went out, and no closing outcome may say
+    otherwise. The rest are closed in ONE UPDATE; its RETURNING is the
+    loop the journal rows are written from (a mass transition has no
+    loop over objects of its own).
+
+    The caller holds the job's row lock and folds the job afterwards.
+    Returns the number of deliveries closed.
+    """
+    waiting = (
+        NotificationDelivery.notification_id == notification_id,
+        NotificationDelivery.status == DeliveryStatus.PENDING,
+        *conditions,
+    )
+    closed = 0
+    accepted = await journal.accepted_answers(session, [notification_id])
+    if accepted:
+        sent = (
+            await session.execute(select(NotificationDelivery).where(*waiting))
+        ).scalars().all()
+        for delivery in sent:
+            accepted_at = accepted.get(
+                (notification_id, delivery.recipient_id, delivery.channel),
+            )
+            if accepted_at is None:
+                continue
+            _close_accepted(delivery, accepted_at)
+            journal.record_delivery(session, delivery, step)
+            closed += 1
+        await session.flush()
+    rows = await session.execute(
+        update(NotificationDelivery)
+        .where(*waiting)
+        .values(
+            status=outcome,
+            failure_class=failure_class,
+            next_retry_at=None,
+            wait_reason=None,
+        )
+        .returning(
+            NotificationDelivery.recipient_id,
+            NotificationDelivery.channel,
+            NotificationDelivery.status,
+            NotificationDelivery.attempts,
+            NotificationDelivery.failure_class,
+        )
+    )
+    closed += journal.record_closed_rows(session, notification_id, rows, step)
+    return closed
 
 
 # ---------------------------------------------------------------------------

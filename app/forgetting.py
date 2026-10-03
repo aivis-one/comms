@@ -13,8 +13,10 @@
 #     deleted_at set -- CHECK ck_recipients_tombstone holds it;
 #   - group memberships, category mutes, section roles, thread read
 #     pointers -- deleted;
-#   - deliveries still waiting -> RECIPIENT_INACTIVE, their jobs
-#     folded; error_message cleared on every delivery of theirs.
+#   - deliveries still waiting -> RECIPIENT_INACTIVE (SENT when the
+#     channel already accepted them), their jobs folded; error_message
+#     cleared on every delivery of theirs, and provider_text on every
+#     journal row of theirs (the journal's one edit).
 #
 # WHAT STAYS, and why: the tombstone row itself (threads and messages
 # reference it with RESTRICT; deleting it would erase the other party's
