@@ -18,6 +18,12 @@ class ValidationError(CommsError):
     """Invalid input (unknown notification type, bad channel, etc.)."""
 
 
+class CursorExpiredError(CommsError):
+    """A changes cursor older than the retention period (P2-3): what
+    happened after it may already be deleted, so continuing from it
+    could hide a change. 410 `cursor_expired` (app/api/errors.py)."""
+
+
 class NotFoundError(CommsError):
     """Requested entity does not exist (or belongs to someone else)."""
 

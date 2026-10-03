@@ -202,7 +202,9 @@ purpose, so that a leftover variable in a shared env file cannot refuse
 a working deploy) leaves the key set empty and therefore reads as "no
 such channel". The map shows `not_configured` where the installer
 expected `live`; the in-code marker (`KNOWN CEILING` in
-`app/core/channels.py`) records the case and its agreed fix.
+`app/core/channels.py`) records the case and its agreed fix. The map
+says what a deploy HAS; what its channels DID is the second answer,
+"Channel health" in section 5.
 
 **Email, concretely.** The channel is decided by its key set like any
 other, and its keys are declared in `app/core/channels.py`. Three of
@@ -285,7 +287,8 @@ runs.
 ## 5. The resource protocol (F1.4)
 
 Every resource route -- recipients, threads, messages, sections, read
-pointers, preferences, the inbox -- speaks the same language as a job.
+pointers, preferences, the inbox, reading a job by its key (section 8)
+-- speaks the same language as a job.
 
 **One form of refusal.** Every error response of every route has one
 body, with a class a program can branch on:
@@ -301,16 +304,19 @@ body, with a class a program can branch on:
 | 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator |
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
+| 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 422 | `validation` | the input is wrong; `fields` names each input |
 | 500 | `internal` | our defect; the text carries nothing from it |
 
 The message is for a human; the class is the contract.
 
 **One way to page.** Every listing -- the inbox, the visible threads, a
-thread's messages -- takes `limit` (1..100, default 20) and `cursor`
+thread's messages, a job's deliveries and its path, the address book,
+the changes feed -- takes `limit` (1..100, default 20) and `cursor`
 (the previous page's `next_cursor`, opaque) and answers
 `{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
-`unread` badge beside them. A `limit` outside 1..100 is **refused**
+`unread` badge beside them, and the changes feed's `next_cursor` is
+never `null` (section 9). A `limit` outside 1..100 is **refused**
 (422), not clamped, and so is a malformed cursor.
 
 **Repeating a call.** A call that creates takes a required
@@ -381,6 +387,93 @@ delivery time -- not when it was sent. A `group_changed` that arrives
 later is not seen by that job, in either direction: a member added
 after resolve does not receive it, a member removed after resolve
 still does. Send the membership before the job when the order matters.
+
+### Channel health
+
+`GET /health` says what a deploy has -- a channel's keys are set -- and
+that is not the same as working: at one install it said `email: live`
+while every letter died on a provider `401`. The second answer is what
+each channel answered over a recent window:
+
+    GET /api/v1/channels/health?window_minutes=60
+
+`window_minutes` is 1..1440, default 60; outside that range it is
+**refused** (422 `validation`), not clamped. The window is measured by
+comms' database clock and closed at both ends. Behind the service token
+like every `/api/v1` route; `GET /health` itself is unchanged.
+
+```json
+{
+  "window": {"minutes": 60, "from": "2026-10-03T11:00:00+00:00", "to": "2026-10-03T12:00:00+00:00"},
+  "channels": {
+    "email": {
+      "state": "live",
+      "answers": 12,
+      "by_outcome": {"accepted": 0, "refused": 12, "rate_limited": 0, "transient": 0, "timeout": 0, "error": 0},
+      "refused_by_class": {"configuration": 12, "message_rejected": 0, "no_address": 0},
+      "configuration_share": 1.0
+    }
+  }
+}
+```
+
+Every channel of the service is listed (`in_app`, `telegram`, `email`,
+`push`), each with every key, zeros included -- an absent key never
+means zero.
+
+| field | meaning |
+|---|---|
+| `state` | the same channel map as `GET /health`: `live` / `not_configured` / `not_implemented` |
+| `answers` | every answer the channel gave in the window -- one per call, so the retries of one letter count once each |
+| `by_outcome` | the answers by what the channel said: took it, refused it, asked to wait (429), failed transiently, did not answer in time, or comms itself failed around the call |
+| `refused_by_class` | the refusals by class: `configuration` -- the channel is dead on this deploy, fix the deploy; `message_rejected` -- this letter will not arrive, others go; `no_address` -- the recipient has no address in this channel, fix the sync |
+| `configuration_share` | refusals of class `configuration` / `answers` -- the headline figure. **`null` when there were no answers**: nothing happened, which is neither healthy nor dead |
+
+`live` with a `configuration_share` near 1 is the case this exists for:
+the keys are there and the provider refuses them -- fix the deploy.
+Suppressed recipients and scheduled waits are not channel answers and
+are not counted. Answers are counted from comms' own transition record;
+nothing is stored as "health", and comms acts on none of it.
+
+### Reconciling the address book
+
+The book is synced eventually: an event that is lost or dead-lettered
+leaves comms' copy behind the product's, silently. To compare, page
+through what comms has recorded:
+
+    GET /api/v1/recipients?limit=100&cursor=<next_cursor>
+
+```json
+{
+  "items": [
+    {"recipient_id": "8d0f6c1e-2b7a-4f0e-9a51-3c2d1e0f4b6a", "version": 1712345678901, "active": true, "deleted": false}
+  ],
+  "next_cursor": null
+}
+```
+
+| field | meaning |
+|---|---|
+| `recipient_id` | the product's user id |
+| `version` | the version of the snapshot comms holds; `0` -- written before snapshots had versions |
+| `active` | as the snapshot set it; `false` for a deleted person |
+| `deleted` | the person was forgotten: the row is a tombstone, nothing reaches them |
+
+No address is listed, for anyone: comms refuses an equal version with
+other content, so an equal version IS an equal snapshot -- compare
+versions. Every recipient comms ever heard of is listed, tombstones
+included. The order is oldest first, so a recipient created while you
+page is reached on a later page -- unless its write was already under
+way when you read the page before; a row that changes after its page
+was read shows its old state. Either way the next pass sees it:
+reconcile periodically, not once.
+
+**The product decides; comms changes nothing on this read.** A version
+behind yours: send the snapshot again (`PUT /recipients/{id}`). A person
+missing: send them. A person you deleted who is not `deleted` here: send
+the deletion. A tombstone you still have: that person cannot be revived
+-- they need a new id. Group memberships and section rosters are not in
+this listing.
 
 ### What comms takes on trust
 
@@ -631,6 +724,227 @@ comms has not been told about yet is retried, the same lag
   persistent one ends in the dead-letter stream.
 - Sync events are safe to replay any number of times.
 - `notification_request` replays collapse on the key.
+
+## 8. Reading a job by its key
+
+The product's last link when it asks "what became of it": its own
+record -> its idempotency key -> the job in comms -> the steps.
+Reading is the source of truth; nothing a later push says replaces it.
+
+    GET /api/v1/notifications/by-key?key=<key>              the summary
+    GET /api/v1/notifications/by-key/deliveries?key=<key>   a page
+    GET /api/v1/notifications/by-key/path?key=<key>         a page
+
+**The key is a query parameter, percent-encoded.** Any key the product
+sent (1..200 characters, any characters) is read back by its exact
+value. Encode it the standard way -- `/`, `?`, `%`, `#`, `&`, spaces and
+non-ASCII all survive. One trap: a `+` sent **unencoded** reads as a
+space; encode it as `%2B` (every standard query encoder does).
+
+**Answers.** The same service token as every route (401 without it).
+`key` empty, missing or longer than 200 -> 422 `validation`. The
+deliveries and path pages take `limit` and `cursor` like every listing
+(section 5); a cursor from one listing is refused by the other (422).
+
+- **404 `not_found`** -- the key answers nothing: comms never received
+  it, **or** the job and its records outlived retention ("How long
+  comms keeps things"). The two are not told apart. Before you look
+  inside comms, look at your own outbox and relay: a 404 within the
+  retention window means the request never arrived.
+- **200, `job: null`** -- the request was **not accepted**: `intake`
+  says why (rejected at intake, with the reason). The job was never
+  taken; the responsibility is the product's.
+- **200 with a `job`** -- accepted: comms owns it, and the job, its
+  deliveries and its path say where it is.
+
+The deliveries and path pages answer 404 when the key has no accepted
+job (only intake outcomes, or nothing).
+
+**What is never in an answer: the letter.** No title, body, action data,
+template variables; no text of an exception of comms' own (only its
+class and place, in `error`). A provider's own answer is in the path,
+sanitized; once its recipient is forgotten it is `null`.
+
+**A replay is not shown.** Sending the same bytes under the same key
+again changes nothing and records nothing: the read shows the accepted
+job, not a "duplicate". A conflict (the same key, other bytes) is
+shown, in `intake`.
+
+**The path starts with the journal.** Jobs accepted before the journal
+existed (comms before migration 0017) have a partial or an empty
+path; their summary and deliveries are whole.
+
+**Adding a field is not a break.** Clients ignore fields they do not
+know. Phase 5 adds the model's answer to `job` that way -- an object
+`response` beside `status` (the body, a snapshot of who answered, the
+letter's hash) -- without changing any field below.
+
+### `summary` -- `GET .../by-key`
+
+| field | value |
+|---|---|
+| `idempotency_key` | the key, as read |
+| `intake` | every request under the key that was not accepted, oldest first (`intake_item`); `[]` when none |
+| `job` | the accepted job (`job`), or `null` |
+
+### `intake_item`
+
+| field | value |
+|---|---|
+| `outcome` | `rejected_at_intake` -- the envelope could not be accepted; `conflict` -- the key is taken by an accepted job with other bytes |
+| `reason` | for a human, redacted; the class is `outcome` |
+| `received_at` | when it arrived |
+| `notification_id` | the accepted job a conflict collided with; `null` for a rejection, and for a conflict whose job is past retention |
+
+### `job`
+
+| field | value |
+|---|---|
+| `id` | the job's id |
+| `type` | the request type |
+| `category` | the category it was gated by, or `null` |
+| `target_type` | `user`, `group`, `all` |
+| `target_value` | the address as sent |
+| `correlation` | as sent, untouched, or `null` |
+| `status` | `pending`, `processing`; or the outcome: `sent`, `partial_sent`, `failed`, `no_recipients`, `suppressed`, `expired`, `cancelled` |
+| `created_at` | when it was accepted |
+| `scheduled_at` | when it becomes deliverable |
+| `expiry_at` | when it expires, or `null` |
+| `pipeline` | the pipeline's own failures (`pipeline`) |
+| `deliveries` | the deliveries counted by channel and status (`delivery_count`); `[]` before resolve |
+
+### `pipeline`
+
+| field | value |
+|---|---|
+| `attempts` | failed pipeline attempts; 0 when none |
+| `step` | the step that tore last: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
+| `error` | the class and the place of the failure, or `null` |
+| `retry_at` | when the job is tried again, or `null` |
+
+### `delivery_count`
+
+| field | value |
+|---|---|
+| `channel` | the channel |
+| `status` | a delivery status (`delivery_item`) |
+| `count` | how many |
+
+### `delivery_item` -- `GET .../by-key/deliveries`
+
+| field | value |
+|---|---|
+| `recipient_id` | the recipient, the product's id |
+| `channel` | the channel |
+| `status` | `pending`, `sent`, `failed`, `suppressed`, `recipient_inactive`, `expired`, `cancelled` |
+| `attempts` | channel attempts spent |
+| `failure_class` | for a failed delivery: `configuration`, `message_rejected`, `no_address`, `transient_exhausted`, `pipeline`; else `null` |
+| `wait_reason` | for a delivery that waits: `recipient_schedule`, `provider_rate_limit`, `transient_backoff`; else `null` |
+| `next_retry_at` | until when it waits, or `null` |
+| `sent_at` | when the channel took it, or `null` |
+| `read_at` | when it was read (in-app), or `null` |
+| `created_at` | when it was created (resolve) |
+
+### `path_item` -- `GET .../by-key/path`
+
+One row per transition, in order.
+
+| field | value |
+|---|---|
+| `at` | when |
+| `subject` | `job`, `delivery`, `channel` (what the channel answered), `gate` (a recipient a mute dropped before a delivery existed) |
+| `step` | `intake`, `lock`, `resolve`, `deliver`, `rollup`, `commit`, `expire`, `cancel`, `withdraw`, `ceiling` |
+| `outcome` | the status after it; for `channel`: `accepted`, `refused`, `rate_limited`, `transient`, `timeout`, `error`; for `gate`: `suppressed` |
+| `recipient_id` | for `delivery`, `channel`, `gate`; else `null` |
+| `channel` | for `delivery`, `channel`; else `null` |
+| `attempt` | the attempt number |
+| `wait_reason` | a wait: the delivery's, or `pipeline_retry` for the job; else `null` |
+| `wait_until` | until when, or `null` |
+| `failure_class` | as on a delivery, or `null` |
+| `category` | the category a mute gate decided by, or `null` |
+| `error` | an exception of comms' own: class and place, never its text; or `null` |
+| `provider_text` | the provider's answer, sanitized; `null` when it said nothing or its recipient was forgotten |
+
+## 9. What changed since a cursor
+
+A push from comms is a hint; the read by key (section 8) is the truth.
+A product that was down -- longer than the stream keeps its pushes, or
+at all -- asks which of its jobs changed while it was not listening, and
+reads each of them by its key.
+
+    GET /api/v1/notifications/changes?limit=20&cursor=<next_cursor>
+
+```json
+{
+  "items": [
+    {"idempotency_key": "order-42:paid"}
+  ],
+  "next_cursor": "<opaque>"
+}
+```
+
+| field | value |
+|---|---|
+| `idempotency_key` | the key of a job that changed after the cursor -- the key the product sent; read the job by it |
+
+That is all an item says: no status, no channel, never the letter. What
+changed is in the read.
+
+**The cursor.** Opaque; send back the `next_cursor` of the last page,
+and keep it where your own state is kept. **It is never `null`**: a page
+with nothing new still answers with a cursor to continue from, and
+`items: []` means "nothing newer than this, for now". **Without a
+cursor** the feed starts at the beginning of what comms keeps (section
+"How long comms keeps things") -- the first call of a new product, and
+the call of one that lost its cursor. Starting over repeats keys you
+have seen; reading a key twice is harmless.
+
+**Repeats are bounded, losses are not allowed.** A key appears once on
+a page. It appears again on a later page only when its job changed
+again -- or when one job wrote more than one page's worth of steps at
+once (a broadcast): then its key heads the following page too. Repeating
+the same cursor answers the same items (the `next_cursor` differs only
+in when it was read).
+
+**The feed is late, not lossy.** A change shows up only once comms is
+sure nothing written before it can still appear: the feed waits for
+every transaction that was running when it was read. The longest
+transaction in comms is a delivery attempt calling a channel, up to that
+call's timeout -- so the feed can lag by that long, and by any longer
+transaction open on comms' database. Nothing is skipped; the next read
+brings it.
+
+**A cursor older than the retention period is refused**: 410
+`cursor_expired`. What changed after it may already be deleted, and
+continuing would hide that. A product that polls never meets it -- every
+read, an empty one too, refreshes the cursor. One that was down for
+longer: read each key it still holds as unfinished by key (section 8),
+then start the feed again without a cursor. With retention switched off
+(0) a cursor never expires. One residue is not caught: a job older than
+the retention period that changed after your cursor may be deleted
+before you read it -- its read by key answers 404.
+
+**Answers.** The same service token as every route (401 without it).
+`limit` outside 1..100 -> 422 `validation`; a malformed cursor, one from
+another listing, or one comms could not have issued (from the future)
+-> 422 `validation`. The feed reads only.
+
+**Recovering after downtime.**
+
+    1. Keep the last next_cursor with your own state, after you have
+       acted on its page -- never before.
+    2. Start: read the feed from the kept cursor (none -> from the start).
+    3. For each item: read the job by its key (section 8) and update
+       your record from the read.
+    4. Store the page's next_cursor; repeat from 2 until a page comes
+       back with items: [].
+    5. Keep polling at your own pace; a push, when it comes, only says
+       "go read" sooner.
+    6. 410 cursor_expired: read every key you hold as unfinished by key,
+       then start again at 2 without a cursor.
+
+Jobs only: a request refused at intake is not a job and is not in the
+feed -- the read by key of your own key shows it (section 8).
 
 ## Operating the comms stack
 

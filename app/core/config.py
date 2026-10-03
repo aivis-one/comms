@@ -62,7 +62,14 @@ from app.core.channels import (
 # there" would have no answer. The tag is `v3.0.0`, set by the owner on
 # the merge commit. (2.0.0 was the schedule turning over: the
 # preferences `schedule` key became a list of allowed periods.)
-APP_VERSION = "3.0.0"
+#
+# MINOR bumps add and narrow nothing: 3.1.0 is D1 (bounds on every
+# number, a pipeline defect becomes an outcome, closed membership
+# events); 3.2.0 is phase 2 (the transition journal, a letter the
+# channel took is never sent twice, reading a job by its key, what
+# changed since a cursor, channel health, the address book). The tag
+# goes on the merge commit, after the merge -- never ahead of it.
+APP_VERSION = "3.2.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
