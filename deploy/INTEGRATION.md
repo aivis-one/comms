@@ -285,7 +285,8 @@ runs.
 ## 5. The resource protocol (F1.4)
 
 Every resource route -- recipients, threads, messages, sections, read
-pointers, preferences, the inbox -- speaks the same language as a job.
+pointers, preferences, the inbox, reading a job by its key (section 8)
+-- speaks the same language as a job.
 
 **One form of refusal.** Every error response of every route has one
 body, with a class a program can branch on:
@@ -307,7 +308,7 @@ body, with a class a program can branch on:
 The message is for a human; the class is the contract.
 
 **One way to page.** Every listing -- the inbox, the visible threads, a
-thread's messages -- takes `limit` (1..100, default 20) and `cursor`
+thread's messages, a job's deliveries and its path -- takes `limit` (1..100, default 20) and `cursor`
 (the previous page's `next_cursor`, opaque) and answers
 `{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
 `unread` badge beside them. A `limit` outside 1..100 is **refused**
@@ -631,6 +632,146 @@ comms has not been told about yet is retried, the same lag
   persistent one ends in the dead-letter stream.
 - Sync events are safe to replay any number of times.
 - `notification_request` replays collapse on the key.
+
+## 8. Reading a job by its key
+
+The product's last link when it asks "what became of it": its own
+record -> its idempotency key -> the job in comms -> the steps.
+Reading is the source of truth; nothing a later push says replaces it.
+
+    GET /api/v1/notifications/by-key?key=<key>              the summary
+    GET /api/v1/notifications/by-key/deliveries?key=<key>   a page
+    GET /api/v1/notifications/by-key/path?key=<key>         a page
+
+**The key is a query parameter, percent-encoded.** Any key the product
+sent (1..200 characters, any characters) is read back by its exact
+value. Encode it the standard way -- `/`, `?`, `%`, `#`, `&`, spaces and
+non-ASCII all survive. One trap: a `+` sent **unencoded** reads as a
+space; encode it as `%2B` (every standard query encoder does).
+
+**Answers.** The same service token as every route (401 without it).
+`key` empty, missing or longer than 200 -> 422 `validation`. The
+deliveries and path pages take `limit` and `cursor` like every listing
+(section 5); a cursor from one listing is refused by the other (422).
+
+- **404 `not_found`** -- the key answers nothing: comms never received
+  it, **or** the job and its records outlived retention ("How long
+  comms keeps things"). The two are not told apart. Before you look
+  inside comms, look at your own outbox and relay: a 404 within the
+  retention window means the request never arrived.
+- **200, `job: null`** -- the request was **not accepted**: `intake`
+  says why (rejected at intake, with the reason). The job was never
+  taken; the responsibility is the product's.
+- **200 with a `job`** -- accepted: comms owns it, and the job, its
+  deliveries and its path say where it is.
+
+The deliveries and path pages answer 404 when the key has no accepted
+job (only intake outcomes, or nothing).
+
+**What is never in an answer: the letter.** No title, body, action data,
+template variables; no text of an exception of comms' own (only its
+class and place, in `error`). A provider's own answer is in the path,
+sanitized; once its recipient is forgotten it is `null`.
+
+**A replay is not shown.** Sending the same bytes under the same key
+again changes nothing and records nothing: the read shows the accepted
+job, not a "duplicate". A conflict (the same key, other bytes) is
+shown, in `intake`.
+
+**The path starts with the journal.** Jobs accepted before the journal
+existed (comms before migration 0017) have a partial or an empty
+path; their summary and deliveries are whole.
+
+**Adding a field is not a break.** Clients ignore fields they do not
+know. Phase 5 adds the model's answer to `job` that way -- an object
+`response` beside `status` (the body, a snapshot of who answered, the
+letter's hash) -- without changing any field below.
+
+### `summary` -- `GET .../by-key`
+
+| field | value |
+|---|---|
+| `idempotency_key` | the key, as read |
+| `intake` | every request under the key that was not accepted, oldest first (`intake_item`); `[]` when none |
+| `job` | the accepted job (`job`), or `null` |
+
+### `intake_item`
+
+| field | value |
+|---|---|
+| `outcome` | `rejected_at_intake` -- the envelope could not be accepted; `conflict` -- the key is taken by an accepted job with other bytes |
+| `reason` | for a human, redacted; the class is `outcome` |
+| `received_at` | when it arrived |
+| `notification_id` | the accepted job a conflict collided with; `null` for a rejection, and for a conflict whose job is past retention |
+
+### `job`
+
+| field | value |
+|---|---|
+| `id` | the job's id |
+| `type` | the request type |
+| `category` | the category it was gated by, or `null` |
+| `target_type` | `user`, `group`, `all` |
+| `target_value` | the address as sent |
+| `correlation` | as sent, untouched, or `null` |
+| `status` | `pending`, `processing`; or the outcome: `sent`, `partial_sent`, `failed`, `no_recipients`, `suppressed`, `expired`, `cancelled` |
+| `created_at` | when it was accepted |
+| `scheduled_at` | when it becomes deliverable |
+| `expiry_at` | when it expires, or `null` |
+| `pipeline` | the pipeline's own failures (`pipeline`) |
+| `deliveries` | the deliveries counted by channel and status (`delivery_count`); `[]` before resolve |
+
+### `pipeline`
+
+| field | value |
+|---|---|
+| `attempts` | failed pipeline attempts; 0 when none |
+| `step` | the step that tore last: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
+| `error` | the class and the place of the failure, or `null` |
+| `retry_at` | when the job is tried again, or `null` |
+
+### `delivery_count`
+
+| field | value |
+|---|---|
+| `channel` | the channel |
+| `status` | a delivery status (`delivery_item`) |
+| `count` | how many |
+
+### `delivery_item` -- `GET .../by-key/deliveries`
+
+| field | value |
+|---|---|
+| `recipient_id` | the recipient, the product's id |
+| `channel` | the channel |
+| `status` | `pending`, `sent`, `failed`, `suppressed`, `recipient_inactive`, `expired`, `cancelled` |
+| `attempts` | channel attempts spent |
+| `failure_class` | for a failed delivery: `configuration`, `message_rejected`, `no_address`, `transient_exhausted`, `pipeline`; else `null` |
+| `wait_reason` | for a delivery that waits: `recipient_schedule`, `provider_rate_limit`, `transient_backoff`; else `null` |
+| `next_retry_at` | until when it waits, or `null` |
+| `sent_at` | when the channel took it, or `null` |
+| `read_at` | when it was read (in-app), or `null` |
+| `created_at` | when it was created (resolve) |
+
+### `path_item` -- `GET .../by-key/path`
+
+One row per transition, in order.
+
+| field | value |
+|---|---|
+| `at` | when |
+| `subject` | `job`, `delivery`, `channel` (what the channel answered), `gate` (a recipient a mute dropped before a delivery existed) |
+| `step` | `intake`, `lock`, `resolve`, `deliver`, `rollup`, `commit`, `expire`, `cancel`, `withdraw`, `ceiling` |
+| `outcome` | the status after it; for `channel`: `accepted`, `refused`, `rate_limited`, `transient`, `timeout`, `error`; for `gate`: `suppressed` |
+| `recipient_id` | for `delivery`, `channel`, `gate`; else `null` |
+| `channel` | for `delivery`, `channel`; else `null` |
+| `attempt` | the attempt number |
+| `wait_reason` | a wait: the delivery's, or `pipeline_retry` for the job; else `null` |
+| `wait_until` | until when, or `null` |
+| `failure_class` | as on a delivery, or `null` |
+| `category` | the category a mute gate decided by, or `null` |
+| `error` | an exception of comms' own: class and place, never its text; or `null` |
+| `provider_text` | the provider's answer, sanitized; `null` when it said nothing or its recipient was forgotten |
 
 ## Operating the comms stack
 

@@ -415,9 +415,9 @@ class IntakeOutcome(UUIDMixin, Base):
     A rejection does NOT occupy the key: a product that fixes its
     request may resend it under the same key and have it accepted.
 
-    Nothing reads these rows for the product yet -- reading by key is
-    phase 2. Until then service.intake_outcomes_for() is the
-    programmatic answer. The unique index on (idempotency_key,
+    The product reads them under its key (P2-2: GET
+    /api/v1/notifications/by-key, the `intake` list;
+    service.intake_outcomes_for). The unique index on (idempotency_key,
     fingerprint, outcome) lives in migration 0012
     (app/core/schema_objects.py): a replay of the same bytes records
     nothing new.

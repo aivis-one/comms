@@ -273,17 +273,167 @@ async def record_intake_outcome(
 async def intake_outcomes_for(
     session: AsyncSession, idempotency_key: str,
 ) -> list[IntakeOutcome]:
-    """Every recorded non-acceptance under a key, oldest first.
-
-    The programmatic answer until reading by key exists for the
-    product (phase 2).
-    """
+    """Every recorded non-acceptance under a key, oldest first -- the
+    `intake` of reading by key (read_job_by_key, P2-2)."""
     rows = await session.execute(
         select(IntakeOutcome)
         .where(IntakeOutcome.idempotency_key == idempotency_key)
         .order_by(IntakeOutcome.received_at, IntakeOutcome.id)
     )
     return list(rows.scalars().all())
+
+
+# -----------------------------------------------------------------------------
+# Reading a job by its key (P2-2, spec §6.2 / §6.6 / §7.1)
+# -----------------------------------------------------------------------------
+#
+# The product's last link: its own record -> the key -> the job in comms
+# -> the steps. READ ONLY: app/api/jobs.py runs every reader below in a
+# read-only REPEATABLE READ transaction, so the summary's three queries
+# see one snapshot and nothing here can write. A fixed number of
+# queries per read -- never one per delivery.
+#
+# NEVER the letter: these return ORM rows, and the wire form
+# (app/api/jobs.py) is a closed field set that names no title, body,
+# action_data, channel_options or error_message (the last can carry the
+# text of a comms exception -- service._deliver_single).
+
+
+@dataclass(frozen=True)
+class JobRead:
+    """What a key answers: its non-acceptances, its job, the job's
+    deliveries counted by (channel, status)."""
+
+    intake: list[IntakeOutcome]
+    job: Notification | None
+    delivery_counts: list[tuple[str, str, int]]
+
+
+async def _job_by_key(
+    session: AsyncSession, idempotency_key: str,
+) -> Notification | None:
+    return (
+        await session.execute(
+            select(Notification).where(
+                Notification.idempotency_key == idempotency_key,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def read_job_by_key(
+    session: AsyncSession, idempotency_key: str,
+) -> JobRead:
+    """The summary under a key. NotFoundError when the key answers
+    nothing at all -- never received, or past retention (the two are
+    not told apart: telling them apart would need a write at cleanup)."""
+    job = await _job_by_key(session, idempotency_key)
+    intake = await intake_outcomes_for(session, idempotency_key)
+    if job is None and not intake:
+        raise NotFoundError("no job and no intake outcome under this key")
+    counts: list[tuple[str, str, int]] = []
+    if job is not None:
+        rows = await session.execute(
+            select(
+                NotificationDelivery.channel,
+                NotificationDelivery.status,
+                func.count(),
+            )
+            .where(NotificationDelivery.notification_id == job.id)
+            .group_by(NotificationDelivery.channel, NotificationDelivery.status)
+            .order_by(NotificationDelivery.channel, NotificationDelivery.status)
+        )
+        counts = [(channel, status, int(n)) for channel, status, n in rows.all()]
+    return JobRead(intake=intake, job=job, delivery_counts=counts)
+
+
+async def job_id_by_key(session: AsyncSession, idempotency_key: str) -> UUID:
+    """The accepted job under a key, or NotFoundError -- a key with only
+    intake outcomes has no deliveries and no path."""
+    job = await _job_by_key(session, idempotency_key)
+    if job is None:
+        raise NotFoundError("no accepted job under this key")
+    return job.id
+
+
+async def list_job_deliveries(
+    session: AsyncSession,
+    notification_id: UUID,
+    *,
+    limit: int,
+    cursor: tuple[datetime, UUID] | None,
+) -> tuple[list[NotificationDelivery], tuple[datetime, UUID] | None]:
+    """One page of a job's deliveries, oldest first, keyset
+    (created_at, id).
+
+    KNOWN CEILING (acknowledged by design -- P2-2, delivery page cost):
+      1. Mechanics: a page is found through the notification_id index
+         and a top-N sort of ALL of the job's deliveries: the cost of
+         one page grows with the size of the job (measured: 0.47 ms at
+         1 000 deliveries, 5.1 ms at 10 000; reading every page of a
+         job is quadratic in its size).
+      2. Status: acknowledged by design.
+      3. Backlog ref: none -- at the measured sizes a page is cheap and
+         reading by key is a diagnostic call, not a feed.
+      4. Promotion trigger (observable): a group job whose deliveries
+         page takes longer than 50 ms, or the product paging a job's
+         deliveries as a routine (not diagnostic) read.
+      5. Agreed fix: an index (notification_id, created_at, id) in a new
+         migration -- the page becomes an index range scan.
+      6. Rejected: ordering by id alone (a uuid: no meaningful order,
+         and the (timestamp, uuid) codec is the deliveries' kind of
+         key); adding the index now -- every delivery insert of every
+         job would pay for a diagnostic read, and the measurement says
+         it is not needed yet.
+    """
+    statement = select(NotificationDelivery).where(
+        NotificationDelivery.notification_id == notification_id,
+    )
+    if cursor is not None:
+        statement = statement.where(
+            tuple_(NotificationDelivery.created_at, NotificationDelivery.id)
+            > cursor
+        )
+    rows = list(
+        (
+            await session.execute(
+                statement.order_by(
+                    NotificationDelivery.created_at, NotificationDelivery.id,
+                ).limit(limit + 1)
+            )
+        ).scalars()
+    )
+    if len(rows) <= limit:
+        return rows, None
+    last = rows[limit - 1]
+    return rows[:limit], (last.created_at, last.id)
+
+
+async def list_job_path(
+    session: AsyncSession,
+    notification_id: UUID,
+    *,
+    limit: int,
+    cursor: int | None,
+) -> tuple[list[NotificationTransition], int | None]:
+    """One page of a job's journal, in order (the journal's identity;
+    ix_transitions_path). A job accepted before the journal existed
+    (migration 0017) has a partial or empty path."""
+    statement = select(NotificationTransition).where(
+        NotificationTransition.notification_id == notification_id,
+    )
+    if cursor is not None:
+        statement = statement.where(NotificationTransition.id > cursor)
+    rows = list(
+        (
+            await session.execute(
+                statement.order_by(NotificationTransition.id).limit(limit + 1)
+            )
+        ).scalars()
+    )
+    if len(rows) <= limit:
+        return rows, None
+    return rows[:limit], rows[limit - 1].id
 
 
 async def delete_intake_outcomes_before(
