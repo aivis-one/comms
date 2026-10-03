@@ -28,8 +28,11 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from app.api.changes import router as changes_router
+from app.api.channels import router as channels_router
 from app.api.errors import register_error_handlers
 from app.api.inbox import router as inbox_router
+from app.api.jobs import router as jobs_router
 from app.api.messaging import participants_router, sections_router
 from app.api.messaging import router as messaging_router
 from app.api.prefs import router as prefs_router
@@ -117,11 +120,14 @@ app = FastAPI(
 )
 register_error_handlers(app)
 app.include_router(inbox_router)
+app.include_router(jobs_router)
+app.include_router(changes_router)
 app.include_router(prefs_router)
 app.include_router(messaging_router)
 app.include_router(sections_router)
 app.include_router(participants_router)
 app.include_router(recipients_router)
+app.include_router(channels_router)
 
 
 async def _db_ok() -> bool:

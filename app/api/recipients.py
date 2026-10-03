@@ -36,6 +36,12 @@
 # wearing a snapshot's clothes. extra="forbid" makes a typo a 422 for
 # the same reason.
 #
+# THE LISTING (P2-4, spec §10.5): GET /api/v1/recipients pages through
+# the book as comms holds it -- id, version, active, deleted, no address
+# -- so the product can reconcile. It writes nothing; what the product
+# does about a difference goes back through PUT and DELETE here
+# (app/audience/book.py).
+#
 # IDEMPOTENCY: a repeat call with identical data is a no-op update, so
 # the product may retry freely, and the same event arriving later
 # through the stream changes nothing. The comms-owned preference
@@ -46,12 +52,14 @@
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_service_auth
+from app.api.paging import PAGE_LIMIT_DEFAULT, decode_cursor, page, page_limit
 from app.audience import sync
+from app.audience.book import list_book
 from app.audience.models import Recipient
 from app.core.constants import (
     MAX_EMAIL_LEN,
@@ -61,7 +69,7 @@ from app.core.constants import (
     MAX_TIMEZONE_LEN,
     MIN_TELEGRAM_ID,
 )
-from app.core.database import get_db_session
+from app.core.database import get_db_reader, get_db_session
 from app.forgetting import forget_recipient
 
 router = APIRouter(
@@ -124,6 +132,22 @@ def _wire(recipient: Recipient) -> dict[str, Any]:
         "active": recipient.active,
         "deleted": recipient.deleted_at is not None,
     }
+
+
+@router.get("")
+async def list_recipients(
+    limit: int = Query(default=PAGE_LIMIT_DEFAULT),
+    cursor: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_db_reader),
+) -> dict[str, Any]:
+    """The address book as comms holds it, a page at a time, for the
+    product to compare with its own (app/audience/book.py). Reads only:
+    comms acts on no difference -- the product does, through PUT and
+    DELETE below."""
+    items, next_cursor = await list_book(
+        session, limit=page_limit(limit), cursor=decode_cursor(cursor),
+    )
+    return page(items, next_cursor, dict)
 
 
 @router.put("/{recipient_id}")

@@ -18,6 +18,7 @@
 #   a known route, another method        -> 405  method_not_allowed
 #   ConflictError (by subclass)          -> 409  conflict | stale_snapshot
 #                                                | recipient_deleted
+#   CursorExpiredError                   -> 410  cursor_expired
 #   DBAPIError                           -> 500  internal
 #
 # Starlette's own HTTPException (401 from the token dependency, the
@@ -49,6 +50,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.core.exceptions import (
     AuthorizationError,
     ConflictError,
+    CursorExpiredError,
     NotFoundError,
     ValidationError,
     conflict_class,
@@ -80,6 +82,8 @@ class ErrorClass(StrEnum):
     CONFLICT = "conflict"
     STALE_SNAPSHOT = "stale_snapshot"
     RECIPIENT_DELETED = "recipient_deleted"
+    # A changes cursor older than the retention period (P2-3).
+    CURSOR_EXPIRED = "cursor_expired"
     INTERNAL = "internal"
 
 
@@ -133,6 +137,12 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConflictError)
     async def _conflict(request: Request, exc: ConflictError) -> JSONResponse:
         return error_response(409, conflict_class(exc), str(exc))
+
+    @app.exception_handler(CursorExpiredError)
+    async def _cursor_expired(
+        request: Request, exc: CursorExpiredError
+    ) -> JSONResponse:
+        return error_response(410, ErrorClass.CURSOR_EXPIRED, str(exc))
 
     @app.exception_handler(RequestValidationError)
     async def _request_validation(

@@ -198,6 +198,54 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "WHERE (close_notify_pending_at IS NOT NULL)"
         ),
     ),
+    # The path of one job in order (P2-1, migration 0017); also the
+    # lookup of the ON DELETE CASCADE from notifications.
+    "ix_transitions_path": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_transitions_path "
+            "ON public.notification_transitions USING btree "
+            "(notification_id, id)"
+        ),
+    ),
+    # Forgetting clears provider_text by recipient (withdraw_recipient):
+    # only rows that carry text are indexed.
+    "ix_transitions_forgetting": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_transitions_forgetting "
+            "ON public.notification_transitions USING btree "
+            "(recipient_id) WHERE (provider_text IS NOT NULL)"
+        ),
+    ),
+    # Channel health over a window (P2-4, migration 0018): channel rows
+    # only, a range over `at`, the grouped columns carried in the index.
+    "ix_transitions_channel_window": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_transitions_channel_window "
+            "ON public.notification_transitions USING btree (at) "
+            "INCLUDE (channel, outcome, failure_class) "
+            "WHERE ((subject)::text = 'channel'::text)"
+        ),
+    ),
+    # The changes feed's order from a cursor (P2-3, migration 0019).
+    "ix_transitions_changes": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_transitions_changes "
+            "ON public.notification_transitions USING btree (xact_id, id) "
+            "INCLUDE (notification_id)"
+        ),
+    ),
+    # The address book listing's keyset order (P2-4, migration 0018).
+    "ix_recipients_book": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_recipients_book ON public.recipients "
+            "USING btree (created_at, id)"
+        ),
+    ),
     "ix_threads_operator_user": IndexShape(
         unique=False,
         definition=(
@@ -239,6 +287,15 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # or not at all; a gate stands only behind a recorded one (T12).
     "ck_notifications_pipeline",
     "ck_notifications_pipeline_gate",
+    # The journal (P2-1, migration 0017): a row's shape follows its
+    # subject; a wait has both its reason and its time or neither; the
+    # provider's words only on a channel row and never blank; no blank
+    # error; no negative attempt.
+    "ck_transitions_subject_shape",
+    "ck_transitions_wait",
+    "ck_transitions_provider_text",
+    "ck_transitions_error_not_blank",
+    "ck_transitions_attempt_not_negative",
 })
 
 # Everything the schema must carry although the metadata never mentions
