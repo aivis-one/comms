@@ -37,7 +37,7 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, func, inspect, select, text
+from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -332,8 +332,14 @@ async def _s_backoff(db: AsyncSession) -> UUID:
 
 
 async def _s_exhausted(db: AsyncSession) -> UUID:
-    settings.notification_max_delivery_attempts = 1
+    # The ceiling is the job's since H1 (snapshot at intake), set on it.
     nid = await _intake(db, (await create_recipient(db)).id)
+    await db.execute(
+        update(Notification)
+        .where(Notification.id == nid)
+        .values(retry_max_attempts=1)
+    )
+    await db.commit()
     with _channel(EmailTransientError("provider error (503)")):
         await process_pending_notifications()
     assert await _status(nid) == NotificationStatus.FAILED

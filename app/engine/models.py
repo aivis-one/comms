@@ -189,6 +189,22 @@ class Notification(UUIDMixin, Base):
         nullable=False,
     )
 
+    # The type's transport retry, AT INTAKE (H1, spec §9.7): the attempt
+    # ceiling and the backoff base its deliveries retry by -- snapshotted
+    # like push_on, so a profile changed between intake and a retry
+    # never changes the rule of an accepted job. Read by
+    # app/engine/service.py _apply_transient_failure; the backoff CAP
+    # stays the deploy's (NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS). The
+    # CHECKs (the settings' own ranges) are in migration 0021.
+    retry_max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    retry_backoff_seconds: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
     # The product's own reference from the envelope (F1.2). Stored and
     # handed back untouched; comms never interprets it. Cancellation
     # matches it by EQUALITY -- a comparison, not a reading (F1.3).

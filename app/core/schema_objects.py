@@ -308,6 +308,10 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # What a job pushes is one of the three PushOn values, never NULL
     # (P3-1, migration 0020).
     "ck_notifications_push_on",
+    # A job's retry ceiling and backoff base are within the settings'
+    # own ranges, never NULL (H1, migration 0021).
+    "ck_notifications_retry_max_attempts",
+    "ck_notifications_retry_backoff_seconds",
 })
 
 # Everything the schema must carry although the metadata never mentions

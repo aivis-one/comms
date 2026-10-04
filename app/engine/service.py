@@ -486,7 +486,9 @@ async def create_notification(
         type: A notification type key declared by the product profile.
             The type's CHANNELS come from its profile record and are
             snapshotted onto the row -- the caller never names one; so
-            are its category and its push_on (what it pushes back).
+            are its category, its push_on (what it pushes back) and
+            its transport retry (retry_max_attempts,
+            retry_backoff_seconds).
         title: Stored fallback title (the letter).
         body: Stored fallback body (the letter).
         target_type: TargetType value (user, group, all).
@@ -506,8 +508,9 @@ async def create_notification(
 
     Raises:
         ValidationError: The request cannot be accepted -- undeclared
-            type, invalid target_type, an expiry already passed or not
-            after scheduled_at.
+            type, a body longer than the type's max_body_chars, invalid
+            target_type, an expiry already passed or not after
+            scheduled_at.
     """
     # -- The profile record IS the registration (every installed type
     # has one; a type without a record is not declared). --
@@ -516,6 +519,17 @@ async def create_notification(
         raise ValidationError(
             f"Unregistered notification type: {type}. "
             f"Registered: {', '.join(sorted(registry.registered_types()))}"
+        )
+
+    # -- The type's size limit (H1, spec §5.9): its LENGTH, never its
+    # content. Refused here, not at delivery: comms does not accept a
+    # job it already knows it will not deliver. The product reads the
+    # refusal and its reason under the key (intake_outcomes). --
+    max_body_chars: int = record.value("max_body_chars")
+    if len(body) > max_body_chars:
+        raise ValidationError(
+            f"body has {len(body)} characters; type {type} allows at "
+            f"most {max_body_chars} (max_body_chars)"
         )
 
     if target_type not in _VALID_TARGET_TYPES:
@@ -554,6 +568,8 @@ async def create_notification(
     channels = list(record.value("channels"))
     category = record.value("category")
     push_on = record.value("push_on")
+    retry_max_attempts = record.value("retry_max_attempts")
+    retry_backoff_seconds = record.value("retry_backoff_seconds")
 
     notification = Notification(
         type=type,
@@ -565,6 +581,8 @@ async def create_notification(
         channels=channels,
         category=category,
         push_on=push_on,
+        retry_max_attempts=retry_max_attempts,
+        retry_backoff_seconds=retry_backoff_seconds,
         correlation=correlation,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
@@ -1025,13 +1043,13 @@ async def deliver_notification(
                         deferrals=delivery.rate_limit_deferrals,
                         budget=budget,
                     )
-                    _apply_transient_failure(delivery, outcome.error)
+                    _apply_transient_failure(notification, delivery, outcome.error)
             elif outcome.success:
                 delivery.attempts += 1
                 delivery.status = DeliveryStatus.SENT
                 delivery.sent_at = datetime.now(UTC)
             else:
-                _apply_transient_failure(delivery, outcome.error)
+                _apply_transient_failure(notification, delivery, outcome.error)
             journal.record_delivery(
                 session, notification, delivery, JournalStep.DELIVER,
             )
@@ -1051,6 +1069,7 @@ def _close_accepted(delivery: NotificationDelivery, accepted_at: datetime) -> No
 
 
 def _apply_transient_failure(
+    notification: Notification,
     delivery: NotificationDelivery,
     error: str | None,
 ) -> None:
@@ -1059,10 +1078,13 @@ def _apply_transient_failure(
     Shared by the regular transient path and the exhausted-budget 429
     path (a 429 past the deferral budget behaves exactly like any
     other transient error).
+
+    The ceiling and the backoff base are the JOB's -- its type's, as
+    snapshotted at intake (H1, spec §9.7); the cap is the deploy's.
     """
     delivery.attempts += 1
     delivery.error_message = error
-    if delivery.attempts >= settings.notification_max_delivery_attempts:
+    if delivery.attempts >= notification.retry_max_attempts:
         delivery.status = DeliveryStatus.FAILED
         delivery.failure_class = FailureClass.TRANSIENT_EXHAUSTED
     else:
@@ -1070,7 +1092,7 @@ def _apply_transient_failure(
         # capped. Without it all attempts burned within one
         # poll interval (review 1.1).
         backoff_seconds = min(
-            settings.notification_retry_backoff_base_seconds
+            notification.retry_backoff_seconds
             * 2 ** (delivery.attempts - 1),
             settings.notification_retry_backoff_max_seconds,
         )

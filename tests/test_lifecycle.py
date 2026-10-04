@@ -160,12 +160,14 @@ class TestFailureClass:
         assert entry["log_level"] == "warning"
 
     async def test_exhausted_transient_attempts_are_classed(
-        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+        self, db_session: AsyncSession,
     ) -> None:
-        from app.core.config import settings
-
-        monkeypatch.setattr(settings, "notification_max_delivery_attempts", 1)
+        # The ceiling is the JOB's since H1 (snapshotted at intake from
+        # its type; the setting is only the default layer, read when the
+        # profile is installed), so it is set on the job, not on the
+        # setting -- which no longer reaches an accepted job.
         notification, (delivery,) = await _job(db_session)
+        notification.retry_max_attempts = 1
         await _deliver_with(db_session, notification, _Raising(RuntimeError("x")))
         assert delivery.status == DeliveryStatus.FAILED
         assert delivery.failure_class == FailureClass.TRANSIENT_EXHAUSTED

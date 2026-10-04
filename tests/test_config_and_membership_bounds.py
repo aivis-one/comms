@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.core.config import NUMERIC_BOUNDS, Settings
+from app.core.config import NUMERIC_BOUNDS, Settings, settings
 from app.core.exceptions import ValidationError
 from app.profile.loader import _FIELDS
 from app.transport.events import (
@@ -184,14 +184,28 @@ class TestTheProfileDefaultLayer:
         ],
     )
     def test_every_value_the_setting_can_take_the_profile_accepts(
-        self, field: str, setting: str,
+        self, field: str, setting: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Since H1 a declared backoff base must also not exceed the
+        deploy's cap (NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS) -- and the
+        SETTING can reach its own top only when the cap is there too
+        (the ordered pair base <= max). So the cap is raised to its top
+        here, the one deploy in which the setting takes bound.hi; the
+        claim -- the default layer hands out nothing a declaration would
+        be refused for -- is unchanged. Since H1 the profile's range
+        also has the setting's top: one above it is refused."""
+        monkeypatch.setattr(
+            settings, "notification_retry_backoff_max_seconds",
+            NUMERIC_BOUNDS["notification_retry_backoff_max_seconds"].hi,
+        )
         bound = NUMERIC_BOUNDS[setting]
         check = _FIELDS[field].check
         assert check(bound.lo) is None
         assert check(bound.hi) is None
-        # The pair: the check is not vacuous -- one below is refused.
+        # The pair: the check is not vacuous -- one below is refused,
+        # and one above.
         assert check(bound.lo - 1) is not None
+        assert check(bound.hi + 1) is not None
 
 
 def _event(event: str, data: dict[str, Any]) -> Any:

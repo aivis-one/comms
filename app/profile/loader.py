@@ -474,6 +474,26 @@ def _int_in_range(
     return check
 
 
+def _backoff_base(value: Any) -> str | None:
+    """Parser for retry_backoff_seconds: an integer in the setting's own
+    range (NUMERIC_BOUNDS, the column's CHECK, migration 0021) and not
+    above the deploy's backoff cap. Above the cap the first wait would
+    already be clipped to it -- the profile would declare a backoff that
+    is never honored -- so it is refused, the rule the settings pair
+    base <= max already follows (app/core/config.py _ORDERED_PAIRS)."""
+    bound = NUMERIC_BOUNDS["notification_retry_backoff_base_seconds"]
+    problem = _int_in_range(bound.lo, bound.hi)(value)
+    if problem is not None:
+        return problem
+    cap = settings.notification_retry_backoff_max_seconds
+    if value > cap:
+        return (
+            f"found {value}; above NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS="
+            f"{cap}, the cap every backoff is clipped to"
+        )
+    return None
+
+
 def _duration_value(literal: str) -> timedelta:
     match = _DURATION_RE.match(literal)
     assert match is not None  # checked by _check_duration first
@@ -532,12 +552,17 @@ _FIELDS: dict[str, _Field] = {
         convert=_duration_value,
     ),
     # Transport retry ceiling -- a number, never a condition (spec §9.7).
+    # Applied (H1): snapshotted onto each job at intake
+    # (notifications.retry_max_attempts) and burnt by its deliveries.
     "retry_max_attempts": _Field(
-        # The lower bound is the setting's own (app/core/config.py,
+        # The range is the setting's own (app/core/config.py,
         # NUMERIC_BOUNDS), so the default layer can never hand out a
-        # value a declared field would be refused for (D1 / R3).
+        # value a declared field would be refused for (D1 / R3), and a
+        # declared one is as bounded as the setting it replaces -- the
+        # same range the column's CHECK holds (migration 0021).
         check=_int_in_range(
             NUMERIC_BOUNDS["notification_max_delivery_attempts"].lo,
+            NUMERIC_BOUNDS["notification_max_delivery_attempts"].hi,
         ),
         default=lambda: (
             settings.notification_max_delivery_attempts,
@@ -545,10 +570,10 @@ _FIELDS: dict[str, _Field] = {
         ),
     ),
     # Transport retry backoff base, in seconds; 0 = no idle wait.
+    # Applied (H1): snapshotted onto each job at intake
+    # (notifications.retry_backoff_seconds); the cap stays the deploy's.
     "retry_backoff_seconds": _Field(
-        check=_int_in_range(
-            NUMERIC_BOUNDS["notification_retry_backoff_base_seconds"].lo,
-        ),
+        check=_backoff_base,
         default=lambda: (
             settings.notification_retry_backoff_base_seconds,
             "settings: NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS",
@@ -556,7 +581,8 @@ _FIELDS: dict[str, _Field] = {
     ),
     # Size limit, in characters of the body. The ceiling is the width
     # the body already has (MAX_BODY_LEN): a type may tighten it, never
-    # widen it past the column.
+    # widen it past the column. Applied (H1) at intake: a longer body
+    # is refused there (app/engine/service.py create_notification).
     "max_body_chars": _Field(
         check=_int_in_range(1, MAX_BODY_LEN),
         default=lambda: (MAX_BODY_LEN, "comms default: MAX_BODY_LEN"),

@@ -81,6 +81,7 @@ from app.core.exceptions import (
     conflict_class,
 )
 from app.engine.formatters import sanitize_text, sanitized_traceback
+from app.transport.connection import redis_client
 from app.transport.events import parse_event
 from app.transport.handlers import HandleResult, handle_event
 
@@ -376,8 +377,10 @@ def _field_str(value: Any) -> str:
 
 
 async def run_consumer_loop() -> None:
-    """Build the Redis client and run the consumer until cancelled."""
-    redis: Redis = Redis.from_url(settings.redis_url)
+    """Build the Redis client and run the consumer until cancelled. A
+    redis that stays silent past the socket timeout raises TimeoutError
+    out of here (app/transport/connection.py)."""
+    redis: Redis = redis_client()
     consumer = StreamConsumer(redis)
     try:
         await consumer.run()

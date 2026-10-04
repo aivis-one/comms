@@ -34,6 +34,19 @@
 #   feed (app/engine/changes.py, the xmin rule), and a redis that hangs
 #   must not hold back the feed the product falls back on.
 #
+# THE DELETE NEVER WAITS (H1). Two other writers delete outbox rows: the
+# ON DELETE CASCADE of a job removed by retention
+# (app/engine/processor.py cleanup_terminal_notifications) or by the
+# expiry cleanup (cleanup_expired_notifications). A cascade locks the
+# rows of each job it deletes, job after job; a relay delete that WAITED
+# for one of those rows while holding another could close a cycle with
+# it -- 40P01. So the relay deletes only the rows it can lock at once
+# (FOR UPDATE SKIP LOCKED): a waiting relay is what a cycle needs, and
+# there is none. A row it skipped is held by a cascade: when that
+# commits, the row went with its job; when it rolls back, the row is
+# still owed and the next tick publishes it again -- a duplicate,
+# harmless. No row is lost either way (tests/test_relay_vs_retention.py).
+#
 # REDIS AWAY: the tick fails, the rows stay, the next tick tries again.
 # The worker never touches redis, so transitions go on and the outbox
 # grows; when redis is back the backlog is published batch by batch
@@ -50,12 +63,14 @@ import structlog
 from redis.asyncio import Redis
 from redis.typing import EncodableT, FieldT
 from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.constants import PUSH_RELAY_BATCH, PUSH_RELAY_INTERVAL_SECONDS
 from app.core.database import get_session_factory
 from app.engine.formatters import sanitized_traceback
 from app.engine.models import Notification, PushOutbox
+from app.transport.connection import redis_client
 
 logger = structlog.get_logger()
 
@@ -70,6 +85,22 @@ PUSH_FIELDS = ("v", "idempotency_key")
 def push_entry(idempotency_key: str) -> dict[FieldT, EncodableT]:
     """The stream entry of one push: the format version and the key."""
     return {"v": str(PUSH_FORMAT_VERSION), "idempotency_key": idempotency_key}
+
+
+async def delete_published(session: AsyncSession, ids: list[int]) -> int:
+    """Delete the published rows `ids` that can be locked without
+    waiting; skip the rest (a cascade holds them -- see THE DELETE NEVER
+    WAITS above). Commit-free; returns the number of rows deleted."""
+    lockable = (
+        select(PushOutbox.id)
+        .where(PushOutbox.id.in_(ids))
+        .with_for_update(skip_locked=True)
+    )
+    result = await session.execute(
+        delete(PushOutbox).where(PushOutbox.id.in_(lockable)),
+    )
+    deleted: int = result.rowcount  # type: ignore[attr-defined]
+    return deleted
 
 
 async def relay_once(redis: Redis) -> int:
@@ -100,9 +131,7 @@ async def relay_once(redis: Redis) -> int:
             approximate=True,
         )
     async with factory() as session:
-        await session.execute(
-            delete(PushOutbox).where(PushOutbox.id.in_([ident for ident, _ in rows]))
-        )
+        await delete_published(session, [ident for ident, _ in rows])
         await session.commit()
     logger.debug("push_relay_published", rows=len(rows), keys=len(keys))
     return len(rows)
@@ -125,8 +154,10 @@ async def run_push_relay(redis: Redis) -> None:
 
 
 async def run_push_relay_loop() -> None:
-    """Build the relay's own redis client and relay until cancelled."""
-    redis: Redis = Redis.from_url(settings.redis_url)
+    """Build the relay's own redis client and relay until cancelled. A
+    silent redis fails a tick after the socket timeout -- logged, and
+    retried on the next tick (app/transport/connection.py)."""
+    redis: Redis = redis_client()
     try:
         await run_push_relay(redis)
     finally:

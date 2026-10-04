@@ -425,10 +425,11 @@ class TestRetryBackoff:
     async def test_gate_blocks_early_retry_and_backs_off(
         self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Attempts don't burn within one poll window; gate grows 2x."""
-        monkeypatch.setattr(
-            settings, "notification_retry_backoff_base_seconds", 100,
-        )
+        """Attempts don't burn within one poll window; gate grows 2x.
+
+        The backoff BASE is the job's since H1 (snapshotted at intake
+        from its type), so it is set on the job; the CAP is still the
+        deploy's setting."""
         monkeypatch.setattr(
             settings, "notification_retry_backoff_max_seconds", 10_000,
         )
@@ -442,6 +443,7 @@ class TestRetryBackoff:
             target_type=TargetType.USER,
             target_value=str(recipient.id),
         )
+        notification.retry_backoff_seconds = 100
         await db_session.commit()
 
         with patch(
@@ -536,10 +538,8 @@ class TestRetryBackoff:
     async def test_backoff_capped(
         self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The gate never exceeds the configured cap."""
-        monkeypatch.setattr(
-            settings, "notification_retry_backoff_base_seconds", 100,
-        )
+        """The gate never exceeds the configured cap -- the cap is the
+        deploy's setting; the base is the job's since H1, set on it."""
         monkeypatch.setattr(
             settings, "notification_retry_backoff_max_seconds", 120,
         )
@@ -553,6 +553,7 @@ class TestRetryBackoff:
             target_type=TargetType.USER,
             target_value=str(recipient.id),
         )
+        notification.retry_backoff_seconds = 100
         await db_session.commit()
 
         with patch(
