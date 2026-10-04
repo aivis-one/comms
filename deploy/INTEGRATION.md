@@ -269,7 +269,7 @@ send.
 ## 4. What the integration code does with all this
 
 Consumers of the variables above are the integration track in the
-velo repo:
+product repo:
 
 - outbox relay: velo -> `notification_request` into the comms stream
   (`COMMS_REDIS_URL`);
@@ -278,7 +278,8 @@ velo repo:
 - the user-facing proxy that sets `recipient_id`/`sender`
   **server-side** (comms authenticates the PRODUCT, not the user --
   the proxy owns user-level authorization);
-- the delivery-callback receiver.
+- the push-stream listener (section 10), if the product wants to learn
+  about a result without polling -- comms never calls the product back.
 
 None of that is wired here; this file only accounts for the network
 path, the credentials and the profile being in place before that code

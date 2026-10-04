@@ -67,9 +67,11 @@ from app.core.channels import (
 # number, a pipeline defect becomes an outcome, closed membership
 # events); 3.2.0 is phase 2 (the transition journal, a letter the
 # channel took is never sent twice, reading a job by its key, what
-# changed since a cursor, channel health, the address book). The tag
+# changed since a cursor, channel health, the address book); 3.3.0 is
+# phase 3 (the push stream: a type that declares push_on owes its
+# product the job's key, after the commit, at least once). The tag
 # goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
