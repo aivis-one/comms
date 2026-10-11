@@ -471,15 +471,21 @@ async def cleanup_expired_notifications() -> int:
 
     IN BATCHES (H2), like cleanup_terminal_notifications: the service
     supplies one commit-free batch of _RETENTION_BATCH_SIZE jobs
-    (delete_expired_notifications_batch); this loop commits each and
-    drains until a batch comes back short. One unbounded DELETE held
-    the cascade's push_outbox rows for its whole transaction -- rows the
-    relay (app/transport/push_relay.py) then skipped, tick after tick.
+    (delete_expired_notifications_batch); this loop commits each. One
+    unbounded DELETE held the cascade's push_outbox rows for its whole
+    transaction -- rows the relay (app/transport/push_relay.py) then
+    skipped, tick after tick.
+
+    AT MOST _EXPIRED_MAX_BATCHES_PER_PASS BATCHES (H5): this runs on
+    EVERY worker tick, on the delivery path, so one pass stops at the
+    ceiling and leaves the rest of a backlog to the next tick -- the
+    next tick comes within the poll interval. A pass also stops on a
+    short batch: nothing more is expired.
 
     Returns:
-        Number of notifications deleted, over every batch. A failing
-        batch is rolled back and logged; the batches before it stay
-        deleted and are counted.
+        Number of notifications deleted in this pass, over its batches.
+        A failing batch is rolled back and logged; the batches before
+        it stay deleted and are counted.
     """
     factory = get_session_factory()
     now = datetime.now(UTC)
@@ -487,7 +493,7 @@ async def cleanup_expired_notifications() -> int:
 
     async with factory() as session:
         try:
-            while True:
+            for _ in range(_EXPIRED_MAX_BATCHES_PER_PASS):
                 deleted = await delete_expired_notifications_batch(
                     session, now=now, limit=_RETENTION_BATCH_SIZE,
                 )
@@ -516,6 +522,11 @@ async def cleanup_expired_notifications() -> int:
 # above. Module-level so tests can shrink it to force a multi-batch
 # drain.
 _RETENTION_BATCH_SIZE = 1000
+
+# H5: batches one expiry-cleanup pass deletes at most -- a backlog of
+# _EXPIRED_MAX_BATCHES_PER_PASS x _RETENTION_BATCH_SIZE jobs a tick,
+# the rest on the next tick. Module-level so tests can shrink it.
+_EXPIRED_MAX_BATCHES_PER_PASS = 10
 
 
 async def cleanup_terminal_notifications() -> int:

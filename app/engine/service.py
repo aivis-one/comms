@@ -53,7 +53,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import delete, func, or_, select, tuple_, update
+from sqlalchemy import any_, delete, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -932,9 +932,13 @@ async def deliver_notification(
         # H3) does not wait for them -- a code someone is waiting for
         # right now goes at night too. The mute gates above are not
         # this gate and do not read the field.
+        # The polarity errs toward the recipient (H5): the schedule is
+        # asked for EVERY value but bypass, so a value this gate does
+        # not know -- the enum grown, a row it was never written for --
+        # waits for the recipient's period instead of going at night.
         quiet_until = (
             recipient_deferred_until(recipient, now)
-            if notification.recipient_schedule == RecipientSchedule.RESPECT
+            if notification.recipient_schedule != RecipientSchedule.BYPASS
             else None
         )
         if quiet_until is not None:
@@ -1602,16 +1606,33 @@ async def delete_terminal_notifications_batch(
         .scalar_subquery()
     )
     result = await session.execute(
-        delete(Notification).where(Notification.id.in_(batch_ids)),
+        delete(Notification).where(_id_in_batch(batch_ids)),
     )
     deleted: int = result.rowcount  # type: ignore[attr-defined]
     return deleted
 
 
+def _id_in_batch(batch_ids: Any) -> Any:
+    """`id = ANY(ARRAY(<batch select>))` -- the delete of a batch (H5).
+
+    The batch is selected ONCE (an InitPlan) and its rows are then
+    deleted through the primary key. The plain `id IN (<batch select>)`
+    is planned as a hash semi-join whose outer side scans the whole
+    notifications table -- for every batch, whatever index serves the
+    batch select itself. Used by both batch deletes: retention's and
+    the expiry cleanup's.
+    """
+    return Notification.id == any_(func.array(batch_ids))
+
+
 # The outcomes an expired job may be deleted in by the expiry cleanup
 # (app/engine/processor.py cleanup_expired_notifications): every outcome
 # but failed -- a failure is kept for inspection until general
-# retention takes it.
+# retention takes it. The SAME list is the predicate of the partial
+# index the batch select runs on (ix_notifications_expired_deletable,
+# migration 0023) -- the planner uses that index only while this
+# list implies its predicate; tests/test_expired_cleanup_index.py holds
+# the two equal.
 _EXPIRED_DELETABLE_STATUSES = (
     NotificationStatus.SENT,
     NotificationStatus.PARTIAL_SENT,
@@ -1636,6 +1657,12 @@ async def delete_expired_notifications_batch(
     deliveries, journal, push_outbox rows -- is bounded to `limit` jobs
     and the outbox rows it holds are let go batch by batch. Returns the
     number of rows deleted in this batch.
+
+    BY INDEX (H5): the select is served by the partial index
+    ix_notifications_expired_deletable -- (expiry_at) over the rows
+    this very filter can match -- in expiry order, so neither a scan of
+    the table nor a sort of it; the delete goes through the primary key
+    (_id_in_batch).
     """
     batch_ids = (
         select(Notification.id)
@@ -1649,7 +1676,7 @@ async def delete_expired_notifications_batch(
         .scalar_subquery()
     )
     result = await session.execute(
-        delete(Notification).where(Notification.id.in_(batch_ids)),
+        delete(Notification).where(_id_in_batch(batch_ids)),
     )
     deleted: int = result.rowcount  # type: ignore[attr-defined]
     return deleted

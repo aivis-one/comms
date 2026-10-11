@@ -167,6 +167,23 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "ON public.notifications USING btree (status, scheduled_at)"
         ),
     ),
+    # The expiry cleanup's batch select, in expiry order, over the rows
+    # it may delete (H5, migration 0023). The status list is
+    # app/engine/service.py _EXPIRED_DELETABLE_STATUSES.
+    "ix_notifications_expired_deletable": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notifications_expired_deletable "
+            "ON public.notifications USING btree (expiry_at) "
+            "WHERE ((expiry_at IS NOT NULL) AND ((status)::text = ANY "
+            "((ARRAY['sent'::character varying, "
+            "'partial_sent'::character varying, "
+            "'expired'::character varying, "
+            "'cancelled'::character varying, "
+            "'suppressed'::character varying, "
+            "'no_recipients'::character varying])::text[])))"
+        ),
+    ),
     # A repeated resource call answers with the row it created (F1.4).
     "uq_messages_idempotency_key": IndexShape(
         unique=True,
