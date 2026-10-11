@@ -196,6 +196,19 @@ class Notification(UUIDMixin, Base):
     # app/engine/service.py _apply_transient_failure; the backoff CAP
     # stays the deploy's (NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS). The
     # CHECKs (the settings' own ranges) are in migration 0021.
+    # Whether its deliveries wait for the recipient's schedule, AT
+    # INTAKE (H3): an app/profile/registry.py RecipientSchedule value,
+    # snapshotted like push_on, so a profile changed before delivery
+    # never changes the rule of an accepted job. Read by the schedule
+    # gate in app/engine/service.py deliver_notification -- and nowhere
+    # else: the mute gates read the category. The CHECK
+    # ck_notifications_recipient_schedule is in migration 0022. Width
+    # 16: the longest value, "respect", is 7.
+    recipient_schedule: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+    )
+
     retry_max_attempts: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

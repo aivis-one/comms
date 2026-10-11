@@ -93,7 +93,7 @@ from app.engine.models import (
     NotificationTransition,
 )
 from app.engine.resolver import resolve_targets
-from app.profile.registry import Decided, Layer, registry
+from app.profile.registry import Decided, Layer, RecipientSchedule, registry
 
 logger = structlog.get_logger()
 
@@ -486,8 +486,9 @@ async def create_notification(
         type: A notification type key declared by the product profile.
             The type's CHANNELS come from its profile record and are
             snapshotted onto the row -- the caller never names one; so
-            are its category, its push_on (what it pushes back) and
-            its transport retry (retry_max_attempts,
+            are its category, its push_on (what it pushes back), its
+            recipient_schedule (whether it waits for the allowed
+            periods) and its transport retry (retry_max_attempts,
             retry_backoff_seconds).
         title: Stored fallback title (the letter).
         body: Stored fallback body (the letter).
@@ -568,6 +569,7 @@ async def create_notification(
     channels = list(record.value("channels"))
     category = record.value("category")
     push_on = record.value("push_on")
+    recipient_schedule = record.value("recipient_schedule")
     retry_max_attempts = record.value("retry_max_attempts")
     retry_backoff_seconds = record.value("retry_backoff_seconds")
 
@@ -581,6 +583,7 @@ async def create_notification(
         channels=channels,
         category=category,
         push_on=push_on,
+        recipient_schedule=recipient_schedule,
         retry_max_attempts=retry_max_attempts,
         retry_backoff_seconds=retry_backoff_seconds,
         correlation=correlation,
@@ -765,7 +768,9 @@ async def deliver_notification(
       not an attempt; prior transient history is kept).
     - DELIVERY SCHEDULE (Phase 2; polarity flipped in R-5): a
       delivery whose recipient is OUTSIDE their allowed periods is
-      DEFERRED, not sent -- next_retry_at is set to the next period's
+      DEFERRED, not sent -- unless the job's type declared
+      recipient_schedule: bypass (H3), which skips this gate and no
+      other -- next_retry_at is set to the next period's
       start (recipient's timezone) and the existing retry gate keeps
       it invisible to the poll until then. Attempts and error_message
       stay untouched: deferral is not a failure. Checked per attempt,
@@ -922,8 +927,16 @@ async def deliver_notification(
         # -- Schedule gate: defer, never suppress --
         # The recipient's allowed periods (app/audience/schedule.py).
         # None means "now is fine" -- both when a period covers now
-        # and when there is no schedule at all.
-        quiet_until = recipient_deferred_until(recipient, now)
+        # and when there is no schedule at all. A job whose type
+        # declared recipient_schedule: bypass (snapshotted at intake,
+        # H3) does not wait for them -- a code someone is waiting for
+        # right now goes at night too. The mute gates above are not
+        # this gate and do not read the field.
+        quiet_until = (
+            recipient_deferred_until(recipient, now)
+            if notification.recipient_schedule == RecipientSchedule.RESPECT
+            else None
+        )
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
             delivery.wait_reason = WaitReason.RECIPIENT_SCHEDULE

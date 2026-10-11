@@ -23,6 +23,7 @@
 #                            default normal
 #   push_on               -- outcome | outcome_and_deferral | none;
 #                            default none
+#   recipient_schedule    -- respect | bypass; default respect
 #   expires_after         -- duration literal: 30s, 15m, 24h, 7d;
 #                            default: no expiry
 #   retry_max_attempts    -- integer from 1 to 100; default from settings
@@ -115,6 +116,7 @@ types:
     channels: [in_app]
     lane: interactive
     push_on: outcome
+    recipient_schedule: bypass
     expires_after: 15m
     retry_max_attempts: 2
     retry_backoff_seconds: 0

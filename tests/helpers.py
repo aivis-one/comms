@@ -327,14 +327,16 @@ def notification_row_fields(channels: list[str] | None = None) -> dict[str, obje
     """The NOT NULL intake columns for a Notification built DIRECTLY
     (tests that construct rows around intake, F1.2). A fresh key, the
     test fingerprint, the channels the row is for (in_app unless said),
-    the default expiry layer, the default push_on and the default
-    transport retry -- what intake would have written for a type with
-    no declared expiry, push_on or retry (P3-1, H1)."""
+    the default expiry layer, the default push_on, the default
+    recipient_schedule and the default transport retry -- what intake
+    would have written for a type that declares none of them (P3-1,
+    H1, H3)."""
     return {
         **intake_fields(),
         "channels": channels if channels is not None else ["in_app"],
         "expiry_layer": "default",
         "push_on": "none",
+        "recipient_schedule": "respect",
         "retry_max_attempts": settings.notification_max_delivery_attempts,
         "retry_backoff_seconds": (
             settings.notification_retry_backoff_base_seconds

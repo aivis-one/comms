@@ -312,6 +312,9 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # own ranges, never NULL (H1, migration 0021).
     "ck_notifications_retry_max_attempts",
     "ck_notifications_retry_backoff_seconds",
+    # Whether a job waits for the recipient's schedule is one of the
+    # two RecipientSchedule values, never NULL (H3, migration 0022).
+    "ck_notifications_recipient_schedule",
 })
 
 # Everything the schema must carry although the metadata never mentions

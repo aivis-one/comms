@@ -67,6 +67,23 @@ class Layer(StrEnum):
     DEFAULT = "default"
 
 
+class RecipientSchedule(StrEnum):
+    """Whether a type's deliveries wait for the recipient's schedule --
+    the allowed periods (app/audience/schedule.py): the values of the
+    profile field `recipient_schedule`, default first
+    (app/profile/loader.py RECIPIENT_SCHEDULE). A job keeps the value
+    it was accepted with (notifications.recipient_schedule); the one
+    gate that reads it is app/engine/service.py deliver_notification.
+    Only the schedule: mutes are the category's, and this never touches
+    them.
+    """
+
+    # Wait for the recipient's next allowed period (the default).
+    RESPECT = "respect"
+    # Deliver at any hour -- a code someone is waiting for right now.
+    BYPASS = "bypass"
+
+
 class PushOn(StrEnum):
     """What a type pushes back to the product (spec §7.4): the values of
     the profile field `push_on`, in the order the schema publishes them

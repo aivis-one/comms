@@ -141,6 +141,30 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+### `recipient_schedule` -- a type that does not wait for the schedule
+
+A recipient's schedule (section 6) holds every delivery outside their
+allowed periods until the next one opens. A type the person is waiting
+for RIGHT NOW -- a login code, a password reset -- cannot wait for the
+morning: its `expiry_at` runs out first and it never goes. Such a type
+declares, in its record in `types.yaml`:
+
+    recipient_schedule: bypass
+
+| value | the type's deliveries |
+|---|---|
+| `respect` | wait for the recipient's next allowed period -- the default, for a type that does not declare it |
+| `bypass` | go at any hour, the recipient's schedule notwithstanding |
+
+What `bypass` does NOT do: it does not pass a mute. A recipient who
+switched the type's category off gets nothing, at any hour. A type with
+no category cannot be muted either way -- that is the category's rule,
+not this field's. Nothing else changes: retries, a provider's "come back
+later", `expiry_at` behave as for any type.
+
+The value is taken when the request is accepted: a job keeps the one
+its type had then, whatever a later profile says.
+
 ## 3a. How a product declares its channels
 
 Every product has a different set of delivery channels, and a channel
@@ -251,6 +275,20 @@ second path no deploy exercises rots from the first day. The
 consequence is worth stating -- while the provider is unreachable, mail
 does not go out at all. Delivery is retried, and products that send
 codes re-send them on request.
+
+**No tracking.** comms sends every message without the provider's
+tracking: clicks and opens are switched off in each request, whatever
+the domain's own tracking settings say, so links arrive as the product
+wrote them. One thing a request cannot switch off: the unsubscribe
+footer is a setting of the product's mail DOMAIN at the provider, with
+no per-message option -- keep it off, or a footer with an unsubscribe
+link lands in every message, a login code's included. Read the domain's
+tracking settings as the running process sees them (nothing is
+changed):
+
+    docker exec comms-app python -c "import httpx; from app.core.config import settings as s; print(httpx.get(f'{s.email_api_base_url}/v3/domains/{s.email_mailgun_domain}/tracking', auth=('api', s.email_mailgun_api_key)).json()['tracking']['unsubscribe']['active'])"
+
+It must print `False`.
 
 **Time.** A product that mails short-lived codes should set `expiry_at`
 on the notification to the life of the code. Delivery is retried on
@@ -498,7 +536,9 @@ errors and trust are the protocol's (section 5). This section is the
 whole contract -- `app/api/prefs.py` points here.
 
 **The schedule is a list of ALLOWED periods.** A period says when comms
-MAY deliver, not when it must stay quiet. One period covers one day and
+MAY deliver, not when it must stay quiet -- for every type except one
+that declares `recipient_schedule: bypass` (section 3), which goes at
+any hour. One period covers one day and
 never crosses midnight: an evening allowance that runs into the night
 is two periods, one per day. A screen built as "quiet hours" must
 convert to this form before it writes -- sending its quiet window as-is

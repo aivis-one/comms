@@ -159,6 +159,7 @@ from app.profile.registry import (
     Layer,
     ProfileRegistry,
     PushOn,
+    RecipientSchedule,
     TemplateTree,
     TypeRecord,
     registry,
@@ -215,6 +216,16 @@ _DEFAULT_LANE = "normal"
 # what each pushes.
 PUSH_ON: tuple[str, ...] = tuple(value.value for value in PushOn)
 _DEFAULT_PUSH_ON = PushOn.NONE.value
+
+# Whether a type waits for the recipient's schedule (H3): one value of
+# a closed set, an attribute and never a condition (spec §9.1) -- not a
+# boolean, which YAML would also accept as yes/no/on/off. The values
+# are the registry's RecipientSchedule; the default is today's
+# behavior, the schedule is respected.
+RECIPIENT_SCHEDULE: tuple[str, ...] = tuple(
+    value.value for value in RecipientSchedule
+)
+_DEFAULT_RECIPIENT_SCHEDULE = RecipientSchedule.RESPECT.value
 
 # Duration literal: a positive integer and one unit letter. No
 # fractions, no compound forms ("1h30m"), no bare numbers -- a bare
@@ -543,6 +554,16 @@ _FIELDS: dict[str, _Field] = {
         check=_one_of(PUSH_ON),
         default=lambda: (
             _DEFAULT_PUSH_ON, "comms default: push_on not declared",
+        ),
+    ),
+    # Whether its deliveries wait for the recipient's allowed periods
+    # (H3). bypass skips that one gate -- never the mutes. Snapshotted
+    # onto each job at intake (notifications.recipient_schedule).
+    "recipient_schedule": _Field(
+        check=_one_of(RECIPIENT_SCHEDULE),
+        default=lambda: (
+            _DEFAULT_RECIPIENT_SCHEDULE,
+            "comms default: recipient_schedule not declared",
         ),
     ),
     # How long a request of this type stays deliverable.
