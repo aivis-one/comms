@@ -177,6 +177,47 @@ class Notification(UUIDMixin, Base):
         nullable=True,
     )
 
+    # What the type pushes back to the product, AT INTAKE (P3-1, spec
+    # §7.4): an app/profile/registry.py PushOn value, snapshotted like
+    # `channels` and `category`, so a restart with another profile
+    # never changes what an accepted job pushes. Read by
+    # app/engine/journal.py push_due; the CHECK ck_notifications_push_on
+    # is in migration 0020. Width 24: the longest value,
+    # "outcome_and_deferral", is 20.
+    push_on: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+    )
+
+    # The type's transport retry, AT INTAKE (H1, spec §9.7): the attempt
+    # ceiling and the backoff base its deliveries retry by -- snapshotted
+    # like push_on, so a profile changed between intake and a retry
+    # never changes the rule of an accepted job. Read by
+    # app/engine/service.py _apply_transient_failure; the backoff CAP
+    # stays the deploy's (NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS). The
+    # CHECKs (the settings' own ranges) are in migration 0021.
+    # Whether its deliveries wait for the recipient's schedule, AT
+    # INTAKE (H3): an app/profile/registry.py RecipientSchedule value,
+    # snapshotted like push_on, so a profile changed before delivery
+    # never changes the rule of an accepted job. Read by the schedule
+    # gate in app/engine/service.py deliver_notification -- and nowhere
+    # else: the mute gates read the category. The CHECK
+    # ck_notifications_recipient_schedule is in migration 0022. Width
+    # 16: the longest value, "respect", is 7.
+    recipient_schedule: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+    )
+
+    retry_max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    retry_backoff_seconds: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
     # The product's own reference from the envelope (F1.2). Stored and
     # handed back untouched; comms never interprets it. Cancellation
     # matches it by EQUALITY -- a comparison, not a reading (F1.3).
@@ -538,5 +579,39 @@ class NotificationTransition(Base):
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("clock_timestamp()"),
+        nullable=False,
+    )
+
+
+class PushOutbox(Base):
+    """A push owed to the product: "the job changed, go read it" (P3-1,
+    spec §7.6). The reverse transactional outbox.
+
+    WRITTEN in the transaction of the transition that owes it, by the
+    one writer of transitions (app/engine/journal.py), so a rolled-back
+    transition owes nothing. PUBLISHED after the commit by the relay
+    (app/transport/push_relay.py), which XADDs the job's idempotency
+    key and then DELETES the row: a published row has no reader, so
+    deleting it is the mark. A relay that dies between the two
+    publishes the key again -- a duplicate, harmless (spec §7.2).
+
+    ONLY THE JOB: no status, no channel, never the letter -- the key is
+    looked up at publish time. Rows go with their job (ON DELETE
+    CASCADE); the index on notification_id is the cascade's lookup
+    (migration 0020, app/core/schema_objects.py).
+    """
+
+    __tablename__ = "push_outbox"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=True), primary_key=True,
+    )
+    notification_id: Mapped[UUID] = mapped_column(
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
         nullable=False,
     )

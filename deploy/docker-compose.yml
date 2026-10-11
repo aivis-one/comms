@@ -30,7 +30,8 @@ name: comms
 #                     "schema is migrated");
 #   comms-worker   -- delivery loop (python -m app.worker);
 #   comms-consumer -- product event stream reader (python -m
-#                     app.consumer), the integration backbone;
+#                     app.consumer), the integration backbone; and
+#                     the push relay back to the product (P3-1);
 #   comms-postgres -- dedicated database (never the product's);
 #   comms-redis    -- DURABLE stream backbone (DD-4): AOF +
 #                     noeviction + requirepass. NOT a cache.

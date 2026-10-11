@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.core.config import NUMERIC_BOUNDS, Settings
+from app.core.config import NUMERIC_BOUNDS, Settings, settings
 from app.core.exceptions import ValidationError
 from app.profile.loader import _FIELDS
 from app.transport.events import (
@@ -69,13 +69,16 @@ def _at(name: str, value: int) -> dict[str, int]:
 class TestTheTable:
     def test_every_int_field_has_a_bound(self) -> None:
         """No numeric knob without a bound -- and no row for a knob that
-        does not exist. M7. The pair: the set is not empty."""
+        does not exist. M7. The pair: the set is not empty. 17 since
+        P3-1 added the push stream's cap (changes_stream_maxlen)."""
         ints = {
             name
             for name, field in Settings.model_fields.items()
             if field.annotation is int
         }
-        assert len(ints) == 16, "16 numeric parameters on D1 (15 + T12's)"
+        assert len(ints) == 17, (
+            "17 numeric parameters: D1's 15, T12's, P3-1's"
+        )
         assert ints == set(NUMERIC_BOUNDS)
 
     def test_the_ranges_are_the_published_ones(self) -> None:
@@ -89,6 +92,7 @@ class TestTheTable:
             "consumer_batch_size": (1, 1000),
             "consumer_block_ms": (1, 60_000),
             "dlq_maxlen": (1, 10_000_000),
+            "changes_stream_maxlen": (1, 10_000_000),
             "notification_poll_interval_seconds": (1, 3600),
             "notification_max_backoff_seconds": (1, 3600),
             "notification_max_delivery_attempts": (1, 100),
@@ -180,14 +184,28 @@ class TestTheProfileDefaultLayer:
         ],
     )
     def test_every_value_the_setting_can_take_the_profile_accepts(
-        self, field: str, setting: str,
+        self, field: str, setting: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Since H1 a declared backoff base must also not exceed the
+        deploy's cap (NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS) -- and the
+        SETTING can reach its own top only when the cap is there too
+        (the ordered pair base <= max). So the cap is raised to its top
+        here, the one deploy in which the setting takes bound.hi; the
+        claim -- the default layer hands out nothing a declaration would
+        be refused for -- is unchanged. Since H1 the profile's range
+        also has the setting's top: one above it is refused."""
+        monkeypatch.setattr(
+            settings, "notification_retry_backoff_max_seconds",
+            NUMERIC_BOUNDS["notification_retry_backoff_max_seconds"].hi,
+        )
         bound = NUMERIC_BOUNDS[setting]
         check = _FIELDS[field].check
         assert check(bound.lo) is None
         assert check(bound.hi) is None
-        # The pair: the check is not vacuous -- one below is refused.
+        # The pair: the check is not vacuous -- one below is refused,
+        # and one above.
         assert check(bound.lo - 1) is not None
+        assert check(bound.hi + 1) is not None
 
 
 def _event(event: str, data: dict[str, Any]) -> Any:

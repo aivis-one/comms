@@ -98,6 +98,24 @@ HEALTH_WINDOW_DEFAULT_MINUTES = 60
 # scan.
 CHANGES_SCAN_ROWS = 5000
 
+# How much longer than the consumer's blocking read (CONSUMER_BLOCK_MS) a
+# redis client waits for any answer before it calls redis gone (H1,
+# app/transport/connection.py). The socket timeout bounds EVERY read,
+# the blocking XREADGROUP included (redis-py does not extend it for
+# BLOCK), so it is derived as block + this margin: longer than the
+# block by construction, and no setting can make an empty wait an
+# error. Ten seconds absorbs a slow redis (an AOF fsync stall) without
+# calling it dead.
+REDIS_TIMEOUT_MARGIN_SECONDS = 10.0
+
+# The push relay (P3-1, app/transport/push_relay.py): how often it looks
+# at the outbox, and how many outbox rows one tick reads. Constants, not
+# settings: neither is a decision a deploy has to make -- a push is a
+# hint that only makes the product read sooner, and the worker's own
+# idle wait (up to a minute) dwarfs a one-second tick.
+PUSH_RELAY_INTERVAL_SECONDS = 1.0
+PUSH_RELAY_BATCH = 500
+
 # recipients.version is a BigInteger: the snapshot version's ceiling is
 # the column's (F1.4). The floor is 1 -- 0 marks rows written before
 # versions existed (migration 0014).

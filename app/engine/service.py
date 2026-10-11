@@ -53,7 +53,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import delete, func, or_, select, tuple_, update
+from sqlalchemy import any_, delete, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -93,7 +93,7 @@ from app.engine.models import (
     NotificationTransition,
 )
 from app.engine.resolver import resolve_targets
-from app.profile.registry import Decided, Layer, registry
+from app.profile.registry import Decided, Layer, RecipientSchedule, registry
 
 logger = structlog.get_logger()
 
@@ -485,7 +485,11 @@ async def create_notification(
         session: Active DB session (caller commits).
         type: A notification type key declared by the product profile.
             The type's CHANNELS come from its profile record and are
-            snapshotted onto the row -- the caller never names one.
+            snapshotted onto the row -- the caller never names one; so
+            are its category, its push_on (what it pushes back), its
+            recipient_schedule (whether it waits for the allowed
+            periods) and its transport retry (retry_max_attempts,
+            retry_backoff_seconds).
         title: Stored fallback title (the letter).
         body: Stored fallback body (the letter).
         target_type: TargetType value (user, group, all).
@@ -505,8 +509,9 @@ async def create_notification(
 
     Raises:
         ValidationError: The request cannot be accepted -- undeclared
-            type, invalid target_type, an expiry already passed or not
-            after scheduled_at.
+            type, a body longer than the type's max_body_chars, invalid
+            target_type, an expiry already passed or not after
+            scheduled_at.
     """
     # -- The profile record IS the registration (every installed type
     # has one; a type without a record is not declared). --
@@ -515,6 +520,17 @@ async def create_notification(
         raise ValidationError(
             f"Unregistered notification type: {type}. "
             f"Registered: {', '.join(sorted(registry.registered_types()))}"
+        )
+
+    # -- The type's size limit (H1, spec §5.9): its LENGTH, never its
+    # content. Refused here, not at delivery: comms does not accept a
+    # job it already knows it will not deliver. The product reads the
+    # refusal and its reason under the key (intake_outcomes). --
+    max_body_chars: int = record.value("max_body_chars")
+    if len(body) > max_body_chars:
+        raise ValidationError(
+            f"body has {len(body)} characters; type {type} allows at "
+            f"most {max_body_chars} (max_body_chars)"
         )
 
     if target_type not in _VALID_TARGET_TYPES:
@@ -552,6 +568,10 @@ async def create_notification(
 
     channels = list(record.value("channels"))
     category = record.value("category")
+    push_on = record.value("push_on")
+    recipient_schedule = record.value("recipient_schedule")
+    retry_max_attempts = record.value("retry_max_attempts")
+    retry_backoff_seconds = record.value("retry_backoff_seconds")
 
     notification = Notification(
         type=type,
@@ -562,6 +582,10 @@ async def create_notification(
         action_data=action_data,
         channels=channels,
         category=category,
+        push_on=push_on,
+        recipient_schedule=recipient_schedule,
+        retry_max_attempts=retry_max_attempts,
+        retry_backoff_seconds=retry_backoff_seconds,
         correlation=correlation,
         scheduled_at=scheduled_at,
         expiry_at=expiry_at,
@@ -703,7 +727,9 @@ async def resolve_notification(
             )
             session.add(delivery)
             deliveries.append(delivery)
-            journal.record_delivery(session, delivery, JournalStep.RESOLVE)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.RESOLVE,
+            )
 
     notification.status = NotificationStatus.PROCESSING
     journal.record_job(session, notification, JournalStep.RESOLVE)
@@ -742,7 +768,9 @@ async def deliver_notification(
       not an attempt; prior transient history is kept).
     - DELIVERY SCHEDULE (Phase 2; polarity flipped in R-5): a
       delivery whose recipient is OUTSIDE their allowed periods is
-      DEFERRED, not sent -- next_retry_at is set to the next period's
+      DEFERRED, not sent -- unless the job's type declared
+      recipient_schedule: bypass (H3), which skips this gate and no
+      other -- next_retry_at is set to the next period's
       start (recipient's timezone) and the existing retry gate keeps
       it invisible to the poll until then. Attempts and error_message
       stay untouched: deferral is not a failure. Checked per attempt,
@@ -856,7 +884,9 @@ async def deliver_notification(
         )
         if accepted_at is not None:
             _close_accepted(delivery, accepted_at)
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
             logger.info(
                 "delivery_closed_from_journal",
                 delivery_id=str(delivery.id),
@@ -869,7 +899,9 @@ async def deliver_notification(
         # person the product removed is not asked about their mutes. --
         if not recipient.active:
             delivery.status = DeliveryStatus.RECIPIENT_INACTIVE
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
             logger.info(
                 "delivery_recipient_inactive",
                 delivery_id=str(delivery.id),
@@ -881,7 +913,8 @@ async def deliver_notification(
         if delivery.recipient_id in muted:
             delivery.status = DeliveryStatus.SUPPRESSED
             journal.record_delivery(
-                session, delivery, JournalStep.DELIVER, category=category,
+                session, notification, delivery, JournalStep.DELIVER,
+                category=category,
             )
             logger.info(
                 "delivery_muted_skipped",
@@ -894,12 +927,26 @@ async def deliver_notification(
         # -- Schedule gate: defer, never suppress --
         # The recipient's allowed periods (app/audience/schedule.py).
         # None means "now is fine" -- both when a period covers now
-        # and when there is no schedule at all.
-        quiet_until = recipient_deferred_until(recipient, now)
+        # and when there is no schedule at all. A job whose type
+        # declared recipient_schedule: bypass (snapshotted at intake,
+        # H3) does not wait for them -- a code someone is waiting for
+        # right now goes at night too. The mute gates above are not
+        # this gate and do not read the field.
+        # The polarity errs toward the recipient (H5): the schedule is
+        # asked for EVERY value but bypass, so a value this gate does
+        # not know -- the enum grown, a row it was never written for --
+        # waits for the recipient's period instead of going at night.
+        quiet_until = (
+            recipient_deferred_until(recipient, now)
+            if notification.recipient_schedule != RecipientSchedule.BYPASS
+            else None
+        )
         if quiet_until is not None:
             delivery.next_retry_at = quiet_until
             delivery.wait_reason = WaitReason.RECIPIENT_SCHEDULE
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
             # Causality flag: the deferral pushes the delivery past
             # the notification's expiry -> step-0 will EXPIRE it
             # before it ever sends. Deliberate (a reminder deferred
@@ -1013,14 +1060,16 @@ async def deliver_notification(
                         deferrals=delivery.rate_limit_deferrals,
                         budget=budget,
                     )
-                    _apply_transient_failure(delivery, outcome.error)
+                    _apply_transient_failure(notification, delivery, outcome.error)
             elif outcome.success:
                 delivery.attempts += 1
                 delivery.status = DeliveryStatus.SENT
                 delivery.sent_at = datetime.now(UTC)
             else:
-                _apply_transient_failure(delivery, outcome.error)
-            journal.record_delivery(session, delivery, JournalStep.DELIVER)
+                _apply_transient_failure(notification, delivery, outcome.error)
+            journal.record_delivery(
+                session, notification, delivery, JournalStep.DELIVER,
+            )
 
     await session.flush()
 
@@ -1037,6 +1086,7 @@ def _close_accepted(delivery: NotificationDelivery, accepted_at: datetime) -> No
 
 
 def _apply_transient_failure(
+    notification: Notification,
     delivery: NotificationDelivery,
     error: str | None,
 ) -> None:
@@ -1045,10 +1095,13 @@ def _apply_transient_failure(
     Shared by the regular transient path and the exhausted-budget 429
     path (a 429 past the deferral budget behaves exactly like any
     other transient error).
+
+    The ceiling and the backoff base are the JOB's -- its type's, as
+    snapshotted at intake (H1, spec §9.7); the cap is the deploy's.
     """
     delivery.attempts += 1
     delivery.error_message = error
-    if delivery.attempts >= settings.notification_max_delivery_attempts:
+    if delivery.attempts >= notification.retry_max_attempts:
         delivery.status = DeliveryStatus.FAILED
         delivery.failure_class = FailureClass.TRANSIENT_EXHAUSTED
     else:
@@ -1056,7 +1109,7 @@ def _apply_transient_failure(
         # capped. Without it all attempts burned within one
         # poll interval (review 1.1).
         backoff_seconds = min(
-            settings.notification_retry_backoff_base_seconds
+            notification.retry_backoff_seconds
             * 2 ** (delivery.attempts - 1),
             settings.notification_retry_backoff_max_seconds,
         )
@@ -1360,7 +1413,7 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     for notification in parents:
         closed += await close_waiting_deliveries(
             session,
-            notification.id,
+            notification,
             DeliveryStatus.RECIPIENT_INACTIVE,
             JournalStep.WITHDRAW,
             NotificationDelivery.recipient_id == recipient_id,
@@ -1424,7 +1477,7 @@ async def close_notifications(
             journal.record_job(session, notification, step)
             continue
         await close_waiting_deliveries(
-            session, notification.id, delivery_outcome, step,
+            session, notification, delivery_outcome, step,
         )
         await rollup_notification(session, notification, step)
     await session.flush()
@@ -1433,7 +1486,7 @@ async def close_notifications(
 
 async def close_waiting_deliveries(
     session: AsyncSession,
-    notification_id: UUID,
+    notification: Notification,
     outcome: DeliveryStatus,
     step: JournalStep,
     *conditions: Any,
@@ -1454,6 +1507,7 @@ async def close_waiting_deliveries(
     The caller holds the job's row lock and folds the job afterwards.
     Returns the number of deliveries closed.
     """
+    notification_id = notification.id
     waiting = (
         NotificationDelivery.notification_id == notification_id,
         NotificationDelivery.status == DeliveryStatus.PENDING,
@@ -1472,7 +1526,7 @@ async def close_waiting_deliveries(
             if accepted_at is None:
                 continue
             _close_accepted(delivery, accepted_at)
-            journal.record_delivery(session, delivery, step)
+            journal.record_delivery(session, notification, delivery, step)
             closed += 1
         await session.flush()
     rows = await session.execute(
@@ -1552,7 +1606,83 @@ async def delete_terminal_notifications_batch(
         .scalar_subquery()
     )
     result = await session.execute(
-        delete(Notification).where(Notification.id.in_(batch_ids)),
+        delete(Notification).where(_id_in_batch(batch_ids)),
+    )
+    deleted: int = result.rowcount  # type: ignore[attr-defined]
+    return deleted
+
+
+def _id_in_batch(batch_ids: Any) -> Any:
+    """`id = ANY(ARRAY(<batch select>))` -- the delete of a batch (H5).
+
+    The batch is selected ONCE (an InitPlan) and its rows are then
+    deleted through the primary key -- the SHAPE is fixed here, not
+    left to the estimates. The plain `id IN (<batch select>)` leaves
+    the join to the planner: on a large table with a small batch it
+    picks the same nested loop on the pkey (measured: identical
+    buffers and time at 50k rows / a 250-row batch), but on other
+    estimates -- a batch that is a large fraction of the table -- it
+    picks a hash semi-join over a seq scan of notifications. That
+    choice is the planner's to make per ANALYZE, and this runs on
+    EVERY worker tick: a pass on the delivery path should not change
+    plan under it. Used by both batch deletes: retention's and the
+    expiry cleanup's.
+    """
+    return Notification.id == any_(func.array(batch_ids))
+
+
+# The outcomes an expired job may be deleted in by the expiry cleanup
+# (app/engine/processor.py cleanup_expired_notifications): every outcome
+# but failed -- a failure is kept for inspection until general
+# retention takes it. The SAME list is the predicate of the partial
+# index the batch select runs on (ix_notifications_expired_deletable,
+# migration 0023) -- the planner uses that index only while this
+# list implies its predicate; tests/test_expired_cleanup_index.py holds
+# the two equal.
+_EXPIRED_DELETABLE_STATUSES = (
+    NotificationStatus.SENT,
+    NotificationStatus.PARTIAL_SENT,
+    NotificationStatus.EXPIRED,
+    NotificationStatus.CANCELLED,
+    NotificationStatus.SUPPRESSED,
+    NotificationStatus.NO_RECIPIENTS,
+)
+
+
+async def delete_expired_notifications_batch(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int,
+) -> int:
+    """Delete ONE batch of expired terminal notifications (H2).
+
+    COMMIT-FREE, like delete_terminal_notifications_batch: the caller
+    (the expiry cleanup in app/engine/processor.py) owns the drain loop
+    and the per-batch commit, so the FK cascade of one transaction --
+    deliveries, journal, push_outbox rows -- is bounded to `limit` jobs
+    and the outbox rows it holds are let go batch by batch. Returns the
+    number of rows deleted in this batch.
+
+    BY INDEX (H5): the select is served by the partial index
+    ix_notifications_expired_deletable -- (expiry_at) over the rows
+    this very filter can match -- in expiry order, so neither a scan of
+    the table nor a sort of it; the delete goes through the primary key
+    (_id_in_batch).
+    """
+    batch_ids = (
+        select(Notification.id)
+        .where(
+            Notification.expiry_at.isnot(None),
+            Notification.expiry_at < now,
+            Notification.status.in_(_EXPIRED_DELETABLE_STATUSES),
+        )
+        .order_by(Notification.expiry_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        delete(Notification).where(_id_in_batch(batch_ids)),
     )
     deleted: int = result.rowcount  # type: ignore[attr-defined]
     return deleted

@@ -67,6 +67,40 @@ class Layer(StrEnum):
     DEFAULT = "default"
 
 
+class RecipientSchedule(StrEnum):
+    """Whether a type's deliveries wait for the recipient's schedule --
+    the allowed periods (app/audience/schedule.py): the values of the
+    profile field `recipient_schedule`, default first
+    (app/profile/loader.py RECIPIENT_SCHEDULE). A job keeps the value
+    it was accepted with (notifications.recipient_schedule); the one
+    gate that reads it is app/engine/service.py deliver_notification.
+    Only the schedule: mutes are the category's, and this never touches
+    them.
+    """
+
+    # Wait for the recipient's next allowed period (the default).
+    RESPECT = "respect"
+    # Deliver at any hour -- a code someone is waiting for right now.
+    BYPASS = "bypass"
+
+
+class PushOn(StrEnum):
+    """What a type pushes back to the product (spec §7.4): the values of
+    the profile field `push_on`, in the order the schema publishes them
+    (app/profile/loader.py PUSH_ON). A job keeps the value it was
+    accepted with (notifications.push_on); which transition each value
+    pushes is decided in one place, app/engine/journal.py push_due.
+    """
+
+    # The job's outcome only (a terminal status).
+    OUTCOME = "outcome"
+    # The outcome, and every transition that puts the job or one of its
+    # deliveries behind a timed gate (a journal row with wait_until).
+    OUTCOME_AND_DEFERRAL = "outcome_and_deferral"
+    # Nothing: the product reads (the default).
+    NONE = "none"
+
+
 @dataclass(frozen=True)
 class Decided:
     """One field of one type: the value and who decided it.

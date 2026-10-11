@@ -167,6 +167,23 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "ON public.notifications USING btree (status, scheduled_at)"
         ),
     ),
+    # The expiry cleanup's batch select, in expiry order, over the rows
+    # it may delete (H5, migration 0023). The status list is
+    # app/engine/service.py _EXPIRED_DELETABLE_STATUSES.
+    "ix_notifications_expired_deletable": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notifications_expired_deletable "
+            "ON public.notifications USING btree (expiry_at) "
+            "WHERE ((expiry_at IS NOT NULL) AND ((status)::text = ANY "
+            "((ARRAY['sent'::character varying, "
+            "'partial_sent'::character varying, "
+            "'expired'::character varying, "
+            "'cancelled'::character varying, "
+            "'suppressed'::character varying, "
+            "'no_recipients'::character varying])::text[])))"
+        ),
+    ),
     # A repeated resource call answers with the row it created (F1.4).
     "uq_messages_idempotency_key": IndexShape(
         unique=True,
@@ -238,6 +255,15 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "INCLUDE (notification_id)"
         ),
     ),
+    # The lookup of the ON DELETE CASCADE from notifications into the
+    # reverse outbox (P3-1, migration 0020).
+    "ix_push_outbox_notification": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_push_outbox_notification "
+            "ON public.push_outbox USING btree (notification_id)"
+        ),
+    ),
     # The address book listing's keyset order (P2-4, migration 0018).
     "ix_recipients_book": IndexShape(
         unique=False,
@@ -296,6 +322,16 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_transitions_provider_text",
     "ck_transitions_error_not_blank",
     "ck_transitions_attempt_not_negative",
+    # What a job pushes is one of the three PushOn values, never NULL
+    # (P3-1, migration 0020).
+    "ck_notifications_push_on",
+    # A job's retry ceiling and backoff base are within the settings'
+    # own ranges, never NULL (H1, migration 0021).
+    "ck_notifications_retry_max_attempts",
+    "ck_notifications_retry_backoff_seconds",
+    # Whether a job waits for the recipient's schedule is one of the
+    # two RecipientSchedule values, never NULL (H3, migration 0022).
+    "ck_notifications_recipient_schedule",
 })
 
 # Everything the schema must carry although the metadata never mentions

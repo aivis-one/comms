@@ -562,11 +562,17 @@ class TestGrid:
     async def test_transient_exhausted(
         self,
         db_session: AsyncSession,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(settings, "notification_max_delivery_attempts", 1)
+        # The ceiling is the job's since H1 (snapshot at intake), so it
+        # is set on the job; the setting no longer reaches it.
         recipient = await create_recipient(db_session)
         nid = await _intake(db_session, recipient.id)
+        await db_session.execute(
+            update(Notification)
+            .where(Notification.id == nid)
+            .values(retry_max_attempts=1)
+        )
+        await db_session.commit()
         with _channel(_Spy({"in_app": EmailTransientError("provider error (503)")})):
             await process_pending_notifications()
         rows = await _rows(nid)

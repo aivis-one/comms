@@ -257,6 +257,9 @@ class TestFieldTypes:
     a channel."""
 
     def test_the_field_set_is_exactly_this(self) -> None:
+        """The closed field set. recipient_schedule joined it in H3 (a
+        type that does not wait for the recipient's schedule); the set
+        stays closed, and every other name is still refused."""
         assert RECORD_FIELDS == (
             "category",
             "channels",
@@ -264,16 +267,20 @@ class TestFieldTypes:
             "lane",
             "max_body_chars",
             "push_on",
+            "recipient_schedule",
             "retry_backoff_seconds",
             "retry_max_attempts",
         )
 
     def test_every_field_declared_lands_on_the_profile_layer(self) -> None:
+        """Every field of the record, declared -- recipient_schedule
+        included since H3 -- is decided by the profile layer."""
         record = _parse(_doc({"t": {
             "category": "c",
             "channels": ["in_app", "telegram"],
             "lane": "critical",
             "push_on": "outcome_and_deferral",
+            "recipient_schedule": "bypass",
             "expires_after": "7d",
             "retry_max_attempts": 5,
             "retry_backoff_seconds": 0,

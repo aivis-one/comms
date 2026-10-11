@@ -587,6 +587,25 @@ _EMAIL_SENDER_FAULT_MARKERS = (
 # to judge rather than the provider's.
 _EMAIL_LIST_SEPARATORS = (",", ";")
 
+# NO TRACKING, IN EVERY MESSAGE (H3). Mailgun's tracking REWRITES the
+# message -- links become redirects through the provider, an open pixel
+# is added -- and comms delivers the message as the product wrote it.
+# The domain's own tracking settings may be switched on in the
+# provider's panel; these per-message options switch clicks and opens
+# off whatever the domain says (Mailgun API, POST
+# /v3/{domain}/messages: o:tracking toggles both, o:tracking-clicks and
+# o:tracking-opens each one -- both spelled out, so no precedence
+# between them is left to guess). The same for every type and every
+# message: there is no knob, because there is no case for changing a
+# message. What these do NOT close: the unsubscribe footer is a DOMAIN
+# setting with no per-message option -- deploy/INTEGRATION.md tells
+# the product to keep it off.
+_NO_TRACKING: dict[str, str] = {
+    "o:tracking": "no",
+    "o:tracking-clicks": "no",
+    "o:tracking-opens": "no",
+}
+
 
 class EmailFormatter:
     """Deliver notifications as plain-text email through the provider.
@@ -656,6 +675,7 @@ class EmailFormatter:
                     "to": [address],
                     "subject": subject,
                     "text": body,
+                    **_NO_TRACKING,
                 },
             )
         except Exception as exc:

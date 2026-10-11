@@ -28,6 +28,18 @@
 # kept, sanitized before it is cut.
 #
 # Rows go only with their job (ON DELETE CASCADE, migration 0017).
+#
+# THE PUSH (P3-1, spec §7.4, §7.6). Being the one writer of
+# transitions, this module is also the one writer of the pushes they
+# owe: a job or delivery row that push_due accepts under the job's
+# push_on adds a push_outbox row to the SAME session, so the push
+# commits with the transition or not at all, and the relay publishes it
+# only after the commit (app/transport/push_relay.py). A transition
+# point that forgot to record would forget its push too -- the fence
+# that holds every point to this module (tests/test_transition_journal.py,
+# TestEveryPointRecords) holds the push with it. Channel and gate rows
+# never push; neither does a delivery closed by a mass transition: the
+# job's outcome that follows is its own row.
 # =============================================================================
 
 import traceback
@@ -38,7 +50,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory
@@ -49,6 +61,7 @@ from app.engine.constants import (
     JobWaitReason,
     JournalStep,
     JournalSubject,
+    NotificationStatus,
 )
 from app.engine.formatters import (
     EmailTransientError,
@@ -61,7 +74,9 @@ from app.engine.models import (
     Notification,
     NotificationDelivery,
     NotificationTransition,
+    PushOutbox,
 )
+from app.profile.registry import PushOn
 
 logger = structlog.get_logger()
 
@@ -111,6 +126,73 @@ def _provider_text(exc: Exception) -> str | None:
 
 
 # -----------------------------------------------------------------------------
+# The push a transition owes (P3-1)
+# -----------------------------------------------------------------------------
+
+# A job's outcome: every status but the two active ones.
+OUTCOME_STATUSES = frozenset(NotificationStatus) - {
+    NotificationStatus.PENDING, NotificationStatus.PROCESSING,
+}
+
+# session.info key: the last push row this session added, per job.
+_PUSH_ADDED = "journal_push_added"
+
+
+def push_due(push_on: str, row: NotificationTransition) -> bool:
+    """Whether a journal row owes the product a push under `push_on`.
+
+    Read off the row alone -- its subject, its outcome, its wait -- and
+    the job's push_on; never off the letter or a provider's answer.
+      outcome: a JOB row whose outcome is the job's outcome.
+      deferral (outcome_and_deferral only): a JOB or DELIVERY row that
+        puts the job or a delivery behind a timed gate -- wait_until
+        set: the recipient's schedule, the provider's 429, comms' own
+        backoff, the pipeline's gate. A delivery waiting its turn has
+        no wait_until and is not a deferral; a future scheduled_at is
+        the product's own and has no row of its kind.
+    Channel and gate rows never push.
+    """
+    if push_on == PushOn.NONE:
+        return False
+    if row.subject == JournalSubject.JOB and row.outcome in OUTCOME_STATUSES:
+        return True
+    return (
+        push_on == PushOn.OUTCOME_AND_DEFERRAL
+        and row.subject in (JournalSubject.JOB, JournalSubject.DELIVERY)
+        and row.wait_until is not None
+    )
+
+
+def _owe_push(session: AsyncSession, notification: Notification) -> None:
+    """Add the job's push row to the session -- unless one this session
+    added for the job is still unflushed: one push per job per flush, so
+    a pass that defers a thousand deliveries owes one push, not a
+    thousand. The check is on that very row's state, not a remembered
+    flag: a savepoint rollback expunges the row it added (pending ->
+    transient) and a flush writes it (pending -> persistent), and in
+    both cases the next transition adds a fresh one. A duplicate after a
+    flush is harmless (spec §7.2)."""
+    added: dict[UUID, PushOutbox] = session.info.setdefault(_PUSH_ADDED, {})
+    previous = added.get(notification.id)
+    if previous is not None and inspect(previous).pending:
+        return
+    push = PushOutbox(notification_id=notification.id)
+    session.add(push)
+    added[notification.id] = push
+
+
+def _record(
+    session: AsyncSession,
+    notification: Notification,
+    row: NotificationTransition,
+) -> None:
+    """Add a job or delivery row, and the push it owes."""
+    session.add(row)
+    if push_due(notification.push_on, row):
+        _owe_push(session, notification)
+
+
+# -----------------------------------------------------------------------------
 # Rows in the session of the change (job, delivery, gate)
 # -----------------------------------------------------------------------------
 
@@ -125,7 +207,7 @@ def record_job(
 ) -> None:
     """A transition of the job: its status after it, its pipeline
     attempt count. `wait_until` is the pipeline gate (T12)."""
-    session.add(NotificationTransition(
+    _record(session, notification, NotificationTransition(
         notification_id=notification.id,
         subject=JournalSubject.JOB,
         step=step,
@@ -141,14 +223,16 @@ def record_job(
 
 def record_delivery(
     session: AsyncSession,
+    notification: Notification,
     delivery: NotificationDelivery,
     step: JournalStep,
     *,
     category: str | None = None,
 ) -> None:
-    """A transition of a delivery, read off the delivery as it stands
-    after the change: status, attempts, wait, failure class."""
-    session.add(NotificationTransition(
+    """A transition of a delivery of `notification`, read off the
+    delivery as it stands after the change: status, attempts, wait,
+    failure class. The job is passed for what it pushes (push_on)."""
+    _record(session, notification, NotificationTransition(
         notification_id=delivery.notification_id,
         recipient_id=delivery.recipient_id,
         channel=delivery.channel,
