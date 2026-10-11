@@ -1595,6 +1595,53 @@ async def delete_terminal_notifications_batch(
     return deleted
 
 
+# The outcomes an expired job may be deleted in by the expiry cleanup
+# (app/engine/processor.py cleanup_expired_notifications): every outcome
+# but failed -- a failure is kept for inspection until general
+# retention takes it.
+_EXPIRED_DELETABLE_STATUSES = (
+    NotificationStatus.SENT,
+    NotificationStatus.PARTIAL_SENT,
+    NotificationStatus.EXPIRED,
+    NotificationStatus.CANCELLED,
+    NotificationStatus.SUPPRESSED,
+    NotificationStatus.NO_RECIPIENTS,
+)
+
+
+async def delete_expired_notifications_batch(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int,
+) -> int:
+    """Delete ONE batch of expired terminal notifications (H2).
+
+    COMMIT-FREE, like delete_terminal_notifications_batch: the caller
+    (the expiry cleanup in app/engine/processor.py) owns the drain loop
+    and the per-batch commit, so the FK cascade of one transaction --
+    deliveries, journal, push_outbox rows -- is bounded to `limit` jobs
+    and the outbox rows it holds are let go batch by batch. Returns the
+    number of rows deleted in this batch.
+    """
+    batch_ids = (
+        select(Notification.id)
+        .where(
+            Notification.expiry_at.isnot(None),
+            Notification.expiry_at < now,
+            Notification.status.in_(_EXPIRED_DELETABLE_STATUSES),
+        )
+        .order_by(Notification.expiry_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        delete(Notification).where(Notification.id.in_(batch_ids)),
+    )
+    deleted: int = result.rowcount  # type: ignore[attr-defined]
+    return deleted
+
+
 def _navigation_intent(
     action_data: dict[str, Any] | None,
 ) -> dict[str, Any] | None:

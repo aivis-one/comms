@@ -57,9 +57,12 @@ _MARGIN = 0.3
 
 
 @asynccontextmanager
-async def _silent() -> AsyncIterator[int]:
-    """Accept every connection; never write a byte."""
-    held: list[asyncio.StreamWriter] = []
+async def _silent(
+    held: list[asyncio.StreamWriter] | None = None,
+) -> AsyncIterator[int]:
+    """Accept every connection; never write a byte. `held`, when given,
+    collects one writer per accepted connection."""
+    held = [] if held is None else held
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -214,20 +217,25 @@ class TestTheRelay:
     async def test_the_relay_on_a_silent_redis_logs_and_keeps_ticking(
         self,
     ) -> None:
+        """Silence is logged ONCE, on the turn into failure (H2: no line
+        per tick); that the relay keeps ticking is shown by the server,
+        which sees it come back on new connections. Before H2 this test
+        counted two error lines -- one per tick -- for the second half;
+        the log moved to the turn, the proof to the connections."""
         await _owe_one()
-        async with _silent() as port:
+        accepted: list[asyncio.StreamWriter] = []
+        async with _silent(accepted) as port:
             with _redis_at(port), capture_logs() as logs:
                 task = asyncio.create_task(relay.run_push_relay_loop())
                 try:
-                    await _until(lambda: sum(
-                        e["event"] == "push_relay_error" for e in logs
-                    ) >= 2)
+                    await _until(lambda: len(accepted) >= 3)
                     assert not task.done()
                 finally:
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await task
         errors = [e for e in logs if e["event"] == "push_relay_error"]
+        assert len(errors) == 1
         assert "Timeout" in errors[0]["exception"]
         async with get_session_factory()() as session:
             owed = (await session.execute(

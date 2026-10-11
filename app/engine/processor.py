@@ -76,7 +76,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -95,6 +95,7 @@ from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
     close_notifications,
     close_waiting_deliveries,
+    delete_expired_notifications_batch,
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
@@ -468,51 +469,52 @@ async def cleanup_expired_notifications() -> int:
 
     Deliveries are CASCADE-deleted automatically.
 
+    IN BATCHES (H2), like cleanup_terminal_notifications: the service
+    supplies one commit-free batch of _RETENTION_BATCH_SIZE jobs
+    (delete_expired_notifications_batch); this loop commits each and
+    drains until a batch comes back short. One unbounded DELETE held
+    the cascade's push_outbox rows for its whole transaction -- rows the
+    relay (app/transport/push_relay.py) then skipped, tick after tick.
+
     Returns:
-        Number of notifications deleted.
+        Number of notifications deleted, over every batch. A failing
+        batch is rolled back and logged; the batches before it stay
+        deleted and are counted.
     """
     factory = get_session_factory()
     now = datetime.now(UTC)
+    total = 0
 
     async with factory() as session:
         try:
-            stmt = (
-                delete(Notification)
-                .where(
-                    Notification.expiry_at.isnot(None),
-                    Notification.expiry_at < now,
-                    Notification.status.in_([
-                        NotificationStatus.SENT,
-                        NotificationStatus.PARTIAL_SENT,
-                        NotificationStatus.EXPIRED,
-                        NotificationStatus.CANCELLED,
-                        NotificationStatus.SUPPRESSED,
-                        NotificationStatus.NO_RECIPIENTS,
-                    ]),
+            while True:
+                deleted = await delete_expired_notifications_batch(
+                    session, now=now, limit=_RETENTION_BATCH_SIZE,
                 )
-            )
-            result = await session.execute(stmt)
-            deleted: int = result.rowcount  # type: ignore[attr-defined]
+                await session.commit()
+                total += deleted
+                if deleted < _RETENTION_BATCH_SIZE:
+                    break
 
-            if deleted:
-                logger.info("notifications_cleaned_up", count=deleted)
-
-            await session.commit()
-            return deleted
+            if total:
+                logger.info("notifications_cleaned_up", count=total)
+            return total
 
         except Exception as exc:
             await session.rollback()
             logger.error(
                 "notification_cleanup_error",
+                deleted=total,
                 exception=sanitized_traceback(exc),
             )
-            return 0
+            return total
 
 
 # Phase 3a item 5: rows deleted per retention batch. One batch = one
-# transaction (bounded FK cascade); the drain loop below commits
-# between batches. Module-level so tests can shrink it to force a
-# multi-batch drain.
+# transaction (bounded FK cascade); the drain loops commit between
+# batches -- the retention pass below and, since H2, the expiry cleanup
+# above. Module-level so tests can shrink it to force a multi-batch
+# drain.
 _RETENTION_BATCH_SIZE = 1000
 
 

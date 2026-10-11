@@ -22,7 +22,13 @@
 # ONE TICK, THREE STEPS, NO TRANSACTION ACROSS REDIS:
 #   1. read a batch of committed rows with their keys (a short read --
 #      an uncommitted row is not visible to it, so nothing is published
-#      before its transition commits);
+#      before its transition commits). The read takes the rows FOR
+#      UPDATE OF push_outbox SKIP LOCKED and lets go before the XADD
+#      (H2): a row a cascade is deleting is not read -- it is not
+#      published again tick after tick, and it does not block the free
+#      rows behind it. OF push_outbox and nothing wider: the join's
+#      job row is held FOR NO KEY UPDATE by a delivery attempt, and a
+#      read that locked it too would stand against the attempt;
 #   2. XADD one entry per distinct key of the batch (approximate MAXLEN);
 #   3. delete the rows that were read, in a second short transaction.
 #   Deleting is the mark "published": a published row has no reader.
@@ -50,8 +56,17 @@
 # REDIS AWAY: the tick fails, the rows stay, the next tick tries again.
 # The worker never touches redis, so transitions go on and the outbox
 # grows; when redis is back the backlog is published batch by batch
-# without pausing. Two relays at once (a deploy rolling over) publish
-# some keys twice, nothing worse.
+# without pausing. A tick that fails is logged ONCE, on the turn into
+# failure (push_relay_error), and the way back once
+# (push_relay_recovered) -- not a line per tick while redis stays away.
+# Two relays at once (a deploy rolling over) publish some keys twice,
+# nothing worse.
+#
+# THE PAUSE IS BY PROGRESS (H2): the loop goes straight on only after a
+# tick that published and deleted a full batch -- a backlog. A tick that
+# read rows it could not delete (a cascade took them between the read
+# and the delete) made no such progress and pauses, so a held row can
+# never spin the loop.
 #
 # RUNS IN THE CONSUMER PROCESS (app/consumer.py), the one process that
 # already holds a redis URL; the API and the worker stay DB-only.
@@ -106,9 +121,12 @@ async def delete_published(session: AsyncSession, ids: list[int]) -> int:
 async def relay_once(redis: Redis) -> int:
     """Publish one batch of committed pushes, then delete their rows.
 
-    Returns the number of outbox rows the batch read (0 when there was
-    nothing owed). Raises whatever redis or the database raised -- the
-    rows of a batch that failed before its delete stay owed.
+    Returns the PROGRESS of the tick: the number of outbox rows it
+    published AND deleted (0 when nothing was owed, or every row it
+    read was taken by a cascade before its delete). Rows read but not
+    deleted are not counted -- the loop pauses on them. Raises whatever
+    redis or the database raised -- the rows of a batch that failed
+    before its delete stay owed.
     """
     factory = get_session_factory()
     async with factory() as session:
@@ -118,8 +136,11 @@ async def relay_once(redis: Redis) -> int:
                 .join(Notification, Notification.id == PushOutbox.notification_id)
                 .order_by(PushOutbox.id)
                 .limit(PUSH_RELAY_BATCH)
+                .with_for_update(of=PushOutbox, skip_locked=True)
             )
         ).all()
+        # The read's row locks go here, before any redis call.
+        await session.rollback()
     if not rows:
         return 0
     keys = list(dict.fromkeys(key for _, key in rows))
@@ -131,25 +152,39 @@ async def relay_once(redis: Redis) -> int:
             approximate=True,
         )
     async with factory() as session:
-        await delete_published(session, [ident for ident, _ in rows])
+        deleted = await delete_published(session, [ident for ident, _ in rows])
         await session.commit()
-    logger.debug("push_relay_published", rows=len(rows), keys=len(keys))
-    return len(rows)
+    logger.debug(
+        "push_relay_published", rows=len(rows), keys=len(keys), deleted=deleted,
+    )
+    return deleted
 
 
 async def run_push_relay(redis: Redis) -> None:
-    """Relay forever: a full batch is followed at once by the next, any
-    other tick by a pause. A failed tick is logged and retried after
-    the pause; it never ends the loop -- only cancellation does."""
+    """Relay forever: a tick that published and deleted a full batch is
+    followed at once by the next, any other tick by a pause. A failed
+    tick is retried after the pause; it is logged on the turn into
+    failure and the way back, not on every tick. It never ends the loop
+    -- only cancellation does.
+
+    The failure state lives in this call, not in the module: every run
+    -- every test -- starts healthy."""
+    failed_ticks = 0
     while True:
         try:
-            read = await relay_once(redis)
+            progress = await relay_once(redis)
         except Exception as exc:
-            logger.error(
-                "push_relay_error", exception=sanitized_traceback(exc),
-            )
-            read = 0
-        if read < PUSH_RELAY_BATCH:
+            if failed_ticks == 0:
+                logger.error(
+                    "push_relay_error", exception=sanitized_traceback(exc),
+                )
+            failed_ticks += 1
+            progress = 0
+        else:
+            if failed_ticks:
+                logger.info("push_relay_recovered", failed_ticks=failed_ticks)
+            failed_ticks = 0
+        if progress < PUSH_RELAY_BATCH:
             await asyncio.sleep(PUSH_RELAY_INTERVAL_SECONDS)
 
 

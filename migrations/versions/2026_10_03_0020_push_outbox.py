@@ -11,7 +11,7 @@ AFTER:
 
   notifications.push_on  new, NOT NULL -- what the type pushes back to
                  the product, AT INTAKE: outcome | outcome_and_deferral
-                 | none (app/engine/constants.py PushOn). A snapshot,
+                 | none (app/profile/registry.py PushOn). A snapshot,
                  like `channels` and `category`.
   push_outbox    new -- a push owed to the product, written in the
                  transaction of the transition that owes it

@@ -13,6 +13,20 @@
 #                               -> TestFailure.test_redis_away_...
 #   M10 the rows dropped when redis refuses
 #                               -> TestFailure.test_redis_away_...
+#   M11 the pause decided by the rows READ, not by the progress
+#       (published and deleted)  -> TestProgress.test_a_tick_without_...
+#                                   (one tick per pause, not two)
+#   M11+M12 together -- the defect the review found: the stream gets
+#       more than one batch of the same keys
+#                               -> TestProgress.test_a_tick_without_...
+#   M12 the read without FOR UPDATE ... SKIP LOCKED
+#                               -> TestProgress.test_a_held_head_...
+#   M13 the read's lock without OF push_outbox
+#                               -> TestProgress.test_a_job_held_by_...
+#   M14 an error line on every failed tick
+#                               -> TestFailureLog
+#   M15 no line on the way back
+#                               -> TestFailureLog
 # =============================================================================
 
 import asyncio
@@ -26,8 +40,9 @@ import pytest
 from fakeredis import FakeServer
 from fakeredis import aioredis as fakeaioredis
 from redis.exceptions import ConnectionError as RedisConnectionError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 import app.consumer as entrypoint
 import app.transport.push_relay as relay
@@ -420,3 +435,225 @@ class TestEntrypoint:
         ):
             await entrypoint._main()
         assert sorted(started) == ["consumer", "relay"]
+
+
+# -----------------------------------------------------------------------------
+# H2 -- progress, held rows, the failure log
+# -----------------------------------------------------------------------------
+
+
+class _Ticks:
+    """Counts the relay's ticks: wraps relay_once, calls the real one."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.real = relay.relay_once
+
+    async def __call__(self, redis: Any) -> int:
+        self.count += 1
+        return await self.real(redis)
+
+
+async def _hold_rows(session: AsyncSession, ids: list[int]) -> None:
+    """A second real session takes the rows FOR UPDATE and keeps them."""
+    await session.execute(
+        text("SELECT id FROM push_outbox WHERE id = ANY(:ids) FOR UPDATE"),
+        {"ids": ids},
+    )
+
+
+async def _row_ids(notification_id: UUID) -> list[int]:
+    async with get_session_factory()() as session:
+        return list((await session.execute(
+            select(PushOutbox.id)
+            .where(PushOutbox.notification_id == notification_id)
+            .order_by(PushOutbox.id)
+        )).scalars())
+
+
+class TestProgress:
+    async def test_a_tick_without_progress_is_followed_by_a_pause(
+        self, redis: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A full batch is read free; between the read and the delete a
+        second real session takes every row FOR UPDATE (a cascade would
+        do the same) and keeps it. The tick published the batch but
+        deleted nothing: no progress. With a 30-second pause and 0.3
+        seconds of running there is ONE tick and at most one batch in
+        the stream -- not a spin re-reading and re-publishing the held
+        rows (the review found 190 entries in half a second)."""
+        monkeypatch.setattr(relay, "PUSH_RELAY_BATCH", 3)
+        monkeypatch.setattr(relay, "PUSH_RELAY_INTERVAL_SECONDS", 30.0)
+        nid = await _owed(copies=3)
+        ids = await _row_ids(nid)
+        ticks = _Ticks()
+        monkeypatch.setattr(relay, "relay_once", ticks)
+        real_delete = relay.delete_published
+        async with get_session_factory()() as holder:
+
+            async def held_then_delete(session: AsyncSession, rows: list[int]) -> int:
+                await _hold_rows(holder, ids)
+                return await real_delete(session, rows)
+
+            monkeypatch.setattr(relay, "delete_published", held_then_delete)
+            task = asyncio.create_task(relay.run_push_relay(redis))
+            try:
+                await asyncio.sleep(0.3)
+                assert not task.done()
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            await holder.rollback()
+        assert ticks.count == 1
+        entries = await _entries(redis)
+        assert 0 < len(entries) <= 3
+        # The rows were held, never lost: still owed.
+        assert await _outbox() == 3
+
+    async def test_a_backlog_still_drains_without_a_pause(
+        self, redis: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The pair: ticks that DO make full progress go straight on."""
+        monkeypatch.setattr(relay, "PUSH_RELAY_BATCH", 2)
+        monkeypatch.setattr(relay, "PUSH_RELAY_INTERVAL_SECONDS", 30.0)
+        for _ in range(5):
+            await _owed()
+        ticks = _Ticks()
+        monkeypatch.setattr(relay, "relay_once", ticks)
+        task = asyncio.create_task(relay.run_push_relay(redis))
+        try:
+            await _until_drained()
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert ticks.count == 3
+        assert len(await _entries(redis)) == 5
+
+    async def test_a_held_head_does_not_block_the_free_rows_behind_it(
+        self, redis: Any,
+    ) -> None:
+        """Job X's rows come first and are held by an UNCOMMITTED CASCADE
+        -- a second real session deleting X. Job Y's rows behind them are
+        free. One tick publishes Y's key, not X's, and deletes Y's rows:
+        its progress. X's rows are still there, held: when the cascade
+        rolls back they are owed, and the next tick publishes X."""
+        x = await _owed(copies=2)
+        y = await _owed(copies=2)
+        assert max(await _row_ids(x)) < min(await _row_ids(y))
+        async with get_session_factory()() as cascade:
+            await cascade.execute(
+                text("DELETE FROM notifications WHERE id = :id"), {"id": x},
+            )
+            assert await relay.relay_once(redis) == 2
+            assert _keys(await _entries(redis)) == [await _key_of(y)]
+            await cascade.rollback()
+        assert await _row_ids(x) != []
+        assert await relay.relay_once(redis) == 2
+        assert _keys(await _entries(redis)) == [
+            await _key_of(y), await _key_of(x),
+        ]
+        assert await _outbox() == 0
+
+    async def test_a_cascade_that_commits_takes_the_held_rows_with_it(
+        self, redis: Any,
+    ) -> None:
+        x = await _owed(copies=2)
+        y = await _owed()
+        async with get_session_factory()() as cascade:
+            await cascade.execute(
+                text("DELETE FROM notifications WHERE id = :id"), {"id": x},
+            )
+            assert await relay.relay_once(redis) == 1
+            await cascade.commit()
+        assert await relay.relay_once(redis) == 0
+        assert _keys(await _entries(redis)) == [await _key_of(y)]
+        assert await _outbox() == 0
+
+    async def test_everything_held_publishes_nothing(self, redis: Any) -> None:
+        nid = await _owed(copies=2)
+        async with get_session_factory()() as holder:
+            await _hold_rows(holder, await _row_ids(nid))
+            assert await relay.relay_once(redis) == 0
+            await holder.rollback()
+        assert await redis.exists(settings.changes_stream) == 0
+        assert await _outbox() == 2
+
+    async def test_a_job_held_by_a_delivery_attempt_is_still_published(
+        self, redis: Any,
+    ) -> None:
+        """A delivery attempt holds its job FOR NO KEY UPDATE. The read
+        locks push_outbox rows only (OF push_outbox), so the job's push
+        is read and published regardless."""
+        nid = await _owed()
+        async with get_session_factory()() as attempt:
+            await attempt.execute(
+                text(
+                    "SELECT id FROM notifications WHERE id = :id "
+                    "FOR NO KEY UPDATE"
+                ),
+                {"id": nid},
+            )
+            assert await relay.relay_once(redis) == 1
+            await attempt.rollback()
+        assert _keys(await _entries(redis)) == [await _key_of(nid)]
+
+
+class TestFailureLog:
+    async def test_one_line_into_failure_one_line_back(
+        self, server: FakeServer, redis: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """N failed ticks in a row: ONE push_relay_error. Then a good
+        tick: ONE push_relay_recovered, naming N. Failing again is a new
+        turn: one more error line."""
+        monkeypatch.setattr(relay, "PUSH_RELAY_INTERVAL_SECONDS", 0.01)
+        await _owed()
+        ticks = _Ticks()
+        monkeypatch.setattr(relay, "relay_once", ticks)
+        server.connected = False
+        with capture_logs() as logs:
+            task = asyncio.create_task(relay.run_push_relay(redis))
+            try:
+                for _ in range(int(_WAIT / 0.01)):
+                    if ticks.count >= 4:
+                        break
+                    await asyncio.sleep(0.01)
+                failed = ticks.count
+                assert failed >= 4
+                server.connected = True
+                await _until_drained()
+                await _owed()
+                server.connected = False
+                for _ in range(int(_WAIT / 0.01)):
+                    if ticks.count >= failed + 4:
+                        break
+                    await asyncio.sleep(0.01)
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        events = [e["event"] for e in logs if e["event"] in (
+            "push_relay_error", "push_relay_recovered",
+        )]
+        assert events == [
+            "push_relay_error", "push_relay_recovered", "push_relay_error",
+        ]
+        (recovered,) = [e for e in logs if e["event"] == "push_relay_recovered"]
+        assert recovered["failed_ticks"] >= 4
+        assert recovered["log_level"] == "info"
+
+    async def test_a_healthy_relay_logs_nothing(self, redis: Any) -> None:
+        """The pair: ticks that succeed write no error and no recovery."""
+        await _owed()
+        with capture_logs() as logs:
+            task = asyncio.create_task(relay.run_push_relay(redis))
+            try:
+                await _until_drained()
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert [e for e in logs if e["event"] in (
+            "push_relay_error", "push_relay_recovered",
+        )] == []
