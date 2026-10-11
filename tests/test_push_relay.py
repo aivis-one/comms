@@ -443,15 +443,35 @@ class TestEntrypoint:
 
 
 class _Ticks:
-    """Counts the relay's ticks: wraps relay_once, calls the real one."""
+    """Counts the relay's ticks: wraps relay_once, calls the real one.
+
+    `count` is the ticks ENTERED -- what the progress tests assert.
+    `outcomes` is the ticks FINISHED, in order, each "fail" (it raised)
+    or "ok" (it returned): what the loop itself counts its failures by.
+    A tick that entered while redis was down may finish after it came
+    back -- only the finished outcome says which it was (H4)."""
 
     def __init__(self) -> None:
         self.count = 0
+        self.outcomes: list[str] = []
         self.real = relay.relay_once
 
     async def __call__(self, redis: Any) -> int:
         self.count += 1
-        return await self.real(redis)
+        try:
+            progress = await self.real(redis)
+        except Exception:
+            self.outcomes.append("fail")
+            raise
+        self.outcomes.append("ok")
+        return progress
+
+    def fails_before_first_ok(self) -> int:
+        """Finished failures in a row before the first success."""
+        return (
+            self.outcomes.index("ok") if "ok" in self.outcomes
+            else len(self.outcomes)
+        )
 
 
 async def _hold_rows(session: AsyncSession, ids: list[int]) -> None:
@@ -605,8 +625,17 @@ class TestFailureLog:
         self, server: FakeServer, redis: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """N failed ticks in a row: ONE push_relay_error. Then a good
-        tick: ONE push_relay_recovered, naming N. Failing again is a new
-        turn: one more error line."""
+        tick: ONE push_relay_recovered, naming exactly N. Failing again
+        is a new turn: one more error line.
+
+        N is read off the FINISHED ticks, not the ticks entered (H4):
+        before, the test counted entries, waited for four and brought
+        redis back -- and a fourth tick that had entered but not yet
+        reached its XADD then succeeded, so the loop rightly reported
+        three failures against an asserted four (13 of 20 runs under a
+        busy CPU). Each wait below is for a finished outcome, so the
+        tick that straddles redis coming back is counted as what it
+        was, whichever way it went."""
         monkeypatch.setattr(relay, "PUSH_RELAY_INTERVAL_SECONDS", 0.01)
         await _owed()
         ticks = _Ticks()
@@ -616,19 +645,20 @@ class TestFailureLog:
             task = asyncio.create_task(relay.run_push_relay(redis))
             try:
                 for _ in range(int(_WAIT / 0.01)):
-                    if ticks.count >= 4:
+                    if ticks.outcomes.count("fail") >= 4:
                         break
                     await asyncio.sleep(0.01)
-                failed = ticks.count
-                assert failed >= 4
+                assert ticks.outcomes.count("fail") >= 4
                 server.connected = True
                 await _until_drained()
+                first_ok = ticks.outcomes.index("ok")
                 await _owed()
                 server.connected = False
                 for _ in range(int(_WAIT / 0.01)):
-                    if ticks.count >= failed + 4:
+                    if "fail" in ticks.outcomes[first_ok:]:
                         break
                     await asyncio.sleep(0.01)
+                assert "fail" in ticks.outcomes[first_ok:]
             finally:
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -640,6 +670,7 @@ class TestFailureLog:
             "push_relay_error", "push_relay_recovered", "push_relay_error",
         ]
         (recovered,) = [e for e in logs if e["event"] == "push_relay_recovered"]
+        assert recovered["failed_ticks"] == ticks.fails_before_first_ok()
         assert recovered["failed_ticks"] >= 4
         assert recovered["log_level"] == "info"
 
