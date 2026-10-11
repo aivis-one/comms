@@ -1616,11 +1616,17 @@ def _id_in_batch(batch_ids: Any) -> Any:
     """`id = ANY(ARRAY(<batch select>))` -- the delete of a batch (H5).
 
     The batch is selected ONCE (an InitPlan) and its rows are then
-    deleted through the primary key. The plain `id IN (<batch select>)`
-    is planned as a hash semi-join whose outer side scans the whole
-    notifications table -- for every batch, whatever index serves the
-    batch select itself. Used by both batch deletes: retention's and
-    the expiry cleanup's.
+    deleted through the primary key -- the SHAPE is fixed here, not
+    left to the estimates. The plain `id IN (<batch select>)` leaves
+    the join to the planner: on a large table with a small batch it
+    picks the same nested loop on the pkey (measured: identical
+    buffers and time at 50k rows / a 250-row batch), but on other
+    estimates -- a batch that is a large fraction of the table -- it
+    picks a hash semi-join over a seq scan of notifications. That
+    choice is the planner's to make per ANALYZE, and this runs on
+    EVERY worker tick: a pass on the delivery path should not change
+    plan under it. Used by both batch deletes: retention's and the
+    expiry cleanup's.
     """
     return Notification.id == any_(func.array(batch_ids))
 
