@@ -533,6 +533,41 @@ Suppressed recipients and scheduled waits are not channel answers and
 are not counted. Answers are counted from comms' own transition record;
 nothing is stored as "health", and comms acts on none of it.
 
+### Lane depth
+
+How many jobs wait in each lane right now -- the backlog of a lane no
+worker takes (`COMMS_WORKER_LANES` without it) grows here and nowhere
+else:
+
+    GET /api/v1/lanes/depth
+
+Behind the service token like every `/api/v1` route; read only, one
+snapshot; `GET /health` is unchanged.
+
+```json
+{
+  "lanes": {
+    "interactive": {"ready": 0, "waiting": 0, "oldest_ready_seconds": null},
+    "critical": {"ready": 0, "waiting": 0, "oldest_ready_seconds": null},
+    "normal": {"ready": 3, "waiting": 12, "oldest_ready_seconds": 4.2},
+    "bulk": {"ready": 250, "waiting": 0, "oldest_ready_seconds": 812.5}
+  }
+}
+```
+
+Every lane is listed, each with every key, zeros included -- an absent
+key never means zero.
+
+| field | meaning |
+|---|---|
+| `ready` | jobs the lane's next pass would take now -- the lane's own selection, its batch size aside |
+| `waiting` | jobs still under way but not ready yet: scheduled for later, waiting out a retry, behind a pipeline failure's backoff |
+| `oldest_ready_seconds` | how long the oldest ready job has been due; **`null` when none is ready** |
+
+A job past its expiry that comms has not closed yet is in neither: it
+will be closed, not delivered. The counts are read from the jobs at the
+moment of the request; nothing is stored as "depth".
+
 ### Reconciling the address book
 
 The book is synced eventually: an event that is lost or dead-lettered

@@ -71,7 +71,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
-from app.engine.formatters import sanitized_traceback
+from app.core.sanitize import sanitized_traceback
 
 logger = structlog.get_logger()
 

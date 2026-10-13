@@ -39,7 +39,7 @@ import structlog
 from app.core.config import settings
 from app.core.database import ProcessRole, dispose_engine, set_process_role
 from app.core.logging import setup_logging
-from app.engine.formatters import sanitized_traceback
+from app.core.sanitize import sanitized_traceback
 from app.profile.loader import install_profile_from_settings
 from app.transport.consumer import run_consumer_loop
 from app.transport.push_relay import run_push_relay_loop

@@ -64,11 +64,8 @@ import structlog
 from app.core.config import settings
 from app.core.database import ProcessRole, dispose_engine, set_process_role
 from app.core.logging import setup_logging
-from app.engine.formatters import (
-    close_formatters,
-    init_formatters,
-    sanitized_traceback,
-)
+from app.core.sanitize import sanitized_traceback
+from app.engine.formatters import close_formatters, init_formatters
 from app.engine.processor import cleanup_terminal_notifications, process_lane
 from app.engine.service import LANE_CONCURRENCY
 from app.engine.wake import listen_for_wakes

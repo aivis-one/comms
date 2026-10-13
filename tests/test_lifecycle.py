@@ -612,9 +612,15 @@ class TestErrorText:
     async def test_an_exception_without_text_writes_its_type(
         self, db_session: AsyncSession, exc: Exception,
     ) -> None:
+        """Was: the bare type name, the fallback of a text comms kept
+        for its own exceptions. Since H8 a comms exception is recorded by
+        the journal's rule -- its class (qualified) and place, never its
+        text, with or without one (journal.answer_text)."""
         notification, (delivery,) = await _job(db_session)
         await _deliver_with(db_session, notification, _Raising(exc))
-        assert delivery.error_message == type(exc).__name__
+        assert (delivery.error_message or "").startswith(
+            f"builtins.{type(exc).__name__} at app/engine/service.py:"
+        )
 
 
 # -----------------------------------------------------------------------------

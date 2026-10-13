@@ -32,7 +32,7 @@
 # (the cursor refusal quotes the decode error of the caller's own
 # cursor). Channel failures never reach this module: they end in the
 # delivery record, and the redaction of their text in the record and
-# the logs (app/engine/formatters.py, sanitize_text) is unrelated to
+# the logs (app/core/sanitize.py, sanitize_text) is unrelated to
 # what this module returns. The database's messages are NOT safe, which
 # is exactly why the internal handler does not pass its own through.
 # =============================================================================
@@ -55,7 +55,7 @@ from app.core.exceptions import (
     ValidationError,
     conflict_class,
 )
-from app.engine.formatters import sanitized_traceback
+from app.core.sanitize import sanitized_traceback
 
 logger = structlog.get_logger()
 

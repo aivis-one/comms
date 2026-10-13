@@ -255,7 +255,10 @@ class TestDeliverAndRollup:
             assert delivery.status == DeliveryStatus.PENDING
             assert delivery.attempts == 1
             assert delivery.error_message is not None
-            assert "boom transient" in delivery.error_message
+            # Since H8: comms' own exception (this formatter is comms
+            # code) is kept as class and place, not its text.
+            assert "boom transient" not in delivery.error_message
+            assert delivery.error_message.startswith("builtins.RuntimeError at ")
             assert delivery.next_retry_at is not None
 
             fresh = await _fetch_notification(notification.id)

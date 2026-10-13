@@ -92,11 +92,12 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, or_, select
+from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.core.sanitize import sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
     DeliveryStatus,
@@ -105,7 +106,6 @@ from app.engine.constants import (
     NotificationStatus,
     PipelineStep,
 )
-from app.engine.formatters import sanitized_traceback
 from app.engine.journal import pipeline_error_of
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
@@ -209,6 +209,50 @@ async def expire_overdue_notifications(lanes: Sequence[Lane]) -> int:
     return expired_count
 
 
+def not_expired(now: datetime) -> ColumnElement[bool]:
+    """A job not yet past its expiry. P4-1: the expiry sweep runs in its
+    own loop, not just before a lane's selection; a job past its expiry
+    that the sweep has not reached yet is not attempted -- and not
+    waiting either: the sweep will close it, not a delivery."""
+    return or_(Notification.expiry_at.is_(None), Notification.expiry_at > now)
+
+
+def ready_now(now: datetime) -> ColumnElement[bool]:
+    """THE condition of a job a lane's pass may attempt now -- one place,
+    read by the pass (process_lane) and by the lane depth
+    (app/engine/depth.py, H8), so the depth's "ready" is exactly what
+    the next pass would select, its batch limit aside: pending, or
+    processing with a delivery due; scheduled; past its pipeline gate
+    (T12); not expired."""
+    ready_delivery = (
+        select(NotificationDelivery.id)
+        .where(
+            NotificationDelivery.notification_id == Notification.id,
+            NotificationDelivery.status == DeliveryStatus.PENDING,
+            or_(
+                NotificationDelivery.next_retry_at.is_(None),
+                NotificationDelivery.next_retry_at <= now,
+            ),
+        )
+        .exists()
+    )
+    return and_(
+        or_(
+            Notification.status == NotificationStatus.PENDING,
+            and_(
+                Notification.status == NotificationStatus.PROCESSING,
+                ready_delivery,
+            ),
+        ),
+        Notification.scheduled_at <= now,
+        or_(
+            Notification.pipeline_retry_at.is_(None),
+            Notification.pipeline_retry_at <= now,
+        ),
+        not_expired(now),
+    )
+
+
 async def process_lane(
     lane: Lane, on_more: Callable[[], None] | None = None,
 ) -> int:
@@ -250,43 +294,9 @@ async def process_lane(
     # the no-op "processed" count would keep the lane's loop from
     # backing off for the whole backoff window.
     async with factory() as session:
-        ready_delivery = (
-            select(NotificationDelivery.id)
-            .where(
-                NotificationDelivery.notification_id == Notification.id,
-                NotificationDelivery.status == DeliveryStatus.PENDING,
-                or_(
-                    NotificationDelivery.next_retry_at.is_(None),
-                    NotificationDelivery.next_retry_at <= now,
-                ),
-            )
-            .exists()
-        )
         stmt = (
             select(Notification.id)
-            .where(
-                Notification.lane == lane.value,
-                or_(
-                    Notification.status == NotificationStatus.PENDING,
-                    and_(
-                        Notification.status == NotificationStatus.PROCESSING,
-                        ready_delivery,
-                    ),
-                ),
-                Notification.scheduled_at <= now,
-                # T12: a job whose pipeline failed waits behind its gate.
-                or_(
-                    Notification.pipeline_retry_at.is_(None),
-                    Notification.pipeline_retry_at <= now,
-                ),
-                # P4-1: the expiry sweep runs in its own loop, not just
-                # before this selection; a job past its expiry that the
-                # sweep has not reached yet is not attempted.
-                or_(
-                    Notification.expiry_at.is_(None),
-                    Notification.expiry_at > now,
-                ),
-            )
+            .where(Notification.lane == lane.value, ready_now(now))
             # Oldest due first within the lane. Priority left the
             # ordering with the column (F1.4); isolation is the lane's.
             .order_by(Notification.scheduled_at)

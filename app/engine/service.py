@@ -64,6 +64,7 @@ from app.audience.prefs import muted_recipient_ids
 from app.audience.schedule import recipient_deferred_until
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
+from app.core.sanitize import sanitize_text, sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
     ChannelAnswer,
@@ -83,9 +84,6 @@ from app.engine.formatters import (
     PermanentDeliveryError,
     RateLimitedError,
     get_formatter,
-    sanitize_error,
-    sanitize_text,
-    sanitized_traceback,
 )
 from app.engine.models import (
     IntakeOutcome,
@@ -1214,14 +1212,6 @@ def _failure_class_of(exc: PermanentDeliveryError) -> FailureClass:
     raise TypeError(f"no failure class for {type(exc).__name__}")
 
 
-def _error_text(exc: Exception) -> str:
-    """What goes into error_message: the redacted text, or -- when the
-    exception has none (KeyError(), a bare RuntimeError) -- its type.
-    An empty string would be the same silence F0 closed for provider
-    answers."""
-    return sanitize_error(exc) or type(exc).__name__
-
-
 class _DeliveryOutcome:
     """Result of a single delivery attempt."""
 
@@ -1293,20 +1283,21 @@ async def _deliver_single(
                 failure_class=failure_class.value,
                 error=sanitize_text(str(exc))[:200],
             )
-            outcome = _DeliveryOutcome(
-                failure_class=failure_class, error=_error_text(exc),
-            )
             answer = journal.answer_of(exc, failure_class)
+            outcome = _DeliveryOutcome(
+                failure_class=failure_class,
+                error=journal.answer_text(answer, exc),
+            )
         except RateLimitedError as exc:
             # Deliberately no log here: whether this becomes a deferral
             # or degrades to a transient failure is decided in the
             # apply loop (it owns the budget counter) -- that decision
             # log is the valuable one, and doubling it would be noise.
+            answer = journal.answer_of(exc)
             outcome = _DeliveryOutcome(
-                error=_error_text(exc),
+                error=journal.answer_text(answer, exc),
                 retry_after=exc.retry_after,
             )
-            answer = journal.answer_of(exc)
         except TimeoutError as exc:
             logger.warning(
                 "delivery_timeout",
@@ -1322,17 +1313,19 @@ async def _deliver_single(
             # Not logger.exception(): the renderer would print the chain
             # raw, and the telegram network error carries the bot token
             # in its text and in its __cause__. Same event, same level,
-            # same `exception` key -- redacted (formatters.py).
+            # same `exception` key -- redacted (app/core/sanitize.py).
             logger.error(
                 "delivery_error",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
                 exception=sanitized_traceback(exc),
             )
-            outcome = _DeliveryOutcome(
-                error=_error_text(exc),
-            )
+            # error_message by the journal's rule (H8): this is comms' own
+            # exception, so its class and place -- never its text.
             answer = journal.answer_of(exc)
+            outcome = _DeliveryOutcome(
+                error=journal.answer_text(answer, exc),
+            )
         else:
             outcome = _DeliveryOutcome(success=success)
             answer = (

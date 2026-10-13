@@ -426,7 +426,7 @@ class TestTheChecks:
 # -- R6 -----------------------------------------------------------------------
 
 _APP = Path(__file__).resolve().parents[1] / "app"
-_SANITIZER = ("formatters.py", "sanitized_traceback")
+_SANITIZER = ("sanitize.py", "sanitized_traceback")
 
 
 def _raw_traceback_calls(source: str, filename: str) -> list[str]:

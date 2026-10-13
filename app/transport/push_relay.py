@@ -83,7 +83,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.constants import PUSH_RELAY_BATCH, PUSH_RELAY_INTERVAL_SECONDS
 from app.core.database import get_session_factory
-from app.engine.formatters import sanitized_traceback
+from app.core.sanitize import sanitized_traceback
 from app.engine.models import Notification, PushOutbox
 from app.transport.connection import redis_client
 
