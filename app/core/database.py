@@ -39,6 +39,8 @@ class Base(DeclarativeBase):
 # channel calls each take a session for the journal while they run
 # (app/engine/service.py LANE_CONCURRENCY), and tests/test_lanes.py
 # holds their sum, with the sessions held beside them, to this size.
+# The worker's wake listener holds one more connection, on its own
+# engine outside this pool (app/engine/wake.py).
 POOL_SIZE = 10
 POOL_MAX_OVERFLOW = 20
 

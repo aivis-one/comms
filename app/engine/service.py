@@ -93,6 +93,7 @@ from app.engine.models import (
     NotificationTransition,
 )
 from app.engine.resolver import resolve_targets
+from app.engine.wake import signal_lane
 from app.profile.registry import (
     Decided,
     Lane,
@@ -131,7 +132,9 @@ _RATE_LIMIT_JITTER_MAX_FRACTION = 0.5
 # maintenance loop's session, must fit the pool
 # (app/core/database.py POOL_SIZE + POOL_MAX_OVERFLOW) -- a call that
 # waits for a connection widens the accepted window of
-# record_channel_answer. tests/test_lanes.py holds the sum.
+# record_channel_answer. tests/test_lanes.py holds the sum. The wake
+# listener's connection is not in it: it has its own engine, outside
+# the pool (app/engine/wake.py).
 #   normal 20 -- the number every job had before lanes: the default lane
 #                behaves exactly as the one queue did;
 #   interactive, critical 2 -- a person or a payment is one recipient,
@@ -238,6 +241,10 @@ async def accept_notification(
     ValidationError from create_notification (a request that cannot be
     accepted) propagates -- the savepoint is rolled back, and the
     caller records the rejection.
+
+    An ACCEPTED job wakes the loops of its lane when the caller's
+    transaction commits (app/engine/wake.py, spec §8.4); DUPLICATE and
+    CONFLICT created nothing and wake nothing.
     """
     try:
         async with session.begin_nested():
@@ -265,6 +272,7 @@ async def accept_notification(
             else Intake.CONFLICT
         )
         return Acceptance(outcome=outcome, notification=holder)
+    await signal_lane(session, notification.lane)
     return Acceptance(outcome=Intake.ACCEPTED, notification=notification)
 
 

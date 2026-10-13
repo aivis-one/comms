@@ -11,7 +11,8 @@
 # This module is the NEUTRAL layer above both `engine` and `messaging`.
 # It owns the eternal poll loops and ALL maintenance SCHEDULING:
 #   - one delivery loop per lane of this process
-#     (engine.processor.process_lane, P4-1);
+#     (engine.processor.process_lane, P4-1), woken by intake through
+#     one listener (engine.wake.listen_for_wakes, P4-2);
 #   - one maintenance loop: the engine's expiry sweep and expired
 #     cleanup (engine.worker.run_engine_maintenance), the close-notify
 #     consumer, and -- each behind its own cadence gate -- the
@@ -32,6 +33,17 @@
 # (up to NOTIFICATION_MAX_BACKOFF_SECONDS); work found -> back to
 # NOTIFICATION_POLL_INTERVAL_SECONDS; a pass that raised -> the maximum.
 # The settings are shared, the state is each loop's own.
+#
+# WAKE (P4-2, spec §8.4): the backoff decides how long an idle loop
+# sleeps, not how soon it notices work. Intake wakes the loop of the
+# job's lane (app/engine/wake.py): one listener per process sets the
+# lane's event, the loop's sleep ends, the pass runs at once. The event
+# is cleared just before each pass, so wakes that come during a pass --
+# one or a thousand -- cost one more pass after it, never one each. A
+# lost wake costs the interval, never the job. The maintenance loop has
+# no producer of wakes: its event is never set and its sleep is its
+# interval. A job that becomes due later is noticed by the poll (the
+# KNOWN CEILING in app/engine/wake.py).
 #
 # SHUTDOWN: SIGTERM/SIGINT cancel the loops. An attempt in flight is
 # cancelled at its current await and rolled back with its session;
@@ -59,6 +71,7 @@ from app.engine.formatters import (
 )
 from app.engine.processor import cleanup_terminal_notifications, process_lane
 from app.engine.service import LANE_CONCURRENCY
+from app.engine.wake import listen_for_wakes
 from app.engine.worker import run_engine_maintenance
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
 from app.notifier import consume_close_notifications
@@ -159,11 +172,17 @@ async def run_maintenance_pass() -> int:
 
 
 async def _poll_loop(
-    run_pass: Callable[[], Awaitable[int]], **log_fields: str,
+    run_pass: Callable[[], Awaitable[int]],
+    wake: asyncio.Event,
+    **log_fields: str,
 ) -> None:
     """Run `run_pass` forever with this loop's own interval: back to the
     base after work, doubled after an empty pass (up to the maximum),
     the maximum after a pass that raised. Cancellation ends it.
+
+    The sleep between passes ends early when `wake` is set; the event
+    is cleared right before the pass, so a wake during the pass is kept
+    for one pass after it, and any number of wakes is one.
 
     `log_fields` name the loop in its error log (lane=..., or
     loop=maintenance).
@@ -172,6 +191,7 @@ async def _poll_loop(
     max_backoff = settings.notification_max_backoff_seconds
     interval = base_interval
     while True:
+        wake.clear()
         try:
             done = await run_pass()
             interval = (
@@ -185,7 +205,9 @@ async def _poll_loop(
                 exception=sanitized_traceback(exc),
             )
             interval = max_backoff
-        await asyncio.sleep(interval)
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(interval):
+                await wake.wait()
 
 
 def _lane_pass(lane: Lane) -> Callable[[], Awaitable[int]]:
@@ -197,7 +219,8 @@ def _lane_pass(lane: Lane) -> Callable[[], Awaitable[int]]:
 
 async def run_worker_loop() -> None:
     """The worker's loops: one per lane of this process and one for
-    maintenance, each with its own interval. Runs until cancelled.
+    maintenance, each with its own interval, and the listener that
+    wakes the lane loops (app/engine/wake.py). Runs until cancelled.
 
     In a task group: cancelling this cancels every loop; a loop that
     ends any other way (each catches Exception, so only a
@@ -241,15 +264,21 @@ async def run_worker_loop() -> None:
             thread_auto_close_days=settings.thread_auto_close_days,
         )
 
+    wakes = {lane.value: asyncio.Event() for lane in lanes}
     try:
         async with asyncio.TaskGroup() as group:
             for lane in lanes:
                 group.create_task(
-                    _poll_loop(_lane_pass(lane), lane=lane.value),
+                    _poll_loop(
+                        _lane_pass(lane), wakes[lane.value], lane=lane.value,
+                    ),
                 )
             group.create_task(
-                _poll_loop(run_maintenance_pass, loop="maintenance"),
+                _poll_loop(
+                    run_maintenance_pass, asyncio.Event(), loop="maintenance",
+                ),
             )
+            group.create_task(listen_for_wakes(wakes))
     except asyncio.CancelledError:
         logger.info("notification_worker_stopped")
         return

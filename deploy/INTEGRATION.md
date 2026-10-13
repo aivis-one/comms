@@ -169,6 +169,14 @@ bypass`, below), the retry rules and `expiry_at` behave as for any
 type. And it does not make a channel faster: a slow provider is as slow
 in `interactive` as anywhere -- only no longer at anyone else's cost.
 
+A job is picked up as soon as it is accepted, in every lane: accepting
+it wakes the loop of its lane in each worker that takes that lane, so an
+idle worker does not hold it for its poll interval. The wake only speeds
+things up: a lost one (the worker's listening connection down) falls
+back to the poll -- up to `NOTIFICATION_MAX_BACKOFF_SECONDS` later -- and
+never loses the job. A job that becomes due later (a `scheduled_at` in
+the future, a retry) is picked up by the poll once due.
+
 A lane outside the four refuses startup, like every other field. The
 value is taken when the request is accepted: a job keeps the lane its
 type had then, whatever a later profile says.

@@ -46,6 +46,7 @@ import pytest
 from sqlalchemy import event, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.pool import NullPool
 from structlog.testing import capture_logs
 
 import app.engine.processor as processor
@@ -82,6 +83,7 @@ from app.engine.service import (
     create_notification,
     resolve_notification,
 )
+from app.engine.wake import wake_engine
 from app.profile.loader import _FIELDS, LANES
 from app.profile.registry import Decided, Lane, Layer, TypeRecord, registry
 from tests.helpers import create_recipient, intake_fields, notification_row_fields
@@ -649,7 +651,14 @@ class TestTheBudgets:
         """Every lane's slots each hold a journal session while they
         call, every lane's attempt holds one, the maintenance loop holds
         one: all of it at once fits the worker's pool, so no journal
-        write waits for a connection."""
+        write waits for a connection.
+
+        P4-2: the worker's wake listener holds a connection for the
+        process's whole life, and it is NOT in this sum: the sum already
+        fills the pool exactly, so the listener has its own engine
+        outside it (app/engine/wake.py) -- asserted beside this sum, not
+        added to it.
+        """
         held = (
             sum(LANE_CONCURRENCY.values())
             + len(Lane)
@@ -657,6 +666,9 @@ class TestTheBudgets:
         )
         assert held <= POOL_SIZE + POOL_MAX_OVERFLOW
         assert worker.MAINTENANCE_SESSIONS >= 1
+        listener = wake_engine()
+        assert isinstance(listener.pool, NullPool)
+        assert listener is not get_engine()
 
     def test_zero_is_not_off(self) -> None:
         with pytest.raises(ValueError) as caught:
@@ -814,19 +826,37 @@ class TestTheLoops:
     ) -> None:
         """Б3 (4): the startup line names the process's lanes and their
         budgets; a loop is started for each lane and one for
-        maintenance, none for a lane the process does not take. M10."""
-        started: list[dict[str, str]] = []
+        maintenance, none for a lane the process does not take. M10.
 
-        async def record(run_pass: Any, **fields: str) -> None:
+        P4-2: each loop is now started with its wake event, and the
+        process's one wake listener gets the lane loops' events by lane
+        -- the maintenance loop's is not among them. The loops' log
+        fields are asserted exactly as before.
+        """
+        started: list[dict[str, str]] = []
+        wakes: dict[str, asyncio.Event] = {}
+        listened: list[dict[str, asyncio.Event]] = []
+
+        async def record(run_pass: Any, wake: asyncio.Event, **fields: str) -> None:
             started.append(fields)
+            wakes[fields.get("lane", "maintenance")] = wake
+
+        async def listen(events: dict[str, asyncio.Event]) -> None:
+            listened.append(dict(events))
 
         monkeypatch.setattr(worker, "_poll_loop", record)
+        monkeypatch.setattr(worker, "listen_for_wakes", listen)
         _lanes(monkeypatch, "critical,bulk")
         with capture_logs() as logs:
             await worker.run_worker_loop()
         assert started == [
             {"lane": "critical"}, {"lane": "bulk"}, {"loop": "maintenance"},
         ]
+        assert listened == [
+            {"critical": wakes["critical"], "bulk": wakes["bulk"]},
+        ]
+        assert wakes["maintenance"] not in listened[0].values()
+        assert len({id(wake) for wake in wakes.values()}) == 3
         (line,) = [
             log for log in logs if log["event"] == "notification_worker_started"
         ]

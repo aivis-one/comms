@@ -111,8 +111,10 @@ REDIS_TIMEOUT_MARGIN_SECONDS = 10.0
 # The push relay (P3-1, app/transport/push_relay.py): how often it looks
 # at the outbox, and how many outbox rows one tick reads. Constants, not
 # settings: neither is a decision a deploy has to make -- a push is a
-# hint that only makes the product read sooner, and the worker's own
-# idle wait (up to a minute) dwarfs a one-second tick.
+# hint that only makes the product read sooner. Since intake wakes the
+# worker (P4-2, app/engine/wake.py) a job is attempted moments after it
+# is accepted, so this tick is no longer small beside the worker's
+# wait: up to one second of a push's delay is the relay's own.
 PUSH_RELAY_INTERVAL_SECONDS = 1.0
 PUSH_RELAY_BATCH = 500
 
