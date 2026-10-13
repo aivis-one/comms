@@ -141,6 +141,51 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+### `lane` -- which lane a type's jobs travel in
+
+comms delivers in four lanes, each with its own budget: its own
+selection of due jobs, its own number of jobs per pass, its own slots
+for channel calls, its own loop in the worker. A backlog or a slow
+channel in one lane takes nothing from another. A type declares its
+lane in its record in `types.yaml`:
+
+    lane: interactive
+
+| value | for | the type's jobs |
+|---|---|---|
+| `interactive` | someone waits for the answer right now (a login code) | small passes, a few slots of their own |
+| `critical` | a failure costs money | capacity no other lane can take |
+| `normal` | notifications | today's behavior -- the default, for a type that does not declare it |
+| `bulk` | large sends | may wait; one slot, so a mass send never holds anyone else's |
+
+What a lane does: it ISOLATES. A bulk backlog of any size does not delay
+an `interactive` job by one pass, and a slow channel call in one lane
+does not hold another lane's loop.
+
+What a lane does NOT do. It is not a priority: no lane is picked before
+another, each simply has its own. It passes no gate: a mute, the
+recipient's schedule (unless the type declares `recipient_schedule:
+bypass`, below), the retry rules and `expiry_at` behave as for any
+type. And it does not make a channel faster: a slow provider is as slow
+in `interactive` as anywhere -- only no longer at anyone else's cost.
+
+A lane outside the four refuses startup, like every other field. The
+value is taken when the request is accepted: a job keeps the lane its
+type had then, whatever a later profile says.
+
+**Which worker takes which lane is the deploy's, not the profile's.**
+One worker image takes the lanes named in `COMMS_WORKER_LANES`
+(comma-separated, in the comms `.env`); left out, it takes all four --
+nothing needs to be written for one worker. A second worker of the
+same image may take a subset, e.g. `COMMS_WORKER_LANES=critical` next
+to one with `interactive,normal,bulk`. **The worker processes of a
+deploy together must take all four lanes:** a lane no process takes is
+neither delivered nor expired -- its jobs stay pending, and nothing
+fails to tell you so. Each worker names its lanes and their budgets in
+its startup log line, `notification_worker_started` (`lanes`,
+`lane_budgets`). Written but empty, an unknown lane or a lane listed
+twice refuses startup, naming the variable.
+
 ### `recipient_schedule` -- a type that does not wait for the schedule
 
 A recipient's schedule (section 6) holds every delivery outside their

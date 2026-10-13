@@ -1,5 +1,5 @@
 # =============================================================================
-# COMMS Service -- Worker Entrypoint + Loop (neutral layer)
+# COMMS Service -- Worker Entrypoint + Loops (neutral layer)
 # =============================================================================
 #
 # Separate worker process: same Docker image as the API, different
@@ -9,23 +9,43 @@
 #   Worker: python -m app.worker
 #
 # This module is the NEUTRAL layer above both `engine` and `messaging`.
-# It owns the eternal poll loop and ALL maintenance SCHEDULING:
-#   - engine delivery batch (engine.worker.run_notification_batch),
-#   - notification retention pass (engine.processor), own cadence,
-#   - thread auto-close pass (messaging.processor), own cadence.
-# Keeping the loop and both cadence gates here is what lets `engine`
+# It owns the eternal poll loops and ALL maintenance SCHEDULING:
+#   - one delivery loop per lane of this process
+#     (engine.processor.process_lane, P4-1);
+#   - one maintenance loop: the engine's expiry sweep and expired
+#     cleanup (engine.worker.run_engine_maintenance), the close-notify
+#     consumer, and -- each behind its own cadence gate -- the
+#     notification retention pass (engine.processor) and the thread
+#     auto-close pass (messaging.processor).
+# Keeping the loops and both cadence gates here is what lets `engine`
 # stay MESSAGING-FREE (Phase 4b, edit 3 / the DAG hygiene of 3b): the
 # only place that imports both engine and messaging is this entrypoint.
 #
-# BACKOFF: empty batch -> interval doubles (up to max_backoff); work
-# found -> interval resets to base. SIGTERM/SIGINT cancel the loop task
-# so the current batch finishes its per-item transaction cleanly.
+# ONE LOOP PER LANE (P4-1, spec §8.2): a lane's pass waits for nothing
+# but its own jobs. A bulk pass held by slow channel calls, or a
+# maintenance pass waiting FOR UPDATE for an attempt in flight, delays
+# only its own loop; every other lane goes on at its own interval. The
+# lanes of the process come from COMMS_WORKER_LANES (all four when
+# unset): one image, any set of lanes (spec §8.6).
+#
+# BACKOFF, per loop: a pass with no work -> that loop's interval doubles
+# (up to NOTIFICATION_MAX_BACKOFF_SECONDS); work found -> back to
+# NOTIFICATION_POLL_INTERVAL_SECONDS; a pass that raised -> the maximum.
+# The settings are shared, the state is each loop's own.
+#
+# SHUTDOWN: SIGTERM/SIGINT cancel the loops. An attempt in flight is
+# cancelled at its current await and rolled back with its session;
+# what its channel calls already journaled stays (app/engine/journal.py).
+# A loop that ends any other way ends the process: the task group
+# cancels the others and the error propagates -- the container restarts
+# with every lane, instead of running on with some of them.
 # =============================================================================
 
 import asyncio
 import contextlib
 import signal
 import time
+from collections.abc import Awaitable, Callable
 
 import structlog
 
@@ -37,16 +57,18 @@ from app.engine.formatters import (
     init_formatters,
     sanitized_traceback,
 )
-from app.engine.processor import cleanup_terminal_notifications
-from app.engine.worker import run_notification_batch
+from app.engine.processor import cleanup_terminal_notifications, process_lane
+from app.engine.service import LANE_CONCURRENCY
+from app.engine.worker import run_engine_maintenance
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
 from app.notifier import consume_close_notifications
 from app.profile.loader import install_profile_from_settings
+from app.profile.registry import Lane
 
 logger = structlog.get_logger()
 
 # -- Maintenance cadence gates (PER-PROCESS, Phase 3a fix H). None ->
-# never ran in this process: the first tick runs the pass immediately
+# never ran in this process: the first maintenance pass runs it at once
 # (restart = bounded catch-up). Two workers -> two cheap idempotent
 # scans per interval; NO DB coordination (see the KNOWN CEILING markers
 # in the two processors -- do not "fix" this with a distributed lock).
@@ -68,27 +90,39 @@ def reset_auto_close_gate() -> None:
     _last_auto_close_at = None
 
 
-async def run_worker_batch() -> int:
-    """One full worker iteration: the engine delivery batch, then the
-    two maintenance passes -- each gated to its OWN slow cadence.
+# Sessions the maintenance loop holds at once: its passes run one after
+# another, each in one session at a time (the expiry sweep, the expired
+# cleanup, the close-notify consumer, retention, auto-close). Counted
+# with the lanes' against the pool (app/engine/service.py
+# LANE_CONCURRENCY; tests/test_lanes.py holds the sum).
+MAINTENANCE_SESSIONS = 1
 
-    ORDER: deliveries first (maintenance never delays them); retention
-    next; auto-close last. Each maintenance pass is skipped when
-    disabled (days <= 0; the startup log names it) and otherwise gated
-    to its interval. The passes commit per batch, so transactions stay
-    short even when a pass drains a backlog.
+
+async def run_maintenance_pass() -> int:
+    """One pass of the maintenance loop: the engine's expiry sweep and
+    expired cleanup, the close-notify consumer, then the two slow
+    passes -- each gated to its OWN cadence.
+
+    It runs beside the lane loops, never on the delivery path: the
+    expiry sweep waits FOR UPDATE for an attempt in flight, and that
+    wait is this loop's alone. Each slow pass is skipped when disabled
+    (days <= 0; the startup log names it) and otherwise gated to its
+    interval. The passes commit per batch, so transactions stay short
+    even when a pass drains a backlog.
 
     Returns:
-        Number of notifications processed (drives the loop backoff).
+        Jobs expired and deleted plus close notices emitted (drives the
+        maintenance loop's backoff). The slow passes do not count: they
+        keep their own cadence whatever the loop's interval.
     """
     global _last_retention_at, _last_auto_close_at
 
-    processed = await run_notification_batch()
+    done = await run_engine_maintenance()
 
-    # Close-notify consumer (Phase 4c item 2): EVERY tick -- a partial
+    # Close-notify consumer (Phase 4c item 2): EVERY pass -- a partial
     # index over a normally-empty flag set makes it cheap and prompt,
     # unlike the two growing-table maintenance scans below (own gates).
-    await consume_close_notifications()
+    done += await consume_close_notifications()
 
     if settings.notification_retention_days > 0:
         now = time.monotonic()
@@ -114,31 +148,75 @@ async def run_worker_batch() -> int:
                 # Logged here, not in the pass: messaging cannot import
                 # the redactor (app/messaging/processor.py,
                 # AutoClosePassError). A failed pass does not stop the
-                # tick -- it never did.
+                # loop -- it never did.
                 logger.error(
                     "thread_auto_close_pass_error",
                     closed=exc.closed,
                     exception=sanitized_traceback(exc),
                 )
 
-    return processed
+    return done
 
 
-async def run_worker_loop() -> None:
-    """Main worker loop. Runs until cancelled.
+async def _poll_loop(
+    run_pass: Callable[[], Awaitable[int]], **log_fields: str,
+) -> None:
+    """Run `run_pass` forever with this loop's own interval: back to the
+    base after work, doubled after an empty pass (up to the maximum),
+    the maximum after a pass that raised. Cancellation ends it.
 
-    Catches all exceptions to prevent the loop from dying; a failing
-    batch backs off to max interval and tries again.
+    `log_fields` name the loop in its error log (lane=..., or
+    loop=maintenance).
     """
     base_interval = settings.notification_poll_interval_seconds
     max_backoff = settings.notification_max_backoff_seconds
     interval = base_interval
+    while True:
+        try:
+            done = await run_pass()
+            interval = (
+                base_interval if done > 0
+                else min(interval * 2, max_backoff)
+            )
+        except Exception as exc:
+            logger.error(
+                "notification_worker_error",
+                **log_fields,
+                exception=sanitized_traceback(exc),
+            )
+            interval = max_backoff
+        await asyncio.sleep(interval)
 
+
+def _lane_pass(lane: Lane) -> Callable[[], Awaitable[int]]:
+    async def run_pass() -> int:
+        return await process_lane(lane)
+
+    return run_pass
+
+
+async def run_worker_loop() -> None:
+    """The worker's loops: one per lane of this process and one for
+    maintenance, each with its own interval. Runs until cancelled.
+
+    In a task group: cancelling this cancels every loop; a loop that
+    ends any other way (each catches Exception, so only a
+    BaseException gets out) cancels the others and propagates.
+    """
+    lanes = settings.worker_lanes
     logger.info(
         "notification_worker_started",
-        poll_interval=base_interval,
-        max_backoff=max_backoff,
+        poll_interval=settings.notification_poll_interval_seconds,
+        max_backoff=settings.notification_max_backoff_seconds,
         max_attempts=settings.notification_max_delivery_attempts,
+        lanes=[lane.value for lane in lanes],
+        lane_budgets={
+            lane.value: {
+                "batch_size": settings.lane_batch_size(lane),
+                "concurrency": LANE_CONCURRENCY[lane],
+            }
+            for lane in lanes
+        },
         retention_days=settings.notification_retention_days,
         retention_interval_seconds=(
             settings.notification_retention_interval_seconds
@@ -163,30 +241,18 @@ async def run_worker_loop() -> None:
             thread_auto_close_days=settings.thread_auto_close_days,
         )
 
-    while True:
-        try:
-            processed = await run_worker_batch()
-
-            if processed > 0:
-                interval = base_interval
-            else:
-                interval = min(interval * 2, max_backoff)
-
-        except asyncio.CancelledError:
-            logger.info("notification_worker_stopped")
-            return
-        except Exception as exc:
-            logger.error(
-                "notification_worker_error",
-                exception=sanitized_traceback(exc),
+    try:
+        async with asyncio.TaskGroup() as group:
+            for lane in lanes:
+                group.create_task(
+                    _poll_loop(_lane_pass(lane), lane=lane.value),
+                )
+            group.create_task(
+                _poll_loop(run_maintenance_pass, loop="maintenance"),
             )
-            interval = max_backoff
-
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            logger.info("notification_worker_stopped")
-            return
+    except asyncio.CancelledError:
+        logger.info("notification_worker_stopped")
+        return
 
 
 async def _main() -> None:

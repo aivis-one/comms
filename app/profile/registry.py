@@ -84,6 +84,28 @@ class RecipientSchedule(StrEnum):
     BYPASS = "bypass"
 
 
+class Lane(StrEnum):
+    """The isolation lane of a type (spec §8.2-8.3): the values of the
+    profile field `lane`, in the order the schema publishes them
+    (app/profile/loader.py LANES). A closed set comms offers; the
+    product picks one per type, and a type that declares none goes to
+    `normal`. A job keeps the lane it was accepted with
+    (notifications.lane); the worker runs one loop per lane of its
+    process (app/worker.py), each selecting only its own lane with its
+    own budget (app/engine/processor.py process_lane) -- isolation, not
+    priority: no lane is ever picked before another.
+    """
+
+    # Someone is waiting for the answer right now.
+    INTERACTIVE = "interactive"
+    # A failure costs money: capacity no other lane can take.
+    CRITICAL = "critical"
+    # Notifications -- the default, and the behavior before lanes.
+    NORMAL = "normal"
+    # Large sends that may wait.
+    BULK = "bulk"
+
+
 class PushOn(StrEnum):
     """What a type pushes back to the product (spec §7.4): the values of
     the profile field `push_on`, in the order the schema publishes them

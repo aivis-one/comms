@@ -999,7 +999,8 @@ _POINTS: dict[tuple[str, str], str] = {
     ),
     # Not a transition: the gate that let a successful attempt through
     # is cleared; the attempt's transitions are recorded by its steps.
-    ("app/engine/processor.py", "process_pending_notifications"): ("not a transition"),
+    # (The attempt moved into the lane's pass in P4-1.)
+    ("app/engine/processor.py", "process_lane"): ("not a transition"),
     # Thread statuses (messaging), not jobs or deliveries.
     ("app/messaging/status.py", "set_status"): "thread",
     ("app/messaging/status.py", "apply_client_message_reopen"): "thread",

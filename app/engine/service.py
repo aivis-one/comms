@@ -93,7 +93,13 @@ from app.engine.models import (
     NotificationTransition,
 )
 from app.engine.resolver import resolve_targets
-from app.profile.registry import Decided, Layer, RecipientSchedule, registry
+from app.profile.registry import (
+    Decided,
+    Lane,
+    Layer,
+    RecipientSchedule,
+    registry,
+)
 
 logger = structlog.get_logger()
 
@@ -113,8 +119,31 @@ _DELIVER_TIMEOUT_SECONDS = 30
 # enough to decorrelate, still the same order as the server's ask.
 _RATE_LIMIT_JITTER_MAX_FRACTION = 0.5
 
-# Max concurrent formatter.deliver() calls per notification.
-_MAX_CONCURRENT_DELIVERIES = 20
+# Concurrent formatter.deliver() calls of one job, by the job's lane
+# (P4-1, spec §8.2): each lane's own slots, which no other lane can
+# take. One semaphore per job IS one per lane: a lane's loop attempts
+# its jobs one after another (app/engine/processor.py process_lane), so
+# at most one job of a lane is in flight in a process. Constants, like
+# the one number they replaced, because they share the worker's
+# connection pool: every call writes the channel's answer in its own
+# session while it holds its slot (journal.record_channel_answer), so
+# the sum of these, plus one attempt session per lane and the
+# maintenance loop's session, must fit the pool
+# (app/core/database.py POOL_SIZE + POOL_MAX_OVERFLOW) -- a call that
+# waits for a connection widens the accepted window of
+# record_channel_answer. tests/test_lanes.py holds the sum.
+#   normal 20 -- the number every job had before lanes: the default lane
+#                behaves exactly as the one queue did;
+#   interactive, critical 2 -- a person or a payment is one recipient,
+#                rarely more; two slots keep a second one from queueing;
+#   bulk 1 -- a send that may wait; the slot it cannot exceed is what
+#                keeps it off everyone else's.
+LANE_CONCURRENCY: dict[Lane, int] = {
+    Lane.INTERACTIVE: 2,
+    Lane.CRITICAL: 2,
+    Lane.NORMAL: 20,
+    Lane.BULK: 1,
+}
 
 
 # -----------------------------------------------------------------------------
@@ -488,8 +517,9 @@ async def create_notification(
             snapshotted onto the row -- the caller never names one; so
             are its category, its push_on (what it pushes back), its
             recipient_schedule (whether it waits for the allowed
-            periods) and its transport retry (retry_max_attempts,
-            retry_backoff_seconds).
+            periods), its lane (which of the worker's loops picks it,
+            with whose budget) and its transport retry
+            (retry_max_attempts, retry_backoff_seconds).
         title: Stored fallback title (the letter).
         body: Stored fallback body (the letter).
         target_type: TargetType value (user, group, all).
@@ -570,6 +600,7 @@ async def create_notification(
     category = record.value("category")
     push_on = record.value("push_on")
     recipient_schedule = record.value("recipient_schedule")
+    lane = record.value("lane")
     retry_max_attempts = record.value("retry_max_attempts")
     retry_backoff_seconds = record.value("retry_backoff_seconds")
 
@@ -584,6 +615,7 @@ async def create_notification(
         category=category,
         push_on=push_on,
         recipient_schedule=recipient_schedule,
+        lane=lane,
         retry_max_attempts=retry_max_attempts,
         retry_backoff_seconds=retry_backoff_seconds,
         correlation=correlation,
@@ -607,6 +639,7 @@ async def create_notification(
         type=type,
         target=f"{target_type}:{target_value}",
         channels=channels,
+        lane=lane,
         scheduled_at=scheduled_at.isoformat(),
         expiry_layer=expiry_layer.value,
     )
@@ -802,7 +835,8 @@ async def deliver_notification(
       shortest window of the three, not worth threading the
       notification through _apply_transient_failure for one log
       field.)
-    - Concurrent delivery via asyncio.gather + Semaphore.
+    - Concurrent delivery via asyncio.gather + Semaphore, sized by the
+      job's lane (LANE_CONCURRENCY).
     - asyncio.wait_for with timeout per formatter call.
     - PermanentDeliveryError -> immediate FAILED with its FailureClass,
       no attempts increment (F1.3: the class is the exception's type).
@@ -854,8 +888,10 @@ async def deliver_notification(
             session, category, list(recipient_ids),
         )
 
-    # -- Concurrent delivery via gather + semaphore --
-    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DELIVERIES)
+    # -- Concurrent delivery via gather + the lane's slots (P4-1) --
+    semaphore = asyncio.Semaphore(
+        LANE_CONCURRENCY[Lane(notification.lane)],
+    )
     tasks = []
 
     for delivery in deliveries:
@@ -1624,9 +1660,10 @@ def _id_in_batch(batch_ids: Any) -> Any:
     estimates -- a batch that is a large fraction of the table -- it
     picks a hash semi-join over a seq scan of notifications. That
     choice is the planner's to make per ANALYZE, and this runs on
-    EVERY worker tick: a pass on the delivery path should not change
-    plan under it. Used by both batch deletes: retention's and the
-    expiry cleanup's.
+    EVERY pass of the worker's maintenance loop (beside the lane loops
+    since P4-1, no longer on the delivery path): a pass that runs that
+    often should not change plan under it. Used by both batch deletes:
+    retention's and the expiry cleanup's.
     """
     return Notification.id == any_(func.array(batch_ids))
 

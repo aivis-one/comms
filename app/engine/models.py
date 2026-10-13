@@ -209,6 +209,20 @@ class Notification(UUIDMixin, Base):
         nullable=False,
     )
 
+    # The type's isolation lane, AT INTAKE (P4-1, spec §8): an
+    # app/profile/registry.py Lane value, snapshotted like push_on, so a
+    # profile changed between intake and delivery never moves an
+    # accepted job to another lane. Read by the worker's selection
+    # (app/engine/processor.py process_lane) -- each lane selects only
+    # its own jobs, by ix_notifications_lane_status_scheduled -- and by
+    # the delivery concurrency of its lane (app/engine/service.py
+    # LANE_CONCURRENCY). The CHECK ck_notifications_lane is in
+    # migration 0024. Width 16: the longest value, "interactive", is 11.
+    lane: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+    )
+
     retry_max_attempts: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

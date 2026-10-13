@@ -156,6 +156,7 @@ from app.core.constants import (
 from app.core.exceptions import ProfileError
 from app.profile.registry import (
     Decided,
+    Lane,
     Layer,
     ProfileRegistry,
     PushOn,
@@ -203,9 +204,11 @@ CHANNEL_NAMES: tuple[str, ...] = tuple(
 )
 
 # Lanes (spec §8.3): a closed set comms offers, the product picks one per
-# type. A type that declares none goes to the normal lane.
-LANES: tuple[str, ...] = ("interactive", "critical", "normal", "bulk")
-_DEFAULT_LANE = "normal"
+# type. A type that declares none goes to the normal lane. The values
+# are the registry's Lane: the job keeps the one it was accepted with
+# (notifications.lane), and the worker selects by it.
+LANES: tuple[str, ...] = tuple(value.value for value in Lane)
+_DEFAULT_LANE = Lane.NORMAL.value
 
 # What to push to the product (spec §7.4): one of three declarations --
 # the outcome only, the outcome and deferrals, or nothing. A closed
@@ -544,7 +547,8 @@ _FIELDS: dict[str, _Field] = {
         ),
         convert=tuple,
     ),
-    # Isolation lane (spec §8.3).
+    # Isolation lane (spec §8.3). Applied (P4-1): snapshotted onto each
+    # job at intake (notifications.lane); the worker selects by it.
     "lane": _Field(
         check=_one_of(LANES),
         default=lambda: (_DEFAULT_LANE, "comms default: lane not declared"),

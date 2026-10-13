@@ -70,14 +70,16 @@ class TestTheTable:
     def test_every_int_field_has_a_bound(self) -> None:
         """No numeric knob without a bound -- and no row for a knob that
         does not exist. M7. The pair: the set is not empty. 17 since
-        P3-1 added the push stream's cap (changes_stream_maxlen)."""
+        P3-1 added the push stream's cap (changes_stream_maxlen); 20
+        since P4-1 replaced the one batch size with one per lane."""
         ints = {
             name
             for name, field in Settings.model_fields.items()
             if field.annotation is int
         }
-        assert len(ints) == 17, (
-            "17 numeric parameters: D1's 15, T12's, P3-1's"
+        assert len(ints) == 20, (
+            "20 numeric parameters: D1's 15, T12's, P3-1's, and P4-1's "
+            "four lane batch sizes in place of D1's one batch size"
         )
         assert ints == set(NUMERIC_BOUNDS)
 
@@ -97,7 +99,10 @@ class TestTheTable:
             "notification_max_backoff_seconds": (1, 3600),
             "notification_max_delivery_attempts": (1, 100),
             "notification_max_pipeline_attempts": (1, 100),
-            "notification_batch_size": (1, 1000),
+            "notification_lane_interactive_batch_size": (1, 1000),
+            "notification_lane_critical_batch_size": (1, 1000),
+            "notification_lane_normal_batch_size": (1, 1000),
+            "notification_lane_bulk_batch_size": (1, 1000),
             "notification_retry_backoff_base_seconds": (0, 86_400),
             "notification_retry_backoff_max_seconds": (0, 86_400),
             "notification_max_retry_after_seconds": (1, 86_400),
@@ -166,9 +171,9 @@ class TestNamedCases:
 
     def test_every_violation_is_named_in_one_pass(self) -> None:
         with pytest.raises(ValueError) as caught:
-            _settings(notification_batch_size=0, dlq_maxlen=0)
+            _settings(notification_lane_bulk_batch_size=0, dlq_maxlen=0)
         message = str(caught.value)
-        assert "NOTIFICATION_BATCH_SIZE=0" in message
+        assert "NOTIFICATION_LANE_BULK_BATCH_SIZE=0" in message
         assert "DLQ_MAXLEN=0" in message
 
 

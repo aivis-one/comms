@@ -580,7 +580,7 @@ class TestBatchLimit:
     async def test_limit_and_next_tick_pickup(
         self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(settings, "notification_batch_size", 2)
+        monkeypatch.setattr(settings, "notification_lane_normal_batch_size", 2)
         recipient = await create_recipient(db_session)
         for index in range(3):
             await create_notification(

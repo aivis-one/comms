@@ -35,6 +35,7 @@ from app.core.channels import (
     channel_optional_keys,
     evaluate_channels,
 )
+from app.profile.registry import Lane
 
 # Single source of truth for API version.
 # Import as: from app.core.config import APP_VERSION, settings
@@ -95,6 +96,13 @@ class Bound:
     why: str
 
 
+# The four lanes' batch sizes share one reason (P4-1).
+_LANE_BATCH_WHY = (
+    "jobs one pass of the lane selects; 0 does NOT switch the lane off "
+    "-- 'off' is leaving the lane out of COMMS_WORKER_LANES; above 1000 "
+    "one pass holds that many jobs in memory"
+)
+
 # THE ONE TABLE OF NUMERIC BOUNDS (D1 / R3). Every int field of
 # Settings has a row -- a test walks the fields against this table, so
 # a new knob without a bound fails the suite. A value outside its row
@@ -133,10 +141,12 @@ NUMERIC_BOUNDS: dict[str, Bound] = {
     "notification_max_pipeline_attempts": Bound(
         1, 100, "0 would close a job without one attempt; T12",
     ),
-    "notification_batch_size": Bound(
-        1, 1000, "0 selects nothing -- delivery stops; above 1000 one tick "
-        "holds that many row locks",
+    "notification_lane_interactive_batch_size": Bound(
+        1, 1000, _LANE_BATCH_WHY,
     ),
+    "notification_lane_critical_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
+    "notification_lane_normal_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
+    "notification_lane_bulk_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
     "notification_retry_backoff_base_seconds": Bound(
         0, 86_400, "0 = no idle wait between attempts (the profile's "
         "retry_backoff_seconds allows 0 too); above a day a retry "
@@ -332,9 +342,31 @@ class Settings(BaseSettings):
     # jobs behind it. A separate knob from the delivery attempts: the
     # channel being down and comms being broken are different facts.
     notification_max_pipeline_attempts: int = 3
-    # Max notifications picked per worker batch; the tail is picked up
-    # on the next tick (review 1.1: unbounded backlog fetch).
-    notification_batch_size: int = 50
+    # -- Lanes (P4-1, spec §8) --
+    # The lanes THIS worker process takes, comma-separated
+    # (app/profile/registry.py Lane values). Unset: all four. One image,
+    # any set: a second container of the same image may take only
+    # `critical` (spec §8.6, phase 7) -- the union over a deploy's
+    # worker processes must cover every lane (deploy/INTEGRATION.md).
+    # Written but empty, an empty item, an unknown lane or a repeated
+    # one refuses startup (worker_lane_problem). Validated here, with
+    # every other knob only the worker reads: every entrypoint refuses
+    # alike on one .env.
+    comms_worker_lanes: str | None = None
+
+    # Jobs one pass of each lane selects, oldest due first; the tail is
+    # picked up on the lane's next pass (review 1.1). Each lane selects
+    # its own jobs only, so a backlog of one never takes another's
+    # places. normal keeps the one number every job had before lanes
+    # (50); interactive and critical are a person or a payment at a
+    # time; bulk is many jobs that may wait, bounded so that one pass
+    # of it stays short. Their delivery concurrency is a constant next
+    # to the pool it is counted against (app/engine/service.py
+    # LANE_CONCURRENCY).
+    notification_lane_interactive_batch_size: int = 10
+    notification_lane_critical_batch_size: int = 10
+    notification_lane_normal_batch_size: int = 50
+    notification_lane_bulk_batch_size: int = 20
     # Per-delivery retry backoff: base * 2**(attempts-1), capped.
     # Defaults give ~30s/60s between the three attempts -- comparable
     # to the cbshome donor's 1-minute worker tick, where retries were
@@ -415,6 +447,25 @@ class Settings(BaseSettings):
     def is_dev(self) -> bool:
         """True when running in development mode."""
         return self.app_env == "development"
+
+    @property
+    def worker_lanes(self) -> tuple[Lane, ...]:
+        """The lanes this worker process takes, in Lane order.
+
+        Read after validation: a value worker_lane_problem refuses never
+        reaches here (startup was refused).
+        """
+        if self.comms_worker_lanes is None:
+            return tuple(Lane)
+        named = {item.strip() for item in self.comms_worker_lanes.split(",")}
+        return tuple(lane for lane in Lane if lane.value in named)
+
+    def lane_batch_size(self, lane: Lane) -> int:
+        """Jobs one pass of `lane` selects."""
+        batch_size: int = getattr(
+            self, f"notification_lane_{lane.value}_batch_size",
+        )
+        return batch_size
 
     # -- Validation --
 
@@ -504,6 +555,13 @@ class Settings(BaseSettings):
         })
         problems.extend(channel_problems)
 
+        # P4-1: the worker's lanes -- a set that takes nothing, or names
+        # something that is not a lane, must not start a worker that
+        # then silently delivers less than it was meant to.
+        lane_problem = worker_lane_problem(self.comms_worker_lanes)
+        if lane_problem is not None:
+            problems.append(lane_problem)
+
         # Phase 3b item 1: an "internal" API without its shared secret
         # is effectively open -- required outside development, the same
         # axis as DATABASE_URL above.
@@ -544,6 +602,48 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+    )
+
+
+def worker_lane_problem(value: str | None) -> str | None:
+    """What is wrong with COMMS_WORKER_LANES, or None (P4-1).
+
+    Unset (None) is all four lanes and is never a problem. Written, it
+    is a comma-separated list of Lane values; spaces around an item are
+    not part of it. Every problem is named in one line, so a deploy
+    fixes them in one pass:
+      - nothing but separators and spaces -- a worker that takes no lane
+        delivers nothing; leaving the variable out takes every lane;
+      - an empty item between commas;
+      - an item that is not a lane (exact spelling, the set is closed);
+      - a lane listed twice.
+    """
+    if value is None:
+        return None
+    lanes = ", ".join(lane.value for lane in Lane)
+    items = [item.strip() for item in value.split(",")]
+    if not any(items):
+        return (
+            f"COMMS_WORKER_LANES={value!r} names no lane: a worker that "
+            f"takes no lane delivers nothing. Leave it unset to take "
+            f"every lane ({lanes})."
+        )
+    found: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not item:
+            found.append("an empty item between commas")
+        elif item not in {lane.value for lane in Lane}:
+            found.append(f"{item!r} is not a lane")
+        elif item in seen:
+            found.append(f"{item!r} is listed twice")
+        else:
+            seen.add(item)
+    if not found:
+        return None
+    return (
+        f"COMMS_WORKER_LANES={value!r}: {'; '.join(found)}. "
+        f"Lanes: {lanes}."
     )
 
 

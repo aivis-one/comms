@@ -34,6 +34,15 @@ class Base(DeclarativeBase):
     """Base class for all SQLAlchemy ORM models."""
 
 
+# The connection pool of each process. Named, because the worker's
+# delivery budgets are counted against it: the lanes' concurrent
+# channel calls each take a session for the journal while they run
+# (app/engine/service.py LANE_CONCURRENCY), and tests/test_lanes.py
+# holds their sum, with the sessions held beside them, to this size.
+POOL_SIZE = 10
+POOL_MAX_OVERFLOW = 20
+
+
 # ---------------------------------------------------------------------------
 # Lazy singletons -- created on first access, not at import time
 # ---------------------------------------------------------------------------
@@ -48,8 +57,8 @@ def get_engine() -> AsyncEngine:
         _engine = create_async_engine(
             settings.database_url,
             echo=False,
-            pool_size=10,
-            max_overflow=20,
+            pool_size=POOL_SIZE,
+            max_overflow=POOL_MAX_OVERFLOW,
             pool_pre_ping=True,
             pool_recycle=1800,
         )
