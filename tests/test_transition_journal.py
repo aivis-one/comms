@@ -548,7 +548,11 @@ class TestGrid:
 
         with (
             patch("app.engine.service.get_formatter", return_value=_Slow()),
-            patch("app.engine.service._DELIVER_TIMEOUT_SECONDS", 0.05),
+            # The job's lane's timeout (normal, the fixture type's) --
+            # the one module constant it replaced is gone (P4-3).
+            patch.object(
+                settings, "notification_lane_normal_deliver_timeout_seconds", 0.05,
+            ),
         ):
             await process_pending_notifications()
         (answer,) = _of(await _rows(nid), subject=JournalSubject.CHANNEL)

@@ -861,14 +861,22 @@ class TestTheLoops:
             log for log in logs if log["event"] == "notification_worker_started"
         ]
         assert line["lanes"] == ["critical", "bulk"]
+        # P4-3 added each lane's deliver timeout to its budget; the
+        # line was complete before it, and is again with it.
         assert line["lane_budgets"] == {
             "critical": {
                 "batch_size": settings.notification_lane_critical_batch_size,
                 "concurrency": LANE_CONCURRENCY[Lane.CRITICAL],
+                "deliver_timeout": (
+                    settings.notification_lane_critical_deliver_timeout_seconds
+                ),
             },
             "bulk": {
                 "batch_size": settings.notification_lane_bulk_batch_size,
                 "concurrency": LANE_CONCURRENCY[Lane.BULK],
+                "deliver_timeout": (
+                    settings.notification_lane_bulk_deliver_timeout_seconds
+                ),
             },
         }
 

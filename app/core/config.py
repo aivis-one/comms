@@ -22,7 +22,8 @@
 #   (recipient locale -> default_locale -> stored title/body).
 # =============================================================================
 
-from collections.abc import Mapping
+import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,6 +32,8 @@ from pydantic import ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.channels import (
+    CHANNEL_SPECS,
+    ChannelState,
     channel_env_keys,
     channel_optional_keys,
     evaluate_channels,
@@ -103,6 +106,15 @@ _LANE_BATCH_WHY = (
     "one pass holds that many jobs in memory"
 )
 
+# The four lanes' deliver timeouts share one reason (P4-3).
+_LANE_DELIVER_TIMEOUT_WHY = (
+    "seconds one channel call of the lane may take before it is "
+    "abandoned as a timeout; 0 abandons every call; above 600 an attempt "
+    "holds its job's row and a pooled connection for ten minutes per "
+    "call; and not at or below the client timeout of a live channel "
+    "(checked below)"
+)
+
 # THE ONE TABLE OF NUMERIC BOUNDS (D1 / R3). Every int field of
 # Settings has a row -- a test walks the fields against this table, so
 # a new knob without a bound fails the suite. A value outside its row
@@ -147,6 +159,18 @@ NUMERIC_BOUNDS: dict[str, Bound] = {
     "notification_lane_critical_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
     "notification_lane_normal_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
     "notification_lane_bulk_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
+    "notification_lane_interactive_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
+    ),
+    "notification_lane_critical_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
+    ),
+    "notification_lane_normal_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
+    ),
+    "notification_lane_bulk_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
+    ),
     "notification_retry_backoff_base_seconds": Bound(
         0, 86_400, "0 = no idle wait between attempts (the profile's "
         "retry_backoff_seconds allows 0 too); above a day a retry "
@@ -205,6 +229,53 @@ def numeric_problems(values: Mapping[str, int]) -> list[str]:
         if values[high] < values[low]
     )
     return problems
+
+
+def deliver_timeout_problems(
+    timeouts: Mapping[Lane, int], live: Iterable[str],
+) -> list[str]:
+    """Every lane whose deliver timeout is not above the client timeout
+    of a live channel, each naming its variable and the channels (P4-3,
+    spec §8.5).
+
+    WHY THE RULE: the lane's timeout (app/engine/service.py
+    _deliver_single) abandons a channel call from OUTSIDE, as a bare
+    TimeoutError. A call that times out inside its client instead tells
+    "never reached" from "reached, no answer" -- which is what decides
+    whether a retry can duplicate the letter. A lane at or below its
+    client's total takes that apart without a word; so it refuses
+    startup, never a clamp. WHICH CHANNELS: the ones live on this
+    deploy -- a channel that is not live never calls a client (its
+    formatter refuses every delivery), and the lane of a job does not
+    fix its channels anyway (the profile decides both, per type).
+    Where the client total is not a hard bound: KNOWN CEILING (client
+    totals) in app/core/channels.py.
+    """
+    clients = [
+        spec for spec in CHANNEL_SPECS
+        if spec.name in set(live) and spec.client_timeouts
+    ]
+    problems: list[str] = []
+    for lane, timeout in timeouts.items():
+        below = [spec for spec in clients if timeout <= spec.client_timeout_total]
+        if not below:
+            continue
+        floor = math.floor(max(spec.client_timeout_total for spec in below)) + 1
+        named = ", ".join(
+            f"{spec.name} ({spec.client_timeout_total:g} s)" for spec in below
+        )
+        problems.append(
+            f"{lane_deliver_timeout_variable(lane)}={timeout} is not above "
+            f"the client timeout of the live channel {named}: a call must "
+            f"time out inside its client first, where 'never reached' and "
+            f"'reached, no answer' stay apart. Set it to {floor} or more."
+        )
+    return problems
+
+
+def lane_deliver_timeout_variable(lane: Lane) -> str:
+    """The environment variable of `lane`'s deliver timeout."""
+    return f"NOTIFICATION_LANE_{lane.value.upper()}_DELIVER_TIMEOUT_SECONDS"
 
 
 class Settings(BaseSettings):
@@ -367,6 +438,21 @@ class Settings(BaseSettings):
     notification_lane_critical_batch_size: int = 10
     notification_lane_normal_batch_size: int = 50
     notification_lane_bulk_batch_size: int = 20
+    # Seconds one channel call of each lane may take before the attempt
+    # abandons it as a timeout (P4-3, spec §8.5) -- the call only, not
+    # the wait for one of the lane's slots. 30 in every lane: the one
+    # timeout every call had before lanes, so normal behaves as it did.
+    # None shorter: startup holds each above the client timeout of
+    # every live channel (deliver_timeout_problems), 29 for telegram
+    # and email (app/core/channels.py), so a short lane would time out
+    # nothing earlier. None longer: a live channel's call ends inside
+    # its client first, so a longer lane would only wait longer where a
+    # client overruns its own total (KNOWN CEILING (client totals),
+    # app/core/channels.py).
+    notification_lane_interactive_deliver_timeout_seconds: int = 30
+    notification_lane_critical_deliver_timeout_seconds: int = 30
+    notification_lane_normal_deliver_timeout_seconds: int = 30
+    notification_lane_bulk_deliver_timeout_seconds: int = 30
     # Per-delivery retry backoff: base * 2**(attempts-1), capped.
     # Defaults give ~30s/60s between the three attempts -- comparable
     # to the cbshome donor's 1-minute worker tick, where retries were
@@ -460,6 +546,13 @@ class Settings(BaseSettings):
         named = {item.strip() for item in self.comms_worker_lanes.split(",")}
         return tuple(lane for lane in Lane if lane.value in named)
 
+    def lane_deliver_timeout(self, lane: Lane) -> int:
+        """Seconds one channel call of `lane` may take (P4-3)."""
+        value: int = getattr(
+            self, f"notification_lane_{lane.value}_deliver_timeout_seconds",
+        )
+        return value
+
     def lane_batch_size(self, lane: Lane) -> int:
         """Jobs one pass of `lane` selects."""
         batch_size: int = getattr(
@@ -549,7 +642,7 @@ class Settings(BaseSettings):
         # deliveries. An EMPTY set is legal: the deploy has no channel.
         # Every declared key is a field of this class under its
         # lower-case name (pinned by a test).
-        _, channel_problems = evaluate_channels({
+        channel_states, channel_problems = evaluate_channels({
             key: getattr(self, key.lower())
             for key in channel_env_keys() + channel_optional_keys()
         })
@@ -588,6 +681,24 @@ class Settings(BaseSettings):
         numeric = numeric_problems(
             {name: getattr(self, name) for name in NUMERIC_BOUNDS}
         )
+        # P4-3: and above the clients of the live channels. Reached only
+        # with a valid key set, so every channel has its state. A lane
+        # already outside its bound is not named twice.
+        in_bounds: dict[Lane, int] = {}
+        for lane in Lane:
+            timeout = self.lane_deliver_timeout(lane)
+            bound = NUMERIC_BOUNDS[
+                f"notification_lane_{lane.value}_deliver_timeout_seconds"
+            ]
+            if bound.lo <= timeout <= bound.hi:
+                in_bounds[lane] = timeout
+        numeric.extend(deliver_timeout_problems(
+            in_bounds,
+            [
+                name for name, state in channel_states.items()
+                if state == ChannelState.LIVE
+            ],
+        ))
         if numeric:
             raise ValueError("\n".join(numeric))
 

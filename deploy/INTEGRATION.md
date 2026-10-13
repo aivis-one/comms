@@ -194,6 +194,12 @@ its startup log line, `notification_worker_started` (`lanes`,
 `lane_budgets`). Written but empty, an unknown lane or a lane listed
 twice refuses startup, naming the variable.
 
+Each lane also has its own timeout for one channel call,
+`NOTIFICATION_LANE_<LANE>_DELIVER_TIMEOUT_SECONDS` (30 by default, in
+`lane_budgets` as `deliver_timeout`); it must be above the client
+timeout of every channel live on the deploy, and a lane at or below
+one refuses startup, naming the variable and the channel.
+
 ### `recipient_schedule` -- a type that does not wait for the schedule
 
 A recipient's schedule (section 6) holds every delivery outside their

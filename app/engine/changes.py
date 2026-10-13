@@ -124,7 +124,8 @@ async def list_changes(
       2. Status: acknowledged by design.
       3. Backlog ref: none -- the delay is the price of the no-loss
          rule, and comms' longest transaction is bounded by its own
-         timeouts (app/engine/service.py _DELIVER_TIMEOUT_SECONDS).
+         timeouts (the lanes' deliver timeouts, app/core/config.py
+         lane_deliver_timeout, per call of an attempt).
       4. Promotion trigger (observable): a feed read that returns
          `items: []` while pg_stat_activity shows a backend_xid older
          than a minute.

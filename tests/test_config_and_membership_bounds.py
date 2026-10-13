@@ -57,12 +57,22 @@ def _settings(**overrides: Any) -> Settings:
     return Settings(**kwargs)
 
 
-def _at(name: str, value: int) -> dict[str, int]:
-    overrides = {name: value}
+# P4-3: a lane's deliver timeout must also be above the client timeout
+# of every live channel, and _FULL_OK has telegram live (29 s) -- so the
+# lane's own lower edge (1) is reachable only on a deploy with no
+# network channel. The twin stands there, to test the bound and not the
+# client rule (tests/test_lane_timeouts.py tests that).
+_NO_CLIENT_CHANNEL = {"telegram_bot_token": "", "telegram_bot_url": ""}
+
+
+def _at(name: str, value: int) -> dict[str, Any]:
+    overrides: dict[str, Any] = {name: value}
     if name in _PARTNER_AT:
         partner, edge = _PARTNER_AT[name]
         bound = NUMERIC_BOUNDS[partner]
         overrides[partner] = bound.hi if edge == "hi" else bound.lo
+    if name.endswith("_deliver_timeout_seconds"):
+        overrides.update(_NO_CLIENT_CHANNEL)
     return overrides
 
 
@@ -71,15 +81,17 @@ class TestTheTable:
         """No numeric knob without a bound -- and no row for a knob that
         does not exist. M7. The pair: the set is not empty. 17 since
         P3-1 added the push stream's cap (changes_stream_maxlen); 20
-        since P4-1 replaced the one batch size with one per lane."""
+        since P4-1 replaced the one batch size with one per lane; 24
+        since P4-3 gave every lane its own deliver timeout."""
         ints = {
             name
             for name, field in Settings.model_fields.items()
             if field.annotation is int
         }
-        assert len(ints) == 20, (
-            "20 numeric parameters: D1's 15, T12's, P3-1's, and P4-1's "
-            "four lane batch sizes in place of D1's one batch size"
+        assert len(ints) == 24, (
+            "24 numeric parameters: D1's 15, T12's, P3-1's, P4-1's "
+            "four lane batch sizes in place of D1's one batch size, and "
+            "P4-3's four lane deliver timeouts"
         )
         assert ints == set(NUMERIC_BOUNDS)
 
@@ -103,6 +115,10 @@ class TestTheTable:
             "notification_lane_critical_batch_size": (1, 1000),
             "notification_lane_normal_batch_size": (1, 1000),
             "notification_lane_bulk_batch_size": (1, 1000),
+            "notification_lane_interactive_deliver_timeout_seconds": (1, 600),
+            "notification_lane_critical_deliver_timeout_seconds": (1, 600),
+            "notification_lane_normal_deliver_timeout_seconds": (1, 600),
+            "notification_lane_bulk_deliver_timeout_seconds": (1, 600),
             "notification_retry_backoff_base_seconds": (0, 86_400),
             "notification_retry_backoff_max_seconds": (0, 86_400),
             "notification_max_retry_after_seconds": (1, 86_400),

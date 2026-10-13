@@ -72,6 +72,25 @@ class ChannelSpec:
     optional_validators: Mapping[str, Validator] = field(
         default_factory=dict,
     )
+    # The timeouts of the channel's network client, in seconds, by the
+    # name of the client's own parameter -- the ONE place they are
+    # written: the client is built from them (app/engine/formatters.py)
+    # and startup holds every lane's deliver timeout above their sum
+    # (app/core/config.py deliver_timeout_problems). Empty: the channel
+    # has no network client (in_app -- its delivery is a row).
+    client_timeouts: Mapping[str, float] = field(default_factory=dict)
+
+    @property
+    def client_timeout_total(self) -> float:
+        """The longest the client's own timeouts let one call run.
+
+        The SUM of the phases, not the largest: each phase (waiting for
+        a pooled connection, connecting, writing, reading) starts its
+        own clock where the previous one stopped, so a call that spends
+        almost all of every phase reaches the last one's timeout only
+        after the sum. 0.0 for a channel without a client.
+        """
+        return sum(self.client_timeouts.values())
 
 
 class ChannelState(StrEnum):
@@ -206,6 +225,14 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
             "TELEGRAM_BOT_TOKEN": _telegram_token,
             "TELEGRAM_BOT_URL": _telegram_url,
         },
+        # aiogram's session takes ONE timeout, and aiohttp counts it
+        # over the whole request (aiohttp ClientTimeout(total=...)):
+        # connect, send and the answer together. Explicit since P4-3 --
+        # aiogram's own default (60 s) sat above the 30 s deliver
+        # timeout, so the session's timeout never fired. 29: below the
+        # 30 s every lane defaults to (app/core/config.py).
+        # See KNOWN CEILING (client totals) below.
+        client_timeouts={"timeout": 29.0},
     ),
     ChannelSpec(
         name="email",
@@ -225,8 +252,56 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
         optional_validators={
             "EMAIL_MAILGUN_REGION": _email_region,
         },
+        # httpx times each phase on its own clock. read keeps its 15 s:
+        # a read timeout is the one that may leave a letter on its way
+        # (formatters.py _request_may_have_arrived), and shortening it
+        # turns slow answers into retries, i.e. duplicates. write was
+        # 10 and pool 5 (35 in all, above the 30 s deliver timeout --
+        # the relation R-1 meant to keep had already broken): a form
+        # of a few KB is not written for 5 s, and with every lane's
+        # slots together (app/engine/service.py LANE_CONCURRENCY, 25)
+        # below httpx's 100 pooled connections a call never waits for
+        # one. 29 in all, below the 30 s every lane defaults to.
+        client_timeouts={"connect": 5.0, "read": 15.0, "write": 5.0, "pool": 4.0},
     ),
 )
+
+# KNOWN CEILING (acknowledged by design -- P4-3, client totals): a
+# client's total is not a wall-clock bound in every case.
+#   1. Mechanics: startup holds each lane's deliver timeout above the
+#      client total of every live channel, so that a call times out
+#      INSIDE its client -- where "never reached" and "reached, no
+#      answer" stay apart -- before the outer wait_for abandons it. Two
+#      ways the client still runs past its total:
+#        - email: httpx's read timeout is per read, not per response; a
+#          provider that drips its answer in pieces, each within 15 s,
+#          keeps reading past the sum;
+#        - telegram: aiohttp rounds a timeout above 5 s up to the next
+#          whole second of the loop's clock (aiohttp helpers
+#          calculate_timeout_when), so 29 s fires 29 to 30 s after the
+#          request starts -- and the request starts a few milliseconds
+#          after the lane's wait_for did. With the lane at 30, the outer
+#          timeout comes first when a whole second falls into those
+#          milliseconds.
+#      Either way the call ends as today's did before P4-3: the lane's
+#      TimeoutError, journaled `timeout` -- transient, retried, the
+#      distinction lost for that one call.
+#   2. Status: acknowledged by design.
+#   3. Backlog ref: none -- found while building P4-3; the numbers
+#      (29 / 30) are the gate's decision; the rounding was read in
+#      aiohttp's body after it.
+#   4. Promotion trigger (observable): a channel row of the journal
+#      (notification_transitions, subject `channel`) with outcome
+#      `timeout` and channel telegram or email -- with the rule in place
+#      every such row is one of these two.
+#   5. Agreed fix: none agreed; candidates -- telegram's total one
+#      rounding second below the lane (28), or the session handed an
+#      aiohttp ClientTimeout with ceil_threshold above it; for email a
+#      total bound of its own around the client call.
+#   6. Rejected: raising the lane defaults above 30 (normal must stay
+#      today's 30 s -- P4-3 done-when 1.3); shortening read (more
+#      duplicates, above); clamping a lane timeout to fit instead of
+#      refusing startup (§0: a red start is the result).
 
 
 def channel_env_keys() -> tuple[str, ...]:
@@ -237,6 +312,11 @@ def channel_env_keys() -> tuple[str, ...]:
     cannot make a channel live or absent anyway.
     """
     return tuple(key for spec in CHANNEL_SPECS for key in spec.keys)
+
+
+def channel_spec(name: str) -> ChannelSpec:
+    """The spec of the implemented channel `name` (KeyError otherwise)."""
+    return {spec.name: spec for spec in CHANNEL_SPECS}[name]
 
 
 def channel_optional_keys() -> tuple[str, ...]:

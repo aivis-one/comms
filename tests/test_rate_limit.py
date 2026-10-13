@@ -215,9 +215,13 @@ class TestRateLimitDeferral:
         self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A delivery timeout must burn an attempt (transient path)
-        and never touch the 429 counter -- guards the except order."""
+        and never touch the 429 counter -- guards the except order.
+
+        Shortens the job's LANE timeout (normal, the fixture's): the one
+        module constant it used to patch was replaced by a timeout per
+        lane (P4-3)."""
         monkeypatch.setattr(
-            "app.engine.service._DELIVER_TIMEOUT_SECONDS", 0.05,
+            settings, "notification_lane_normal_deliver_timeout_seconds", 0.05,
         )
         _, notification = await _rate_limited_setup(db_session)
 

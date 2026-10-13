@@ -66,7 +66,12 @@ from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 import structlog
 
 from app.audience.models import Recipient
-from app.core.channels import ChannelState, channel_env_keys, evaluate_channels
+from app.core.channels import (
+    ChannelState,
+    channel_env_keys,
+    channel_spec,
+    evaluate_channels,
+)
 from app.core.config import Settings, settings
 from app.engine.constants import DeliveryChannel
 from app.engine.models import Notification, NotificationDelivery
@@ -1368,9 +1373,14 @@ _registry: ChannelRegistry | None = None
 
 
 def _real_bot_factory(**kwargs: Any) -> "Bot":
+    """The telegram channel's Bot, its session timed by the channel's
+    spec (app/core/channels.py client_timeouts) -- see the email client
+    below for why the timeout is explicit."""
     from aiogram import Bot
+    from aiogram.client.session.aiohttp import AiohttpSession
 
-    return Bot(**kwargs)
+    timeouts = channel_spec(DeliveryChannel.TELEGRAM).client_timeouts
+    return Bot(session=AiohttpSession(timeout=timeouts["timeout"]), **kwargs)
 
 
 def _real_http_client_factory() -> Any:
@@ -1379,18 +1389,19 @@ def _real_http_client_factory() -> Any:
     Lazy import, same hygiene as the Bot above: one image serves every
     product, and a deploy without email must not pay for the client.
 
-    TIMEOUTS ARE EXPLICIT AND BELOW the service-layer deliver timeout
-    (30s, app/engine/service.py): a timeout that surfaces INSIDE the
+    TIMEOUTS ARE EXPLICIT, taken from the channel's spec
+    (app/core/channels.py client_timeouts), and startup refuses a lane
+    whose deliver timeout is not above their sum (app/core/config.py
+    deliver_timeout_problems): a timeout that surfaces INSIDE the
     formatter can still be told apart -- connect failed (nothing was
     sent) versus read timed out (the message may be on its way). A
-    timeout swallowed by the outer wait_for arrives as a bare
-    TimeoutError with that distinction lost.
+    timeout swallowed by the lane's wait_for (app/engine/service.py)
+    arrives as a bare TimeoutError with that distinction lost.
     """
     import httpx
 
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
-    )
+    timeouts = channel_spec(DeliveryChannel.EMAIL).client_timeouts
+    return httpx.AsyncClient(timeout=httpx.Timeout(**timeouts))
 
 
 def init_formatters() -> ChannelRegistry:

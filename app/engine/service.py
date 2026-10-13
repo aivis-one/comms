@@ -32,7 +32,8 @@
 #   mark_all_read()             -- mark all sent deliveries as read
 #
 # RELIABILITY (cbshome Sprint 8.2):
-#   - asyncio.wait_for timeout on formatter.deliver()
+#   - asyncio.wait_for timeout on formatter.deliver(), the job's lane's
+#     (P4-3, settings.lane_deliver_timeout)
 #   - concurrent delivery via gather + semaphore
 #   - PermanentDeliveryError -> immediate FAILED, no attempts increment
 #   - error messages sanitized to prevent credential leaks
@@ -109,9 +110,6 @@ _VALID_TARGET_TYPES = frozenset(e.value for e in TargetType)
 
 # The one unique index that means "this key is taken" (migration 0012).
 IDEMPOTENCY_INDEX_NAME = "uq_notifications_idempotency_key"
-
-# Timeout for a single formatter.deliver() call.
-_DELIVER_TIMEOUT_SECONDS = 30
 
 # Phase 3a item 7: 429 jitter as a FRACTION of the honored wait
 # (uniform(0, fraction) x honored, one-sided -- see the deferral
@@ -845,7 +843,8 @@ async def deliver_notification(
       field.)
     - Concurrent delivery via asyncio.gather + Semaphore, sized by the
       job's lane (LANE_CONCURRENCY).
-    - asyncio.wait_for with timeout per formatter call.
+    - asyncio.wait_for with timeout per formatter call: the job's
+      lane's (P4-3), around the call and not around the wait for a slot.
     - PermanentDeliveryError -> immediate FAILED with its FailureClass,
       no attempts increment (F1.3: the class is the exception's type).
     - WAIT REASONS (F1.3): every path that sets next_retry_at sets
@@ -1216,18 +1215,25 @@ async def _deliver_single(
 ) -> tuple[NotificationDelivery, _DeliveryOutcome]:
     """Deliver a single notification with concurrency control.
 
-    Runs formatter.deliver() under semaphore with timeout. Does NOT
+    Runs formatter.deliver() under semaphore with the timeout of the
+    job's lane (P4-3, spec §8.5) -- inside the slot, so a call waiting
+    for one is not timed; startup holds every lane's timeout above the
+    client timeout of every live channel (app/core/config.py
+    deliver_timeout_problems), so the client's own error, which still
+    tells a call that never reached the provider from one left without
+    an answer, comes first. Does NOT
     touch the attempt's SQLAlchemy session -- only the external call and
     the journal: whatever the channel answered is written in its OWN
     transaction right here, before the attempt goes on
     (journal.record_channel_answer). Returns (delivery, outcome) for the
     caller to apply to the attempt's session.
     """
+    timeout = settings.lane_deliver_timeout(Lane(notification.lane))
     async with semaphore:
         try:
             success = await asyncio.wait_for(
                 formatter.deliver(notification, delivery, recipient),
-                timeout=_DELIVER_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except PermanentDeliveryError as exc:
             # THE one place a channel exception becomes a failure class:
@@ -1267,10 +1273,10 @@ async def _deliver_single(
                 "delivery_timeout",
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
-                timeout=_DELIVER_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             outcome = _DeliveryOutcome(
-                error=f"Timeout after {_DELIVER_TIMEOUT_SECONDS}s",
+                error=f"Timeout after {timeout}s",
             )
             answer = journal.answer_of(exc)
         except Exception as exc:

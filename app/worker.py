@@ -237,6 +237,7 @@ async def run_worker_loop() -> None:
             lane.value: {
                 "batch_size": settings.lane_batch_size(lane),
                 "concurrency": LANE_CONCURRENCY[lane],
+                "deliver_timeout": settings.lane_deliver_timeout(lane),
             }
             for lane in lanes
         },
