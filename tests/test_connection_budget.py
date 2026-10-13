@@ -174,8 +174,14 @@ class TestTheRole:
     async def test_the_api_lifespan_sets_it(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # The profile is the stub's already; the lifespan's own install
-        # wants a directory this suite does not set.
+        # Only the role is under test. The lifespan's other startup calls
+        # change the process for every test after this one, and stay out:
+        # setup_logging() configures structlog with cached loggers, after
+        # which structlog's capture_logs() sees nothing in any later test
+        # (it broke tests/test_transport_consumer.py on the stand, one
+        # process for the whole suite); the profile is the stub's already,
+        # and its install wants a directory this suite does not set.
+        monkeypatch.setattr(api_entry, "setup_logging", lambda: None)
         monkeypatch.setattr(api_entry, "install_profile_from_settings", lambda: None)
         await dispose_engine()
         set_process_role(ProcessRole.WORKER)
