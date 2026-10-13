@@ -62,7 +62,7 @@ from collections.abc import Awaitable, Callable
 import structlog
 
 from app.core.config import settings
-from app.core.database import dispose_engine
+from app.core.database import ProcessRole, dispose_engine, set_process_role
 from app.core.logging import setup_logging
 from app.engine.formatters import (
     close_formatters,
@@ -210,9 +210,16 @@ async def _poll_loop(
                 await wake.wait()
 
 
-def _lane_pass(lane: Lane) -> Callable[[], Awaitable[int]]:
+def _lane_pass(
+    lane: Lane, wake: asyncio.Event,
+) -> Callable[[], Awaitable[int]]:
+    """One pass of `lane`; a pass that left a job with a full portion
+    sets the lane's own wake (H7), so the next portion goes at once --
+    the pass clears the event before it starts (_poll_loop), and this is
+    set after it ends, so it is kept for the sleep that follows."""
+
     async def run_pass() -> int:
-        return await process_lane(lane)
+        return await process_lane(lane, on_more=wake.set)
 
     return run_pass
 
@@ -271,7 +278,9 @@ async def run_worker_loop() -> None:
             for lane in lanes:
                 group.create_task(
                     _poll_loop(
-                        _lane_pass(lane), wakes[lane.value], lane=lane.value,
+                        _lane_pass(lane, wakes[lane.value]),
+                        wakes[lane.value],
+                        lane=lane.value,
                     ),
                 )
             group.create_task(
@@ -308,6 +317,7 @@ async def _main() -> None:
 def main() -> None:
     """Console entrypoint: `python -m app.worker`."""
     setup_logging()
+    set_process_role(ProcessRole.WORKER)
     # The worker renders templates -> it MUST have the profile. A
     # broken profile kills the process at startup (ProfileError).
     install_profile_from_settings()

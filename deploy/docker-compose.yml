@@ -150,6 +150,12 @@ services:
     # NO published port (unlike the product's postgres): nothing on
     # the host needs it; the CLI's `db` subcommand goes through
     # `docker compose exec`.
+    # max_connections WRITTEN, not left to the image's default (H7):
+    # every comms process's pool at full overflow, the worker's wake
+    # listener and the connections outside any pool must fit it --
+    # app/core/database.py POOLS, held against this line and the
+    # --workers of comms-app by tests/test_connection_budget.py.
+    command: ["postgres", "-c", "max_connections=100"]
     volumes:
       - comms_postgres_data:/var/lib/postgresql/data
     healthcheck:

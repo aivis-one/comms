@@ -18,6 +18,8 @@
 # =============================================================================
 
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from enum import StrEnum
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -34,15 +36,62 @@ class Base(DeclarativeBase):
     """Base class for all SQLAlchemy ORM models."""
 
 
-# The connection pool of each process. Named, because the worker's
-# delivery budgets are counted against it: the lanes' concurrent
-# channel calls each take a session for the journal while they run
-# (app/engine/service.py LANE_CONCURRENCY), and tests/test_lanes.py
-# holds their sum, with the sessions held beside them, to this size.
-# The worker's wake listener holds one more connection, on its own
-# engine outside this pool (app/engine/wake.py).
-POOL_SIZE = 10
-POOL_MAX_OVERFLOW = 20
+class ProcessRole(StrEnum):
+    """What a comms process is, for the size of its connection pool (H7).
+
+    Set by the process's own entry point before its first engine
+    (set_process_role): app/main.py lifespan (each uvicorn worker),
+    app/worker.py main, app/consumer.py main. An engine asked for with
+    no role refuses -- a process nobody sized does not get a default.
+    """
+
+    API = "api"
+    WORKER = "worker"
+    CONSUMER = "consumer"
+
+
+@dataclass(frozen=True)
+class Pool:
+    """A process's pool: connections kept, and the overflow above them."""
+
+    size: int
+    overflow: int
+
+    @property
+    def capacity(self) -> int:
+        return self.size + self.overflow
+
+
+# THE CONNECTION BUDGET (H7). Every comms process has its own pool, and
+# all of them share one Postgres (comms-postgres, deploy/docker-compose.yml)
+# whose max_connections is written in the compose file. Every pool at
+# its full overflow, the worker's wake listener, and the connections
+# outside any pool (RESERVED_CONNECTIONS) must fit it -- a pool that
+# overflowed past it would fail with "too many connections" in
+# whichever process asked next, under load, where it is hardest to see.
+# tests/test_connection_budget.py holds the sum against the compose
+# file, the uvicorn --workers count included.
+#   worker 10 + 20 -- its lanes' slots each hold a journal session while
+#       they call (app/engine/service.py LANE_CONCURRENCY), each lane's
+#       attempt holds one, the maintenance loop holds one: 25 + 4 + 1,
+#       the whole of it at once (tests/test_lanes.py). Its wake listener
+#       holds one more, on its own engine outside this pool
+#       (app/engine/wake.py).
+#   api 10 + 10, per uvicorn worker -- one session per request.
+#   consumer 5 + 5 -- one event at a time in one session, and the push
+#       relay beside it, one session at a time (app/transport): two.
+POOLS: dict[ProcessRole, Pool] = {
+    ProcessRole.API: Pool(size=10, overflow=10),
+    ProcessRole.WORKER: Pool(size=10, overflow=20),
+    ProcessRole.CONSUMER: Pool(size=5, overflow=5),
+}
+
+# Connections outside every pool: the migration (alembic in comms-app,
+# its own engine -- migrations/env.py -- running beside the old worker
+# and consumer during an update), an operator's psql or pg_dump
+# (comms-deploy.sh db, backup, restore), and the deploy script's own
+# asyncpg probe (comms-deploy.sh drain).
+RESERVED_CONNECTIONS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -50,17 +99,32 @@ POOL_MAX_OVERFLOW = 20
 # ---------------------------------------------------------------------------
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_role: ProcessRole | None = None
+
+
+def set_process_role(role: ProcessRole) -> None:
+    """Name this process's role; its next engine is sized by it."""
+    global _role
+    _role = role
 
 
 def get_engine() -> AsyncEngine:
-    """Get or create the async engine (singleton)."""
+    """Get or create the async engine (singleton), sized by the process's
+    role (POOLS). Raises when no role was set: see ProcessRole."""
     global _engine
     if _engine is None:
+        if _role is None:
+            raise RuntimeError(
+                "no process role: the entry point must call "
+                "set_process_role() before the first engine -- its pool "
+                "is sized by it (app/core/database.py POOLS)"
+            )
+        pool = POOLS[_role]
         _engine = create_async_engine(
             settings.database_url,
             echo=False,
-            pool_size=POOL_SIZE,
-            max_overflow=POOL_MAX_OVERFLOW,
+            pool_size=pool.size,
+            max_overflow=pool.overflow,
             pool_pre_ping=True,
             pool_recycle=1800,
         )

@@ -54,7 +54,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import any_, delete, func, or_, select, tuple_, update
+from sqlalchemy import any_, delete, exists, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -92,6 +92,7 @@ from app.engine.models import (
     Notification,
     NotificationDelivery,
     NotificationTransition,
+    PushOutbox,
 )
 from app.engine.resolver import resolve_targets
 from app.engine.wake import signal_lane
@@ -128,7 +129,7 @@ _RATE_LIMIT_JITTER_MAX_FRACTION = 0.5
 # session while it holds its slot (journal.record_channel_answer), so
 # the sum of these, plus one attempt session per lane and the
 # maintenance loop's session, must fit the pool
-# (app/core/database.py POOL_SIZE + POOL_MAX_OVERFLOW) -- a call that
+# (app/core/database.py POOLS, the worker's) -- a call that
 # waits for a connection widens the accepted window of
 # record_channel_answer. tests/test_lanes.py holds the sum. The wake
 # listener's connection is not in it: it has its own engine, outside
@@ -145,6 +146,26 @@ LANE_CONCURRENCY: dict[Lane, int] = {
     Lane.NORMAL: 20,
     Lane.BULK: 1,
 }
+
+
+def delivery_portion(lane: Lane) -> int:
+    """The deliveries one attempt of a `lane` job takes (H7): one round
+    of the lane's slots.
+
+    An attempt holds its job's row and a pooled connection, and keeps
+    the change feed's xmin, for as long as it runs (app/engine/changes.py
+    KNOWN CEILING P2-3) -- and expiry, cancellation and forgetting of the
+    job wait for it. Over every due delivery of a job at once that is
+    ceil(N / slots) channel calls end to end: a bulk send to a thousand
+    people, one slot, was a thousand calls in one transaction. Over one
+    round it is ONE call's time, the lane's deliver timeout at most. The
+    rest of the job goes in the lane's next passes, each its own
+    attempt; a pass whose portion was full wakes its own loop
+    (app/worker.py), so there is no sleep between portions. The number
+    is the slots, not one of its own: a round fills them once, and a
+    larger portion would only lengthen the transaction again.
+    """
+    return LANE_CONCURRENCY[lane]
 
 
 # -----------------------------------------------------------------------------
@@ -788,8 +809,12 @@ async def resolve_notification(
 async def deliver_notification(
     session: AsyncSession,
     notification: Notification,
-) -> None:
-    """Deliver pending deliveries for a notification via formatters.
+) -> bool:
+    """Deliver pending deliveries for a notification via formatters --
+    ONE PORTION of them (H7, delivery_portion): the due ones, in id
+    order, at most one round of the lane's slots. Returns True when the
+    portion was full, i.e. more of the job may be due: the caller wakes
+    the lane's loop for the next portion rather than wait its interval.
 
     - Batch-loads Recipient objects for credentials and locale.
     - LATE-MUTE RE-CHECK (Phase 2.1): the resolve-time mute gate is
@@ -858,21 +883,30 @@ async def deliver_notification(
     Args:
         session: Active DB session (caller commits).
         notification: The notification whose deliveries to process.
+
+    Returns:
+        Whether the portion was full.
     """
     now = datetime.now(UTC)
-    stmt = select(NotificationDelivery).where(
-        NotificationDelivery.notification_id == notification.id,
-        NotificationDelivery.status == DeliveryStatus.PENDING,
-        or_(
-            NotificationDelivery.next_retry_at.is_(None),
-            NotificationDelivery.next_retry_at <= now,
-        ),
+    portion = delivery_portion(Lane(notification.lane))
+    stmt = (
+        select(NotificationDelivery)
+        .where(
+            NotificationDelivery.notification_id == notification.id,
+            NotificationDelivery.status == DeliveryStatus.PENDING,
+            or_(
+                NotificationDelivery.next_retry_at.is_(None),
+                NotificationDelivery.next_retry_at <= now,
+            ),
+        )
+        .order_by(NotificationDelivery.id)
+        .limit(portion)
     )
     result = await session.execute(stmt)
     deliveries = list(result.scalars().all())
 
     if not deliveries:
-        return
+        return False
 
     # -- Batch load recipients for all pending deliveries --
     recipient_ids: set[UUID] = {d.recipient_id for d in deliveries}
@@ -884,7 +918,11 @@ async def deliver_notification(
 
     # -- Accepted by the channel in an attempt that did not commit: the
     # letter is out. Read once per pass, by (recipient, channel). --
-    accepted = await journal.accepted_answers(session, [notification.id])
+    # Narrowed to the portion's recipients (H7): the job's whole journal
+    # read once per portion would grow with every portion sent.
+    accepted = await journal.accepted_answers(
+        session, [notification.id], recipient_ids=recipient_ids,
+    )
 
     # -- Late-mute re-check: one batched probe per pass, over the
     # category snapshotted at intake (F1.3) --
@@ -1115,6 +1153,7 @@ async def deliver_notification(
             )
 
     await session.flush()
+    return len(deliveries) == portion
 
 
 def _close_accepted(delivery: NotificationDelivery, accepted_at: datetime) -> None:
@@ -1346,6 +1385,26 @@ async def _deliver_single(
 # waiting delivery the channel already accepted is closed SENT, not
 # with the closing outcome (journal.accepted_answers), because the
 # letter went out.
+#
+# THE ORDER OF ROW LOCKS (H7): a path that locks MORE THAN ONE job row
+# locks them in ascending id -- ORDER BY notifications.id under the FOR
+# UPDATE; Postgres sorts before it locks (LockRows over Sort), so the
+# rows are taken in that order. Two such paths over overlapping sets
+# then queue on the first row they share and never hold each other's
+# next one: no 40P01. It matters because a deadlock is not retried:
+# asyncpg's DeadlockDetectedError reaches SQLAlchemy as a bare
+# DBAPIError, not an OperationalError, so the consumer -- where
+# cancellation and forgetting arrive -- dead-letters the event at once
+# (app/transport/consumer.py), and the reminders stay or the person is
+# not forgotten. The paths: close_notifications (expiry, cancellation)
+# and withdraw_recipient (forgetting), which locks EVERY job it will
+# write, finished ones included, before its mass updates. The batch
+# deletes of retention and of the expiry cleanup take their jobs in the
+# same order, through the primary key (_id_in_batch: id = ANY(ARRAY),
+# whose keys an index scan walks sorted), and their cascade reaches a
+# job's deliveries and journal only after the job -- so forgetting and
+# a cleanup queue on a job row, never on its children
+# (tests/test_lock_order.py).
 
 
 async def rollup_notification(
@@ -1438,27 +1497,45 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     it (close_waiting_deliveries) -- and each affected job is folded
     (THE FOLD).
     The jobs are locked FOR UPDATE and the lock is WAITED for, like
-    expiry and cancellation: an attempt in flight finishes first. Every
+    expiry and cancellation: an attempt in flight finishes first. EVERY
+    job the mass updates below reach is locked -- finished ones too, in
+    ascending id (THE ORDER OF ROW LOCKS): those updates touch the
+    deliveries and journal rows of finished jobs that retention and the
+    expiry cleanup delete in batches, and two writers of the same rows
+    that took them in two orders would deadlock. Every
     delivery of theirs, finished or not, loses its error_message -- a
     provider's words may quote the address being forgotten -- and every
     journal row of theirs loses its provider_text, for the same reason.
 
     Returns the number of deliveries closed.
     """
-    parents = (
+    touched = (
         await session.execute(
             select(Notification)
             .where(
                 Notification.id.in_(
                     select(NotificationDelivery.notification_id).where(
                         NotificationDelivery.recipient_id == recipient_id,
-                        NotificationDelivery.status == DeliveryStatus.PENDING,
                     )
                 ),
             )
+            .order_by(Notification.id)
             .with_for_update()
         )
     ).scalars().all()
+    # Read under the locks: no attempt adds or moves a delivery of a
+    # locked job.
+    waiting_in = set(
+        (
+            await session.execute(
+                select(NotificationDelivery.notification_id).where(
+                    NotificationDelivery.recipient_id == recipient_id,
+                    NotificationDelivery.status == DeliveryStatus.PENDING,
+                )
+            )
+        ).scalars().all()
+    )
+    parents = [job for job in touched if job.id in waiting_in]
     closed = 0
     for notification in parents:
         closed += await close_waiting_deliveries(
@@ -1508,7 +1585,8 @@ async def close_notifications(
     outcome directly.
     A job already at an outcome is not touched -- that is the guard,
     and a second call is a zero-row no-op. Rows are locked FOR UPDATE
-    and the lock is WAITED for: an attempt in flight finishes first.
+    and the lock is WAITED for: an attempt in flight finishes first --
+    in ascending id (THE ORDER OF ROW LOCKS).
 
     Returns the number of jobs closed.
     """
@@ -1517,6 +1595,7 @@ async def close_notifications(
     rows = await session.execute(
         select(Notification)
         .where(condition, Notification.status.in_(_ACTIVE_STATUSES))
+        .order_by(Notification.id)
         .with_for_update()
     )
     notifications = list(rows.scalars().all())
@@ -1720,6 +1799,18 @@ async def delete_expired_notifications_batch(
     this very filter can match -- in expiry order, so neither a scan of
     the table nor a sort of it; the delete goes through the primary key
     (_id_in_batch).
+
+    NOT WHILE A PUSH IS OWED (H7): a job with a row in push_outbox is
+    skipped -- the cascade would take the push with the job, and the
+    product, told nothing and finding nothing by its key, would lose
+    the result itself (deploy/INTEGRATION.md section 10: a push may be
+    lost, the result may not). The relay deletes the row once it has
+    published; the next pass deletes the job. No deadline of its own:
+    a push still owed when general retention reaches the job
+    (delete_terminal_notifications_batch, by created_at) goes with it
+    -- retention is the one bound on how long anything is kept. The
+    check is an anti-join on ix_push_outbox_notification, beside the
+    partial index, not instead of it (tests/test_push_survives_cleanup.py).
     """
     batch_ids = (
         select(Notification.id)
@@ -1727,6 +1818,7 @@ async def delete_expired_notifications_batch(
             Notification.expiry_at.isnot(None),
             Notification.expiry_at < now,
             Notification.status.in_(_EXPIRED_DELETABLE_STATUSES),
+            ~exists().where(PushOutbox.notification_id == Notification.id),
         )
         .order_by(Notification.expiry_at)
         .limit(limit)

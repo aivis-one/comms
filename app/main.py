@@ -38,7 +38,12 @@ from app.api.messaging import router as messaging_router
 from app.api.prefs import router as prefs_router
 from app.api.recipients import router as recipients_router
 from app.core.config import APP_VERSION, settings
-from app.core.database import dispose_engine, get_engine
+from app.core.database import (
+    ProcessRole,
+    dispose_engine,
+    get_engine,
+    set_process_role,
+)
 from app.core.logging import setup_logging
 from app.engine.formatters import channel_map, close_formatters
 from app.profile.loader import install_profile_from_settings
@@ -53,8 +58,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     A broken profile raises ProfileError here and the process dies
     before serving traffic -- by design (fail at startup, not on the
     delivery path).
+
+    Each uvicorn worker is its own process and runs this before it
+    serves: the role sizes its pool (app/core/database.py POOLS).
     """
     setup_logging()
+    set_process_role(ProcessRole.API)
     install_profile_from_settings()
     if not settings.comms_service_token:
         # Only reachable in development: any other APP_ENV refuses to

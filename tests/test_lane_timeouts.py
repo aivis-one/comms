@@ -21,7 +21,9 @@
 #   M8  the Bot built without the spec's session     -> TestOnePlaceForTheNumbers
 #   M9  the rule over every implemented channel, not the live ones
 #                                                   -> TestTheRule (in_app only)
-#   M10 the wait for a slot inside the timeout       -> TestTheSlotIsNotTimed
+#   M10 the wait for a slot inside the timeout -- unkillable since H7: a
+#       portion is one round of the slots, no call waits for one
+#       (TestTheSlotIsNotTimed holds what stays)
 #   M11 a key out of .env.example / the sentence out of INTEGRATION.md
 #                                                   -> TestTheContract
 # NOT BUILT: a call that ends exactly AT the lane's timeout -- which of
@@ -280,26 +282,40 @@ class TestTheLaneTimesTheCall:
 
 
 class TestTheSlotIsNotTimed:
-    """REPEAT: two calls of one bulk job share its one slot. Each is
-    shorter than the lane's timeout, the two together longer -- both go:
-    the timeout is the call's, not the call's plus its wait for a slot.
-    M10."""
+    """REPEAT: two calls of one bulk job. Each is shorter than the lane's
+    timeout, the two together longer -- both go: the timeout is the
+    call's, never the job's.
 
-    async def test_two_calls_through_one_slot(
+    Until H7 the two calls shared one attempt and queued for the lane's
+    one slot, and this test caught the wait for the slot inside the
+    timeout (M10). Since H7 an attempt takes one portion -- one round of
+    the slots (app/engine/service.py delivery_portion) -- so within an
+    attempt no call waits for a slot at all and M10 has nothing left to
+    break. What stays true, and is held here: the second call goes in
+    the lane's next pass, with its own full timeout."""
+
+    async def test_two_calls_two_passes_each_its_own_timeout(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         assert service.LANE_CONCURRENCY[Lane.BULK] == 1
+        assert service.delivery_portion(Lane.BULK) == 1
         call, timeout = 0.7, 1.0
         assert call < timeout < 2 * call
         _lane_timeout(monkeypatch, Lane.BULK, timeout)
         nid = await _job_in(Lane.BULK, _TWO_CALLS)
+        more: list[bool] = []
         with _channel(_Slow(call)) as spy:
+            await process_lane(Lane.BULK, on_more=lambda: more.append(True))
+            assert sorted(d.status for d in await _deliveries(nid)) == sorted([
+                DeliveryStatus.SENT, DeliveryStatus.PENDING,
+            ])
             await process_lane(Lane.BULK)
         assert [d.status for d in await _deliveries(nid)] == [
             DeliveryStatus.SENT, DeliveryStatus.SENT,
         ]
+        assert more == [True]  # the first pass's portion was full
         (_, first_end), (second_start, _) = sorted(spy.calls)
-        assert second_start >= first_end  # one slot: one after the other
+        assert second_start >= first_end
 
 
 class TestTheOutcome:

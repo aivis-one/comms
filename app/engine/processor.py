@@ -87,7 +87,7 @@
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -209,11 +209,24 @@ async def expire_overdue_notifications(lanes: Sequence[Lane]) -> int:
     return expired_count
 
 
-async def process_lane(lane: Lane) -> int:
+async def process_lane(
+    lane: Lane, on_more: Callable[[], None] | None = None,
+) -> int:
     """One pass of one lane: select its due jobs, at most the lane's
     batch size, and attempt them one after another, each in its own
     session/transaction. Pipeline per notification: resolve -> deliver
     -> rollup.
+
+    ONE PORTION PER JOB PER PASS (H7): an attempt delivers at most one
+    round of the lane's slots (app/engine/service.py delivery_portion)
+    and commits, so it never holds the job's row, a connection and the
+    change feed's xmin for a whole audience. A job with more due goes on
+    in the lane's NEXT pass, selected afresh -- expiry, cancellation and
+    forgetting get the row between two portions, and a job accepted
+    meanwhile is selected beside it. When any attempt of the pass had
+    its portion full, `on_more` is called once, after the pass: the
+    worker passes the lane's wake (app/worker.py), so the next pass
+    follows at once instead of after the interval.
 
     THE LANE'S BUDGET (P4-1, spec §8.2): the selection names the lane,
     so another lane's backlog never takes its places; the deliveries of
@@ -289,6 +302,7 @@ async def process_lane(lane: Lane) -> int:
 
     # -- Step 2: Process each notification in its own session --
     processed = 0
+    more = False
     for notif_id in notification_ids:
         step = PipelineStep.LOCK
         async with factory() as session:
@@ -331,9 +345,9 @@ async def process_lane(lane: Lane) -> int:
                 step = PipelineStep.RESOLVE
                 await resolve_notification(session, notification)
 
-                # deliver
+                # deliver -- one portion
                 step = PipelineStep.DELIVER
-                await deliver_notification(session, notification)
+                portion_full = await deliver_notification(session, notification)
 
                 # rollup
                 step = PipelineStep.ROLLUP
@@ -346,6 +360,7 @@ async def process_lane(lane: Lane) -> int:
                 step = PipelineStep.COMMIT
                 await session.commit()
                 processed += 1
+                more = more or portion_full
 
             except Exception as exc:
                 await session.rollback()
@@ -367,6 +382,8 @@ async def process_lane(lane: Lane) -> int:
         processed=processed,
         duration_ms=round((time.monotonic() - started) * 1000, 1),
     )
+    if more and on_more is not None:
+        on_more()
     return processed
 
 
@@ -561,6 +578,9 @@ async def cleanup_expired_notifications() -> int:
       - expiry_at < now()
       - status is an outcome other than failed (a failure is kept for
         inspection until general retention takes it)
+      - no push is owed for them (H7): a job whose push_outbox row the
+        relay has not published yet waits for it -- the cascade would
+        take the push with the job (delete_expired_notifications_batch)
 
     Suppressed, no-recipients and cancelled are outcomes like sent: an
     expired one is as dead as an expired sent one. General retention of terminal

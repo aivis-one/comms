@@ -53,8 +53,8 @@ import app.engine.processor as processor
 import app.worker as worker
 from app.core.config import NUMERIC_BOUNDS, Settings, settings
 from app.core.database import (
-    POOL_MAX_OVERFLOW,
-    POOL_SIZE,
+    POOLS,
+    ProcessRole,
     dispose_engine,
     get_engine,
     get_session_factory,
@@ -385,8 +385,16 @@ class TestIsolation:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Б2 (3): four lanes, budgets 1..4, six due jobs each: one pass
-        delivers exactly the budget of each lane, and the rest waits
-        (REPEAT, and the pair: something is left). M3."""
+        ATTEMPTS exactly the budget of each lane, and the rest waits
+        untouched (REPEAT, and the pair: something is left). M3.
+
+        Until H7 an attempted job here was a SENT one: an attempt took
+        every due delivery of its job. Since H7 it takes one portion
+        (app/engine/service.py delivery_portion) -- bulk's is one, and
+        bulk's type here has two channels, so its attempted jobs are
+        half-sent, PROCESSING, after one pass. What the budget bounds --
+        the jobs a pass selects -- is the same; it is now counted as
+        what the pass touched."""
         recipient = await _recipient()
         jobs: dict[Lane, list[UUID]] = {}
         for budget, (lane, type_key) in enumerate(
@@ -401,8 +409,14 @@ class TestIsolation:
             await process_pending_notifications()
         for budget, lane in enumerate(Lane, start=1):
             statuses = [await _status(nid) for nid in jobs[lane]]
-            assert statuses.count(NotificationStatus.SENT) == budget, lane
+            attempted = len(statuses) - statuses.count(NotificationStatus.PENDING)
+            assert attempted == budget, lane
             assert statuses.count(NotificationStatus.PENDING) == 6 - budget
+            # Attempted means delivered to: SENT, or half-sent in bulk.
+            assert set(statuses) - {NotificationStatus.PENDING} == (
+                {NotificationStatus.PROCESSING} if lane == Lane.BULK
+                else {NotificationStatus.SENT}
+            ), lane
 
     async def test_an_empty_lane_takes_nothing_and_holds_nothing(self) -> None:
         """EMPTY: three lanes with nothing due; the fourth delivers."""
@@ -658,13 +672,21 @@ class TestTheBudgets:
         fills the pool exactly, so the listener has its own engine
         outside it (app/engine/wake.py) -- asserted beside this sum, not
         added to it.
+
+        H7: pools are sized per process role; the sum is held to the
+        WORKER's pool (it was the one pool every process had), and it
+        fills it exactly -- 25 + 4 + 1 = 10 + 20 -- so a slot added to
+        a lane without its connection fails here. The engine a worker
+        builds is that pool (the pair).
         """
         held = (
             sum(LANE_CONCURRENCY.values())
             + len(Lane)
             + worker.MAINTENANCE_SESSIONS
         )
-        assert held <= POOL_SIZE + POOL_MAX_OVERFLOW
+        assert held == 30
+        assert held <= POOLS[ProcessRole.WORKER].capacity
+        assert get_engine().pool.size() == POOLS[ProcessRole.WORKER].size
         assert worker.MAINTENANCE_SESSIONS >= 1
         listener = wake_engine()
         assert isinstance(listener.pool, NullPool)

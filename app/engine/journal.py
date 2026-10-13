@@ -43,6 +43,7 @@
 # =============================================================================
 
 import traceback
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -414,10 +415,16 @@ async def record_channel_answer(
 
 
 async def accepted_answers(
-    session: AsyncSession, notification_ids: list[UUID],
+    session: AsyncSession,
+    notification_ids: list[UUID],
+    *,
+    recipient_ids: Iterable[UUID] | None = None,
 ) -> dict[tuple[UUID, UUID, str], datetime]:
     """Every (notification_id, recipient_id, channel) a channel has
-    accepted the letter for, with the moment it first did.
+    accepted the letter for, with the moment it first did -- of
+    `recipient_ids` only, when given (an attempt's portion, H7: a
+    thousand-recipient job read whole for every portion would cost the
+    square of its size).
 
     The key is the triple, not a delivery id: the deliveries of a first
     attempt are created in its transaction and vanish with its rollback,
@@ -425,6 +432,11 @@ async def accepted_answers(
     """
     if not notification_ids:
         return {}
+    narrowed = (
+        ()
+        if recipient_ids is None
+        else (NotificationTransition.recipient_id.in_(list(recipient_ids)),)
+    )
     rows = await session.execute(
         select(
             NotificationTransition.notification_id,
@@ -436,6 +448,7 @@ async def accepted_answers(
             NotificationTransition.notification_id.in_(notification_ids),
             NotificationTransition.subject == JournalSubject.CHANNEL,
             NotificationTransition.outcome == ChannelAnswer.ACCEPTED,
+            *narrowed,
         )
         .group_by(
             NotificationTransition.notification_id,

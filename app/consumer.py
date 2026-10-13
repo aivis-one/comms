@@ -37,7 +37,7 @@ import signal
 import structlog
 
 from app.core.config import settings
-from app.core.database import dispose_engine
+from app.core.database import ProcessRole, dispose_engine, set_process_role
 from app.core.logging import setup_logging
 from app.engine.formatters import sanitized_traceback
 from app.profile.loader import install_profile_from_settings
@@ -93,6 +93,7 @@ async def _main() -> None:
 def main() -> None:
     """Console entrypoint: `python -m app.consumer`."""
     setup_logging()
+    set_process_role(ProcessRole.CONSUMER)
     if not settings.redis_url:
         # Fail-at-startup, same philosophy as the startup config
         # validation (app/core/config.py): a consumer without Redis is

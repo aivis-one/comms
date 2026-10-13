@@ -101,7 +101,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute, GroupMembership, Recipient
 from app.core.config import settings
-from app.core.database import dispose_engine, get_session_factory
+from app.core.database import (
+    ProcessRole,
+    dispose_engine,
+    get_session_factory,
+    set_process_role,
+)
 from app.engine.formatters import reset_formatters
 from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
 from app.messaging.models import Message, Section, Thread, ThreadReadState
@@ -205,7 +210,19 @@ async def dispose_engine_at_end() -> AsyncGenerator[None, None]:
 
 
 @pytest.fixture(autouse=True)
-async def clean_db(apply_migrations: None) -> AsyncGenerator[None, None]:
+def worker_process_role() -> None:
+    """Every test runs as the worker process (H7): the engine refuses a
+    process without a role (app/core/database.py ProcessRole), and the
+    worker's pool is the one the lane budgets are held to. Before
+    clean_db, which opens the first session; set again for each test,
+    since app/main.py lifespan (run by a few tests) names the API."""
+    set_process_role(ProcessRole.WORKER)
+
+
+@pytest.fixture(autouse=True)
+async def clean_db(
+    worker_process_role: None, apply_migrations: None,
+) -> AsyncGenerator[None, None]:
     """Delete all comms rows before each test (ORM delete, FK order)."""
     factory = get_session_factory()
     async with factory() as session:
