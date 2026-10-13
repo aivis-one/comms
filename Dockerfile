@@ -24,7 +24,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder -- install all dependencies
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /build
 
@@ -58,7 +58,7 @@ RUN python -m venv /opt/venv && \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 WORKDIR /app
 
