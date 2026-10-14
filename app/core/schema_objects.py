@@ -186,6 +186,16 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "'no_recipients'::character varying])::text[])))"
         ),
     ),
+    # A job's waiting deliveries (H9, migration 0025): the fold's probe
+    # "does any still wait?" (app/engine/service.py rollup_notification).
+    "ix_notification_deliveries_pending": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notification_deliveries_pending "
+            "ON public.notification_deliveries USING btree (notification_id) "
+            "WHERE ((status)::text = 'pending'::text)"
+        ),
+    ),
     # A repeated resource call answers with the row it created (F1.4).
     "uq_messages_idempotency_key": IndexShape(
         unique=True,

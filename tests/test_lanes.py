@@ -59,6 +59,7 @@ from app.core.database import (
     get_engine,
     get_session_factory,
 )
+from app.core.lanes import Lane
 from app.engine import journal
 from app.engine.constants import (
     ChannelAnswer,
@@ -85,7 +86,7 @@ from app.engine.service import (
 )
 from app.engine.wake import wake_engine
 from app.profile.loader import _FIELDS, LANES
-from app.profile.registry import Decided, Lane, Layer, TypeRecord, registry
+from app.profile.registry import Decided, Layer, TypeRecord, registry
 from tests.helpers import create_recipient, intake_fields, notification_row_fields
 
 _REPO = Path(__file__).resolve().parents[1]

@@ -30,6 +30,7 @@ from sqlalchemy import event, text
 
 from app.core.config import settings
 from app.core.database import get_engine, get_session_factory
+from app.core.lanes import Lane
 from app.engine.constants import (
     DeliveryStatus,
     NotificationStatus,
@@ -38,7 +39,6 @@ from app.engine.constants import (
 )
 from app.engine.depth import lane_depth
 from app.engine.models import Notification, NotificationDelivery
-from app.profile.registry import Lane
 from tests.helpers import create_recipient, notification_row_fields
 
 _URL = "/api/v1/lanes/depth"

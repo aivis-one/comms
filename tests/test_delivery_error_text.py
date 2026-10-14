@@ -29,6 +29,7 @@ import pytest
 from sqlalchemy import select, text
 
 from app.core.database import get_session_factory
+from app.core.lanes import Lane
 from app.engine import journal
 from app.engine.constants import FailureClass, JournalSubject, TargetType
 from app.engine.formatters import (
@@ -42,7 +43,6 @@ from app.engine.formatters import (
 from app.engine.models import NotificationDelivery, NotificationTransition
 from app.engine.processor import process_lane
 from app.engine.service import create_notification
-from app.profile.registry import Lane
 from tests.helpers import create_recipient, intake_fields
 from tests.test_formatters import BOT_URL, _FakeBot
 

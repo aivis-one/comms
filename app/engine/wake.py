@@ -76,7 +76,7 @@ from app.core.sanitize import sanitized_traceback
 logger = structlog.get_logger()
 
 # The Postgres channel of the wake: written by intake, listened to by
-# the worker. The payload is a lane value (app/profile/registry.py Lane).
+# the worker. The payload is a lane value (app/core/lanes.py Lane).
 WAKE_CHANNEL = "comms_lane_wake"
 
 # How the listening connection names itself in pg_stat_activity, so the

@@ -97,6 +97,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.core.lanes import Lane
 from app.core.sanitize import sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
@@ -118,7 +119,6 @@ from app.engine.service import (
     resolve_notification,
     rollup_notification,
 )
-from app.profile.registry import Lane
 
 logger = structlog.get_logger()
 

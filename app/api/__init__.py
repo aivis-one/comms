@@ -8,10 +8,9 @@
 # faces the frontend. Authorization is service-to-service via a shared
 # bearer token (deps.py) on top of network isolation.
 #
-# Sits at the TOP of the package DAG:
-#
-#   core <- profile <- {engine, audience} <- api
-#   engine -> audience
+# Sits near the TOP of the package graph: rank 5, beside transport,
+# under the processes (the whole table: app/__init__.py, held by
+# tests/test_h9_release.py).
 #
 # FROZEN CONTRACTS (Phase 6 consumes them as-is):
 #   inbox.py -- the in-app "bell": inbox feed / unread badge /

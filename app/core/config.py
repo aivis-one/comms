@@ -38,7 +38,7 @@ from app.core.channels import (
     channel_optional_keys,
     evaluate_channels,
 )
-from app.profile.registry import Lane
+from app.core.lanes import Lane
 
 # Single source of truth for API version.
 # Import as: from app.core.config import APP_VERSION, settings
@@ -73,9 +73,15 @@ from app.profile.registry import Lane
 # channel took is never sent twice, reading a job by its key, what
 # changed since a cursor, channel health, the address book); 3.3.0 is
 # phase 3 (the push stream: a type that declares push_on owes its
-# product the job's key, after the commit, at least once). The tag
-# goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.3.0"
+# product the job's key, after the commit, at least once); 3.4.0 is
+# phase 4 (isolation lanes: each with its own batch, slots and deliver
+# timeout held above its channels' clients, intake waking its lane, the
+# lanes a worker takes chosen by the deploy) with H7 (row locks in one
+# order, a push outliving the expiry cleanup, one portion of deliveries
+# per attempt, connection pools by process) and H8 (comms' own errors
+# kept as class and place, every log line sanitized, the lanes' depth).
+# The tag goes on the merge commit, after the merge -- never ahead of it.
+APP_VERSION = "3.4.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -415,7 +421,7 @@ class Settings(BaseSettings):
     notification_max_pipeline_attempts: int = 3
     # -- Lanes (P4-1, spec §8) --
     # The lanes THIS worker process takes, comma-separated
-    # (app/profile/registry.py Lane values). Unset: all four. One image,
+    # (app/core/lanes.py Lane values). Unset: all four. One image,
     # any set: a second container of the same image may take only
     # `critical` (spec §8.6, phase 7) -- the union over a deploy's
     # worker processes must cover every lane (deploy/INTEGRATION.md).

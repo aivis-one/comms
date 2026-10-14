@@ -34,6 +34,7 @@ from sqlalchemy import func, select
 import app.worker as worker
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.core.lanes import Lane
 from app.engine import service
 from app.engine.changes import list_changes
 from app.engine.constants import (
@@ -49,7 +50,7 @@ from app.engine.models import (
 )
 from app.engine.processor import process_lane
 from app.engine.service import create_notification
-from app.profile.registry import Decided, Lane, Layer, TypeRecord, registry
+from app.profile.registry import Decided, Layer, TypeRecord, registry
 from tests.helpers import create_recipient, intake_fields
 
 _TYPE = "unit_event_in_app"

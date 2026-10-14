@@ -63,6 +63,7 @@ import structlog
 
 from app.core.config import settings
 from app.core.database import ProcessRole, dispose_engine, set_process_role
+from app.core.lanes import Lane
 from app.core.logging import setup_logging
 from app.core.sanitize import sanitized_traceback
 from app.engine.formatters import close_formatters, init_formatters
@@ -73,7 +74,6 @@ from app.engine.worker import run_engine_maintenance
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
 from app.notifier import consume_close_notifications
 from app.profile.loader import install_profile_from_settings
-from app.profile.registry import Lane
 
 logger = structlog.get_logger()
 
@@ -267,6 +267,23 @@ async def run_worker_loop() -> None:
         logger.warning(
             "thread_auto_close_disabled",
             thread_auto_close_days=settings.thread_auto_close_days,
+        )
+    untaken = [lane.value for lane in Lane if lane not in lanes]
+    if untaken:
+        # H9: a valid subset is lawful -- another worker process of the
+        # deploy may take the rest (spec §8.6) -- so it starts; but this
+        # process neither delivers nor expires those lanes, and if no
+        # other one does, their jobs wait for ever. A knob that stops
+        # work is loud, like the two above: one line, naming them.
+        logger.warning(
+            "worker_lanes_partial",
+            lanes_not_taken=untaken,
+            hint=(
+                "this process does not deliver or expire these lanes; "
+                "another worker process of the deploy must take them "
+                "(COMMS_WORKER_LANES), or their jobs stay pending -- "
+                "GET /api/v1/lanes/depth shows them"
+            ),
         )
 
     wakes = {lane.value: asyncio.Event() for lane in lanes}

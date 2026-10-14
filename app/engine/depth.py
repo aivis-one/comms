@@ -35,10 +35,10 @@ from typing import Any
 from sqlalchemy import func, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.lanes import Lane
 from app.engine.constants import NotificationStatus
 from app.engine.models import Notification
 from app.engine.processor import not_expired, ready_now
-from app.profile.registry import Lane
 
 _ACTIVE = (NotificationStatus.PENDING, NotificationStatus.PROCESSING)
 

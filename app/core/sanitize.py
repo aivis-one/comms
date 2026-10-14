@@ -4,10 +4,10 @@
 # =============================================================================
 #
 # Lives in core (H8): the logging setup (app/core/logging.py) runs every
-# log line through it, and core imports nothing above it -- the graph is
-# core <- profile <- engine. Every caller imports it from HERE; there is
-# no second copy and no re-export (tests/test_log_sanitizing.py holds
-# that with an AST check).
+# log line through it, and core imports nothing above it -- core is
+# rank 0 of the package graph (app/__init__.py). Every caller imports
+# it from HERE; there is no second copy and no re-export
+# (tests/test_log_sanitizing.py holds that with an AST check).
 # =============================================================================
 
 import re

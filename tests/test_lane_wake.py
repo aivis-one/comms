@@ -48,10 +48,11 @@ import app.engine.service as service
 import app.worker as worker
 from app.core.config import Settings, settings
 from app.core.database import get_session_factory
+from app.core.lanes import Lane
 from app.engine.constants import NotificationStatus
 from app.engine.models import Notification
 from app.engine.wake import WAKE_APPLICATION_NAME
-from app.profile.registry import Decided, Lane, Layer, TypeRecord, registry
+from app.profile.registry import Decided, Layer, TypeRecord, registry
 from app.transport.events import parse_event
 from app.transport.handlers import HandleResult, handle_event
 from tests.helpers import create_recipient

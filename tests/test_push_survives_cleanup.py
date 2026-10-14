@@ -31,6 +31,7 @@ from sqlalchemy import func, select, text
 import app.transport.push_relay as relay
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.core.lanes import Lane
 from app.engine.constants import NotificationStatus, TargetType
 from app.engine.models import Notification, PushOutbox
 from app.engine.processor import cleanup_expired_notifications, process_lane
@@ -38,7 +39,6 @@ from app.engine.service import (
     create_notification,
     delete_expired_notifications_batch,
 )
-from app.profile.registry import Lane
 from tests.helpers import create_recipient, intake_fields
 from tests.test_expired_cleanup_index import (
     _index_names,

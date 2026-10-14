@@ -64,6 +64,7 @@ from app.audience.prefs import muted_recipient_ids
 from app.audience.schedule import recipient_deferred_until
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
+from app.core.lanes import Lane
 from app.core.sanitize import sanitize_text, sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
@@ -94,13 +95,7 @@ from app.engine.models import (
 )
 from app.engine.resolver import resolve_targets
 from app.engine.wake import signal_lane
-from app.profile.registry import (
-    Decided,
-    Lane,
-    Layer,
-    RecipientSchedule,
-    registry,
-)
+from app.profile.registry import Decided, Layer, RecipientSchedule, registry
 
 logger = structlog.get_logger()
 
@@ -1417,6 +1412,23 @@ async def rollup_notification(
             pipeline's rollup, or the closing path that called it.
     """
     if notification.status != NotificationStatus.PROCESSING:
+        return
+
+    # A delivery still waiting decides alone (H9): the fold of any set
+    # that holds a PENDING is "still open" (_fold), so the set is read
+    # only once none waits. After every portion but the last (H7) one
+    # probe on ix_notification_deliveries_pending (migration 0025) --
+    # the job's waiting deliveries, nothing else -- instead of a read of
+    # every delivery of the job: the square H7 took off accepted_answers.
+    still_waiting = await session.scalar(
+        select(
+            exists().where(
+                NotificationDelivery.notification_id == notification.id,
+                NotificationDelivery.status == DeliveryStatus.PENDING,
+            )
+        )
+    )
+    if still_waiting:
         return
 
     stmt = (

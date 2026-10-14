@@ -154,9 +154,9 @@ from app.core.constants import (
     MSG_TYPE_KEYS,
 )
 from app.core.exceptions import ProfileError
+from app.core.lanes import Lane
 from app.profile.registry import (
     Decided,
-    Lane,
     Layer,
     ProfileRegistry,
     PushOn,

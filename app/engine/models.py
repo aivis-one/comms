@@ -210,7 +210,7 @@ class Notification(UUIDMixin, Base):
     )
 
     # The type's isolation lane, AT INTAKE (P4-1, spec §8): an
-    # app/profile/registry.py Lane value, snapshotted like push_on, so a
+    # app/core/lanes.py Lane value, snapshotted like push_on, so a
     # profile changed between intake and delivery never moves an
     # accepted job to another lane. Read by the worker's selection
     # (app/engine/processor.py process_lane) -- each lane selects only

@@ -59,6 +59,7 @@ from app.core.config import (
     settings,
 )
 from app.core.database import get_session_factory
+from app.core.lanes import Lane
 from app.engine import journal
 from app.engine.constants import (
     ChannelAnswer,
@@ -72,7 +73,7 @@ from app.engine.formatters import _real_bot_factory, _real_http_client_factory
 from app.engine.models import NotificationDelivery, NotificationTransition
 from app.engine.processor import process_lane
 from app.engine.service import create_notification
-from app.profile.registry import Decided, Lane, Layer, TypeRecord, registry
+from app.profile.registry import Decided, Layer, TypeRecord, registry
 from tests.helpers import create_recipient, intake_fields
 
 _REPO = Path(__file__).resolve().parents[1]

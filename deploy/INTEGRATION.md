@@ -188,10 +188,12 @@ nothing needs to be written for one worker. A second worker of the
 same image may take a subset, e.g. `COMMS_WORKER_LANES=critical` next
 to one with `interactive,normal,bulk`. **The worker processes of a
 deploy together must take all four lanes:** a lane no process takes is
-neither delivered nor expired -- its jobs stay pending, and nothing
-fails to tell you so. Each worker names its lanes and their budgets in
-its startup log line, `notification_worker_started` (`lanes`,
-`lane_budgets`). Written but empty, an unknown lane or a lane listed
+neither delivered nor expired -- its jobs stay pending. Nothing fails
+on it: a worker that takes a subset starts, and says so in one warning
+line, `worker_lanes_partial` (`lanes_not_taken`); the lanes' backlog
+shows in `GET /api/v1/lanes/depth`. Each worker names its lanes and
+their budgets in its startup log line, `notification_worker_started`
+(`lanes`, `lane_budgets`). Written but empty, an unknown lane or a lane listed
 twice refuses startup, naming the variable.
 
 Each lane also has its own timeout for one channel call,
