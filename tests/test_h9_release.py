@@ -439,11 +439,16 @@ class TestPartialLanes:
 
 
 def test_the_number_and_its_line() -> None:
-    """3.4.0 in code; its comment says what 3.4.0 is, like 3.1.0-3.3.0.
+    """The number in code says what it is, like 3.1.0-3.4.0; 3.4.0 stays
+    described as phase 4. This test once pinned APP_VERSION == "3.4.0" --
+    true for that release, and false for every release after it: a pin on
+    the number itself is replaced by the rule it stood for -- the comment
+    above the number names the CURRENT number.
     (APP_VERSION == pyproject's version: tests/test_delivery_contract.py.)"""
-    assert config_module.APP_VERSION == "3.4.0"
+    version = config_module.APP_VERSION
     source = inspect.getsource(config_module)
-    comment = source[: source.index('APP_VERSION = "3.4.0"')]
+    comment = source[: source.index(f'APP_VERSION = "{version}"')]
+    assert f"{version} is" in comment
     assert re.search(r"3\.4\.0 is\s+#?\s*phase 4", comment)
     for part in ("lanes", "H7", "H8"):
         assert part in comment.rsplit("3.4.0 is", 1)[1]
