@@ -288,8 +288,9 @@ class TestTheFold:
 class TestTheProbePlan:
     """правка 1 of the H9 gate: the probe the fold sends, captured and
     explained with ANALYZE, on a job of 5000 deliveries of which one
-    waits, beside another send with 5000 waiting, in a table of 200 000
-    finished deliveries -- by the pending index, a handful of buffers.
+    waits, beside another send with 5000 waiting, among 20 000 finished
+    jobs (40 000 finished deliveries) -- by the pending index, a handful
+    of buffers.
     I1."""
 
     async def test_by_the_pending_index(self) -> None:
@@ -316,10 +317,14 @@ class TestTheProbePlan:
                     "FROM recipients WHERE snapshot_fingerprint = 'h9'"
                 ), {"j": job_id})
             # The table around them, as in life: a fortnight of finished
-            # sends -- 20 000 jobs, ten deliveries each. On a table that
+            # sends -- 20 000 jobs, two deliveries each. On a table that
             # held only these two sends the planner would take every
             # job for a coin toss between them and expect thousands of
-            # matches; that is not the table the probe runs on.
+            # matches; that is not the table the probe runs on. What it
+            # needs is the DISTINCTNESS of notification_id (20 000 jobs),
+            # not the row count: two deliveries a job give the planner
+            # the same n_distinct as ten at a fifth of the seed (review
+            # of 3.4.0: the call went from ~2 minutes to ~2 seconds).
             await session.execute(text(
                 "INSERT INTO notifications (id, type, title, body, target_type, "
                 "target_value, idempotency_key, fingerprint, channels, "
@@ -336,7 +341,7 @@ class TestTheProbePlan:
                 "(id, notification_id, recipient_id, channel, status) "
                 "SELECT gen_random_uuid(), n.id, (SELECT id FROM recipients "
                 "WHERE snapshot_fingerprint = 'h9' LIMIT 1), 'in_app', 'sent' "
-                "FROM notifications n, generate_series(1, 10) "
+                "FROM notifications n, generate_series(1, 2) "
                 "WHERE n.idempotency_key LIKE 'h9-done-%'"
             ))
             # Mine: all but one done.
