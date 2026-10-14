@@ -249,7 +249,7 @@ class TestNoStarvation:
         of poison; tick 2 must deliver the healthy job. M2: without the
         gate tick 2 takes the same poison again."""
         batch = 3
-        monkeypatch.setattr(settings, "notification_batch_size", batch)
+        monkeypatch.setattr(settings, "notification_lane_normal_batch_size", batch)
         recipient = await create_recipient(db_session)
         poisoned = {
             await _job(db_session, recipient.id, age_minutes=100 + i)
@@ -275,7 +275,7 @@ class TestNoStarvation:
         M3: ordering by attempts put every fresh row ahead of it, and it
         never got an outcome."""
         batch, ceiling = 2, 3
-        monkeypatch.setattr(settings, "notification_batch_size", batch)
+        monkeypatch.setattr(settings, "notification_lane_normal_batch_size", batch)
         monkeypatch.setattr(settings, "notification_max_pipeline_attempts", ceiling)
         recipient = await create_recipient(db_session)
         failing = await _job(db_session, recipient.id, age_minutes=500)
@@ -426,7 +426,7 @@ class TestTheChecks:
 # -- R6 -----------------------------------------------------------------------
 
 _APP = Path(__file__).resolve().parents[1] / "app"
-_SANITIZER = ("formatters.py", "sanitized_traceback")
+_SANITIZER = ("sanitize.py", "sanitized_traceback")
 
 
 def _raw_traceback_calls(source: str, filename: str) -> list[str]:
@@ -530,12 +530,12 @@ class TestNoRawTraceback:
         monkeypatch.setattr(
             messaging_processor, "auto_close_idle_threads_batch", boom,
         )
-        monkeypatch.setattr(worker, "run_notification_batch", _zero)
+        monkeypatch.setattr(worker, "run_engine_maintenance", _zero)
         monkeypatch.setattr(worker, "cleanup_terminal_notifications", _zero)
         monkeypatch.setattr(settings, "thread_auto_close_days", 30)
         monkeypatch.setattr(worker, "_last_auto_close_at", None)
         with capture_logs() as logs:
-            await worker.run_worker_batch()
+            await worker.run_maintenance_pass()
         (entry,) = [
             log for log in logs if log["event"] == "thread_auto_close_pass_error"
         ]

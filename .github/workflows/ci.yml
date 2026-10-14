@@ -1,9 +1,18 @@
 # =============================================================================
 # COMMS Service -- CI (handoff item 5)
 # =============================================================================
-# Ephemeral Postgres 16 service container; schema via `alembic upgrade
-# head`; then pytest + ruff + mypy. NO deploy steps, NO SSH, NO secrets
-# (deploy wiring is Phase 5).
+# Two jobs, side by side:
+#   test   the suite on the runner's Python 3.12 against Postgres; schema
+#          via `alembic upgrade head`; then ruff, the fences, mypy.
+#   image  the comms image built from the Dockerfile -- its base pinned
+#          by digest -- and the suite run INSIDE it, as the `test` verb of
+#          deploy/comms-deploy.sh does on a box: the Python and Debian the
+#          boxes run, not the runner's.
+# Postgres is the image deploy/docker-compose.yml pins for comms-postgres,
+# read from there (H10): one pin, kept by Dependabot's docker-compose
+# ecosystem, and CI on the database the boxes run. A `services:` image
+# here would be a second pin no Dependabot ecosystem updates.
+# NO deploy steps, NO SSH, NO secrets (deploy wiring is Phase 5).
 # =============================================================================
 
 name: CI
@@ -15,25 +24,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: comms
-          POSTGRES_PASSWORD: comms
-          # T-78: the suite refuses to run against a database whose
-          # name does not end in _test, because it deletes every row
-          # before each test. The rule has no exceptions, so CI obeys it
-          # like every other caller rather than being one.
-          POSTGRES_DB: comms_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U comms -d comms_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
 
     env:
       APP_ENV: ci
@@ -60,6 +50,27 @@ jobs:
           pip install -r requirements.lock
           pip install -e . --no-deps
 
+      # The pinned image, from deploy/docker-compose.yml. Ready is asked
+      # over TCP: during initdb the image's temporary server listens on
+      # the socket only, so a TCP answer is the server that stays.
+      # T-78: the suite refuses a database whose name does not end in
+      # _test, because it deletes every row before each test.
+      - name: Start Postgres (the image deploy/docker-compose.yml pins)
+        run: |
+          image=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-postgres']['image'])")
+          echo "comms-postgres image: $image"
+          docker run -d --name comms-postgres -p 5432:5432 \
+            -e POSTGRES_USER=comms -e POSTGRES_PASSWORD=comms \
+            -e POSTGRES_DB=comms_test "$image"
+          for _ in $(seq 60); do
+            if docker exec comms-postgres pg_isready -h 127.0.0.1 -U comms -d comms_test; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs comms-postgres
+          exit 1
+
       - name: Apply migrations (alembic upgrade head)
         run: alembic upgrade head
 
@@ -85,3 +96,96 @@ jobs:
 
       - name: Type check (mypy)
         run: mypy app
+
+  image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Only to read the compose file (PyYAML at the lock's version).
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read the compose file's pins
+        run: pip install pyyaml==6.0.3
+
+      # Every image the compose file pins is pulled by its digest -- a pin
+      # that does not resolve (a typo, a digest withdrawn) is red here,
+      # before any box meets it.
+      - name: Pull every image deploy/docker-compose.yml pins
+        run: |
+          python -c "import yaml; [print(s['image']) for s in yaml.safe_load(open('deploy/docker-compose.yml'))['services'].values() if 'image' in s]" |
+          while read -r image; do
+            docker pull "$image"
+          done
+      # The pinned image, from deploy/docker-compose.yml. Ready is asked
+      # over TCP: during initdb the image's temporary server listens on
+      # the socket only, so a TCP answer is the server that stays.
+      # T-78: the suite refuses a database whose name does not end in
+      # _test, because it deletes every row before each test.
+      - name: Start Postgres (the image deploy/docker-compose.yml pins)
+        run: |
+          image=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-postgres']['image'])")
+          echo "comms-postgres image: $image"
+          docker run -d --name comms-postgres -p 5432:5432 \
+            -e POSTGRES_USER=comms -e POSTGRES_PASSWORD=comms \
+            -e POSTGRES_DB=comms_test "$image"
+          for _ in $(seq 60); do
+            if docker exec comms-postgres pg_isready -h 127.0.0.1 -U comms -d comms_test; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs comms-postgres
+          exit 1
+
+      - name: Build the comms image (the Dockerfile's pinned base)
+        run: docker build -t comms:ci .
+
+      # The image's own command, as comms-app runs it: it starts and
+      # answers readiness (200 only with the database reached). The test
+      # profile routes to telegram and email, and startup refuses a
+      # channel with no keys -- so the channels get keys of the right
+      # shape that reach nothing (the token assembled here: a literal of
+      # a real token's shape would trip secret scanning).
+      - name: The image starts (GET /ready)
+        run: |
+          token="123456789:$(printf 'A%.0s' $(seq 35))"
+          docker run -d --name comms-app --network host \
+            -e APP_ENV=ci \
+            -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
+            -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
+            -e TEMPLATES_DIR=/app/tests/fixtures/profile \
+            -e TELEGRAM_BOT_TOKEN="$token" \
+            -e TELEGRAM_BOT_URL=https://t.me/comms_ci_bot \
+            -e EMAIL_MAILGUN_API_KEY=ci-not-a-provider-key \
+            -e EMAIL_MAILGUN_DOMAIN=mg.example.org \
+            -e "EMAIL_FROM_ADDRESS=CI <ci@example.org>" \
+            comms:ci
+          for _ in $(seq 60); do
+            if curl -sf http://127.0.0.1:8000/ready; then
+              docker rm -f comms-app
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs comms-app
+          exit 1
+
+      # On the image's Python, Debian and installed packages. The checkout
+      # is mounted over /app, read-only: the suite also reads files the
+      # image does not ship (deploy/, scripts/, .github/, .env.example) --
+      # the code is the same, the interpreter and the packages are the
+      # image's (/opt/venv).
+      - name: The suite inside the image
+        run: |
+          docker run --rm --network host \
+            -v "$PWD:/app:ro" \
+            -e APP_ENV=ci \
+            -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
+            -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
+            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q -p no:cacheprovider"

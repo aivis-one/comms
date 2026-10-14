@@ -22,7 +22,8 @@
 #   (recipient locale -> default_locale -> stored title/body).
 # =============================================================================
 
-from collections.abc import Mapping
+import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,10 +32,13 @@ from pydantic import ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.channels import (
+    CHANNEL_SPECS,
+    ChannelState,
     channel_env_keys,
     channel_optional_keys,
     evaluate_channels,
 )
+from app.core.lanes import Lane
 
 # Single source of truth for API version.
 # Import as: from app.core.config import APP_VERSION, settings
@@ -69,9 +73,15 @@ from app.core.channels import (
 # channel took is never sent twice, reading a job by its key, what
 # changed since a cursor, channel health, the address book); 3.3.0 is
 # phase 3 (the push stream: a type that declares push_on owes its
-# product the job's key, after the commit, at least once). The tag
-# goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.3.0"
+# product the job's key, after the commit, at least once); 3.4.0 is
+# phase 4 (isolation lanes: each with its own batch, slots and deliver
+# timeout held above its channels' clients, intake waking its lane, the
+# lanes a worker takes chosen by the deploy) with H7 (row locks in one
+# order, a push outliving the expiry cleanup, one portion of deliveries
+# per attempt, connection pools by process) and H8 (comms' own errors
+# kept as class and place, every log line sanitized, the lanes' depth).
+# The tag goes on the merge commit, after the merge -- never ahead of it.
+APP_VERSION = "3.4.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -94,6 +104,22 @@ class Bound:
     hi: int
     why: str
 
+
+# The four lanes' batch sizes share one reason (P4-1).
+_LANE_BATCH_WHY = (
+    "jobs one pass of the lane selects; 0 does NOT switch the lane off "
+    "-- 'off' is leaving the lane out of COMMS_WORKER_LANES; above 1000 "
+    "one pass holds that many jobs in memory"
+)
+
+# The four lanes' deliver timeouts share one reason (P4-3).
+_LANE_DELIVER_TIMEOUT_WHY = (
+    "seconds one channel call of the lane may take before it is "
+    "abandoned as a timeout; 0 abandons every call; above 600 an attempt "
+    "holds its job's row and a pooled connection for ten minutes per "
+    "call; and not at or below the client timeout of a live channel "
+    "(checked below)"
+)
 
 # THE ONE TABLE OF NUMERIC BOUNDS (D1 / R3). Every int field of
 # Settings has a row -- a test walks the fields against this table, so
@@ -133,9 +159,23 @@ NUMERIC_BOUNDS: dict[str, Bound] = {
     "notification_max_pipeline_attempts": Bound(
         1, 100, "0 would close a job without one attempt; T12",
     ),
-    "notification_batch_size": Bound(
-        1, 1000, "0 selects nothing -- delivery stops; above 1000 one tick "
-        "holds that many row locks",
+    "notification_lane_interactive_batch_size": Bound(
+        1, 1000, _LANE_BATCH_WHY,
+    ),
+    "notification_lane_critical_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
+    "notification_lane_normal_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
+    "notification_lane_bulk_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
+    "notification_lane_interactive_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
+    ),
+    "notification_lane_critical_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
+    ),
+    "notification_lane_normal_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
+    ),
+    "notification_lane_bulk_deliver_timeout_seconds": Bound(
+        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
     ),
     "notification_retry_backoff_base_seconds": Bound(
         0, 86_400, "0 = no idle wait between attempts (the profile's "
@@ -195,6 +235,53 @@ def numeric_problems(values: Mapping[str, int]) -> list[str]:
         if values[high] < values[low]
     )
     return problems
+
+
+def deliver_timeout_problems(
+    timeouts: Mapping[Lane, int], live: Iterable[str],
+) -> list[str]:
+    """Every lane whose deliver timeout is not above the client timeout
+    of a live channel, each naming its variable and the channels (P4-3,
+    spec §8.5).
+
+    WHY THE RULE: the lane's timeout (app/engine/service.py
+    _deliver_single) abandons a channel call from OUTSIDE, as a bare
+    TimeoutError. A call that times out inside its client instead tells
+    "never reached" from "reached, no answer" -- which is what decides
+    whether a retry can duplicate the letter. A lane at or below its
+    client's total takes that apart without a word; so it refuses
+    startup, never a clamp. WHICH CHANNELS: the ones live on this
+    deploy -- a channel that is not live never calls a client (its
+    formatter refuses every delivery), and the lane of a job does not
+    fix its channels anyway (the profile decides both, per type).
+    Where the client total is not a hard bound: KNOWN CEILING (client
+    totals) in app/core/channels.py.
+    """
+    clients = [
+        spec for spec in CHANNEL_SPECS
+        if spec.name in set(live) and spec.client_timeouts
+    ]
+    problems: list[str] = []
+    for lane, timeout in timeouts.items():
+        below = [spec for spec in clients if timeout <= spec.client_timeout_total]
+        if not below:
+            continue
+        floor = math.floor(max(spec.client_timeout_total for spec in below)) + 1
+        named = ", ".join(
+            f"{spec.name} ({spec.client_timeout_total:g} s)" for spec in below
+        )
+        problems.append(
+            f"{lane_deliver_timeout_variable(lane)}={timeout} is not above "
+            f"the client timeout of the live channel {named}: a call must "
+            f"time out inside its client first, where 'never reached' and "
+            f"'reached, no answer' stay apart. Set it to {floor} or more."
+        )
+    return problems
+
+
+def lane_deliver_timeout_variable(lane: Lane) -> str:
+    """The environment variable of `lane`'s deliver timeout."""
+    return f"NOTIFICATION_LANE_{lane.value.upper()}_DELIVER_TIMEOUT_SECONDS"
 
 
 class Settings(BaseSettings):
@@ -332,9 +419,46 @@ class Settings(BaseSettings):
     # jobs behind it. A separate knob from the delivery attempts: the
     # channel being down and comms being broken are different facts.
     notification_max_pipeline_attempts: int = 3
-    # Max notifications picked per worker batch; the tail is picked up
-    # on the next tick (review 1.1: unbounded backlog fetch).
-    notification_batch_size: int = 50
+    # -- Lanes (P4-1, spec §8) --
+    # The lanes THIS worker process takes, comma-separated
+    # (app/core/lanes.py Lane values). Unset: all four. One image,
+    # any set: a second container of the same image may take only
+    # `critical` (spec §8.6, phase 7) -- the union over a deploy's
+    # worker processes must cover every lane (deploy/INTEGRATION.md).
+    # Written but empty, an empty item, an unknown lane or a repeated
+    # one refuses startup (worker_lane_problem). Validated here, with
+    # every other knob only the worker reads: every entrypoint refuses
+    # alike on one .env.
+    comms_worker_lanes: str | None = None
+
+    # Jobs one pass of each lane selects, oldest due first; the tail is
+    # picked up on the lane's next pass (review 1.1). Each lane selects
+    # its own jobs only, so a backlog of one never takes another's
+    # places. normal keeps the one number every job had before lanes
+    # (50); interactive and critical are a person or a payment at a
+    # time; bulk is many jobs that may wait, bounded so that one pass
+    # of it stays short. Their delivery concurrency is a constant next
+    # to the pool it is counted against (app/engine/service.py
+    # LANE_CONCURRENCY).
+    notification_lane_interactive_batch_size: int = 10
+    notification_lane_critical_batch_size: int = 10
+    notification_lane_normal_batch_size: int = 50
+    notification_lane_bulk_batch_size: int = 20
+    # Seconds one channel call of each lane may take before the attempt
+    # abandons it as a timeout (P4-3, spec §8.5) -- the call only, not
+    # the wait for one of the lane's slots. 30 in every lane: the one
+    # timeout every call had before lanes, so normal behaves as it did.
+    # None shorter: startup holds each above the client timeout of
+    # every live channel (deliver_timeout_problems), 29 for telegram
+    # and email (app/core/channels.py), so a short lane would time out
+    # nothing earlier. None longer: a live channel's call ends inside
+    # its client first, so a longer lane would only wait longer where a
+    # client overruns its own total (KNOWN CEILING (client totals),
+    # app/core/channels.py).
+    notification_lane_interactive_deliver_timeout_seconds: int = 30
+    notification_lane_critical_deliver_timeout_seconds: int = 30
+    notification_lane_normal_deliver_timeout_seconds: int = 30
+    notification_lane_bulk_deliver_timeout_seconds: int = 30
     # Per-delivery retry backoff: base * 2**(attempts-1), capped.
     # Defaults give ~30s/60s between the three attempts -- comparable
     # to the cbshome donor's 1-minute worker tick, where retries were
@@ -415,6 +539,32 @@ class Settings(BaseSettings):
     def is_dev(self) -> bool:
         """True when running in development mode."""
         return self.app_env == "development"
+
+    @property
+    def worker_lanes(self) -> tuple[Lane, ...]:
+        """The lanes this worker process takes, in Lane order.
+
+        Read after validation: a value worker_lane_problem refuses never
+        reaches here (startup was refused).
+        """
+        if self.comms_worker_lanes is None:
+            return tuple(Lane)
+        named = {item.strip() for item in self.comms_worker_lanes.split(",")}
+        return tuple(lane for lane in Lane if lane.value in named)
+
+    def lane_deliver_timeout(self, lane: Lane) -> int:
+        """Seconds one channel call of `lane` may take (P4-3)."""
+        value: int = getattr(
+            self, f"notification_lane_{lane.value}_deliver_timeout_seconds",
+        )
+        return value
+
+    def lane_batch_size(self, lane: Lane) -> int:
+        """Jobs one pass of `lane` selects."""
+        batch_size: int = getattr(
+            self, f"notification_lane_{lane.value}_batch_size",
+        )
+        return batch_size
 
     # -- Validation --
 
@@ -498,11 +648,18 @@ class Settings(BaseSettings):
         # deliveries. An EMPTY set is legal: the deploy has no channel.
         # Every declared key is a field of this class under its
         # lower-case name (pinned by a test).
-        _, channel_problems = evaluate_channels({
+        channel_states, channel_problems = evaluate_channels({
             key: getattr(self, key.lower())
             for key in channel_env_keys() + channel_optional_keys()
         })
         problems.extend(channel_problems)
+
+        # P4-1: the worker's lanes -- a set that takes nothing, or names
+        # something that is not a lane, must not start a worker that
+        # then silently delivers less than it was meant to.
+        lane_problem = worker_lane_problem(self.comms_worker_lanes)
+        if lane_problem is not None:
+            problems.append(lane_problem)
 
         # Phase 3b item 1: an "internal" API without its shared secret
         # is effectively open -- required outside development, the same
@@ -530,6 +687,24 @@ class Settings(BaseSettings):
         numeric = numeric_problems(
             {name: getattr(self, name) for name in NUMERIC_BOUNDS}
         )
+        # P4-3: and above the clients of the live channels. Reached only
+        # with a valid key set, so every channel has its state. A lane
+        # already outside its bound is not named twice.
+        in_bounds: dict[Lane, int] = {}
+        for lane in Lane:
+            timeout = self.lane_deliver_timeout(lane)
+            bound = NUMERIC_BOUNDS[
+                f"notification_lane_{lane.value}_deliver_timeout_seconds"
+            ]
+            if bound.lo <= timeout <= bound.hi:
+                in_bounds[lane] = timeout
+        numeric.extend(deliver_timeout_problems(
+            in_bounds,
+            [
+                name for name, state in channel_states.items()
+                if state == ChannelState.LIVE
+            ],
+        ))
         if numeric:
             raise ValueError("\n".join(numeric))
 
@@ -544,6 +719,48 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+    )
+
+
+def worker_lane_problem(value: str | None) -> str | None:
+    """What is wrong with COMMS_WORKER_LANES, or None (P4-1).
+
+    Unset (None) is all four lanes and is never a problem. Written, it
+    is a comma-separated list of Lane values; spaces around an item are
+    not part of it. Every problem is named in one line, so a deploy
+    fixes them in one pass:
+      - nothing but separators and spaces -- a worker that takes no lane
+        delivers nothing; leaving the variable out takes every lane;
+      - an empty item between commas;
+      - an item that is not a lane (exact spelling, the set is closed);
+      - a lane listed twice.
+    """
+    if value is None:
+        return None
+    lanes = ", ".join(lane.value for lane in Lane)
+    items = [item.strip() for item in value.split(",")]
+    if not any(items):
+        return (
+            f"COMMS_WORKER_LANES={value!r} names no lane: a worker that "
+            f"takes no lane delivers nothing. Leave it unset to take "
+            f"every lane ({lanes})."
+        )
+    found: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not item:
+            found.append("an empty item between commas")
+        elif item not in {lane.value for lane in Lane}:
+            found.append(f"{item!r} is not a lane")
+        elif item in seen:
+            found.append(f"{item!r} is listed twice")
+        else:
+            seen.add(item)
+    if not found:
+        return None
+    return (
+        f"COMMS_WORKER_LANES={value!r}: {'; '.join(found)}. "
+        f"Lanes: {lanes}."
     )
 
 

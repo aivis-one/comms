@@ -145,39 +145,42 @@ class TestBatches:
 
 
 class TestAgainstTheRelay:
-    async def test_a_held_row_in_a_later_batch_waits_for_the_relay_only(
+    async def test_a_job_owing_a_push_is_not_waited_for_nor_deleted(
         self, batch_of_two: None,
     ) -> None:
-        """Batches of two; the relay has deleted (and not committed) the
-        outbox row of one expired job. The cleanup's cascade waits for
-        the relay -- which waits for nobody -- the relay commits, the
-        cleanup goes on to the end. Every job gone, no outbox row left,
-        none lost (the relay's row was published and deleted)."""
+        """Batches of two; five expired jobs each owe a push, and the
+        relay has deleted (and not committed) the outbox row of one.
+
+        Until H7 this test held that the cleanup's cascade WAITED for
+        the relay on that row and then deleted all five -- true while
+        the cleanup deleted jobs whatever they owed: the cascade took
+        their outbox rows (H2's race). H7 made the cleanup skip a job
+        whose push is still owed (delete_expired_notifications_batch,
+        an anti-join on push_outbox), so the race is gone, not just
+        survived: the relay's uncommitted delete still shows the row,
+        the job is skipped, nothing waits. After the relay commits, the
+        next pass deletes that one job; the four whose pushes are still
+        owed stay, rows and all."""
         ids = [await _job(owed=True) for _ in range(5)]
         async with get_session_factory()() as session:
             rows = list((await session.execute(
-                select(PushOutbox.id).order_by(PushOutbox.id)
-            )).scalars())
+                select(PushOutbox.id, PushOutbox.notification_id)
+                .order_by(PushOutbox.id)
+            )).all())
+        published_row, published_job = rows[-1]
         factory = get_session_factory()
         async with factory() as r:
-            assert await relay.delete_published(r, [rows[-1]]) == 1
-            cleanup = asyncio.ensure_future(cleanup_expired_notifications())
-            waiting = 0
-            for _ in range(int(_BOUND / _POLL)):
-                async with factory() as observer:
-                    waiting = (await observer.execute(text(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE wait_event_type = 'Lock' "
-                        "AND query ILIKE 'DELETE FROM notifications%'"
-                    ))).scalar_one()
-                if waiting or cleanup.done():
-                    break
-                await asyncio.sleep(_POLL)
-            assert waiting == 1 and not cleanup.done()
+            assert await relay.delete_published(r, [published_row]) == 1
+            # No wait: the pass ends while the relay's delete is open.
+            assert await asyncio.wait_for(
+                cleanup_expired_notifications(), _BOUND,
+            ) == 0
             await r.commit()
-        assert await cleanup == 5
-        assert await _left(*ids) == 0
+        assert await _left(*ids) == 5
+        assert await cleanup_expired_notifications() == 1
+        assert await _left(published_job) == 0
+        assert await _left(*ids) == 4
         async with factory() as session:
             assert (await session.execute(
                 select(func.count()).select_from(PushOutbox)
-            )).scalar_one() == 0
+            )).scalar_one() == 4

@@ -80,7 +80,7 @@ from app.core.exceptions import (
     ValidationError,
     conflict_class,
 )
-from app.engine.formatters import sanitize_text, sanitized_traceback
+from app.core.sanitize import sanitize_text, sanitized_traceback
 from app.transport.connection import redis_client
 from app.transport.events import parse_event
 from app.transport.handlers import HandleResult, handle_event
@@ -291,7 +291,7 @@ class StreamConsumer:
                 # Not logger.exception(): the renderer would print the
                 # chain raw -- an OperationalError's text is its SQL and
                 # bound parameters. Same event, level and `exception`
-                # key, redacted (app/engine/formatters.py).
+                # key, redacted (app/core/sanitize.py).
                 logger.error(
                     "event_unexpected_error",
                     entry_id=_id_str(entry_id),

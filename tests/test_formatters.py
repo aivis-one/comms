@@ -37,6 +37,7 @@ from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import Settings
+from app.core.sanitize import sanitize_error, sanitize_text, sanitized_traceback
 from app.engine.constants import DeliveryChannel, FailureClass
 from app.engine.formatters import (
     ChannelRegistry,
@@ -48,9 +49,6 @@ from app.engine.formatters import (
     build_formatters,
     close_formatters,
     get_formatter,
-    sanitize_error,
-    sanitize_text,
-    sanitized_traceback,
 )
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import _deliver_single
@@ -78,6 +76,10 @@ def _notification(**overrides: Any) -> Notification:
     """Transient Notification for formatter unit tests (no DB)."""
     defaults: dict[str, Any] = {
         "type": "unit_event",
+        # NOT NULL on the table (migration 0024): the delivery reads the
+        # job's lane for its timeout (P4-3), so a hand-built job carries
+        # one like every job that reaches it.
+        "lane": "normal",
         "title": "Hello",
         "body": "World",
         "target_type": "user",

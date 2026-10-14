@@ -338,7 +338,8 @@ async def consume_close_notifications(
     limit: int = _CLOSE_NOTIFY_BATCH_SIZE,
 ) -> int:
     """Item 2: emit the close notice for flagged section threads, clear
-    the flag. Runs EVERY worker tick -- unlike the auto-close scan over
+    the flag. Runs on EVERY pass of the worker's maintenance loop
+    (app/worker.py run_maintenance_pass) -- unlike the auto-close scan over
     a growing table (its own slow gate), this hits a partial index over
     a NORMALLY-EMPTY set (the flag is transient: set on close, cleared
     here), so it is cheap and prompt.

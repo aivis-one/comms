@@ -548,7 +548,11 @@ class TestGrid:
 
         with (
             patch("app.engine.service.get_formatter", return_value=_Slow()),
-            patch("app.engine.service._DELIVER_TIMEOUT_SECONDS", 0.05),
+            # The job's lane's timeout (normal, the fixture type's) --
+            # the one module constant it replaced is gone (P4-3).
+            patch.object(
+                settings, "notification_lane_normal_deliver_timeout_seconds", 0.05,
+            ),
         ):
             await process_pending_notifications()
         (answer,) = _of(await _rows(nid), subject=JournalSubject.CHANNEL)
@@ -999,7 +1003,8 @@ _POINTS: dict[tuple[str, str], str] = {
     ),
     # Not a transition: the gate that let a successful attempt through
     # is cleared; the attempt's transitions are recorded by its steps.
-    ("app/engine/processor.py", "process_pending_notifications"): ("not a transition"),
+    # (The attempt moved into the lane's pass in P4-1.)
+    ("app/engine/processor.py", "process_lane"): ("not a transition"),
     # Thread statuses (messaging), not jobs or deliveries.
     ("app/messaging/status.py", "set_status"): "thread",
     ("app/messaging/status.py", "apply_client_message_reopen"): "thread",

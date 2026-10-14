@@ -21,10 +21,17 @@
 # everywhere: uvicorn, alembic, pytest -- without `pip install -e .`.
 # =============================================================================
 
+# THE BASE IMAGE IS PINNED BY DIGEST (H10), the tag kept for the reader
+# and for Dependabot (.github/dependabot.yml, ecosystem docker): a tag
+# moves -- python:3.12-slim moved to Debian 13 under every build that
+# pulled it -- and only the digest says which image a build gets. Both
+# stages name the same one (tests/test_image_pins.py holds that). A new
+# digest arrives as a Dependabot pull request into `test`, never quietly.
+
 # ---------------------------------------------------------------------------
 # Stage 1: Builder -- install all dependencies
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a AS builder
 
 WORKDIR /build
 
@@ -58,7 +65,7 @@ RUN python -m venv /opt/venv && \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a AS runtime
 
 WORKDIR /app
 

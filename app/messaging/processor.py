@@ -36,7 +36,7 @@ class AutoClosePassError(Exception):
     WHY RAISED AND NOT LOGGED HERE: the log line of a failure carries
     its traceback, and the traceback must be redacted -- a database
     error can print the connection URL. The redactor is the engine's
-    (app/engine/formatters.py, sanitized_traceback), and this module
+    (app/core/sanitize.py, sanitized_traceback), and this module
     is engine-free by rule. So the pass rolls back and raises; the
     neutral layer that schedules it (app/worker.py) logs the failure,
     redacted, under the same event as before.

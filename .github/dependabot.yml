@@ -10,11 +10,34 @@ updates:
       python:
         patterns: ["*"]
 
+  # Container images are pinned by digest, the tag kept for the line
+  # (H10): a new digest or a newer tag of the same line comes as a pull
+  # request into `test`. A new major line (Postgres 17, Redis 8) -- and
+  # for Python a new minor, 3.13 being a new line -- is a decision, not
+  # an update, so it is ignored here.
+  #
+  # The Dockerfile: python:<tag>@sha256:... in both stages.
   - package-ecosystem: "docker"
     directory: "/"
     target-branch: "test"
     schedule:
       interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor"]
+
+  # deploy/docker-compose.yml: comms-postgres and comms-redis. CI reads
+  # its Postgres from this file, so this entry keeps CI's too.
+  - package-ecosystem: "docker-compose"
+    directory: "/deploy"
+    target-branch: "test"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"

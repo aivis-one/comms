@@ -143,13 +143,26 @@ services:
       - aivis-shared
 
   comms-postgres:
-    image: postgres:16
+    # Pinned by digest, like every image comms names (H10): a tag such as
+    # postgres:16 resolves to whatever was pulled last on each box -- two
+    # boxes were on 16.14 and 16.15 under one tag. The tag stays for the
+    # reader and for Dependabot (.github/dependabot.yml, ecosystem
+    # docker-compose), which brings a new digest as a pull request into
+    # `test`. CI runs this same image (.github/workflows/ci.yml reads it
+    # from here). tests/test_image_pins.py holds the pins.
+    image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
     container_name: comms-postgres
     env_file:
       - ./.env
     # NO published port (unlike the product's postgres): nothing on
     # the host needs it; the CLI's `db` subcommand goes through
     # `docker compose exec`.
+    # max_connections WRITTEN, not left to the image's default (H7):
+    # every comms process's pool at full overflow, the worker's wake
+    # listener and the connections outside any pool must fit it --
+    # app/core/database.py POOLS, held against this line and the
+    # --workers of comms-app by tests/test_connection_budget.py.
+    command: ["postgres", "-c", "max_connections=100"]
     volumes:
       - comms_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -162,7 +175,8 @@ services:
       - aivis-shared
 
   comms-redis:
-    image: redis:7-alpine
+    # Pinned by digest -- see comms-postgres above.
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
     container_name: comms-redis
     env_file:
       - ./.env

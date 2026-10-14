@@ -15,11 +15,20 @@
 #   drain terminal notifications past retention (Phase 3a item 5).
 #
 # CALLED BY:
-#   app/engine/worker.py (run_notification_batch) for the delivery
-#   pipeline + expiry; app/worker.py for the retention pass on its own
-#   cadence. The worker LOOP and all maintenance scheduling live in
-#   app/worker.py (the neutral layer above engine and messaging), which
-#   keeps `engine` messaging-free (Phase 4b, edit 3).
+#   app/worker.py: one loop per lane of the process calls process_lane;
+#   the maintenance loop calls app/engine/worker.py
+#   (run_engine_maintenance: the expiry sweep + the expired cleanup)
+#   and the retention pass on its own cadence. The worker LOOPS and all
+#   maintenance scheduling live in app/worker.py (the neutral layer
+#   above engine and messaging), which keeps `engine` messaging-free
+#   (Phase 4b, edit 3). process_pending_notifications is the same steps
+#   in one call.
+#
+# LANES (P4-1, spec §8): a job carries the lane of its type
+# (notifications.lane, snapshotted at intake). Each lane is selected by
+# its own query with its own batch size, and its jobs deliver in its own
+# slots (app/engine/service.py LANE_CONCURRENCY) -- a backlog or a slow
+# channel in one lane takes nothing from another.
 #
 # SESSION MANAGEMENT:
 #   Each notification is processed in its own session/transaction.
@@ -27,8 +36,11 @@
 #
 # CONCURRENCY:
 #   SELECT ... FOR NO KEY UPDATE SKIP LOCKED prevents double-processing
-#   when multiple worker instances run concurrently (the lock rule is
-#   written at the lock itself, in process_pending_notifications).
+#   when multiple worker instances -- or several lane loops of one
+#   instance -- run concurrently (the lock rule is written at the lock
+#   itself, in process_lane). A job is in exactly one lane, so two lane
+#   loops of one process never select the same row; the pair they form
+#   is the one two worker processes already formed.
 #
 # RETRY:
 #   Selects both PENDING and PROCESSING notifications. PROCESSING
@@ -41,7 +53,9 @@
 # a future scheduled_at simply waits its turn.
 #
 # EXPIRE LOGIC:
-#   Expires both PENDING and PROCESSING notifications past expiry_at.
+#   Expires both PENDING and PROCESSING notifications past expiry_at,
+#   of the process's lanes only (expire_overdue_notifications); the lane
+#   selection skips a job past expiry_at that the sweep has not reached.
 #
 # A PIPELINE DEFECT IS AN OUTCOME (T12):
 #   An exception of comms' own in an attempt (channel answers never get
@@ -71,16 +85,20 @@
 # journal.record_channel_answer.
 # =============================================================================
 
+import asyncio
 import time
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, or_, select
+from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_session_factory
+from app.core.lanes import Lane
+from app.core.sanitize import sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
     DeliveryStatus,
@@ -89,7 +107,6 @@ from app.engine.constants import (
     NotificationStatus,
     PipelineStep,
 )
-from app.engine.formatters import sanitized_traceback
 from app.engine.journal import pipeline_error_of
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
@@ -107,26 +124,73 @@ logger = structlog.get_logger()
 
 
 async def process_pending_notifications() -> int:
-    """Process all pending/processing notifications that are ready.
+    """One pass over this process's lanes: the expiry sweep, then one
+    pass of every lane (process_lane), the lanes concurrently.
 
-    Each notification is processed in its own session/transaction.
-    Pipeline per notification: resolve -> deliver -> rollup.
+    The worker does not call this: it runs the same steps as separate
+    loops -- one per lane and one for maintenance (app/worker.py) -- so
+    that no lane waits for another's pass. This is those steps in one
+    call, for a caller that wants everything due done once.
+
+    A lane that fails does not stop the others: every lane's pass runs
+    to its end, each failure is logged with its lane, and then the
+    first one is raised.
 
     Returns:
-        Number of notifications processed.
+        Number of notifications processed, over the lanes.
+    """
+    lanes = settings.worker_lanes
+    await expire_overdue_notifications(lanes)
+    results = await asyncio.gather(
+        *(process_lane(lane) for lane in lanes), return_exceptions=True,
+    )
+    processed = 0
+    failure: BaseException | None = None
+    for lane, result in zip(lanes, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.error(
+                "lane_pass_error",
+                lane=lane.value,
+                exception=sanitized_traceback(result),
+            )
+            failure = failure or result
+        else:
+            processed += result
+    if failure is not None:
+        raise failure
+    return processed
+
+
+async def expire_overdue_notifications(lanes: Sequence[Lane]) -> int:
+    """Expire the overdue jobs of `lanes` (own session). Returns the
+    number of jobs closed.
+
+    Through the deliveries (F1.3): the waiting ones expire, the job is
+    folded -- a job half of which went out is PARTIAL_SENT, and its
+    waiting deliveries no longer stay PENDING forever.
+
+    ONLY THE LANES OF THIS PROCESS (P4-1): close_notifications locks
+    FOR UPDATE and WAITS for an attempt in flight. A process that takes
+    only `critical` must not wait for a `bulk` attempt of another
+    process; the process that takes `bulk` expires its jobs. A lane no
+    process takes is neither delivered nor expired -- the deploy
+    contract is that the processes' lanes cover all four
+    (deploy/INTEGRATION.md).
+
+    The worker runs this in its maintenance loop, beside the lane loops:
+    the sweep waits for an attempt of this process too, while the
+    attempt's channel answers are journaled in their own sessions -- a
+    KEY SHARE on the job row that does not queue behind the waiting
+    FOR UPDATE (tests/test_lanes.py, the race of attempt and expiry).
     """
     factory = get_session_factory()
     now = datetime.now(UTC)
-
-    # -- Step 0: Expire overdue notifications (own session) --
-    # Through the deliveries (F1.3): the waiting ones expire, the job is
-    # folded -- a job half of which went out is PARTIAL_SENT, and its
-    # waiting deliveries no longer stay PENDING forever.
     async with factory() as session:
         try:
             expired_count = await close_notifications(
                 session,
                 and_(
+                    Notification.lane.in_([lane.value for lane in lanes]),
                     Notification.expiry_at.isnot(None),
                     Notification.expiry_at < now,
                 ),
@@ -141,50 +205,104 @@ async def process_pending_notifications() -> int:
                 "notification_expire_error",
                 exception=sanitized_traceback(exc),
             )
+            return 0
+    return expired_count
 
-    # -- Step 1: Collect IDs of notifications to process --
+
+def not_expired(now: datetime) -> ColumnElement[bool]:
+    """A job not yet past its expiry. P4-1: the expiry sweep runs in its
+    own loop, not just before a lane's selection; a job past its expiry
+    that the sweep has not reached yet is not attempted -- and not
+    waiting either: the sweep will close it, not a delivery."""
+    return or_(Notification.expiry_at.is_(None), Notification.expiry_at > now)
+
+
+def ready_now(now: datetime) -> ColumnElement[bool]:
+    """THE condition of a job a lane's pass may attempt now -- one place,
+    read by the pass (process_lane) and by the lane depth
+    (app/engine/depth.py, H8), so the depth's "ready" is exactly what
+    the next pass would select, its batch limit aside: pending, or
+    processing with a delivery due; scheduled; past its pipeline gate
+    (T12); not expired."""
+    ready_delivery = (
+        select(NotificationDelivery.id)
+        .where(
+            NotificationDelivery.notification_id == Notification.id,
+            NotificationDelivery.status == DeliveryStatus.PENDING,
+            or_(
+                NotificationDelivery.next_retry_at.is_(None),
+                NotificationDelivery.next_retry_at <= now,
+            ),
+        )
+        .exists()
+    )
+    return and_(
+        or_(
+            Notification.status == NotificationStatus.PENDING,
+            and_(
+                Notification.status == NotificationStatus.PROCESSING,
+                ready_delivery,
+            ),
+        ),
+        Notification.scheduled_at <= now,
+        or_(
+            Notification.pipeline_retry_at.is_(None),
+            Notification.pipeline_retry_at <= now,
+        ),
+        not_expired(now),
+    )
+
+
+async def process_lane(
+    lane: Lane, on_more: Callable[[], None] | None = None,
+) -> int:
+    """One pass of one lane: select its due jobs, at most the lane's
+    batch size, and attempt them one after another, each in its own
+    session/transaction. Pipeline per notification: resolve -> deliver
+    -> rollup.
+
+    ONE PORTION PER JOB PER PASS (H7): an attempt delivers at most one
+    round of the lane's slots (app/engine/service.py delivery_portion)
+    and commits, so it never holds the job's row, a connection and the
+    change feed's xmin for a whole audience. A job with more due goes on
+    in the lane's NEXT pass, selected afresh -- expiry, cancellation and
+    forgetting get the row between two portions, and a job accepted
+    meanwhile is selected beside it. When any attempt of the pass had
+    its portion full, `on_more` is called once, after the pass: the
+    worker passes the lane's wake (app/worker.py), so the next pass
+    follows at once instead of after the interval.
+
+    THE LANE'S BUDGET (P4-1, spec §8.2): the selection names the lane,
+    so another lane's backlog never takes its places; the deliveries of
+    a job run in the lane's own slots (app/engine/service.py
+    LANE_CONCURRENCY), and the lane's jobs go one at a time, so one
+    lane never holds more than its slots. Isolation, not priority: no
+    lane is picked before another -- each has its own loop.
+
+    Returns:
+        Number of notifications processed.
+    """
+    factory = get_session_factory()
+    now = datetime.now(UTC)
+    started = time.monotonic()
+
+    # -- Step 1: Collect IDs of the lane's notifications to process --
     # Review 1.2: PENDING rows are always ready (not yet resolved).
     # PROCESSING rows are picked only when at least one delivery is
     # actually attemptable (pending + retry gate open) -- otherwise a
-    # gated notification would be locked and no-op'ed every tick, and
-    # the no-op "processed" count would keep the worker loop from
+    # gated notification would be locked and no-op'ed every pass, and
+    # the no-op "processed" count would keep the lane's loop from
     # backing off for the whole backoff window.
     async with factory() as session:
-        ready_delivery = (
-            select(NotificationDelivery.id)
-            .where(
-                NotificationDelivery.notification_id == Notification.id,
-                NotificationDelivery.status == DeliveryStatus.PENDING,
-                or_(
-                    NotificationDelivery.next_retry_at.is_(None),
-                    NotificationDelivery.next_retry_at <= now,
-                ),
-            )
-            .exists()
-        )
         stmt = (
             select(Notification.id)
-            .where(
-                or_(
-                    Notification.status == NotificationStatus.PENDING,
-                    and_(
-                        Notification.status == NotificationStatus.PROCESSING,
-                        ready_delivery,
-                    ),
-                ),
-                Notification.scheduled_at <= now,
-                # T12: a job whose pipeline failed waits behind its gate.
-                or_(
-                    Notification.pipeline_retry_at.is_(None),
-                    Notification.pipeline_retry_at <= now,
-                ),
-            )
-            # Oldest due first. Priority left the ordering with the
-            # column (F1.4); isolation is the job of lanes (phase 4).
+            .where(Notification.lane == lane.value, ready_now(now))
+            # Oldest due first within the lane. Priority left the
+            # ordering with the column (F1.4); isolation is the lane's.
             .order_by(Notification.scheduled_at)
-            # Review 1.1: cap the batch; the tail is picked up on the
-            # next tick (the worker loop is eternal anyway).
-            .limit(settings.notification_batch_size)
+            # Review 1.1: cap the batch -- the lane's own (P4-1); the
+            # tail is picked up on the lane's next pass.
+            .limit(settings.lane_batch_size(lane))
         )
         result = await session.execute(stmt)
         notification_ids = [row[0] for row in result.all()]
@@ -194,6 +312,7 @@ async def process_pending_notifications() -> int:
 
     # -- Step 2: Process each notification in its own session --
     processed = 0
+    more = False
     for notif_id in notification_ids:
         step = PipelineStep.LOCK
         async with factory() as session:
@@ -236,9 +355,9 @@ async def process_pending_notifications() -> int:
                 step = PipelineStep.RESOLVE
                 await resolve_notification(session, notification)
 
-                # deliver
+                # deliver -- one portion
                 step = PipelineStep.DELIVER
-                await deliver_notification(session, notification)
+                portion_full = await deliver_notification(session, notification)
 
                 # rollup
                 step = PipelineStep.ROLLUP
@@ -251,6 +370,7 @@ async def process_pending_notifications() -> int:
                 step = PipelineStep.COMMIT
                 await session.commit()
                 processed += 1
+                more = more or portion_full
 
             except Exception as exc:
                 await session.rollback()
@@ -262,11 +382,18 @@ async def process_pending_notifications() -> int:
                 )
                 await _record_pipeline_failure(notif_id, step, exc)
 
+    # Every pass with work logs its lane and duration: a pass far longer
+    # than the poll interval is a lane whose channel is slow -- visible
+    # per lane, and no longer anyone else's wait.
     logger.info(
         "notifications_processed",
+        lane=lane.value,
         total=len(notification_ids),
         processed=processed,
+        duration_ms=round((time.monotonic() - started) * 1000, 1),
     )
+    if more and on_more is not None:
+        on_more()
     return processed
 
 
@@ -461,6 +588,9 @@ async def cleanup_expired_notifications() -> int:
       - expiry_at < now()
       - status is an outcome other than failed (a failure is kept for
         inspection until general retention takes it)
+      - no push is owed for them (H7): a job whose push_outbox row the
+        relay has not published yet waits for it -- the cascade would
+        take the push with the job (delete_expired_notifications_batch)
 
     Suppressed, no-recipients and cancelled are outcomes like sent: an
     expired one is as dead as an expired sent one. General retention of terminal
@@ -477,10 +607,12 @@ async def cleanup_expired_notifications() -> int:
     skipped, tick after tick.
 
     AT MOST _EXPIRED_MAX_BATCHES_PER_PASS BATCHES (H5): this runs on
-    EVERY worker tick, on the delivery path, so one pass stops at the
-    ceiling and leaves the rest of a backlog to the next tick -- the
-    next tick comes within the poll interval. A pass also stops on a
-    short batch: nothing more is expired.
+    EVERY pass of the worker's maintenance loop (app/worker.py), so one
+    pass stops at the ceiling and leaves the rest of a backlog to the
+    next pass -- which comes at the poll interval, since a pass that
+    deleted something keeps the loop from backing off. A pass also
+    stops on a short batch: nothing more is expired. (Since P4-1 the
+    loop runs beside the lane loops, not on the delivery path.)
 
     Returns:
         Number of notifications deleted in this pass, over its batches.
@@ -524,8 +656,8 @@ async def cleanup_expired_notifications() -> int:
 _RETENTION_BATCH_SIZE = 1000
 
 # H5: batches one expiry-cleanup pass deletes at most -- a backlog of
-# _EXPIRED_MAX_BATCHES_PER_PASS x _RETENTION_BATCH_SIZE jobs a tick,
-# the rest on the next tick. Module-level so tests can shrink it.
+# _EXPIRED_MAX_BATCHES_PER_PASS x _RETENTION_BATCH_SIZE jobs a pass,
+# the rest on the next pass. Module-level so tests can shrink it.
 _EXPIRED_MAX_BATCHES_PER_PASS = 10
 
 

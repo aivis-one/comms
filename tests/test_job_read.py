@@ -584,7 +584,15 @@ class TestNoLetter:
                 )
             ).one()
         assert stored.title == _TITLE_SENTINEL
-        assert _ERROR_SENTINEL in (stored.error_message or "")
+        # Until H8 the comms error text was stored too (and only kept out
+        # of the answers); since H8 the delivery keeps the journal's
+        # reading of comms' own exception -- its class and place, never
+        # its text (journal.answer_text). The pair: it is there.
+        assert _ERROR_SENTINEL not in (stored.error_message or "")
+        assert re.fullmatch(
+            r"tests\.test_job_read\..*\._DefectError at app/engine/service\.py:\d+",
+            stored.error_message or "",
+        )
         answers = [
             (await _read(bare_client, key, tail)).text
             for tail in ("", "/deliveries", "/path")

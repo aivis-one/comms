@@ -18,10 +18,8 @@
 #                  else -- into comms' own push stream, in the same
 #                  consumer process.
 #
-# Package DAG position: transport sits at the top, next to api --
-#
-#   core <- profile <- {engine, audience} <- {api, transport}
-#   engine -> audience
+# Package graph position: rank 5, next to api, under the processes
+# (the whole table: app/__init__.py, held by tests/test_h9_release.py).
 #
 # Model B split (arch): the PRODUCT owns the domain and maps domain
 # events to notification types / group targets in its own outbox; the

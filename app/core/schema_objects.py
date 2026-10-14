@@ -158,13 +158,15 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "(recipient_id, status, read_at)"
         ),
     ),
-    # The processor's pick order (F1.4: priority left the ordering and
-    # the table; the index was recreated without it).
-    "ix_notifications_status_scheduled": IndexShape(
+    # Each lane's pick, in pick order (P4-1, migration 0024): equality on
+    # lane and status, a range on scheduled_at
+    # (app/engine/processor.py process_lane). It replaced the lane-less
+    # (status, scheduled_at) of F1.4.
+    "ix_notifications_lane_status_scheduled": IndexShape(
         unique=False,
         definition=(
-            "CREATE INDEX ix_notifications_status_scheduled "
-            "ON public.notifications USING btree (status, scheduled_at)"
+            "CREATE INDEX ix_notifications_lane_status_scheduled "
+            "ON public.notifications USING btree (lane, status, scheduled_at)"
         ),
     ),
     # The expiry cleanup's batch select, in expiry order, over the rows
@@ -182,6 +184,16 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "'cancelled'::character varying, "
             "'suppressed'::character varying, "
             "'no_recipients'::character varying])::text[])))"
+        ),
+    ),
+    # A job's waiting deliveries (H9, migration 0025): the fold's probe
+    # "does any still wait?" (app/engine/service.py rollup_notification).
+    "ix_notification_deliveries_pending": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notification_deliveries_pending "
+            "ON public.notification_deliveries USING btree (notification_id) "
+            "WHERE ((status)::text = 'pending'::text)"
         ),
     ),
     # A repeated resource call answers with the row it created (F1.4).
@@ -332,6 +344,9 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # Whether a job waits for the recipient's schedule is one of the
     # two RecipientSchedule values, never NULL (H3, migration 0022).
     "ck_notifications_recipient_schedule",
+    # A job's lane is one of the four Lane values, never NULL (P4-1,
+    # migration 0024).
+    "ck_notifications_lane",
 })
 
 # Everything the schema must carry although the metadata never mentions

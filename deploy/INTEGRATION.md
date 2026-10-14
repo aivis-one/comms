@@ -141,6 +141,67 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+### `lane` -- which lane a type's jobs travel in
+
+comms delivers in four lanes, each with its own budget: its own
+selection of due jobs, its own number of jobs per pass, its own slots
+for channel calls, its own loop in the worker. A backlog or a slow
+channel in one lane takes nothing from another. A type declares its
+lane in its record in `types.yaml`:
+
+    lane: interactive
+
+| value | for | the type's jobs |
+|---|---|---|
+| `interactive` | someone waits for the answer right now (a login code) | small passes, a few slots of their own |
+| `critical` | a failure costs money | capacity no other lane can take |
+| `normal` | notifications | today's behavior -- the default, for a type that does not declare it |
+| `bulk` | large sends | may wait; one slot, so a mass send never holds anyone else's |
+
+What a lane does: it ISOLATES. A bulk backlog of any size does not delay
+an `interactive` job by one pass, and a slow channel call in one lane
+does not hold another lane's loop.
+
+What a lane does NOT do. It is not a priority: no lane is picked before
+another, each simply has its own. It passes no gate: a mute, the
+recipient's schedule (unless the type declares `recipient_schedule:
+bypass`, below), the retry rules and `expiry_at` behave as for any
+type. And it does not make a channel faster: a slow provider is as slow
+in `interactive` as anywhere -- only no longer at anyone else's cost.
+
+A job is picked up as soon as it is accepted, in every lane: accepting
+it wakes the loop of its lane in each worker that takes that lane, so an
+idle worker does not hold it for its poll interval. The wake only speeds
+things up: a lost one (the worker's listening connection down) falls
+back to the poll -- up to `NOTIFICATION_MAX_BACKOFF_SECONDS` later -- and
+never loses the job. A job that becomes due later (a `scheduled_at` in
+the future, a retry) is picked up by the poll once due.
+
+A lane outside the four refuses startup, like every other field. The
+value is taken when the request is accepted: a job keeps the lane its
+type had then, whatever a later profile says.
+
+**Which worker takes which lane is the deploy's, not the profile's.**
+One worker image takes the lanes named in `COMMS_WORKER_LANES`
+(comma-separated, in the comms `.env`); left out, it takes all four --
+nothing needs to be written for one worker. A second worker of the
+same image may take a subset, e.g. `COMMS_WORKER_LANES=critical` next
+to one with `interactive,normal,bulk`. **The worker processes of a
+deploy together must take all four lanes:** a lane no process takes is
+neither delivered nor expired -- its jobs stay pending. Nothing fails
+on it: a worker that takes a subset starts, and says so in one warning
+line, `worker_lanes_partial` (`lanes_not_taken`); the lanes' backlog
+shows in `GET /api/v1/lanes/depth`. Each worker names its lanes and
+their budgets in its startup log line, `notification_worker_started`
+(`lanes`, `lane_budgets`). Written but empty, an unknown lane or a lane listed
+twice refuses startup, naming the variable.
+
+Each lane also has its own timeout for one channel call,
+`NOTIFICATION_LANE_<LANE>_DELIVER_TIMEOUT_SECONDS` (30 by default, in
+`lane_budgets` as `deliver_timeout`); it must be above the client
+timeout of every channel live on the deploy, and a lane at or below
+one refuses startup, naming the variable and the channel.
+
 ### `recipient_schedule` -- a type that does not wait for the schedule
 
 A recipient's schedule (section 6) holds every delivery outside their
@@ -473,6 +534,41 @@ the keys are there and the provider refuses them -- fix the deploy.
 Suppressed recipients and scheduled waits are not channel answers and
 are not counted. Answers are counted from comms' own transition record;
 nothing is stored as "health", and comms acts on none of it.
+
+### Lane depth
+
+How many jobs wait in each lane right now -- the backlog of a lane no
+worker takes (`COMMS_WORKER_LANES` without it) grows here and nowhere
+else:
+
+    GET /api/v1/lanes/depth
+
+Behind the service token like every `/api/v1` route; read only, one
+snapshot; `GET /health` is unchanged.
+
+```json
+{
+  "lanes": {
+    "interactive": {"ready": 0, "waiting": 0, "oldest_ready_seconds": null},
+    "critical": {"ready": 0, "waiting": 0, "oldest_ready_seconds": null},
+    "normal": {"ready": 3, "waiting": 12, "oldest_ready_seconds": 4.2},
+    "bulk": {"ready": 250, "waiting": 0, "oldest_ready_seconds": 812.5}
+  }
+}
+```
+
+Every lane is listed, each with every key, zeros included -- an absent
+key never means zero.
+
+| field | meaning |
+|---|---|
+| `ready` | jobs the lane's next pass would take now -- the lane's own selection, its batch size aside |
+| `waiting` | jobs still under way but not ready yet: scheduled for later, waiting out a retry, behind a pipeline failure's backoff |
+| `oldest_ready_seconds` | how long the oldest ready job has been due; **`null` when none is ready** |
+
+A job past its expiry that comms has not closed yet is in neither: it
+will be closed, not delivered. The counts are read from the jobs at the
+moment of the request; nothing is stored as "depth".
 
 ### Reconciling the address book
 

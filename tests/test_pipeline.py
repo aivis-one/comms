@@ -255,7 +255,10 @@ class TestDeliverAndRollup:
             assert delivery.status == DeliveryStatus.PENDING
             assert delivery.attempts == 1
             assert delivery.error_message is not None
-            assert "boom transient" in delivery.error_message
+            # Since H8: comms' own exception (this formatter is comms
+            # code) is kept as class and place, not its text.
+            assert "boom transient" not in delivery.error_message
+            assert delivery.error_message.startswith("builtins.RuntimeError at ")
             assert delivery.next_retry_at is not None
 
             fresh = await _fetch_notification(notification.id)
@@ -580,7 +583,7 @@ class TestBatchLimit:
     async def test_limit_and_next_tick_pickup(
         self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(settings, "notification_batch_size", 2)
+        monkeypatch.setattr(settings, "notification_lane_normal_batch_size", 2)
         recipient = await create_recipient(db_session)
         for index in range(3):
             await create_notification(

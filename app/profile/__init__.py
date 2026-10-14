@@ -10,10 +10,8 @@
 # cycle that would otherwise appear with the HTTP api package:
 # audience/prefs validates categories against the registry, and the
 # engine consumes the registry too -- so the profile concern must sit
-# BELOW both. Resulting package DAG (arrows = imports):
-#
-#   core <- profile <- {engine, audience} <- api
-#   engine -> audience
+# BELOW both. Its rank in the package graph: 1, above core only (the
+# whole table: app/__init__.py, held by tests/test_h9_release.py).
 #
 # No behavior change: a mechanical move of registry.py and
 # engine/profile.py (renamed loader.py -- app/profile/profile.py would

@@ -276,40 +276,34 @@ class TestTwoRelays:
 
 
 class TestTheExpiryCleanup:
-    """The second deleter: cleanup_expired_notifications, one statement
-    in its own transaction. R holds a (deleted, not yet committed); the
-    cleanup's cascade waits for it -- and R, which never waits, commits;
-    both reach the end, and no row is lost."""
+    """The second deleter: cleanup_expired_notifications.
+
+    Until H7 the cleanup deleted X and Y whatever they owed, its cascade
+    WAITED for R on a, and the test held that both reached the end with
+    no row lost -- true then. H7 made the cleanup skip a job whose push
+    is still owed (delete_expired_notifications_batch, an anti-join on
+    push_outbox): the cascade never reaches an outbox row, so it never
+    meets R. Held now, more precisely: with R open the cleanup deletes
+    nothing and does not wait; R committed, the next pass deletes X
+    (its push published) and keeps Y (b still owed); R rolled back,
+    both stay, rows and all."""
 
     @pytest.mark.parametrize("r_commits", [True, False])
-    async def test_both_sides_reach_the_end(self, r_commits: bool) -> None:
+    async def test_the_cleanup_never_meets_the_relay(self, r_commits: bool) -> None:
         x, y, a, _b = await _jobs()
         factory = get_session_factory()
         async with factory() as r:
             assert await relay.delete_published(r, [a]) == 1
-            cleanup = _later(cleanup_expired_notifications())
-            # The cleanup runs in a session of its own; it is seen
-            # waiting by its statement, not by its pid.
-            for _ in range(int(_BOUND / _POLL)):
-                async with factory() as observer:
-                    waiting = (await observer.execute(text(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE wait_event_type = 'Lock' "
-                        "AND query ILIKE 'DELETE FROM notifications%'"
-                    ))).scalar_one()
-                if waiting or cleanup.done():
-                    break
-                await asyncio.sleep(_POLL)
-            assert not cleanup.done()
-            assert waiting == 1
+            assert await asyncio.wait_for(
+                cleanup_expired_notifications(), _BOUND,
+            ) == 0
             if r_commits:
                 await r.commit()
             else:
                 await r.rollback()
-        assert await cleanup == 2
-        # Both jobs gone; their rows with them -- a deleted by R or, R
-        # rolled back, by the cascade; b by the cascade. None left.
-        assert await _count(
-            Notification, Notification.id.in_([x, y]),
-        ) == 0
-        assert await _count(PushOutbox) == 0
+        assert await cleanup_expired_notifications() == (1 if r_commits else 0)
+        assert await _count(Notification, Notification.id == x) == (
+            0 if r_commits else 1
+        )
+        assert await _count(Notification, Notification.id == y) == 1
+        assert await _count(PushOutbox) == (1 if r_commits else 2)
