@@ -77,6 +77,15 @@ MAX_BODY_LEN = 5000
 # ceiling is ours, the product's own limit is the model's context.
 MAX_LLM_LETTER_CHARS = 200_000
 
+# The ceiling of a type's max_audio_bytes (P5-2): an audio body is held
+# in the attempt's memory whole, and once more as base64 in the request
+# -- 20 MiB is about 50 MiB of one attempt's memory.
+MAX_LLM_AUDIO_BYTES = 20 * 1024 * 1024
+
+# The longest signed link to a body (P5-2, `llm_audio.url`): a presigned
+# object URL of an S3-compatible store is a few hundred characters.
+MAX_LLM_AUDIO_URL_LEN = 4096
+
 # The longest name of an llm key set (LLM_KEY_SETS, app/core/channels.py)
 # -- the width of llm_calls / llm_answers columns that hold it.
 MAX_LLM_SET_NAME_LEN = 64

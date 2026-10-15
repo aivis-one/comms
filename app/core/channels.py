@@ -429,6 +429,83 @@ def _llm_key_sets(value: str) -> str | None:
     return "; ".join(complaints) if complaints else None
 
 
+# -- llm: the body of a letter by link (P5-2) ---------------------------------
+#
+# A large body -- a voice recording -- does not travel in the envelope
+# (spec §5.10): the product keeps it in its own object store and puts a
+# SIGNED link to it in the envelope (`llm_audio.url`); comms fetches it
+# on every attempt over the internal network and hands the bytes to the
+# model. A link from a product's envelope is an address comms will GET
+# -- without a limit, a way into every internal service of the box
+# (comms-postgres, comms-redis, comms-app itself). LLM_BODY_HOSTS is the
+# limit: the exact `host:port` pairs a link may point at, comma
+# separated. Empty (the default): this deploy fetches nothing, and an
+# envelope with a link is rejected at intake. A list of what is
+# ALLOWED, never of what is forbidden -- a deny list is never complete.
+
+_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\Z")
+
+
+def parse_llm_body_hosts(value: str) -> tuple[frozenset[tuple[str, int]], list[str]]:
+    """LLM_BODY_HOSTS -> (the allowed (host, port) pairs; complaints).
+    Hosts compare in lower case; no default port -- written out, so the
+    list says exactly what is reached."""
+    allowed: set[tuple[str, int]] = set()
+    complaints: list[str] = []
+    for position, raw in enumerate(value.split(","), start=1):
+        entry = raw.strip()
+        if entry == "":
+            complaints.append(f"entry #{position} is empty")
+            continue
+        host, sep, port = entry.rpartition(":")
+        host = host.lower()
+        if (
+            not sep
+            or _HOST_RE.match(host) is None
+            or not port.isdigit()
+            or not 1 <= int(port) <= 65535
+        ):
+            complaints.append(
+                f"entry #{position} {entry!r} is not host:port (a name or "
+                f"an IPv4 address, a port from 1 to 65535)"
+            )
+            continue
+        pair = (host, int(port))
+        if pair in allowed:
+            complaints.append(f"{host}:{port} is listed twice")
+            continue
+        allowed.add(pair)
+    return frozenset(allowed), complaints
+
+
+def body_endpoint(url: str) -> tuple[str, int]:
+    """(host, port) of a body link, the host in lower case and the port
+    written out -- the form LLM_BODY_HOSTS lists. Only for a link whose
+    form intake accepted (app/transport/events.py validate_llm_audio)."""
+    parts = urlsplit(url)
+    if parts.hostname is None:
+        raise ValueError("a body link without a host")
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return parts.hostname.lower(), port
+
+
+def _llm_body_hosts(value: str) -> str | None:
+    """The form validator of LLM_BODY_HOSTS: every complaint, one line."""
+    _, complaints = parse_llm_body_hosts(value)
+    return "; ".join(complaints) if complaints else None
+
+
+# The client that fetches a body: its own numbers, in this one place.
+# read is per chunk, not for the whole body -- the whole download is
+# bounded by LLM_BODY_DOWNLOAD_TIMEOUT on top of the client, which is
+# above the client's total, so a stalled store times out inside the
+# client first. The job's call bound adds it once (app/engine/service.py).
+LLM_BODY_CLIENT_TIMEOUTS: Mapping[str, float] = {
+    "connect": 5.0, "read": 20.0, "write": 5.0, "pool": 4.0,
+}
+LLM_BODY_DOWNLOAD_TIMEOUT: float = sum(LLM_BODY_CLIENT_TIMEOUTS.values()) + 1.0
+
+
 CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
     ChannelSpec(name="in_app", keys=()),
     ChannelSpec(
@@ -481,6 +558,10 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
         name="llm",
         keys=("LLM_KEY_SETS",),
         validators={"LLM_KEY_SETS": _llm_key_sets},
+        # Defaulted (empty = no body is ever fetched), so not a key that
+        # decides whether llm exists; its form is checked when spelled
+        # out (P5-2).
+        optional_validators={"LLM_BODY_HOSTS": _llm_body_hosts},
         # One call to one set. read is the model writing its answer: a
         # long answer of a slow model takes tens of seconds, and a read
         # timeout here -- unlike a connect timeout -- may leave a paid

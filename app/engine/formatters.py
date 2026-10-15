@@ -68,10 +68,13 @@
 #   startup channel map).
 # =============================================================================
 
+import asyncio
+import base64
+import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from html import escape
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol
@@ -80,8 +83,11 @@ import structlog
 
 from app.audience.models import Recipient
 from app.core.channels import (
+    LLM_BODY_CLIENT_TIMEOUTS,
+    LLM_BODY_DOWNLOAD_TIMEOUT,
     ChannelState,
     LLMKeySet,
+    body_endpoint,
     channel_env_keys,
     channel_spec,
     evaluate_channels,
@@ -259,7 +265,10 @@ class UnavailableChannelFormatter:
         )
 
     async def ask(
-        self, letter: Mapping[str, Any], set_names: Sequence[str],
+        self,
+        letter: Mapping[str, Any],
+        set_names: Sequence[str],
+        audio: Mapping[str, Any] | None = None,
     ) -> "LLMReply":
         """The llm channel absent on this deploy: refused like deliver."""
         logger.error(
@@ -945,6 +954,8 @@ class LLMReply:
     set_name: str
     provider: str | None
     model: str | None
+    # SHA-256 hex of the audio body sent with the letter (P5-2), or None.
+    audio_hash: str | None = None
 
 
 class ModelChannel(Protocol):
@@ -952,9 +963,14 @@ class ModelChannel(Protocol):
     the job's ordered key sets; an answer or a channel exception."""
 
     async def ask(
-        self, letter: Mapping[str, Any], set_names: Sequence[str],
+        self,
+        letter: Mapping[str, Any],
+        set_names: Sequence[str],
+        audio: Mapping[str, Any] | None = None,
     ) -> LLMReply:
         """Ask the model, going down the key sets on transport failures.
+        With `audio` (P5-2), the body is fetched first, once, and sent to
+        every set the call reaches.
 
         Raises:
             RateLimitedError: every set named a wait (the shortest).
@@ -1008,7 +1024,9 @@ class _SetFailure:
 
 
 def build_llm_request(
-    letter: Mapping[str, Any], key_set: LLMKeySet,
+    letter: Mapping[str, Any],
+    key_set: LLMKeySet,
+    audio: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """The chat completions request for one key set.
 
@@ -1021,7 +1039,21 @@ def build_llm_request(
     """
     request: dict[str, Any] = dict(letter.get("params") or {})
     request["model"] = key_set.model
-    request["messages"] = letter["messages"]
+    request["messages"] = list(letter["messages"])
+    if audio is not None:
+        # THE BODY GOES AS ONE MORE MESSAGE, AT THE END (P5-2): nothing in
+        # the letter is searched or changed -- the list is appended to,
+        # as `model` is written. The product writes its prompt knowing
+        # the audio comes last. The data is base64 of the raw bytes, not
+        # a data URI (the input_audio part of the protocol).
+        data, audio_format = audio
+        request["messages"].append({
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": data, "format": audio_format},
+            }],
+        })
     if "response_format" in letter:
         request["response_format"] = letter["response_format"]
     if key_set.gateway:
@@ -1172,6 +1204,25 @@ def fold_llm_failures(failures: Sequence[_SetFailure]) -> Exception:
     )
 
 
+def _body_status_failure(status: int) -> Exception:
+    """The store's answer to a body link that is not 200 (P5-2). Object
+    gone, link expired or refused (403 -- an S3 store's answer to an
+    expired signature), any other 4xx, a redirect (not followed): the
+    message's -- this body will not be fetched. 408, 429, 5xx: the
+    store's weather, transient."""
+    text = f"body download: status {status}"
+    if status >= 500 or status in (408, 429):
+        return LLMTransientError(text)
+    return MessageRejectedError(text)
+
+
+def _body_too_large(size: int, limit: int) -> MessageRejectedError:
+    return MessageRejectedError(
+        f"body download: larger than max_audio_bytes ({size} > {limit}; "
+        f"not read further)"
+    )
+
+
 class LLMFormatter:
     """The llm channel: one OpenAI-compatible adapter (spec §14.12 item 2).
 
@@ -1183,16 +1234,34 @@ class LLMFormatter:
     """
 
     def __init__(
-        self, *, client: Any, sets: Mapping[str, LLMKeySet],
+        self,
+        *,
+        client: Any,
+        sets: Mapping[str, LLMKeySet],
+        body_client: Any = None,
+        body_hosts: frozenset[tuple[str, int]] = frozenset(),
     ) -> None:
-        """Hold the HTTP client and this deploy's key sets."""
+        """Hold the HTTP clients, this deploy's key sets and the hosts a
+        body may be fetched from (LLM_BODY_HOSTS)."""
         self._client = client
         self._sets = dict(sets)
+        self._body_client = body_client
+        self._body_hosts = body_hosts
 
     async def ask(
-        self, letter: Mapping[str, Any], set_names: Sequence[str],
+        self,
+        letter: Mapping[str, Any],
+        set_names: Sequence[str],
+        audio: Mapping[str, Any] | None = None,
     ) -> LLMReply:
         """Ask through the sets in order; see ModelChannel.ask."""
+        body: tuple[str, str] | None = None
+        audio_hash: str | None = None
+        if audio is not None:
+            raw = await self._fetch_body(audio)
+            audio_hash = hashlib.sha256(raw).hexdigest()
+            body = (base64.b64encode(raw).decode("ascii"), audio["format"])
+            del raw
         failures: list[_SetFailure] = []
         for name in set_names:
             key_set = self._sets.get(name)
@@ -1205,9 +1274,9 @@ class LLMFormatter:
                     "not defined in LLM_KEY_SETS on this deploy",
                 ))
                 continue
-            outcome = await self._ask_one(letter, key_set)
+            outcome = await self._ask_one(letter, key_set, body)
             if isinstance(outcome, LLMReply):
-                return outcome
+                return replace(outcome, audio_hash=audio_hash)
             logger.warning(
                 "llm_set_failed",
                 key_set=name,
@@ -1217,11 +1286,81 @@ class LLMFormatter:
             failures.append(outcome)
         raise fold_llm_failures(failures)
 
+    async def _fetch_body(self, audio: Mapping[str, Any]) -> bytes:
+        """The audio body behind its signed link, whole, in memory (P5-2,
+        spec §5.10). Fetched on EVERY attempt -- never stored.
+
+        THE LINK IS USED AS IT CAME and named NOWHERE: not in an
+        exception, not in a log line (the HTTP client's own request
+        lines are held at WARNING, app/core/logging.py). Every failure
+        reads by status or by exception class only.
+
+        A failure of the BODY (refused, gone, expired, too large) is the
+        message's: no set is asked -- every one would get the same bad
+        body. A failure of the STORE is transient.
+        """
+        url: str = audio["url"]
+        limit: int = audio["max_bytes"]
+        if body_endpoint(url) not in self._body_hosts:
+            # Intake checked the host; the list changed since (a restart
+            # with another .env). The deploy's, not the message's.
+            raise ConfigurationError(
+                "body download: the link's host is not in LLM_BODY_HOSTS "
+                "on this deploy"
+            )
+        try:
+            async with asyncio.timeout(LLM_BODY_DOWNLOAD_TIMEOUT):
+                async with self._body_client.stream("GET", url) as response:
+                    status = int(response.status_code)
+                    if status != 200:
+                        raise _body_status_failure(status)
+                    declared = response.headers.get("content-length", "")
+                    if declared.isdigit() and int(declared) > limit:
+                        raise _body_too_large(int(declared), limit)
+                    received = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        received.extend(chunk)
+                        if len(received) > limit:
+                            raise _body_too_large(len(received), limit)
+        except TimeoutError:
+            logger.warning("llm_body_download_failed", outcome="timeout")
+            raise LLMTransientError(
+                "body download: the store did not answer in time"
+            ) from None
+        except PermanentDeliveryError as exc:
+            logger.warning(
+                "llm_body_download_failed",
+                outcome="refused",
+                detail=str(exc),
+            )
+            raise
+        except LLMTransientError as exc:
+            logger.warning(
+                "llm_body_download_failed", outcome="transient", detail=str(exc),
+            )
+            raise
+        except Exception as exc:
+            # Class only, never the text: an HTTP client's exception may
+            # carry the request, and the request is the signed link.
+            logger.warning(
+                "llm_body_download_failed",
+                outcome="transient",
+                error=type(exc).__name__,
+            )
+            raise LLMTransientError(
+                f"body download failed ({type(exc).__name__})"
+            ) from None
+        logger.info("llm_body_downloaded", size=len(received))
+        return bytes(received)
+
     async def _ask_one(
-        self, letter: Mapping[str, Any], key_set: LLMKeySet,
+        self,
+        letter: Mapping[str, Any],
+        key_set: LLMKeySet,
+        body: tuple[str, str] | None,
     ) -> LLMReply | _SetFailure:
         content = json.dumps(
-            build_llm_request(letter, key_set), ensure_ascii=False,
+            build_llm_request(letter, key_set, body), ensure_ascii=False,
         ).encode("utf-8")
         try:
             response = await self._client.post(
@@ -1531,9 +1670,22 @@ def _build_llm(source: Settings, factories: "_Factories") -> _Built:
     async def _close_client() -> None:
         await client.aclose()
 
+    body_client = factories.llm_body_client()
+
+    async def _close_body_client() -> None:
+        await body_client.aclose()
+
     return _Built(
-        model=LLMFormatter(client=client, sets=source.llm_sets),
-        closers=[("llm_http_client", _close_client)],
+        model=LLMFormatter(
+            client=client,
+            sets=source.llm_sets,
+            body_client=body_client,
+            body_hosts=source.llm_body_host_set,
+        ),
+        closers=[
+            ("llm_http_client", _close_client),
+            ("llm_body_client", _close_body_client),
+        ],
     )
 
 
@@ -1583,6 +1735,7 @@ class _Factories:
     bot: BotFactory
     http_client: HttpClientFactory
     llm_http_client: HttpClientFactory
+    llm_body_client: HttpClientFactory
 
 
 # One builder per implemented channel (app/core/channels.py
@@ -1607,6 +1760,7 @@ def build_formatters(
     bot_factory: BotFactory,
     http_client_factory: HttpClientFactory | None = None,
     llm_http_client_factory: HttpClientFactory | None = None,
+    llm_body_client_factory: HttpClientFactory | None = None,
 ) -> ChannelRegistry:
     """Build the formatter of every channel from validated settings.
 
@@ -1619,6 +1773,9 @@ def build_formatters(
         http_client=http_client_factory or _real_http_client_factory,
         llm_http_client=(
             llm_http_client_factory or _real_llm_http_client_factory
+        ),
+        llm_body_client=(
+            llm_body_client_factory or _real_llm_body_client_factory
         ),
     )
     formatters: dict[str, ChannelFormatter] = {}
@@ -1690,6 +1847,26 @@ def _real_llm_http_client_factory() -> Any:
 
     timeouts = channel_spec(DeliveryChannel.LLM).client_timeouts
     return httpx.AsyncClient(timeout=httpx.Timeout(**timeouts))
+
+
+def _real_llm_body_client_factory() -> Any:
+    """The client that fetches a letter's body by its link (P5-2).
+
+    trust_env=False: the link is fetched AS IT IS -- the same host and
+    port, over the internal network, never through a proxy the
+    environment names (HTTP(S)_PROXY), and with no credentials from a
+    .netrc. Redirects are not followed: a link that redirects is not the
+    object (app/core/channels.py LLM_BODY_HOSTS bounds where it may
+    point; a redirect would leave that bound). Its numbers are
+    LLM_BODY_CLIENT_TIMEOUTS.
+    """
+    import httpx
+
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(**LLM_BODY_CLIENT_TIMEOUTS),
+        trust_env=False,
+        follow_redirects=False,
+    )
 
 
 def llm_set_map(source: Settings) -> dict[str, dict[str, Any]]:

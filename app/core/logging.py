@@ -119,6 +119,22 @@ def _sanitize_handlers() -> None:
                 handler.setFormatter(SanitizingFormatter(handler.formatter))
 
 
+# The HTTP client's own loggers write every request at INFO with its
+# FULL address -- `HTTP Request: GET <url> "HTTP/1.1 200 OK"` (httpx
+# _client.py). An address can be a secret: the signed link to a person's
+# voice (P5-2, app/engine/formatters.py LLMFormatter._fetch_body), whose
+# object path and credential scope the sanitizer cannot tell from a
+# path. Held at WARNING whatever LOG_LEVEL says; comms writes its own
+# line for each call it makes (email_accepted, llm_set_failed,
+# llm_body_downloaded, ...), without the address.
+HTTP_CLIENT_LOGGERS: tuple[str, ...] = ("httpx", "httpcore")
+
+
+def _quiet_http_client_loggers() -> None:
+    for name in HTTP_CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def _log_uncaught(
     kind: str, exc: BaseException | None, **fields: Any,
 ) -> None:
@@ -199,6 +215,7 @@ def setup_logging() -> None:
         level=level,
         stream=sys.stdout,
     )
+    _quiet_http_client_loggers()
     _sanitize_handlers()
     sys.excepthook = _excepthook
     threading.excepthook = _thread_excepthook

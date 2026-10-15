@@ -90,8 +90,8 @@ JOB_FIELDS = (
 # which), kept (the body is here), purged (past keep_until: the body is
 # gone, the snapshot and the letter's hash stay).
 ANSWER_FIELDS = (
-    "state", "letter_hash", "answered_by", "answered_at", "keep_until",
-    "body",
+    "state", "letter_hash", "audio_hash", "answered_by", "answered_at",
+    "keep_until", "body",
 )
 ANSWERED_BY_FIELDS = ("set", "provider", "model")
 PIPELINE_FIELDS = ("attempts", "step", "error", "retry_at")
@@ -168,6 +168,9 @@ def _answer(call: LLMCall, answer: LLMAnswer | None) -> dict[str, Any]:
     return _closed(ANSWER_FIELDS, {
         "state": state,
         "letter_hash": call.letter_hash,
+        # The audio body's hash (P5-2): the body is part of the question
+        # (spec §14.11). Known once the body was fetched and answered.
+        "audio_hash": None if answer is None else answer.audio_hash,
         "answered_by": (
             None if answer is None else _closed(ANSWERED_BY_FIELDS, {
                 "set": answer.answered_set,

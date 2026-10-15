@@ -673,8 +673,9 @@ class LLMCall(Base):
     snapshot like notifications.channels: a profile changed before the
     call neither re-routes nor re-terms an accepted job.
 
-    The writers of this row: intake (insert), the outcome (letter ->
-    NULL, under the job's row lock), the cascade of the job's deletion.
+    The writers of this row: intake (insert), the outcome (letter and
+    audio -> NULL, under the job's row lock), the cascade of the job's
+    deletion.
     """
 
     __tablename__ = "llm_calls"
@@ -686,9 +687,12 @@ class LLMCall(Base):
     # The ordered list of key set names (LLM_KEY_SETS) the call goes
     # through, first to last, on transport failures only.
     sets: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
-    # NULL once the job has its outcome.
+    # NULL once the job has its outcome. none_as_null: Python None is SQL
+    # NULL here, not the JSON value null -- without it, the cleared
+    # letter was a JSON null that IS NOT NULL in SQL, and
+    # ck_llm_calls_audio_with_letter could never see it gone (P5-2).
     letter: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB, nullable=True,
+        JSONB(none_as_null=True), nullable=True,
     )
     # SHA-256 hex of the letter's canonical JSON
     # (app/engine/service.py canonical_fingerprint).
@@ -697,6 +701,15 @@ class LLMCall(Base):
     )
     # How long the answer is kept after it came (the type's answer_keep).
     answer_keep_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The link to the letter's audio body (P5-2): {"url", "format",
+    # "max_bytes"} -- the signed link and the format as the product sent
+    # them, and the type's max_audio_bytes AT INTAKE. NULL for a letter
+    # without a body, and once the job has its outcome: it is cleared
+    # with the letter (ck_llm_calls_audio_with_letter, migration 0028).
+    # The body itself is never stored: fetched on every attempt.
+    audio: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True,
+    )
 
 
 class LLMAnswer(Base):
@@ -741,6 +754,13 @@ class LLMAnswer(Base):
     )
     answered_model: Mapped[str | None] = mapped_column(
         String(200), nullable=True,
+    )
+    # SHA-256 hex of the audio body as fetched and sent (P5-2, spec
+    # §14.11): the body is part of the question, and the letter's hash
+    # is taken without its link -- a signature changes with every
+    # upload. NULL when the letter had no body.
+    audio_hash: Mapped[str | None] = mapped_column(
+        String(FINGERPRINT_LEN), nullable=True,
     )
     answered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,

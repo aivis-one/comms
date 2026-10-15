@@ -270,6 +270,8 @@ class TestFieldTypes:
             "lane",
             # P5-1: the llm kind's ordered key sets.
             "llm_sets",
+            # P5-2: the largest audio body an llm job may link to.
+            "max_audio_bytes",
             "max_body_chars",
             "push_on",
             "recipient_schedule",
@@ -302,6 +304,7 @@ class TestFieldTypes:
                 "channels": ["llm"],
                 "llm_sets": ["llm.text", "llm.backup"],
                 "answer_keep": "2h",
+                "max_audio_bytes": 4096,
                 "lane": "bulk",
                 "push_on": "outcome",
                 "expires_after": "10m",
@@ -322,9 +325,10 @@ class TestFieldTypes:
             if decided.layer is Layer.PROFILE
         }
         assert declared == set(RECORD_FIELDS)
-        assert {record.fields[f].layer for f in ("llm_sets", "answer_keep")} == {
-            Layer.DEFAULT,
-        }
+        assert {
+            record.fields[f].layer
+            for f in ("llm_sets", "answer_keep", "max_audio_bytes")
+        } == {Layer.DEFAULT}
 
     @pytest.mark.parametrize("field", [f for f in RECORD_FIELDS if f != "category"])
     @pytest.mark.parametrize(
@@ -804,6 +808,7 @@ class TestShippedProfiles:
         # people -- declaring them there is refused (_check_kinds).
         assert layers.pop("llm_sets") is Layer.DEFAULT
         assert layers.pop("answer_keep") is Layer.DEFAULT
+        assert layers.pop("max_audio_bytes") is Layer.DEFAULT  # P5-2
         assert set(layers.values()) == {Layer.PROFILE}
 
 

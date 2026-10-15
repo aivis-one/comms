@@ -730,6 +730,7 @@ never interprets.
 | `body` | by type | letter | 1..5000; as `title` |
 | `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
+| `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
 
 There is no channel and no priority on a request. The channel is the
 profile's (section 3a). Which of the fields marked "by type" a request
@@ -970,6 +971,7 @@ job's outcome, within `keep_until`.
 |---|---|
 | `state` | `none` -- no answer: the job is active, or ended without one (its `status` says which); `kept` -- `body` is here; `purged` -- past `keep_until`, the body is gone, the rest stays |
 | `letter_hash` | SHA-256 (hex) of the letter's canonical JSON (sorted keys, no spaces, UTF-8) -- which letter was asked; the letter itself is deleted at the outcome |
+| `audio_hash` | SHA-256 (hex) of the audio body as fetched and sent (`llm_audio`), or `null` -- the body is part of the question; the link is not in the hash, a signature changes with every upload |
 | `answered_by` | who answered (`answered_by`), or `null` when there is no answer |
 | `answered_at` | when the answer came, or `null` |
 | `keep_until` | until when the body is kept, or `null` |
@@ -1247,7 +1249,7 @@ put a credit limit on the key at the provider. A key out of credit is a
 **A call to one set may take `LLM_DELIVER_TIMEOUT_SECONDS`** (default
 120; above the channel's client, 114 s, or the start is refused). A
 job's call over its list may take that many times the number of its
-sets. It is the channel's own bound, not a lane's: the lanes' 30 s stay
+sets, and 35 s more when it fetches an audio body first. It is the channel's own bound, not a lane's: the lanes' 30 s stay
 what they are for email and telegram.
 
 ### The type -- for the product's profile
@@ -1259,10 +1261,11 @@ alone: with another channel in the same type the start is refused.
 |---|---|
 | `llm_sets` | required: the ordered list of key sets the call goes through, e.g. `[llm.text, llm.text_backup]` -- every one defined in `LLM_KEY_SETS`, or the start is refused |
 | `answer_keep` | how long the answer is kept after it came: a duration, `24h` when not declared; not longer than `NOTIFICATION_RETENTION_DAYS` |
+| `max_audio_bytes` | the largest audio body a job may link to, in bytes as fetched: 1..20971520 (20 MiB), `2097152` (2 MiB) when not declared |
 
 `category`, `recipient_schedule` and `max_body_chars` concern a person
-and are refused on an llm type; `answer_keep` and `llm_sets` are
-refused on any other. `lane`, `push_on`, `expires_after`,
+and are refused on an llm type; `answer_keep`, `llm_sets` and
+`max_audio_bytes` are refused on any other. `lane`, `push_on`, `expires_after`,
 `retry_max_attempts` and `retry_backoff_seconds` work as for any type.
 
     support_reply_draft:
@@ -1297,6 +1300,54 @@ gateway's, the schema is `response_format`; such a request is rejected
 at intake. The letter is at most 200 000 characters of canonical JSON.
 comms checks the letter's FORM only; what it says is never read, logged
 or kept past the job's outcome -- its hash is.
+
+### `llm_audio` -- an audio body by link
+
+A recording does not travel in the envelope: megabytes of a person's
+voice would sit in your outbox, in the stream and in a dead letter. Keep
+the body in your own object store and put a SIGNED link to it in the
+envelope, beside the letter (never inside it -- comms does not read the
+letter):
+
+| field | value |
+|---|---|
+| `url` | a signed GET link to the object on the INTERNAL address of your store (path-style), `http://` or `https://`, no credentials or fragment, at most 4096 characters; comms fetches it as it is -- the same host and port, no proxy, no redirect followed |
+| `format` | the audio format the model is told, 1..16 lower-case letters or digits (`wav`, `mp3`, ...) |
+
+**Where the body goes.** comms fetches the body and appends ONE message
+to the end of the letter's `messages`:
+`{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "<format>"}}]}`.
+Nothing in your messages is read or changed: write the prompt knowing
+the audio comes last. The link never goes to the model -- the bytes do.
+
+**The operator names the store.** `LLM_BODY_HOSTS` in the comms `.env`
+is the exact `host:port` pairs a link may point at, comma separated
+(`rustfs:9000`). Empty, the default: this deploy fetches nothing, and a
+request with `llm_audio` is rejected at intake. A link to any other
+host -- `comms-postgres`, `comms-redis`, `comms-app`, a metadata
+address -- is rejected at intake, and refused again at the attempt if
+the list changed since.
+
+**Every attempt fetches the body again,** and comms keeps it only in the
+attempt's memory -- never in its database, stream or dead letters. So:
+
+- **the link and the object must live at least as long as the job**
+  (its `expiry_at`, or the type's `expires_after`, with its retries);
+- the link is kept on the job until its outcome and deleted then, with
+  the letter; it is in no answer, path, log line or error text;
+- deleting the recording after the outcome is yours.
+
+| the store answers | the delivery |
+|---|---|
+| 200, within `max_audio_bytes` | the body is sent to the model (every set the call reaches) |
+| 200, larger than `max_audio_bytes` (by its `Content-Length`, or counted while reading) | `failed`, `message_rejected` -- read no further, no model asked |
+| 403 (an expired signature included), 404, any other 4xx, a redirect | `failed`, `message_rejected` -- no model asked |
+| 408, 429, 5xx, no connection, no answer in 35 s | transient: retried by the type's rule, the body fetched again |
+
+**A resend** is the same bytes under the same key -- the same link
+included: nothing new is done. Another link under the same key is a
+`conflict`, as for any field. Asking again with a fresh link is a new
+key.
 
 ### What comes back
 
@@ -1435,8 +1486,9 @@ variable). A model's answer is kept by its type.
   removed by the worker's retention pass after that many days. Nothing
   is removed while a delivery is still pending.
 - **A model's answer** (section 11): the type's `answer_keep`, default
-  **24h**, counted from the answer; the letter it answered is deleted
-  at the job's outcome. Neither outlives the notification history.
+  **24h**, counted from the answer; the letter it answered, and the
+  link to its audio body, are deleted at the job's outcome; the body
+  itself is never kept. None outlives the notification history.
 - **Threads closing themselves**: `THREAD_AUTO_CLOSE_DAYS`, default
   **30**. A thread with no activity for that long is closed by the
   same worker. Closing is a status change -- the thread, its messages

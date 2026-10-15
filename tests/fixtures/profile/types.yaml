@@ -39,6 +39,9 @@
 #                            names (LLM_KEY_SETS); required there
 #   answer_keep           -- the llm kind only: duration literal; how
 #                            long the model's answer is kept; default 24h
+#   max_audio_bytes       -- the llm kind only: integer from 1 to
+#                            20971520; the largest audio body a job may
+#                            link to; default 2097152
 # =============================================================================
 
 version: 2

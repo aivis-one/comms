@@ -45,9 +45,11 @@
 # =============================================================================
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from app.core.constants import (
@@ -56,6 +58,7 @@ from app.core.constants import (
     MAX_EMAIL_LEN,
     MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_LLM_AUDIO_URL_LEN,
     MAX_LOCALE_LEN,
     MAX_SNAPSHOT_VERSION,
     MAX_TELEGRAM_ID,
@@ -137,6 +140,10 @@ class NotificationRequest:
     body: str | None
     action_data: dict[str, Any] | None
     llm: dict[str, Any] | None
+    # The link to the audio body of an llm letter (P5-2) -- a field of
+    # the ENVELOPE, beside the letter, not inside it: comms reads the
+    # envelope and never the letter.
+    llm_audio: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -479,6 +486,64 @@ def validate_llm_letter(
     return letter
 
 
+# The fields of `llm_audio` (P5-2): the signed link to the body and the
+# audio format the model is told (the `format` of an input_audio part).
+LLM_AUDIO_FIELDS = frozenset({"url", "format"})
+_AUDIO_FORMAT_RE = re.compile(r"[a-z0-9]{1,16}\Z")
+
+
+def validate_llm_audio(
+    audio: Any, *, event: str = EVENT_NOTIFICATION_REQUEST,
+) -> dict[str, Any]:
+    """The FORM of the link to an audio body. Every refusal names a
+    field, never the link: it is signed, and the reason is recorded
+    under the product's key. Whether the link's host may be fetched is
+    the deploy's (LLM_BODY_HOSTS), decided at intake against the live
+    settings (app/engine/service.py create_notification)."""
+    if not isinstance(audio, dict):
+        raise ValidationError(f"{event}: llm_audio must be a JSON object")
+    unknown = sorted(str(k) for k in audio if k not in LLM_AUDIO_FIELDS)
+    if unknown:
+        raise ValidationError(
+            f"{event}: llm_audio has unknown field(s) "
+            f"{', '.join(map(repr, unknown))}; allowed: "
+            f"{', '.join(sorted(LLM_AUDIO_FIELDS))}"
+        )
+    url = _require(audio, "url", f"{event}: llm_audio")
+    if not isinstance(url, str) or not url or len(url) > MAX_LLM_AUDIO_URL_LEN:
+        raise ValidationError(
+            f"{event}: llm_audio.url must be a non-empty string of at most "
+            f"{MAX_LLM_AUDIO_URL_LEN} characters"
+        )
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        raise ValidationError(
+            f"{event}: llm_audio.url is not a URL"
+        ) from None
+    if (
+        parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment
+        or any(ch.isspace() for ch in url)
+        or port == 0
+    ):
+        raise ValidationError(
+            f"{event}: llm_audio.url must be an http(s) URL with a host and "
+            f"no credentials, fragment or spaces"
+        )
+    fmt = _require(audio, "format", f"{event}: llm_audio")
+    if not isinstance(fmt, str) or _AUDIO_FORMAT_RE.match(fmt) is None:
+        raise ValidationError(
+            f"{event}: llm_audio.format must be 1..16 lower-case letters or "
+            f"digits (an audio format: wav, mp3, ...)"
+        )
+    return audio
+
+
 def _validate_target(
     target_type: Any, target_value: Any, event: str
 ) -> tuple[str, str]:
@@ -620,6 +685,7 @@ _NOTIFICATION_REQUEST_FIELDS = frozenset({
     "body",
     "action_data",
     "llm",
+    "llm_audio",
 })
 
 
@@ -697,6 +763,9 @@ def _parse_notification_request(
     llm: dict[str, Any] | None = None
     if "llm" in data:
         llm = validate_llm_letter(data["llm"])
+    llm_audio: dict[str, Any] | None = None
+    if "llm_audio" in data:
+        llm_audio = validate_llm_audio(data["llm_audio"])
 
     scheduled_at: datetime | None = None
     if data.get("scheduled_at") is not None:
@@ -729,6 +798,7 @@ def _parse_notification_request(
         body=body,
         action_data=action_data,
         llm=llm,
+        llm_audio=llm_audio,
     )
 
 

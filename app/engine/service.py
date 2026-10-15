@@ -62,6 +62,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.models import Recipient
 from app.audience.prefs import muted_recipient_ids
 from app.audience.schedule import recipient_deferred_until
+from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT, body_endpoint
 from app.core.config import settings
 from app.core.constants import MAX_LLM_LETTER_CHARS
 from app.core.exceptions import NotFoundError, ValidationError
@@ -542,6 +543,7 @@ def _letter_by_kind(
     target_value: str | None,
     action_data: dict[str, Any] | None,
     llm: dict[str, Any] | None,
+    llm_audio: dict[str, Any] | None = None,
 ) -> None:
     """Refuse a request whose fields do not match its TYPE's kind (P5-1).
 
@@ -573,10 +575,10 @@ def _letter_by_kind(
                 f"request may not carry {', '.join(present)}"
             )
         return
-    if llm is not None:
+    if llm is not None or llm_audio is not None:
         raise ValidationError(
             f"type {type} is not an llm type: the request may not carry "
-            f"'llm'"
+            f"{'llm' if llm is not None else 'llm_audio'!r}"
         )
     missing = [
         name for name, value in (
@@ -591,6 +593,24 @@ def _letter_by_kind(
         raise ValidationError(
             f"type {type} is delivered to people: the request needs "
             f"{', '.join(missing)}"
+        )
+
+
+def _check_body_host(url: str) -> None:
+    """Refuse a body link this deploy may not fetch (P5-2): its host and
+    port are not in LLM_BODY_HOSTS, or the list is empty. Names the host
+    -- never the link, which is signed."""
+    allowed = settings.llm_body_host_set
+    host, port = body_endpoint(url)
+    if not allowed:
+        raise ValidationError(
+            "llm_audio: this deploy fetches no body (LLM_BODY_HOSTS is "
+            "empty)"
+        )
+    if (host, port) not in allowed:
+        raise ValidationError(
+            f"llm_audio: {host}:{port} is not in LLM_BODY_HOSTS on this "
+            f"deploy"
         )
 
 
@@ -618,6 +638,7 @@ async def create_notification(
     fingerprint: str,
     action_data: dict[str, Any] | None = None,
     llm: dict[str, Any] | None = None,
+    llm_audio: dict[str, Any] | None = None,
     scheduled_at: datetime | None = None,
     expiry_at: datetime | None = None,
     correlation: str | None = None,
@@ -650,6 +671,9 @@ async def create_notification(
         llm: The model's letter -- required for a type of the llm kind
             and refused for any other (P5-1). Kept in llm_calls until the
             job's outcome, with its hash and the type's key sets.
+        llm_audio: The link to the letter's audio body (P5-2) -- an llm
+            type only; its host must be in LLM_BODY_HOSTS. Kept with the
+            letter, cleared with it.
         scheduled_at: "Not before" -- when the job becomes deliverable.
             Defaults to now.
         expiry_at: The envelope's expiry. Wins over the profile's
@@ -678,8 +702,10 @@ async def create_notification(
         type, record,
         title=title, body=body,
         target_type=target_type, target_value=target_value,
-        action_data=action_data, llm=llm,
+        action_data=action_data, llm=llm, llm_audio=llm_audio,
     )
+    if llm_audio is not None:
+        _check_body_host(llm_audio["url"])
 
     # -- The size limit (H1, spec §5.9): its LENGTH, never its content.
     # Refused here, not at delivery: comms does not accept a job it
@@ -780,6 +806,15 @@ async def create_notification(
             ).hexdigest(),
             answer_keep_seconds=int(
                 record.value("answer_keep").total_seconds(),
+            ),
+            # The link, its format, and the type's limit AT INTAKE -- a
+            # snapshot like the sets (P5-2).
+            audio=(
+                None if llm_audio is None else {
+                    "url": llm_audio["url"],
+                    "format": llm_audio["format"],
+                    "max_bytes": record.value("max_audio_bytes"),
+                }
             ),
         ))
         await session.flush()
@@ -1472,10 +1507,15 @@ async def _deliver_single(
     caller to apply to the attempt's session.
     """
     llm_answer: LLMAnswer | None = None
+    timeout: float
     if call is None:
         timeout = settings.lane_deliver_timeout(Lane(notification.lane))
     else:
-        timeout = settings.llm_deliver_timeout_seconds * len(call.sets)
+        timeout = float(settings.llm_deliver_timeout_seconds * len(call.sets))
+        if call.audio is not None:
+            # The body is fetched once per attempt, before the first set
+            # (P5-2): its own bound, added once.
+            timeout += LLM_BODY_DOWNLOAD_TIMEOUT
     async with semaphore:
         try:
             # The two shapes of a channel: a person's channel is given a
@@ -1492,7 +1532,9 @@ async def _deliver_single(
             else:
                 assert call.letter is not None
                 reply = await asyncio.wait_for(
-                    cast(ModelChannel, formatter).ask(call.letter, call.sets),
+                    cast(ModelChannel, formatter).ask(
+                        call.letter, call.sets, call.audio,
+                    ),
                     timeout=timeout,
                 )
                 llm_answer = _answer_row(call, reply)
@@ -1588,6 +1630,7 @@ def _answer_row(call: LLMCall, reply: LLMReply) -> LLMAnswer:
         answered_set=reply.set_name,
         answered_provider=reply.provider,
         answered_model=reply.model,
+        audio_hash=reply.audio_hash,
         answered_at=answered_at,
         keep_until=answered_at + timedelta(seconds=call.answer_keep_seconds),
     )
@@ -1722,9 +1765,10 @@ async def forget_llm_letter(
     session: AsyncSession, notification: Notification,
 ) -> None:
     """Clear the model's letter of a job that reached its outcome (P5-1,
-    spec §14.12 item 5): the letter was only ever needed to ask; its
-    hash stays (llm_calls.letter_hash). A no-op for a job for people,
-    and for one still active.
+    spec §14.12 item 5), and the link to its audio body with it (P5-2):
+    both were only ever needed to ask; the letter's hash stays
+    (llm_calls.letter_hash), and the body's is on the answer. A no-op
+    for a job for people, and for one still active.
 
     Called beside the three transitions that give an llm job its
     outcome: the fold (rollup_notification -- the attempt, expiry and
@@ -1748,7 +1792,10 @@ async def forget_llm_letter(
             LLMCall.notification_id == notification.id,
             LLMCall.letter.is_not(None),
         )
-        .values(letter=None)
+        # The link to the body goes with the letter (P5-2): a signed URL
+        # to a person's voice is not kept past the outcome.
+        # ck_llm_calls_audio_with_letter: no link without its letter.
+        .values(letter=None, audio=None)
     )
 
 

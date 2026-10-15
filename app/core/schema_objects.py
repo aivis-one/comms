@@ -368,6 +368,9 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # Only the llm channel's delivery has no recipient (P5-1, migration
     # 0026).
     "ck_deliveries_recipient_by_channel",
+    # A signed link to an audio body never outlives its letter (P5-2,
+    # migration 0028).
+    "ck_llm_calls_audio_with_letter",
 })
 
 # Everything the schema must carry although the metadata never mentions

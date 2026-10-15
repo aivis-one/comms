@@ -1471,10 +1471,12 @@ class TestTheContract:
         assert set(_table("`llm`")) == LLM_LETTER_FIELDS
 
     def test_the_type_is_its_two_fields(self) -> None:
+        """The llm kind's own fields, documented in order: two in P5-1,
+        three since P5-2 added max_audio_bytes."""
         from app.profile.loader import RECORD_FIELDS
 
         documented = _table("The type")
-        assert documented == ["llm_sets", "answer_keep"]
+        assert documented == ["llm_sets", "answer_keep", "max_audio_bytes"]
         assert set(documented) <= set(RECORD_FIELDS)
 
     def test_the_reserved_params_are_listed(self) -> None:

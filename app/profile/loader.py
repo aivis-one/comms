@@ -54,11 +54,13 @@
 # [llm] asks a model, not people: it routes to an ordered list of named
 # key sets (`llm_sets`, required on that kind and refused on any other)
 # and keeps the model's answer for `answer_keep` (a duration, default
-# 24h, not longer than NOTIFICATION_RETENTION_DAYS). llm shares a type
+# 24h, not longer than NOTIFICATION_RETENTION_DAYS); a body its jobs
+# link to (P5-2) is held to `max_audio_bytes`. llm shares a type
 # with no other channel, and the fields that concern a person --
 # `category` (the mute gate), `recipient_schedule` (the person's hours),
 # `max_body_chars` (the letter for people) -- are refused on it when
-# declared; `answer_keep` is refused when declared on a type for people.
+# declared; `answer_keep` and `max_audio_bytes` are refused when declared
+# on a type for people.
 # The kind is a SHAPE of the record, not a condition: nothing in it reads
 # a message. The answer is kept by duration, not by a storage class: the
 # owner's decision (§14.12 item 5) is a term per type, and no class set
@@ -163,6 +165,7 @@ from app.core.constants import (
     DOMAIN_LITERAL_PATTERNS,
     MAX_BODY_LEN,
     MAX_CATEGORY_LEN,
+    MAX_LLM_AUDIO_BYTES,
     MAX_LLM_SET_NAME_LEN,
     MAX_TYPE_KEY_LEN,
     MSG_TYPE_KEYS,
@@ -491,6 +494,11 @@ _LLM_ROUTE = (LLM_CHANNEL,)
 # is down overnight; a support conversation is not kept for weeks.
 _DEFAULT_ANSWER_KEEP = "24h"
 
+# The largest audio body when the type does not say (P5-2): 2 MiB, the
+# limit velo's own transcription holds today (spec §5.10) -- a chunk of
+# 50 s of its 16 kHz mono WAV is about 1.6 MB.
+_DEFAULT_MAX_AUDIO_BYTES = 2 * 1024 * 1024
+
 # The fields that concern a person, refused when DECLARED on an llm
 # kind -- it has no person: no mute, no hours, no letter for people.
 _PERSON_FIELDS = ("category", "max_body_chars", "recipient_schedule")
@@ -714,6 +722,18 @@ _FIELDS: dict[str, _Field] = {
     "max_body_chars": _Field(
         check=_int_in_range(1, MAX_BODY_LEN),
         default=lambda: (MAX_BODY_LEN, "comms default: MAX_BODY_LEN"),
+    ),
+    # The largest audio body an llm type's job may link to, in bytes as
+    # fetched (P5-2, spec §5.10): a body above it is refused without
+    # being read further. Applies to the llm kind; refused when declared
+    # on any other.
+    "max_audio_bytes": _Field(
+        check=_int_in_range(1, MAX_LLM_AUDIO_BYTES),
+        default=lambda: (
+            _DEFAULT_MAX_AUDIO_BYTES,
+            f"comms default: {_DEFAULT_MAX_AUDIO_BYTES} bytes, 2 MiB "
+            f"(the llm kind only)",
+        ),
     ),
 }
 
@@ -1037,6 +1057,13 @@ def _check_kinds(
                 _TYPES_FILE, key, "answer_keep",
                 f"type {key!r} declares `answer_keep` but does not route to "
                 f"{LLM_CHANNEL!r} alone; only a model's answer is kept",
+            ))
+        if record.fields["max_audio_bytes"].layer is Layer.PROFILE:
+            violations.append(Violation(
+                _TYPES_FILE, key, "max_audio_bytes",
+                f"type {key!r} declares `max_audio_bytes` but does not route "
+                f"to {LLM_CHANNEL!r} alone; only a model is sent a body by "
+                f"link",
             ))
 
 

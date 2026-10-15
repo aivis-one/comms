@@ -40,6 +40,7 @@ from app.core.channels import (
     channel_optional_keys,
     channel_spec,
     evaluate_channels,
+    parse_llm_body_hosts,
     parse_llm_key_sets,
 )
 from app.core.lanes import Lane
@@ -427,6 +428,18 @@ class Settings(BaseSettings):
     # (app/engine/service.py). Not a lane's: a model writes for tens of
     # seconds, and the lanes' 30 must stay what it is for email.
     llm_deliver_timeout_seconds: int = 120
+    # The exact host:port pairs a body link may point at (P5-2,
+    # app/core/channels.py); empty = this deploy fetches no body.
+    llm_body_hosts: str = ""
+
+    @property
+    def llm_body_host_set(self) -> frozenset[tuple[str, int]]:
+        """The allowed (host, port) pairs; empty when nothing may be
+        fetched. Read only off validated settings."""
+        if self.llm_body_hosts == "":
+            return frozenset()
+        allowed, _ = parse_llm_body_hosts(self.llm_body_hosts)
+        return allowed
 
     @property
     def llm_sets(self) -> dict[str, LLMKeySet]:
