@@ -1094,6 +1094,12 @@ async def deliver_notification(
                 NotificationDelivery.next_retry_at <= now,
             ),
         )
+        # Read off ix_notification_deliveries_status (status,
+        # notification_id, id), migration 0029 (H12): the job's waiting
+        # deliveries already in id order, so neither a walk of the primary
+        # key past every other job's rows nor a sort of all of this job's.
+        # The order itself carries no meaning (ids are uuid4); it keeps a
+        # portion the same from one attempt to the next.
         .order_by(NotificationDelivery.id)
         .limit(portion)
     )
@@ -1721,8 +1727,8 @@ async def rollup_notification(
     # A delivery still waiting decides alone (H9): the fold of any set
     # that holds a PENDING is "still open" (_fold), so the set is read
     # only once none waits. After every portion but the last (H7) one
-    # probe on ix_notification_deliveries_status (status, notification_id),
-    # migration 0027 -- the job's waiting deliveries, nothing else, under
+    # probe on ix_notification_deliveries_status (status, notification_id,
+    # id), migrations 0027/0029 -- the job's waiting deliveries, nothing else, under
     # any statistics (H11: with no index on status alone, no plan of it
     # walks other jobs' waiting rows) -- instead of a read of every
     # delivery of the job: the square H7 took off accepted_answers.
