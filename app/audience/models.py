@@ -37,7 +37,6 @@ from sqlalchemy import (
     String,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.constants import (
@@ -48,7 +47,7 @@ from app.core.constants import (
     MAX_LOCALE_LEN,
     MAX_TIMEZONE_LEN,
 )
-from app.core.database import Base
+from app.core.database import JSON_VALUE, Base
 from app.core.mixins import TimestampMixin
 
 
@@ -162,7 +161,7 @@ class Recipient(TimestampMixin, Base):
     # (audience/prefs.set_schedule) is the only door, so the shape is
     # validated there.
     allowed_windows: Mapped[list[dict[str, int]] | None] = mapped_column(
-        JSONB,
+        JSON_VALUE,
         nullable=True,
     )
 

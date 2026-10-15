@@ -21,6 +21,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from enum import StrEnum
 
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -34,6 +35,20 @@ from app.core.config import settings
 
 class Base(DeclarativeBase):
     """Base class for all SQLAlchemy ORM models."""
+
+
+# THE ONE JSONB TYPE OF COMMS (H13). Python None is SQL NULL -- not the
+# JSON value `null`, which is what a bare JSONB writes for an explicit
+# None, by every write form (an ORM insert or update, Core values()).
+# A JSON `null` IS NOT NULL in SQL, so a CHECK or a query that asks
+# "no value?" by IS NULL misses it: ck_recipients_tombstone did, and a
+# recipient who ever had a schedule could not be forgotten (H13). On a
+# NOT NULL column it turns a None from a silent JSON `null` into the
+# refusal it should be. Every JSONB column of every model uses it
+# (tests/test_json_null.py holds it, by the models' metadata), and each
+# carries CHECK ck_<table>_<column>_not_json_null at the database
+# (migration 0030), for a writer that goes around the type.
+JSON_VALUE = JSONB(none_as_null=True)
 
 
 class ProcessRole(StrEnum):

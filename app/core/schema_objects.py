@@ -373,6 +373,15 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # A signed link to an audio body never outlives its letter (P5-2,
     # migration 0028).
     "ck_llm_calls_audio_with_letter",
+    # A JSONB value is never the JSON value null -- empty is SQL NULL
+    # (H13, migration 0030; app/core/database.py JSON_VALUE).
+    "ck_notifications_channels_not_json_null",
+    "ck_notifications_action_data_not_json_null",
+    "ck_notification_deliveries_channel_options_not_json_null",
+    "ck_recipients_allowed_windows_not_json_null",
+    "ck_llm_calls_sets_not_json_null",
+    "ck_llm_calls_letter_not_json_null",
+    "ck_llm_calls_audio_not_json_null",
 })
 
 # Everything the schema must carry although the metadata never mentions

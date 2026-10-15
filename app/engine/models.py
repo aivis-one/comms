@@ -58,7 +58,6 @@ from sqlalchemy import (
     inspect,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql.base import ischema_names
 from sqlalchemy.orm import Mapped, mapped_column, validates
 from sqlalchemy.types import UserDefinedType
@@ -73,7 +72,7 @@ from app.core.constants import (
     MAX_TITLE_LEN,
     MAX_TYPE_KEY_LEN,
 )
-from app.core.database import Base
+from app.core.database import JSON_VALUE, Base
 from app.core.mixins import UUIDMixin
 from app.engine.constants import DeliveryStatus, NotificationStatus
 
@@ -173,7 +172,7 @@ class Notification(UUIDMixin, Base):
     # that was already accepted. The channel is never named by the
     # caller -- only the profile decides.
     channels: Mapped[list[str]] = mapped_column(
-        JSONB,
+        JSON_VALUE,
         nullable=False,
     )
 
@@ -252,7 +251,7 @@ class Notification(UUIDMixin, Base):
     # Deep-link intent + template variables -- the LETTER, opaque.
     # {"action": "open_thread", "params": {"thread_id": "uuid"}, ...}
     action_data: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB,
+        JSON_VALUE,
         nullable=True,
     )
 
@@ -383,7 +382,7 @@ class NotificationDelivery(UUIDMixin, Base):
     #   telegram: {button_text, disable_preview, silent}
     #   in_app:   {action_url, dismissable}
     channel_options: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB,
+        JSON_VALUE,
         nullable=True,
     )
 
@@ -686,13 +685,10 @@ class LLMCall(Base):
     )
     # The ordered list of key set names (LLM_KEY_SETS) the call goes
     # through, first to last, on transport failures only.
-    sets: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
-    # NULL once the job has its outcome. none_as_null: Python None is SQL
-    # NULL here, not the JSON value null -- without it, the cleared
-    # letter was a JSON null that IS NOT NULL in SQL, and
-    # ck_llm_calls_audio_with_letter could never see it gone (P5-2).
+    sets: Mapped[list[str]] = mapped_column(JSON_VALUE, nullable=False)
+    # NULL once the job has its outcome -- SQL NULL (JSON_VALUE).
     letter: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB(none_as_null=True), nullable=True,
+        JSON_VALUE, nullable=True,
     )
     # SHA-256 hex of the letter's canonical JSON
     # (app/engine/service.py canonical_fingerprint).
@@ -708,7 +704,7 @@ class LLMCall(Base):
     # with the letter (ck_llm_calls_audio_with_letter, migration 0028).
     # The body itself is never stored: fetched on every attempt.
     audio: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB(none_as_null=True), nullable=True,
+        JSON_VALUE, nullable=True,
     )
 
 
