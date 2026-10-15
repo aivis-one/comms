@@ -30,6 +30,8 @@ import traceback
 #   EMAIL_MAILGUN_API_KEY bare <32hex>-<8hex>-<8hex> or key-<32hex>;
 #                       Authorization: Basic <b64 of api:key>     mailgun,
 #                                                                  header
+#   LLM_KEY_SETS keys   bare sk-<key chars>; Authorization: Bearer   llm,
+#                       <key> (the adapter's header)               bearer
 # Generated passwords and the service token (openssl rand -hex 24/32 in
 # comms-deploy.sh) are also caught BARE by the long-hex pattern.
 #
@@ -55,6 +57,11 @@ _TELEGRAM_TOKEN_RE = re.compile(r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}")
 _MAILGUN_KEY_RE = re.compile(
     r"(?i)\b(?:key-[0-9a-f]{32}|[0-9a-f]{32}-[0-9a-f]{8}-[0-9a-f]{8})\b"
 )
+# The key shape of OpenAI-compatible providers and gateways (P5-1, the
+# llm channel's LLM_KEY_SETS): `sk-` and then a long run of key
+# characters (`sk-or-v1-<hex>`, `sk-proj-...`). A vendor key of another
+# shape is the KNOWN CEILING below.
+_LLM_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
 # KNOWN CEILING -- bare secrets the operator chose by hand.
 #   1. Mechanics: this pattern catches a secret with no keyword, header
 #      or URL around it ONLY in the shape comms-deploy.sh mints (48+ hex
@@ -95,6 +102,7 @@ def sanitize_text(text: str) -> str:
     text = _URL_USERINFO_RE.sub(r"\1[redacted]\2", text)
     text = _TELEGRAM_TOKEN_RE.sub("[redacted]", text)
     text = _MAILGUN_KEY_RE.sub("[redacted]", text)
+    text = _LLM_KEY_RE.sub("[redacted]", text)
     text = _LONG_HEX_RE.sub("[redacted]", text)
     return _KEYVAL_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
 

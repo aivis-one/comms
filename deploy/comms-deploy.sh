@@ -159,6 +159,9 @@ TELEGRAM_BOT_URL=
 EMAIL_MAILGUN_API_KEY=
 EMAIL_MAILGUN_DOMAIN=
 EMAIL_FROM_ADDRESS=
+# The llm channel: named key sets, one JSON object (deploy/INTEGRATION.md
+# section 11). Empty = no llm on this deploy.
+LLM_KEY_SETS=
 
 DEFAULT_LOCALE=en
 DEFAULT_TIMEZONE=UTC

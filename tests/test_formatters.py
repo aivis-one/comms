@@ -49,6 +49,7 @@ from app.engine.formatters import (
     build_formatters,
     close_formatters,
     get_formatter,
+    get_model_channel,
 )
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import _deliver_single
@@ -56,6 +57,10 @@ from app.profile.registry import registry
 from tests.helpers import next_telegram_id
 
 BOT_URL = "https://t.me/comms_testbot"
+
+# The llm channel of a hand-built registry (P5-1): these tests are about
+# closing, and a deploy without llm has the refusal in that place.
+_NO_MODEL = UnavailableChannelFormatter("llm", "not configured")
 
 
 class _FakeBot:
@@ -124,11 +129,14 @@ class TestLocalByDefault:
         every other channel resolves to the refusal, never a stub."""
         assert isinstance(get_formatter(DeliveryChannel.IN_APP), InAppFormatter)
         for channel in DeliveryChannel:
-            if channel is DeliveryChannel.IN_APP:
+            if channel in (DeliveryChannel.IN_APP, DeliveryChannel.LLM):
                 continue
             assert isinstance(
                 get_formatter(channel), UnavailableChannelFormatter,
             )
+        # P5-1: the llm channel is asked through get_model_channel, not
+        # get_formatter -- and with its key set empty it refuses too.
+        assert isinstance(get_model_channel(), UnavailableChannelFormatter)
 
     def test_full_key_set_makes_telegram_live_through_the_factory(
         self,
@@ -487,6 +495,7 @@ class TestCloseFormatters:
 
         formatters_module._registry = ChannelRegistry(
             formatters={},
+            model=_NO_MODEL,
             closers=[
                 ("telegram_bot_session", _closer("telegram")),
                 ("email_http_client", _closer("email")),
@@ -516,6 +525,7 @@ class TestCloseFormatters:
 
         formatters_module._registry = ChannelRegistry(
             formatters={},
+            model=_NO_MODEL,
             closers=[("first", _boom), ("second", _ok)],
         )
         try:
@@ -535,7 +545,9 @@ class TestCloseFormatters:
         the empty list."""
         from app.engine import formatters as formatters_module
 
-        formatters_module._registry = ChannelRegistry(formatters={})
+        formatters_module._registry = ChannelRegistry(
+            formatters={}, model=_NO_MODEL,
+        )
         await close_formatters()
         assert formatters_module._registry is None
 

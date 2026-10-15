@@ -18,7 +18,10 @@
 #                            (see the unit_rem_* family below). A type
 #                            WITHOUT a category is exempt from mute gating.
 #   channels              -- non-empty list of channel names
-#                            (in_app, telegram, email); default [in_app]
+#                            (in_app, telegram, email, llm); default
+#                            [in_app]. llm goes alone: such a type asks
+#                            a model (none in this file -- the llm kind
+#                            is built by tests/test_llm_channel.py)
 #   lane                  -- interactive | critical | normal | bulk;
 #                            default normal
 #   push_on               -- outcome | outcome_and_deferral | none;
@@ -32,6 +35,10 @@
 #                            default from settings
 #   max_body_chars        -- integer from 1 to MAX_BODY_LEN (the body
 #                            column width); default MAX_BODY_LEN
+#   llm_sets              -- the llm kind only: ordered list of key set
+#                            names (LLM_KEY_SETS); required there
+#   answer_keep           -- the llm kind only: duration literal; how
+#                            long the model's answer is kept; default 24h
 # =============================================================================
 
 version: 2

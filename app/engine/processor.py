@@ -116,6 +116,8 @@ from app.engine.service import (
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
+    forget_llm_letter,
+    purge_llm_answers,
     resolve_notification,
     rollup_notification,
 )
@@ -550,6 +552,7 @@ async def _close_at_ceiling(
             # Nothing to fold: the resolve failed (branch (a) above).
             notification.status = NotificationStatus.FAILED
             journal.record_job(session, notification, JournalStep.CEILING)
+            await forget_llm_letter(session, notification)
             return 0
     closed = await close_waiting_deliveries(
         session,
@@ -646,6 +649,41 @@ async def cleanup_expired_notifications() -> int:
                 exception=sanitized_traceback(exc),
             )
             return total
+
+
+async def purge_expired_llm_answers() -> int:
+    """Clear the model answers past their term (P5-1), in batches of
+    _RETENTION_BATCH_SIZE, at most _EXPIRED_MAX_BATCHES_PER_PASS a pass
+    -- the expiry cleanup's shape, on the same maintenance loop. A
+    failing batch is rolled back and logged; the batches before it stay.
+
+    Returns:
+        Number of answers cleared in this pass.
+    """
+    factory = get_session_factory()
+    now = datetime.now(UTC)
+    total = 0
+    async with factory() as session:
+        try:
+            for _ in range(_EXPIRED_MAX_BATCHES_PER_PASS):
+                cleared = await purge_llm_answers(
+                    session, now=now, limit=_RETENTION_BATCH_SIZE,
+                )
+                await session.commit()
+                total += cleared
+                if cleared < _RETENTION_BATCH_SIZE:
+                    break
+        except Exception as exc:
+            await session.rollback()
+            logger.error(
+                "llm_answer_purge_error",
+                cleared=total,
+                exception=sanitized_traceback(exc),
+            )
+            return total
+    if total:
+        logger.info("llm_answers_purged", count=total)
+    return total
 
 
 # Phase 3a item 5: rows deleted per retention batch. One batch = one

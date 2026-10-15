@@ -51,7 +51,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, inspect, select
+from sqlalchemy import func, inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory
@@ -67,10 +67,12 @@ from app.engine.constants import (
 )
 from app.engine.formatters import (
     EmailTransientError,
+    LLMTransientError,
     PermanentDeliveryError,
     RateLimitedError,
 )
 from app.engine.models import (
+    LLMAnswer,
     Notification,
     NotificationDelivery,
     NotificationTransition,
@@ -340,7 +342,10 @@ def answer_of(
     if isinstance(exc, TimeoutError):
         return Answer(outcome=ChannelAnswer.TIMEOUT)
     root = type(exc).__module__.partition(".")[0]
-    if isinstance(exc, EmailTransientError) or root in _PROVIDER_MODULE_ROOTS:
+    if (
+        isinstance(exc, (EmailTransientError, LLMTransientError))
+        or root in _PROVIDER_MODULE_ROOTS
+    ):
         return Answer(
             outcome=ChannelAnswer.TRANSIENT,
             provider_text=_provider_text(exc),
@@ -368,9 +373,13 @@ def answer_text(answer: Answer, exc: Exception) -> str:
 
 
 async def record_channel_answer(
-    delivery: NotificationDelivery, answer: Answer,
-) -> None:
-    """Write one channel answer in its OWN transaction, now.
+    delivery: NotificationDelivery,
+    answer: Answer,
+    *,
+    llm_answer: LLMAnswer | None = None,
+) -> bool:
+    """Write one channel answer in its OWN transaction, now. Returns
+    whether it committed.
 
     Called from inside the attempt while it holds its row lock on the
     job. The insert's foreign key takes FOR KEY SHARE on that row,
@@ -378,9 +387,18 @@ async def record_channel_answer(
     (app/engine/processor.py, the lock rule); under FOR UPDATE this
     session would wait for the attempt and the attempt for it.
 
+    THE MODEL'S ANSWER GOES IN THE SAME TRANSACTION (P5-1): `llm_answer`
+    is inserted beside the `accepted` row, so the two are one fact -- a
+    torn attempt keeps the paid answer, and the next attempt, closing
+    the delivery SENT from that row, finds the answer stored. Its
+    insert takes the same FOR KEY SHARE and nothing else.
+
     A failure to write is logged loudly and does not fail the attempt:
     the answer is still applied to the delivery, and failing the attempt
-    would re-send the letter anyway.
+    would re-send the letter anyway. For an llm answer the caller reads
+    the False: a delivery SENT with no answer stored would be a paid
+    answer lost, so it is a transient failure instead (the model is
+    asked again).
 
     KNOWN CEILING (acknowledged by design -- P2-1, the accepted window):
       1. Mechanics: between the channel taking the letter and this
@@ -419,6 +437,8 @@ async def record_channel_answer(
                 provider_text=answer.provider_text,
                 error=answer.error,
             ))
+            if llm_answer is not None:
+                session.add(llm_answer)
             await session.commit()
         except Exception as exc:
             await session.rollback()
@@ -430,14 +450,16 @@ async def record_channel_answer(
                 answer=answer.outcome.value,
                 exception=sanitized_traceback(exc),
             )
+            return False
+    return True
 
 
 async def accepted_answers(
     session: AsyncSession,
     notification_ids: list[UUID],
     *,
-    recipient_ids: Iterable[UUID] | None = None,
-) -> dict[tuple[UUID, UUID, str], datetime]:
+    recipient_ids: Iterable[UUID | None] | None = None,
+) -> dict[tuple[UUID, UUID | None, str], datetime]:
     """Every (notification_id, recipient_id, channel) a channel has
     accepted the letter for, with the moment it first did -- of
     `recipient_ids` only, when given (an attempt's portion, H7: a
@@ -450,11 +472,22 @@ async def accepted_answers(
     """
     if not notification_ids:
         return {}
-    narrowed = (
-        ()
-        if recipient_ids is None
-        else (NotificationTransition.recipient_id.in_(list(recipient_ids)),)
-    )
+    narrowed: tuple[Any, ...] = ()
+    if recipient_ids is not None:
+        wanted = list(recipient_ids)
+        people = [r for r in wanted if r is not None]
+        # The llm channel's answer has no recipient (P5-1): `IN (NULL)`
+        # matches nothing, so the llm delivery of a portion is asked for
+        # by IS NULL -- without it a torn attempt would ask the model
+        # again.
+        narrowed = (
+            or_(
+                NotificationTransition.recipient_id.in_(people),
+                NotificationTransition.recipient_id.is_(None),
+            )
+            if len(people) < len(wanted)
+            else NotificationTransition.recipient_id.in_(people),
+        )
     rows = await session.execute(
         select(
             NotificationTransition.notification_id,
@@ -474,7 +507,7 @@ async def accepted_answers(
             NotificationTransition.channel,
         )
     )
-    accepted: dict[tuple[UUID, UUID, str], datetime] = {}
+    accepted: dict[tuple[UUID, UUID | None, str], datetime] = {}
     for notification_id, recipient_id, channel, at in rows.all():
         accepted[(notification_id, recipient_id, channel)] = at
     return accepted

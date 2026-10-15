@@ -70,6 +70,17 @@ MAX_CATEGORY_LEN = 50
 MAX_TITLE_LEN = 500
 MAX_BODY_LEN = 5000
 
+# The largest letter of an llm job (P5-1): characters of its canonical
+# JSON (app/engine/service.py canonical_fingerprint encoding) -- the
+# chat messages, the response schema and the model parameters together.
+# A conversation with its instruction does not fit MAX_BODY_LEN; the
+# ceiling is ours, the product's own limit is the model's context.
+MAX_LLM_LETTER_CHARS = 200_000
+
+# The longest name of an llm key set (LLM_KEY_SETS, app/core/channels.py)
+# -- the width of llm_calls / llm_answers columns that hold it.
+MAX_LLM_SET_NAME_LEN = 64
+
 # Width of notifications.idempotency_key -- the producer-supplied
 # dedup key of a stream-ingested notification request (Phase 3c).
 # 200 fits any sane producer key (outbox row uuid, composite string);

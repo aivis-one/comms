@@ -50,13 +50,25 @@
 # NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS), not a copy: one knob, one
 # number.
 #
-# STORAGE CLASS is not a field yet: it arrives together with the
-# storage of answers, and the set of classes is not defined today.
+# THE LLM KIND (P5-1, spec §14.12). A type whose channels are exactly
+# [llm] asks a model, not people: it routes to an ordered list of named
+# key sets (`llm_sets`, required on that kind and refused on any other)
+# and keeps the model's answer for `answer_keep` (a duration, default
+# 24h, not longer than NOTIFICATION_RETENTION_DAYS). llm shares a type
+# with no other channel, and the fields that concern a person --
+# `category` (the mute gate), `recipient_schedule` (the person's hours),
+# `max_body_chars` (the letter for people) -- are refused on it when
+# declared; `answer_keep` is refused when declared on a type for people.
+# The kind is a SHAPE of the record, not a condition: nothing in it reads
+# a message. The answer is kept by duration, not by a storage class: the
+# owner's decision (§14.12 item 5) is a term per type, and no class set
+# exists.
 #
 # CROSS-CHECK WITH THE DEPLOY (install_profile_from_settings): a type
 # routed to a channel whose key set is entirely empty on this deploy
 # (not_configured) refuses startup -- a route into a missing
-# capability must not reach a running service. The channel-name check
+# capability must not reach a running service. So does an llm type
+# naming a key set that LLM_KEY_SETS does not define. The channel-name check
 # against the capability registry is the same enumeration check every
 # channel list gets. A PARTIAL key set is not checked here at all: the
 # settings validator refuses it before this module runs
@@ -90,7 +102,8 @@
 #   - tree shape (mappings at every level, strings at the leaves);
 #   - a template for a type the profile does not declare, and a
 #     channel key that is not a channel of this service, refuse
-#     startup -- both are typos that would otherwise never render;
+#     startup -- both are typos that would otherwise never render; so
+#     does the llm channel, which renders nothing (P5-1);
 #   - the YAML flow-mapping trap: a bare `body: {title}` parses as a
 #     dict, not a string -- caught with an explicit hint;
 #   - presentation FLAG fields (disable_preview / silent) must be YAML
@@ -130,7 +143,7 @@
 # =============================================================================
 
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -150,6 +163,7 @@ from app.core.constants import (
     DOMAIN_LITERAL_PATTERNS,
     MAX_BODY_LEN,
     MAX_CATEGORY_LEN,
+    MAX_LLM_SET_NAME_LEN,
     MAX_TYPE_KEY_LEN,
     MSG_TYPE_KEYS,
 )
@@ -201,6 +215,13 @@ _CATEGORY_MAX_LENGTH = MAX_CATEGORY_LEN
 # names are the values a channel list may hold.
 CHANNEL_NAMES: tuple[str, ...] = tuple(
     sorted(spec.name for spec in CHANNEL_SPECS)
+)
+
+# The channels a template sheet may name: every channel but llm, whose
+# letter is the product's own and never rendered (P5-1) -- a sheet for
+# it would be a template no delivery ever reads.
+TEMPLATE_CHANNELS: tuple[str, ...] = tuple(
+    name for name in CHANNEL_NAMES if name != "llm"
 )
 
 # Lanes (spec §8.3): a closed set comms offers, the product picks one per
@@ -459,6 +480,70 @@ def _check_channels(value: Any) -> str | None:
     return None
 
 
+# The llm channel's name (app/engine/constants.py DeliveryChannel.LLM,
+# which this package cannot import: profile sits below engine). A type
+# whose channels are exactly this one is of the llm kind.
+LLM_CHANNEL = "llm"
+_LLM_ROUTE = (LLM_CHANNEL,)
+
+# How long an llm answer is kept when the type does not say (P5-1,
+# spec §14.12 item 5: "a short default"): a day covers a product that
+# is down overnight; a support conversation is not kept for weeks.
+_DEFAULT_ANSWER_KEEP = "24h"
+
+# The fields that concern a person, refused when DECLARED on an llm
+# kind -- it has no person: no mute, no hours, no letter for people.
+_PERSON_FIELDS = ("category", "max_body_chars", "recipient_schedule")
+
+
+def is_llm_route(channels: tuple[str, ...] | list[str]) -> bool:
+    """Whether a type's channels make it the llm kind."""
+    return tuple(channels) == _LLM_ROUTE
+
+
+def _check_llm_sets(value: Any) -> str | None:
+    expected = (
+        "expected a non-empty list of distinct key set names, each a name "
+        "of LLM_KEY_SETS"
+    )
+    if not isinstance(value, list):
+        return f"found {_describe(value)}; {expected}"
+    if not value:
+        return f"found an empty list (routes the call nowhere); {expected}"
+    problems: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > MAX_LLM_SET_NAME_LEN
+        ):
+            problems.append(f"{_describe(item)} is not a set name")
+        elif item in seen:
+            problems.append(f"{item!r} is listed twice")
+        else:
+            seen.add(item)
+    if problems:
+        return f"found {value!r}: {'; '.join(problems)}; {expected}"
+    return None
+
+
+def _check_answer_keep(value: Any) -> str | None:
+    """A duration literal, and not longer than general retention: the
+    retention pass deletes the job, and the answer with it -- a term
+    past it would be declared and never kept."""
+    problem = _check_duration(value)
+    if problem is not None:
+        return problem
+    days = settings.notification_retention_days
+    if days > 0 and _duration_value(value) > timedelta(days=days):
+        return (
+            f"found {value!r}; longer than NOTIFICATION_RETENTION_DAYS="
+            f"{days}, after which the job and its answer are deleted"
+        )
+    return None
+
+
 def _check_duration(value: Any) -> str | None:
     if isinstance(value, str) and _DURATION_RE.match(value):
         return None
@@ -604,6 +689,24 @@ _FIELDS: dict[str, _Field] = {
             "settings: NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS",
         ),
     ),
+    # The llm kind's ordered key sets (P5-1): the call goes to the first,
+    # and to the next on a transport failure only. Required on the llm
+    # kind, refused on any other (_check_kinds).
+    "llm_sets": _Field(
+        check=_check_llm_sets,
+        default=lambda: ((), "comms default: no key sets (not an llm type)"),
+        convert=tuple,
+    ),
+    # How long the model's answer is kept after it came (P5-1). Applies
+    # to the llm kind; refused when declared on any other.
+    "answer_keep": _Field(
+        check=_check_answer_keep,
+        default=lambda: (
+            _duration_value(_DEFAULT_ANSWER_KEEP),
+            f"comms default: {_DEFAULT_ANSWER_KEEP} (the llm kind only)",
+        ),
+        convert=_duration_value,
+    ),
     # Size limit, in characters of the body. The ceiling is the width
     # the body already has (MAX_BODY_LEN): a type may tighten it, never
     # widen it past the column. Applied (H1) at intake: a longer body
@@ -646,13 +749,15 @@ class Profile:
 def parse_profile(
     raw: RawProfile,
     channel_states: Mapping[str, ChannelState] | None = None,
+    llm_set_names: Collection[str] | None = None,
 ) -> Profile:
     """Validate a raw profile and return the parsed form.
 
     Source-independent: everything loaded by any ProfileSource goes
     through the same checks. `channel_states` is this deploy's channel
-    map; when given, routes are cross-checked against it (the startup
-    path passes it, tests that only exercise the schema do not).
+    map, `llm_set_names` the names of its llm key sets; when given,
+    routes are cross-checked against them (the startup path passes
+    them, tests that only exercise the schema do not).
 
     Raises ProfileError: at once for a missing or wrong schema version;
     otherwise once, listing every violation found.
@@ -662,8 +767,11 @@ def parse_profile(
     types = _parse_types(body, violations)
     if types is not None:
         _require_msg_type_categories(types, violations)
+        _check_kinds(types, violations)
         if channel_states is not None:
             _check_routes(types, channel_states, violations)
+        if llm_set_names is not None:
+            _check_llm_set_routes(types, llm_set_names, violations)
 
     declared = types or {}
     templates: dict[str, TemplateTree] = {}
@@ -885,6 +993,71 @@ def _require_msg_type_categories(
             ))
 
 
+def _check_kinds(
+    types: dict[str, TypeRecord], violations: list[Violation],
+) -> None:
+    """The llm kind's shape (see the header): llm alone in `channels`,
+    `llm_sets` exactly on that kind, no person's field declared on it,
+    no `answer_keep` declared off it."""
+    for key, record in types.items():
+        channels = record.value("channels")
+        llm_sets = record.fields["llm_sets"]
+        if is_llm_route(channels):
+            if not llm_sets.value:
+                violations.append(Violation(
+                    _TYPES_FILE, key, "llm_sets",
+                    f"type {key!r} routes to {LLM_CHANNEL!r} but declares no "
+                    f"`llm_sets`; an llm type names the key sets its call "
+                    f"goes through, in order",
+                ))
+            for fname in _PERSON_FIELDS:
+                if record.fields[fname].layer is Layer.PROFILE:
+                    violations.append(Violation(
+                        _TYPES_FILE, key, fname,
+                        f"type {key!r} routes to {LLM_CHANNEL!r} and declares "
+                        f"`{fname}`, which concerns a person; an llm job has "
+                        f"no recipient -- remove the field",
+                    ))
+            continue
+        if LLM_CHANNEL in channels:
+            violations.append(Violation(
+                _TYPES_FILE, key, "channels",
+                f"type {key!r} routes to {LLM_CHANNEL!r} together with "
+                f"{', '.join(c for c in channels if c != LLM_CHANNEL)}; a "
+                f"model is not a person -- {LLM_CHANNEL!r} goes alone",
+            ))
+        if llm_sets.layer is Layer.PROFILE:
+            violations.append(Violation(
+                _TYPES_FILE, key, "llm_sets",
+                f"type {key!r} declares `llm_sets` but does not route to "
+                f"{LLM_CHANNEL!r} alone; key sets belong to an llm type",
+            ))
+        if record.fields["answer_keep"].layer is Layer.PROFILE:
+            violations.append(Violation(
+                _TYPES_FILE, key, "answer_keep",
+                f"type {key!r} declares `answer_keep` but does not route to "
+                f"{LLM_CHANNEL!r} alone; only a model's answer is kept",
+            ))
+
+
+def _check_llm_set_routes(
+    types: dict[str, TypeRecord],
+    llm_set_names: Collection[str],
+    violations: list[Violation],
+) -> None:
+    """Refuse a key set this deploy does not define (LLM_KEY_SETS)."""
+    defined = set(llm_set_names)
+    for key, record in types.items():
+        for name in record.value("llm_sets"):
+            if name not in defined:
+                violations.append(Violation(
+                    _TYPES_FILE, key, "llm_sets",
+                    f"type {key!r} routes to key set {name!r}, which "
+                    f"LLM_KEY_SETS on this deploy does not define (defined: "
+                    f"{', '.join(sorted(defined)) or 'none'})",
+                ))
+
+
 def _check_routes(
     types: dict[str, TypeRecord],
     channel_states: Mapping[str, ChannelState],
@@ -1006,12 +1179,12 @@ def _parse_template_tree(
             continue
         tree_channels: dict[str, dict[str, str | bool]] = {}
         for channel, fields in channels.items():
-            if not isinstance(channel, str) or channel not in CHANNEL_NAMES:
+            if not isinstance(channel, str) or channel not in TEMPLATE_CHANNELS:
                 violations.append(Violation(
                     where, type_key, str(channel),
                     f"{type_key}: channel key {channel!r} is not a channel "
-                    f"of this service; expected one of: "
-                    f"{', '.join(CHANNEL_NAMES)}",
+                    f"of this service that renders a template; expected one "
+                    f"of: {', '.join(TEMPLATE_CHANNELS)}",
                 ))
                 continue
             if not isinstance(fields, dict):
@@ -1157,9 +1330,42 @@ def _leaf_complaint(fname: str, template: Any) -> str | None:
 def load_profile(
     source: ProfileSource,
     channel_states: Mapping[str, ChannelState] | None = None,
+    llm_set_names: Collection[str] | None = None,
 ) -> Profile:
     """Load and validate a profile from a source."""
-    return parse_profile(source.load(), channel_states)
+    return parse_profile(source.load(), channel_states, llm_set_names)
+
+
+@dataclass(frozen=True)
+class LaneMix:
+    """A lane that carries llm types beside types for people."""
+
+    lane: str
+    llm_types: tuple[str, ...]
+    other_types: tuple[str, ...]
+
+
+def lanes_mixing_llm(target: ProfileRegistry = registry) -> list[LaneMix]:
+    """Every lane the installed profile gives both llm types and types
+    for people, in lane order -- the input of the worker's startup
+    warning (app/worker.py). A lane attempts its jobs one after another
+    (app/engine/processor.py process_lane), so a model writing for a
+    minute holds every job of its lane behind it: the KNOWN CEILING on
+    app/engine/service.py _deliver_llm."""
+    by_lane: dict[str, tuple[list[str], list[str]]] = {
+        lane: ([], []) for lane in LANES
+    }
+    for key in sorted(target.registered_types()):
+        record = target.record_of(key)
+        if record is None:
+            continue
+        llm, other = by_lane[record.value("lane")]
+        (llm if is_llm_route(record.value("channels")) else other).append(key)
+    return [
+        LaneMix(lane=lane, llm_types=tuple(llm), other_types=tuple(other))
+        for lane, (llm, other) in by_lane.items()
+        if llm and other
+    ]
 
 
 def deploy_channel_states() -> dict[str, ChannelState]:
@@ -1223,6 +1429,7 @@ def install_profile_from_settings() -> bool:
     profile = load_profile(
         FileProfileSource(Path(settings.templates_dir)),
         channel_states=deploy_channel_states(),
+        llm_set_names=tuple(settings.llm_sets),
     )
     install_profile(profile)
     return True

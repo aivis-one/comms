@@ -50,7 +50,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import structlog
@@ -63,12 +63,14 @@ from app.audience.models import Recipient
 from app.audience.prefs import muted_recipient_ids
 from app.audience.schedule import recipient_deferred_until
 from app.core.config import settings
+from app.core.constants import MAX_LLM_LETTER_CHARS
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.lanes import Lane
 from app.core.sanitize import sanitize_text, sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
     ChannelAnswer,
+    DeliveryChannel,
     DeliveryStatus,
     FailureClass,
     IntakeOutcomeClass,
@@ -80,14 +82,19 @@ from app.engine.constants import (
 from app.engine.formatters import (
     ChannelFormatter,
     ConfigurationError,
+    LLMReply,
     MessageRejectedError,
+    ModelChannel,
     NoAddressError,
     PermanentDeliveryError,
     RateLimitedError,
     get_formatter,
+    get_model_channel,
 )
 from app.engine.models import (
     IntakeOutcome,
+    LLMAnswer,
+    LLMCall,
     Notification,
     NotificationDelivery,
     NotificationTransition,
@@ -95,6 +102,7 @@ from app.engine.models import (
 )
 from app.engine.resolver import resolve_targets
 from app.engine.wake import signal_lane
+from app.profile.loader import is_llm_route
 from app.profile.registry import Decided, Layer, RecipientSchedule, registry
 
 logger = structlog.get_logger()
@@ -351,11 +359,14 @@ async def intake_outcomes_for(
 @dataclass(frozen=True)
 class JobRead:
     """What a key answers: its non-acceptances, its job, the job's
-    deliveries counted by (channel, status)."""
+    deliveries counted by (channel, status) -- and, for a job of the llm
+    kind (P5-1), its call and its answer (None while there is none)."""
 
     intake: list[IntakeOutcome]
     job: Notification | None
     delivery_counts: list[tuple[str, str, int]]
+    llm_call: LLMCall | None = None
+    llm_answer: LLMAnswer | None = None
 
 
 async def _job_by_key(
@@ -393,7 +404,19 @@ async def read_job_by_key(
             .order_by(NotificationDelivery.channel, NotificationDelivery.status)
         )
         counts = [(channel, status, int(n)) for channel, status, n in rows.all()]
-    return JobRead(intake=intake, job=job, delivery_counts=counts)
+    llm_call: LLMCall | None = None
+    llm_answer: LLMAnswer | None = None
+    if job is not None and is_llm_route(job.channels):
+        # Two reads by primary key -- a fixed number per read.
+        llm_call = await session.get(LLMCall, job.id)
+        llm_answer = await session.get(LLMAnswer, job.id)
+    return JobRead(
+        intake=intake,
+        job=job,
+        delivery_counts=counts,
+        llm_call=llm_call,
+        llm_answer=llm_answer,
+    )
 
 
 async def job_id_by_key(session: AsyncSession, idempotency_key: str) -> UUID:
@@ -509,17 +532,92 @@ def expiry_of(notification: Notification) -> Decided:
     return Decided(value=notification.expiry_at, layer=layer, source=source)
 
 
+def _letter_by_kind(
+    type: str,
+    record: Any,
+    *,
+    title: str | None,
+    body: str | None,
+    target_type: str | None,
+    target_value: str | None,
+    action_data: dict[str, Any] | None,
+    llm: dict[str, Any] | None,
+) -> None:
+    """Refuse a request whose fields do not match its TYPE's kind (P5-1).
+
+    A type for people takes an address and a letter for people -- target
+    and title and body -- and no model's letter. A type of the llm kind
+    (channels exactly [llm], app/profile/loader.py) takes the model's
+    letter and nothing a person would need: it has no audience. Each
+    refusal names the fields, never a value.
+    """
+    if is_llm_route(record.value("channels")):
+        if llm is None:
+            raise ValidationError(
+                f"type {type} asks a model: the request needs the field "
+                f"'llm' (its letter)"
+            )
+        present = [
+            name for name, value in (
+                ("target_type", target_type),
+                ("target_value", target_value),
+                ("title", title),
+                ("body", body),
+                ("action_data", action_data),
+            )
+            if value is not None
+        ]
+        if present:
+            raise ValidationError(
+                f"type {type} asks a model and has no audience: the "
+                f"request may not carry {', '.join(present)}"
+            )
+        return
+    if llm is not None:
+        raise ValidationError(
+            f"type {type} is not an llm type: the request may not carry "
+            f"'llm'"
+        )
+    missing = [
+        name for name, value in (
+            ("target_type", target_type),
+            ("target_value", target_value),
+            ("title", title),
+            ("body", body),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValidationError(
+            f"type {type} is delivered to people: the request needs "
+            f"{', '.join(missing)}"
+        )
+
+
+def llm_letter_encoding(letter: Mapping[str, Any]) -> str:
+    """The canonical JSON of an llm letter -- what its size is measured
+    on and its hash taken over (the encoding of canonical_fingerprint)."""
+    return json.dumps(
+        letter,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 async def create_notification(
     session: AsyncSession,
     *,
     type: str,
-    title: str,
-    body: str,
-    target_type: str,
-    target_value: str,
+    title: str | None,
+    body: str | None,
+    target_type: str | None,
+    target_value: str | None,
     idempotency_key: str,
     fingerprint: str,
     action_data: dict[str, Any] | None = None,
+    llm: dict[str, Any] | None = None,
     scheduled_at: datetime | None = None,
     expiry_at: datetime | None = None,
     correlation: str | None = None,
@@ -540,7 +638,8 @@ async def create_notification(
             periods), its lane (which of the worker's loops picks it,
             with whose budget) and its transport retry
             (retry_max_attempts, retry_backoff_seconds).
-        title: Stored fallback title (the letter).
+        title: Stored fallback title (the letter). None exactly for a
+            type of the llm kind (P5-1), like body and the target.
         body: Stored fallback body (the letter).
         target_type: TargetType value (user, group, all).
         target_value: Bare target specifier ("<uuid>", "<group_key>", "*").
@@ -548,6 +647,9 @@ async def create_notification(
         fingerprint: Digest of the request's bytes (see above).
         action_data: Optional JSONB letter (deep-link intent + template
             variables).
+        llm: The model's letter -- required for a type of the llm kind
+            and refused for any other (P5-1). Kept in llm_calls until the
+            job's outcome, with its hash and the type's key sets.
         scheduled_at: "Not before" -- when the job becomes deliverable.
             Defaults to now.
         expiry_at: The envelope's expiry. Wins over the profile's
@@ -572,18 +674,36 @@ async def create_notification(
             f"Registered: {', '.join(sorted(registry.registered_types()))}"
         )
 
-    # -- The type's size limit (H1, spec §5.9): its LENGTH, never its
-    # content. Refused here, not at delivery: comms does not accept a
-    # job it already knows it will not deliver. The product reads the
-    # refusal and its reason under the key (intake_outcomes). --
-    max_body_chars: int = record.value("max_body_chars")
-    if len(body) > max_body_chars:
-        raise ValidationError(
-            f"body has {len(body)} characters; type {type} allows at "
-            f"most {max_body_chars} (max_body_chars)"
-        )
+    _letter_by_kind(
+        type, record,
+        title=title, body=body,
+        target_type=target_type, target_value=target_value,
+        action_data=action_data, llm=llm,
+    )
 
-    if target_type not in _VALID_TARGET_TYPES:
+    # -- The size limit (H1, spec §5.9): its LENGTH, never its content.
+    # Refused here, not at delivery: comms does not accept a job it
+    # already knows it will not deliver. The product reads the refusal
+    # and its reason under the key (intake_outcomes). A letter for
+    # people by its type's max_body_chars; a model's letter by the one
+    # ceiling of comms (P5-1). --
+    llm_encoded: str | None = None
+    if llm is not None:
+        llm_encoded = llm_letter_encoding(llm)
+        if len(llm_encoded) > MAX_LLM_LETTER_CHARS:
+            raise ValidationError(
+                f"llm letter has {len(llm_encoded)} characters (canonical "
+                f"JSON); the limit is {MAX_LLM_LETTER_CHARS}"
+            )
+    elif body is not None:
+        max_body_chars: int = record.value("max_body_chars")
+        if len(body) > max_body_chars:
+            raise ValidationError(
+                f"body has {len(body)} characters; type {type} allows at "
+                f"most {max_body_chars} (max_body_chars)"
+            )
+
+    if target_type is not None and target_type not in _VALID_TARGET_TYPES:
         raise ValidationError(
             f"Invalid target_type: {target_type}. "
             f"Valid: {', '.join(sorted(_VALID_TARGET_TYPES))}"
@@ -648,6 +768,21 @@ async def create_notification(
     )
     session.add(notification)
     await session.flush()
+    if llm is not None and llm_encoded is not None:
+        # The letter, its hash and the type's key sets and answer term,
+        # AT INTAKE (P5-1): a snapshot like `channels`.
+        session.add(LLMCall(
+            notification_id=notification.id,
+            sets=list(record.value("llm_sets")),
+            letter=llm,
+            letter_hash=hashlib.sha256(
+                llm_encoded.encode("utf-8"),
+            ).hexdigest(),
+            answer_keep_seconds=int(
+                record.value("answer_keep").total_seconds(),
+            ),
+        ))
+        await session.flush()
     # The birth of the job (null -> pending) is its first transition;
     # inside accept_notification's savepoint, so a key collision leaves
     # no row.
@@ -657,7 +792,10 @@ async def create_notification(
         "notification_created",
         notification_id=str(notification.id),
         type=type,
-        target=f"{target_type}:{target_value}",
+        target=(
+            f"{target_type}:{target_value}" if target_type is not None
+            else None
+        ),
         channels=channels,
         lane=lane,
         scheduled_at=scheduled_at.isoformat(),
@@ -709,7 +847,36 @@ async def resolve_notification(
         result = await session.execute(stmt)
         return list(result.scalars().all())
 
+    # -- A job of the llm kind (P5-1) has no audience: ONE delivery, on
+    # its one channel, without a recipient -- no resolve over the sync
+    # projection and no mute gate, which ask about people. --
+    if is_llm_route(notification.channels):
+        delivery = NotificationDelivery(
+            notification_id=notification.id,
+            recipient_id=None,
+            channel=DeliveryChannel.LLM,
+            status=DeliveryStatus.PENDING,
+        )
+        session.add(delivery)
+        journal.record_delivery(
+            session, notification, delivery, JournalStep.RESOLVE,
+        )
+        notification.status = NotificationStatus.PROCESSING
+        journal.record_job(session, notification, JournalStep.RESOLVE)
+        await session.flush()
+        logger.info(
+            "notification_resolved",
+            notification_id=str(notification.id),
+            recipients=0,
+            channels=1,
+            deliveries=1,
+        )
+        return [delivery]
+
     # -- Resolve target recipients over the sync projection --
+    # A job for people has its address (ck_notifications_letter_by_kind).
+    assert notification.target_type is not None
+    assert notification.target_value is not None
     recipient_ids = await resolve_targets(
         session,
         notification.target_type,
@@ -901,13 +1068,19 @@ async def deliver_notification(
     if not deliveries:
         return False
 
-    # -- Batch load recipients for all pending deliveries --
-    recipient_ids: set[UUID] = {d.recipient_id for d in deliveries}
-    recipient_stmt = select(Recipient).where(Recipient.id.in_(recipient_ids))
-    recipient_result = await session.execute(recipient_stmt)
-    recipients_by_id: dict[UUID, Recipient] = {
-        r.id: r for r in recipient_result.scalars().all()
-    }
+    # -- Batch load recipients for all pending deliveries. The llm
+    # delivery has none (P5-1): its job's call is loaded instead. --
+    recipient_ids: set[UUID | None] = {d.recipient_id for d in deliveries}
+    people: set[UUID] = {r for r in recipient_ids if r is not None}
+    recipients_by_id: dict[UUID, Recipient] = {}
+    if people:
+        recipient_result = await session.execute(
+            select(Recipient).where(Recipient.id.in_(people)),
+        )
+        recipients_by_id = {r.id: r for r in recipient_result.scalars().all()}
+    call: LLMCall | None = None
+    if None in recipient_ids:
+        call = await session.get(LLMCall, notification.id)
 
     # -- Accepted by the channel in an attempt that did not commit: the
     # letter is out. Read once per pass, by (recipient, channel). --
@@ -921,10 +1094,8 @@ async def deliver_notification(
     # category snapshotted at intake (F1.3) --
     category = notification.category
     muted: set[UUID] = set()
-    if category is not None:
-        muted = await muted_recipient_ids(
-            session, category, list(recipient_ids),
-        )
+    if category is not None and people:
+        muted = await muted_recipient_ids(session, category, list(people))
 
     # -- Concurrent delivery via gather + the lane's slots (P4-1) --
     semaphore = asyncio.Semaphore(
@@ -933,13 +1104,6 @@ async def deliver_notification(
     tasks = []
 
     for delivery in deliveries:
-        # Every delivery has its recipient row: recipient_id is a
-        # foreign key with ON DELETE CASCADE, so deleting a recipient
-        # deletes its deliveries. (A "recipient not found -> FAILED"
-        # branch stood here for a state that cannot exist; removed in
-        # F1.3 rather than given a failure class.)
-        recipient = recipients_by_id[delivery.recipient_id]
-
         # -- Leaving the wait: the gate that held this delivery has
         # opened; its reason goes with it. A gate below may set both
         # again. --
@@ -967,6 +1131,27 @@ async def deliver_notification(
                 accepted_at=accepted_at.isoformat(),
             )
             continue
+
+        # -- The llm delivery (P5-1): no recipient, so none of the gates
+        # below, which ask about a person. Its job's call carries the
+        # letter and the sets (ck_deliveries_recipient_by_channel: the
+        # llm delivery and the recipient-less one are the same). --
+        if delivery.recipient_id is None:
+            assert call is not None and call.letter is not None
+            tasks.append(
+                _deliver_single(
+                    semaphore, get_model_channel(), notification, delivery,
+                    None, call,
+                )
+            )
+            continue
+
+        # Every delivery for a person has its recipient row:
+        # recipient_id is a foreign key with ON DELETE CASCADE, so
+        # deleting a recipient deletes its deliveries. (A "recipient not
+        # found -> FAILED" branch stood here for a state that cannot
+        # exist; removed in F1.3 rather than given a failure class.)
+        recipient = recipients_by_id[delivery.recipient_id]
 
         # -- Late activity gate (F1.4): deactivated or deleted by the
         # product after resolve -> close out, no send. Checked first: a
@@ -1232,12 +1417,46 @@ class _DeliveryOutcome:
 
 async def _deliver_single(
     semaphore: asyncio.Semaphore,
-    formatter: ChannelFormatter,
+    formatter: ChannelFormatter | ModelChannel,
     notification: Notification,
     delivery: NotificationDelivery,
-    recipient: Recipient,
+    recipient: Recipient | None,
+    call: LLMCall | None = None,
 ) -> tuple[NotificationDelivery, _DeliveryOutcome]:
     """Deliver a single notification with concurrency control.
+
+    THE LLM DELIVERY (P5-1) runs here too -- this is the one place a
+    channel exception becomes a failure class. With `call` the channel
+    is ASKED (ModelChannel.ask, the letter and the job's sets) and its
+    answer is stored with the journal row (journal.record_channel_answer)
+    -- a delivery is SENT only with its answer stored. Its bound is the
+    channel's own, LLM_DELIVER_TIMEOUT_SECONDS for each set of the job's
+    list: the lanes' 30 is email's and telegram's, and a model writes for
+    longer (app/core/channels.py own_deliver_timeout).
+
+    KNOWN CEILING (acknowledged by design -- P5-1, the head of a lane):
+      1. Mechanics: a lane attempts its jobs one after another
+         (app/engine/processor.py process_lane), and an llm call may run
+         up to LLM_DELIVER_TIMEOUT_SECONDS for each set of its list. Every
+         job of the same lane behind it -- a login code by email, if the
+         profile put both in one lane -- waits that long.
+      2. Status: acknowledged by design.
+      3. Backlog ref: none -- parallel jobs inside a lane are a separate
+         task (the owner's answer at the P5-1 gate).
+      4. Promotion trigger (observable): the worker's startup line
+         `lane_mixes_llm` (app/worker.py), which names every lane that
+         carries llm types beside types for people; or a
+         notifications_processed line of such a lane whose duration_ms
+         is above its poll interval.
+      5. Agreed fix: jobs of a lane attempted concurrently, within the
+         lane's slots.
+      6. Rejected: refusing a lane that mixes the two at startup (a red
+         start on a valid profile; the choice of lane is the product's);
+         raising the lanes' timeouts to the model's (the interactive
+         email would wait minutes for a dead provider); a lane of comms'
+         own for llm (the lanes are a closed set, spec §8).
+    deploy/INTEGRATION.md tells the product to keep llm types in a lane
+    without types for people.
 
     Runs formatter.deliver() under semaphore with the timeout of the
     job's lane (P4-3, spec §8.5) -- inside the slot, so a call waiting
@@ -1252,13 +1471,32 @@ async def _deliver_single(
     (journal.record_channel_answer). Returns (delivery, outcome) for the
     caller to apply to the attempt's session.
     """
-    timeout = settings.lane_deliver_timeout(Lane(notification.lane))
+    llm_answer: LLMAnswer | None = None
+    if call is None:
+        timeout = settings.lane_deliver_timeout(Lane(notification.lane))
+    else:
+        timeout = settings.llm_deliver_timeout_seconds * len(call.sets)
     async with semaphore:
         try:
-            success = await asyncio.wait_for(
-                formatter.deliver(notification, delivery, recipient),
-                timeout=timeout,
-            )
+            # The two shapes of a channel: a person's channel is given a
+            # recipient, the model channel a call -- the caller passes
+            # exactly one of the two (deliver_notification).
+            if call is None:
+                assert recipient is not None
+                success = await asyncio.wait_for(
+                    cast(ChannelFormatter, formatter).deliver(
+                        notification, delivery, recipient,
+                    ),
+                    timeout=timeout,
+                )
+            else:
+                assert call.letter is not None
+                reply = await asyncio.wait_for(
+                    cast(ModelChannel, formatter).ask(call.letter, call.sets),
+                    timeout=timeout,
+                )
+                llm_answer = _answer_row(call, reply)
+                success = True
         except PermanentDeliveryError as exc:
             # THE one place a channel exception becomes a failure class:
             # the exception's type is the class (formatters raise only
@@ -1328,8 +1566,31 @@ async def _deliver_single(
                 if success
                 else journal.Answer(outcome=ChannelAnswer.TRANSIENT)
             )
-        await journal.record_channel_answer(delivery, answer)
+        stored = await journal.record_channel_answer(
+            delivery, answer, llm_answer=llm_answer,
+        )
+        if llm_answer is not None and not stored:
+            # The model answered and the answer could not be kept: not a
+            # SENT without its answer -- transient, asked again.
+            outcome = _DeliveryOutcome(
+                error="the model answered, but the answer could not be "
+                "stored (journal_channel_answer_error in the log)",
+            )
         return delivery, outcome
+
+
+def _answer_row(call: LLMCall, reply: LLMReply) -> LLMAnswer:
+    """The answer as it is kept: who answered, when, until when."""
+    answered_at = datetime.now(UTC)
+    return LLMAnswer(
+        notification_id=call.notification_id,
+        body=reply.body,
+        answered_set=reply.set_name,
+        answered_provider=reply.provider,
+        answered_model=reply.model,
+        answered_at=answered_at,
+        keep_until=answered_at + timedelta(seconds=call.answer_keep_seconds),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1446,11 +1707,46 @@ async def rollup_notification(
         return
     notification.status = verdict
     journal.record_job(session, notification, step)
+    await forget_llm_letter(session, notification)
     await session.flush()
     logger.info(
         "notification_rollup",
         notification_id=str(notification.id),
         status=notification.status,
+    )
+
+
+async def forget_llm_letter(
+    session: AsyncSession, notification: Notification,
+) -> None:
+    """Clear the model's letter of a job that reached its outcome (P5-1,
+    spec §14.12 item 5): the letter was only ever needed to ask; its
+    hash stays (llm_calls.letter_hash). A no-op for a job for people,
+    and for one still active.
+
+    Called beside the three transitions that give an llm job its
+    outcome: the fold (rollup_notification -- the attempt, expiry and
+    cancellation of a resolved job, the pipeline's ceiling), the direct
+    close of a job not resolved yet (close_notifications), and the
+    ceiling's close of a job whose resolve failed
+    (app/engine/processor.py _close_at_ceiling). The caller holds the
+    job's row lock. The row written is llm_calls, whose other writers are
+    intake and the cascade -- and its foreign key is not changed, so the
+    UPDATE takes no lock on the job.
+    """
+    if not is_llm_route(notification.channels):
+        return
+    if notification.status in (
+        NotificationStatus.PENDING, NotificationStatus.PROCESSING,
+    ):
+        return
+    await session.execute(
+        update(LLMCall)
+        .where(
+            LLMCall.notification_id == notification.id,
+            LLMCall.letter.is_not(None),
+        )
+        .values(letter=None)
     )
 
 
@@ -1609,6 +1905,7 @@ async def close_notifications(
             # Not resolved: no deliveries exist to carry the outcome.
             notification.status = outcome
             journal.record_job(session, notification, step)
+            await forget_llm_letter(session, notification)
             continue
         await close_waiting_deliveries(
             session, notification, delivery_outcome, step,
@@ -1816,6 +2113,12 @@ async def delete_expired_notifications_batch(
     -- retention is the one bound on how long anything is kept. The
     check is an anti-join on ix_push_outbox_notification, beside the
     partial index, not instead of it (tests/test_push_survives_cleanup.py).
+
+    NOT WHILE AN ANSWER IS KEPT (P5-1): a job whose model answer still
+    has its body is skipped the same way -- an anti-join on the primary
+    key of llm_answers; once purge_llm_answers clears the body at
+    keep_until, the job goes like any other. General retention bounds
+    this too.
     """
     batch_ids = (
         select(Notification.id)
@@ -1824,6 +2127,14 @@ async def delete_expired_notifications_batch(
             Notification.expiry_at < now,
             Notification.status.in_(_EXPIRED_DELETABLE_STATUSES),
             ~exists().where(PushOutbox.notification_id == Notification.id),
+            # NOT WHILE A MODEL'S ANSWER IS KEPT (P5-1): the job's expiry
+            # bounds when it may be ASKED, not how long its answer is
+            # kept -- that is the type's answer_keep. The purge clears
+            # the body at keep_until; the next pass deletes the job.
+            ~exists().where(
+                LLMAnswer.notification_id == Notification.id,
+                LLMAnswer.body.is_not(None),
+            ),
         )
         .order_by(Notification.expiry_at)
         .limit(limit)
@@ -1834,6 +2145,37 @@ async def delete_expired_notifications_batch(
     )
     deleted: int = result.rowcount  # type: ignore[attr-defined]
     return deleted
+
+
+async def purge_llm_answers(
+    session: AsyncSession, *, now: datetime, limit: int,
+) -> int:
+    """Clear ONE batch of model answers past their term (P5-1, spec
+    §14.12 item 5): body -> NULL where keep_until has passed. The
+    snapshot -- set, provider, model, when -- stays with the job, and so
+    does the letter's hash: what answered which letter outlives the
+    answer. COMMIT-FREE like the batch deletes: the caller commits.
+
+    By ix_llm_answers_keep (keep_until WHERE body IS NOT NULL), in term
+    order, through the primary key. The rows written: llm_answers only,
+    whose other writers are the channel's answer (an INSERT -- never a
+    row this sees) and the cascade of a job's deletion. Returns the
+    number cleared.
+    """
+    batch_ids = (
+        select(LLMAnswer.notification_id)
+        .where(LLMAnswer.body.is_not(None), LLMAnswer.keep_until < now)
+        .order_by(LLMAnswer.keep_until)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        update(LLMAnswer)
+        .where(LLMAnswer.notification_id == any_(func.array(batch_ids)))
+        .values(body=None)
+    )
+    cleared: int = result.rowcount  # type: ignore[attr-defined]
+    return cleared
 
 
 def _navigation_intent(

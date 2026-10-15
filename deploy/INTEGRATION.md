@@ -291,6 +291,9 @@ expected `live`; the in-code marker (`KNOWN CEILING` in
 says what a deploy HAS; what its channels DID is the second answer,
 "Channel health" in section 5.
 
+**The llm channel, concretely,** is one key, `LLM_KEY_SETS`, holding
+named key sets: section 11.
+
 **Email, concretely.** The channel is decided by its key set like any
 other, and its keys are declared in `app/core/channels.py`. Three of
 them decide it -- the provider API key, the provider domain, and the
@@ -518,7 +521,7 @@ like every `/api/v1` route; `GET /health` itself is unchanged.
 ```
 
 Every channel of the service is listed (`in_app`, `telegram`, `email`,
-`push`), each with every key, zeros included -- an absent key never
+`push`, `llm`), each with every key, zeros included -- an absent key never
 means zero.
 
 | field | meaning |
@@ -718,17 +721,22 @@ never interprets.
 | `v` | required | frame | `1` |
 | `idempotency_key` | required | envelope | string, 1..200 -- names the request (see below) |
 | `type` | required | envelope | declared by the profile; the profile routes it to its channels |
-| `target_type` | required | envelope | `user` \| `group` \| `all` |
-| `target_value` | required | envelope | a recipient uuid, a group key, or `*`, matching `target_type` |
+| `target_type` | by type | envelope | `user` \| `group` \| `all` -- required for a type delivered to people, refused for an llm type (section 11) |
+| `target_value` | by type | envelope | a recipient uuid, a group key, or `*`, matching `target_type`; with `target_type` or not at all |
 | `scheduled_at` | optional | envelope | ISO 8601 with a zone -- "not before" |
 | `expiry_at` | optional | envelope | ISO 8601 with a zone; in the future and after `scheduled_at`; wins over the profile's `expires_after` |
 | `correlation` | optional | envelope | string, 1..200 -- the product's own reference, stored untouched (see below) |
-| `title` | required | letter | 1..500 -- the stored fallback; templates override it at delivery |
-| `body` | required | letter | 1..5000 |
-| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable |
+| `title` | by type | letter | 1..500 -- the stored fallback; templates override it at delivery. Required for a type delivered to people, refused for an llm type |
+| `body` | by type | letter | 1..5000; as `title` |
+| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
+| `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
 
 There is no channel and no priority on a request. The channel is the
-profile's (section 3a).
+profile's (section 3a). Which of the fields marked "by type" a request
+carries is its type's: a type delivered to people takes the address and
+`title` and `body`; an llm type (section 11) takes `llm` and none of
+those -- either way the wrong set is rejected at intake, naming the
+fields.
 
 **What intake answers.** A request is decided the moment it is read:
 
@@ -898,9 +906,11 @@ The deliveries and path pages answer 404 when the key has no accepted
 job (only intake outcomes, or nothing).
 
 **What is never in an answer: the letter.** No title, body, action data,
-template variables; no text of an exception of comms' own (only its
-class and place, in `error`). A provider's own answer is in the path,
-sanitized; once its recipient is forgotten it is `null`.
+template variables, no llm letter; no text of an exception of comms' own
+(only its class and place, in `error`). A provider's own answer is in
+the path, sanitized; once its recipient is forgotten it is `null`. The
+one body a read carries is a MODEL'S answer to an llm job (`answer`,
+below) -- the answer, never the letter it answered.
 
 **A replay is not shown.** Sending the same bytes under the same key
 again changes nothing and records nothing: the read shows the accepted
@@ -912,9 +922,9 @@ existed (comms before migration 0017) have a partial or an empty
 path; their summary and deliveries are whole.
 
 **Adding a field is not a break.** Clients ignore fields they do not
-know. Phase 5 adds the model's answer to `job` that way -- an object
-`response` beside `status` (the body, a snapshot of who answered, the
-letter's hash) -- without changing any field below.
+know. Phase 5 added the model's answer to `job` that way -- the object
+`answer` (the body, a snapshot of who answered, the letter's hash) --
+without changing any field that was there.
 
 ### `summary` -- `GET .../by-key`
 
@@ -940,8 +950,8 @@ letter's hash) -- without changing any field below.
 | `id` | the job's id |
 | `type` | the request type |
 | `category` | the category it was gated by, or `null` |
-| `target_type` | `user`, `group`, `all` |
-| `target_value` | the address as sent |
+| `target_type` | `user`, `group`, `all`; `null` for an llm job (it has no audience) |
+| `target_value` | the address as sent; `null` for an llm job |
 | `correlation` | as sent, untouched, or `null` |
 | `status` | `pending`, `processing`; or the outcome: `sent`, `partial_sent`, `failed`, `no_recipients`, `suppressed`, `expired`, `cancelled` |
 | `created_at` | when it was accepted |
@@ -949,6 +959,29 @@ letter's hash) -- without changing any field below.
 | `expiry_at` | when it expires, or `null` |
 | `pipeline` | the pipeline's own failures (`pipeline`) |
 | `deliveries` | the deliveries counted by channel and status (`delivery_count`); `[]` before resolve |
+| `answer` | the model's answer of an llm job (`answer`); `null` for a job delivered to people |
+
+### `answer`
+
+The model's answer to an llm job (section 11). Read it on the push of the
+job's outcome, within `keep_until`.
+
+| field | value |
+|---|---|
+| `state` | `none` -- no answer: the job is active, or ended without one (its `status` says which); `kept` -- `body` is here; `purged` -- past `keep_until`, the body is gone, the rest stays |
+| `letter_hash` | SHA-256 (hex) of the letter's canonical JSON (sorted keys, no spaces, UTF-8) -- which letter was asked; the letter itself is deleted at the outcome |
+| `answered_by` | who answered (`answered_by`), or `null` when there is no answer |
+| `answered_at` | when the answer came, or `null` |
+| `keep_until` | until when the body is kept, or `null` |
+| `body` | the provider's HTTP response body, as it came, as a string -- a chat completion the product parses itself; or `null` |
+
+### `answered_by`
+
+| field | value |
+|---|---|
+| `set` | the key set the call went through (`LLM_KEY_SETS`) |
+| `provider` | the provider as the response names it (a gateway's `provider` field), or `null` when it does not |
+| `model` | the model as the response names it, or `null` -- never the requested one |
 
 ### `pipeline`
 
@@ -971,7 +1004,7 @@ letter's hash) -- without changing any field below.
 
 | field | value |
 |---|---|
-| `recipient_id` | the recipient, the product's id |
+| `recipient_id` | the recipient, the product's id; `null` on the `llm` channel -- its delivery has no recipient |
 | `channel` | the channel |
 | `status` | `pending`, `sent`, `failed`, `suppressed`, `recipient_inactive`, `expired`, `cancelled` |
 | `attempts` | channel attempts spent |
@@ -1169,6 +1202,136 @@ async def listen(redis, read_job, reconcile):
 Read, then acknowledge -- never the reverse: an entry acknowledged
 before its read is lost if the listener dies in between.
 
+## 11. The llm channel
+
+comms carries a letter to a MODEL and brings its answer back -- the
+same delivery as any other, to a different kind of addressee. Writing
+the letter and reading the answer are the product's: comms never reads
+either. A translation, a summary, a transcript: different letters, one
+channel.
+
+### The key sets -- for the operator
+
+The models a deploy can reach are **named key sets** in the comms
+`.env`, one variable holding all of them as one JSON object:
+
+    LLM_KEY_SETS='{"llm.text": {"endpoint": "https://<gateway host>/api/v1", "key": "<key>", "model": "<vendor>/<model>", "gateway": true}, "llm.text_direct": {"endpoint": "https://<vendor host>/v1", "key": "<key>", "model": "<model>", "gateway": false}}'
+
+Empty: the deploy has no llm, and the rest of comms works as before.
+Set: every set must be whole, or comms refuses to start, naming the set
+and the field -- never the value. A set name is lower-case words joined
+by dots (`llm.text`), at most 64 characters; a name written twice is a
+refusal.
+
+### `key_set` -- one set
+
+| field | value |
+|---|---|
+| `endpoint` | the provider's OpenAI-compatible base address, `https://`, no credentials, query or fragment; comms appends `/chat/completions` |
+| `gateway` | `true` -- the address is an aggregating gateway; `false` -- it is the vendor itself. No default |
+| `key` | the provider's key; sent as `Authorization: Bearer`, never written anywhere else |
+| `model` | the model id the request names; one ending in `:free` (a free route) refuses the start outside development |
+
+**A gateway set carries the gateway's conditions in every request:**
+`"provider": {"allow_fallbacks": false, "data_collection": "deny"}` --
+the gateway does not silently fall back to another provider, and only
+providers that do not collect the data are used. A vendor set
+(`gateway: false`) never carries the block: a vendor refuses a
+parameter it does not know. Zero data retention is not asked for: check
+the gateway's terms for the chosen model before production.
+
+**The cost is the key's.** comms counts no tokens and keeps no budget:
+put a credit limit on the key at the provider. A key out of credit is a
+`configuration` failure -- the set is dead, fix the deploy.
+
+**A call to one set may take `LLM_DELIVER_TIMEOUT_SECONDS`** (default
+120; above the channel's client, 114 s, or the start is refused). A
+job's call over its list may take that many times the number of its
+sets. It is the channel's own bound, not a lane's: the lanes' 30 s stay
+what they are for email and telegram.
+
+### The type -- for the product's profile
+
+A type whose `channels` are exactly `[llm]` asks a model. `llm` goes
+alone: with another channel in the same type the start is refused.
+
+| field | value |
+|---|---|
+| `llm_sets` | required: the ordered list of key sets the call goes through, e.g. `[llm.text, llm.text_backup]` -- every one defined in `LLM_KEY_SETS`, or the start is refused |
+| `answer_keep` | how long the answer is kept after it came: a duration, `24h` when not declared; not longer than `NOTIFICATION_RETENTION_DAYS` |
+
+`category`, `recipient_schedule` and `max_body_chars` concern a person
+and are refused on an llm type; `answer_keep` and `llm_sets` are
+refused on any other. `lane`, `push_on`, `expires_after`,
+`retry_max_attempts` and `retry_backoff_seconds` work as for any type.
+
+    support_reply_draft:
+      channels: [llm]
+      llm_sets: [llm.text, llm.text_direct]
+      lane: interactive
+      push_on: outcome
+      answer_keep: 24h
+      expires_after: 10m
+
+**Give llm types a lane of their own.** A lane attempts its jobs one
+after another, and a model writes for up to the bound above -- every job
+of a type for people in the same lane waits behind it. Such a profile
+starts, and the worker says so in one warning line, `lane_mixes_llm`,
+naming the lane and both sets of types.
+
+### `llm` -- the letter
+
+The request (section 7) carries no address, no `title`, `body` or
+`action_data` -- only `llm`:
+
+| field | value |
+|---|---|
+| `messages` | required: the chat messages, a non-empty list of objects, each with a non-empty `role` and a `content` (a string or a list of content parts); handed to the model as they came |
+| `response_format` | optional: an object handed to the provider's structured output as it came (a JSON schema the answer is held to) |
+| `params` | optional: the model's parameters (`temperature`, `max_tokens`, ...), handed over as they came |
+
+`params` may not name what the transport writes: `messages`, `model`,
+`models`, `provider`, `response_format`, `route`, `stream`,
+`stream_options` -- the model is the key set's, the routing is the
+gateway's, the schema is `response_format`; such a request is rejected
+at intake. The letter is at most 200 000 characters of canonical JSON.
+comms checks the letter's FORM only; what it says is never read, logged
+or kept past the job's outcome -- its hash is.
+
+### What comes back
+
+**Any answer the model gives is a delivered answer.** A refusal in
+words, a filtered or a cut answer, an answer that does not fit the
+schema asked for: the delivery is `sent`, the job's outcome `sent`, and
+the body is in the read. Whether it is good is the product's to judge --
+and to ask again with a new letter, under a new key.
+
+**A failure is the transport's only,** and only then is the NEXT set of
+the list asked, in the same call: the status of the response (401, 402,
+403, 404 -- the set is wrong; 429; 408, 409, 5xx), a failure the
+provider puts inside a 200 (an `error` object), an answer that is not a
+chat completion, no answer in time. A request the provider refuses
+(another 4xx) goes to the next set too. When every set failed:
+
+| the sets | the delivery |
+|---|---|
+| every one asked to wait (429 with `Retry-After`) | waits the shortest of the waits, like any channel's rate limit |
+| any failure a retry can fix | an attempt is spent; it is retried from the first set, by the type's retry rule; `transient_exhausted` at the end |
+| none of those, and one refused the request | `failed`, `message_rejected` |
+| every one refused on configuration | `failed`, `configuration` |
+
+The path (section 8) shows what each set answered, by status and the
+provider's error code -- never the provider's error message, which may
+quote the request.
+
+**The answer.** On the job's outcome (`push_on: outcome` pushes it),
+read the job by its key: `answer.body` is the provider's response body,
+`answer.answered_by` the set, provider and model that answered. The
+body is kept for the type's `answer_keep` after it came -- read it again
+as often as needed within it -- and then deleted (`state: purged`); who
+answered and the letter's hash stay with the job, which general
+retention deletes like any other.
+
 ## Operating the comms stack
 
 What an operator needs on the box, collected here because every item
@@ -1261,15 +1424,19 @@ in that order, with the operator at the terminal for step 3.
 
 ## How long comms keeps things
 
-Two questions every product asks once, answered here so the answer is
-not a trip through our source. Both are deploy-side settings with
-defaults; both are days-granular, and both treat zero as "never" (a
-negative value refuses the start, naming the variable).
+The questions every product asks once, answered here so the answer is
+not a trip through our source. The history and the threads are
+deploy-side settings with defaults; both are days-granular, and both
+treat zero as "never" (a negative value refuses the start, naming the
+variable). A model's answer is kept by its type.
 
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is
   removed by the worker's retention pass after that many days. Nothing
   is removed while a delivery is still pending.
+- **A model's answer** (section 11): the type's `answer_keep`, default
+  **24h**, counted from the answer; the letter it answered is deleted
+  at the job's outcome. Neither outlives the notification history.
 - **Threads closing themselves**: `THREAD_AUTO_CLOSE_DAYS`, default
   **30**. A thread with no activity for that long is closed by the
   same worker. Closing is a status change -- the thread, its messages

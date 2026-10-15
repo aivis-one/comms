@@ -82,16 +82,18 @@ class TestTheTable:
         does not exist. M7. The pair: the set is not empty. 17 since
         P3-1 added the push stream's cap (changes_stream_maxlen); 20
         since P4-1 replaced the one batch size with one per lane; 24
-        since P4-3 gave every lane its own deliver timeout."""
+        since P4-3 gave every lane its own deliver timeout; 25 since
+        P5-1 gave the llm channel its own."""
         ints = {
             name
             for name, field in Settings.model_fields.items()
             if field.annotation is int
         }
-        assert len(ints) == 24, (
-            "24 numeric parameters: D1's 15, T12's, P3-1's, P4-1's "
-            "four lane batch sizes in place of D1's one batch size, and "
-            "P4-3's four lane deliver timeouts"
+        assert len(ints) == 25, (
+            "25 numeric parameters: D1's 15, T12's, P3-1's, P4-1's "
+            "four lane batch sizes in place of D1's one batch size, "
+            "P4-3's four lane deliver timeouts and P5-1's llm deliver "
+            "timeout"
         )
         assert ints == set(NUMERIC_BOUNDS)
 
@@ -123,6 +125,7 @@ class TestTheTable:
             "notification_retry_backoff_max_seconds": (0, 86_400),
             "notification_max_retry_after_seconds": (1, 86_400),
             "notification_max_rate_limit_deferrals": (0, 1000),
+            "llm_deliver_timeout_seconds": (1, 600),
             "notification_retention_days": (0, 3650),
             "notification_retention_interval_seconds": (1, 86_400),
             "thread_auto_close_days": (0, 3650),

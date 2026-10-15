@@ -52,6 +52,7 @@ from sqlalchemy import (
     Integer,
     SmallInteger,
     String,
+    Text,
     Uuid,
     func,
     inspect,
@@ -68,6 +69,7 @@ from app.core.constants import (
     MAX_CATEGORY_LEN,
     MAX_CORRELATION_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_LLM_SET_NAME_LEN,
     MAX_TITLE_LEN,
     MAX_TYPE_KEY_LEN,
 )
@@ -91,25 +93,32 @@ class Notification(UUIDMixin, Base):
         index=True,
     )
 
-    title: Mapped[str] = mapped_column(
+    # THE LETTER OF A JOB FOR PEOPLE, and its address. NULL exactly on a
+    # job of an llm type (P5-1): its letter is the model's, kept in
+    # llm_calls until the outcome, and it has no audience -- its one
+    # delivery has no recipient. CHECK ck_notifications_letter_by_kind
+    # (migration 0026) ties the four to the kind: all NULL when the
+    # channels are exactly ["llm"], none NULL otherwise. Readers on the
+    # path of a person's channel take them through letter_text().
+    title: Mapped[str | None] = mapped_column(
         String(MAX_TITLE_LEN),
-        nullable=False,
+        nullable=True,
     )
 
-    body: Mapped[str] = mapped_column(
+    body: Mapped[str | None] = mapped_column(
         String(MAX_BODY_LEN),
-        nullable=False,
+        nullable=True,
     )
 
-    target_type: Mapped[str] = mapped_column(
+    target_type: Mapped[str | None] = mapped_column(
         String(20),
-        nullable=False,
+        nullable=True,
     )
 
     # Bare value: uuid string for USER, group_key for GROUP, "*" for ALL.
-    target_value: Mapped[str] = mapped_column(
+    target_value: Mapped[str | None] = mapped_column(
         String(200),
-        nullable=False,
+        nullable=True,
     )
 
     # The request's idempotency key (F1.2: REQUIRED on every intake
@@ -323,6 +332,18 @@ class Notification(UUIDMixin, Base):
             )
         return value
 
+    def letter_text(self) -> tuple[str, str]:
+        """(title, body) of a job for people -- the one way a person's
+        channel reads them. A job of an llm type has neither (CHECK
+        ck_notifications_letter_by_kind) and never reaches such a
+        channel: its one delivery is on llm."""
+        if self.title is None or self.body is None:
+            raise RuntimeError(
+                f"job {self.id} has no title/body: a job of an llm type "
+                f"reached the path of a person's channel"
+            )
+        return self.title, self.body
+
     def __repr__(self) -> str:
         return (
             f"<Notification id={self.id} type={self.type} "
@@ -342,10 +363,14 @@ class NotificationDelivery(UUIDMixin, Base):
     )
 
     # De-domainization: points at the sync-projection recipient
-    # (= product user id), not a product-local users table.
-    recipient_id: Mapped[UUID] = mapped_column(
+    # (= product user id), not a product-local users table. NULL exactly
+    # on the llm channel (P5-1): the model is not a person of the
+    # address book, and its delivery is not a recipient's -- forgetting,
+    # the inbox and the gates, all of which ask by recipient, never meet
+    # it. CHECK ck_deliveries_recipient_by_channel (migration 0026).
+    recipient_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("recipients.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
 
@@ -628,4 +653,97 @@ class PushOutbox(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+
+
+class LLMCall(Base):
+    """What an llm job asks, and of whom (P5-1, spec §14.11, §14.12).
+
+    One row per job of an llm type, written at intake beside the job.
+    THE LETTER is the product's -- the chat messages, the response
+    schema, the model's parameters -- and comms never reads it: the
+    adapter hands it to the model as it came (app/engine/formatters.py
+    LLMFormatter). It is kept only until the job's outcome and is then
+    cleared (app/engine/service.py forget_llm_letter); its HASH stays, so
+    "which letter was this answer to" outlives the letter (§14.11): a
+    comparison of bytes, not a reading.
+
+    `sets` and `answer_keep_seconds` are the type's AT INTAKE -- a
+    snapshot like notifications.channels: a profile changed before the
+    call neither re-routes nor re-terms an accepted job.
+
+    The writers of this row: intake (insert), the outcome (letter ->
+    NULL, under the job's row lock), the cascade of the job's deletion.
+    """
+
+    __tablename__ = "llm_calls"
+
+    notification_id: Mapped[UUID] = mapped_column(
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # The ordered list of key set names (LLM_KEY_SETS) the call goes
+    # through, first to last, on transport failures only.
+    sets: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    # NULL once the job has its outcome.
+    letter: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True,
+    )
+    # SHA-256 hex of the letter's canonical JSON
+    # (app/engine/service.py canonical_fingerprint).
+    letter_hash: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN), nullable=False,
+    )
+    # How long the answer is kept after it came (the type's answer_keep).
+    answer_keep_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class LLMAnswer(Base):
+    """The model's answer to an llm job, and who gave it (P5-1, §14.12).
+
+    INSERTED IN THE TRANSACTION OF THE CHANNEL'S ANSWER
+    (app/engine/journal.py record_channel_answer), together with the
+    journal row `accepted`: an attempt that tears after the model
+    answered keeps the paid answer, and the next attempt closes the
+    delivery SENT from that row without a second call. An INSERT on a
+    table of its own, so that write never waits for a row the attempt
+    holds -- its foreign key takes FOR KEY SHARE on the job, which the
+    attempt's FOR NO KEY UPDATE does not block (tests/test_llm_channel.py
+    measures it).
+
+    THE BODY is the provider's HTTP response body as it came, as TEXT:
+    comms does not parse what the model said (spec §14.8) -- a JSONB
+    would already re-order it. It is cleared when keep_until passes
+    (app/engine/service.py purge_llm_answers); the snapshot of who
+    answered stays with the job.
+
+    THE SNAPSHOT is who ANSWERED (§12.1 condition 4): the set the call
+    went through, and the provider and the model as the RESPONSE names
+    them -- NULL when the response does not, never the requested ones.
+
+    The writers of this row: the channel's answer (insert), the purge
+    (body -> NULL), the cascade of the job's deletion.
+    """
+
+    __tablename__ = "llm_answers"
+
+    notification_id: Mapped[UUID] = mapped_column(
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answered_set: Mapped[str] = mapped_column(
+        String(MAX_LLM_SET_NAME_LEN), nullable=False,
+    )
+    answered_provider: Mapped[str | None] = mapped_column(
+        String(200), nullable=True,
+    )
+    answered_model: Mapped[str | None] = mapped_column(
+        String(200), nullable=True,
+    )
+    answered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    keep_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
     )

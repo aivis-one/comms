@@ -196,6 +196,17 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "WHERE ((status)::text = 'pending'::text)"
         ),
     ),
+    # The llm answers past their term, for the purge (P5-1, migration
+    # 0026): only rows that still carry a body
+    # (app/engine/service.py purge_llm_answers).
+    "ix_llm_answers_keep": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_llm_answers_keep "
+            "ON public.llm_answers USING btree (keep_until) "
+            "WHERE (body IS NOT NULL)"
+        ),
+    ),
     # A repeated resource call answers with the row it created (F1.4).
     "uq_messages_idempotency_key": IndexShape(
         unique=True,
@@ -347,6 +358,12 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # A job's lane is one of the four Lane values, never NULL (P4-1,
     # migration 0024).
     "ck_notifications_lane",
+    # A job of an llm type has no letter for people and no audience; any
+    # other job has all four (P5-1, migration 0026).
+    "ck_notifications_letter_by_kind",
+    # Only the llm channel's delivery has no recipient (P5-1, migration
+    # 0026).
+    "ck_deliveries_recipient_by_channel",
 })
 
 # Everything the schema must carry although the metadata never mentions

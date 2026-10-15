@@ -471,6 +471,9 @@ class TestOnePlaceForTheNumbers:
             "in_app": {},
             "telegram": {"timeout": 29.0},
             "email": {"connect": 5.0, "read": 15.0, "write": 5.0, "pool": 4.0},
+            # P5-1 gate: the model writes for up to 100 s; 114 in all,
+            # held below LLM_DELIVER_TIMEOUT_SECONDS, not below a lane.
+            "llm": {"connect": 5.0, "read": 100.0, "write": 5.0, "pool": 4.0},
         }
 
     async def test_the_email_client_carries_the_spec(self) -> None:
@@ -615,12 +618,16 @@ class TestTheContract:
     defaults, and the rule said once in INTEGRATION.md. M11."""
 
     def test_the_variables_are_the_settings_both_ways(self) -> None:
+        """The lanes' deliver timeouts are the settings named by lane --
+        and, since P5-1, the one other deliver timeout is the llm
+        channel's own (not a lane's): exactly five, named."""
         fields = {
             name for name in Settings.model_fields
             if name.endswith("_deliver_timeout_seconds")
         }
-        assert fields == {lane_deliver_timeout_variable(lane).lower() for lane in Lane}
-        assert len(fields) == 4
+        lanes = {lane_deliver_timeout_variable(lane).lower() for lane in Lane}
+        assert fields == lanes | {"llm_deliver_timeout_seconds"}
+        assert len(lanes) == 4
 
     @pytest.mark.parametrize("lane", list(Lane))
     def test_env_example_has_the_default(self, lane: Lane) -> None:

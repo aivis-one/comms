@@ -117,19 +117,26 @@ _MAX_SECTION_LABEL_LEN = MAX_SECTION_LABEL_LEN
 
 @dataclass(frozen=True)
 class NotificationRequest:
+    """A parsed notification_request. The address and the letter for
+    people (target_*, title, body) and the model's letter (llm) are each
+    optional HERE: which of them a request must carry is decided by its
+    TYPE (app/engine/service.py create_notification, P5-1), and the type
+    is checked against the live profile there, not in the parser."""
+
     # -- envelope --
     idempotency_key: str
     fingerprint: str
     type: str
-    target_type: str
-    target_value: str
+    target_type: str | None
+    target_value: str | None
     scheduled_at: datetime | None
     expiry_at: datetime | None
     correlation: str | None
     # -- letter --
-    title: str
-    body: str
+    title: str | None
+    body: str | None
     action_data: dict[str, Any] | None
+    llm: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -388,6 +395,90 @@ def validate_action_data(
     return action_data
 
 
+# The fields of an llm letter (P5-1, deploy/INTEGRATION.md section 7,
+# the `llm` row): the chat messages (required), the response schema the
+# provider's structured output holds the answer to, and the model's
+# parameters.
+LLM_LETTER_FIELDS = frozenset({"messages", "response_format", "params"})
+
+# Request fields the TRANSPORT writes (app/engine/formatters.py
+# LLMFormatter): the model is the key set's, the routing block is the
+# gateway's conditions (spec §12.1), the answer comes whole (no stream).
+# A `params` key among them would let the letter override the
+# transport -- refused, not dropped.
+LLM_RESERVED_PARAMS = frozenset({
+    "messages",
+    "model",
+    "models",
+    "provider",
+    "response_format",
+    "route",
+    "stream",
+    "stream_options",
+})
+
+
+def validate_llm_letter(
+    letter: Any, *, event: str = EVENT_NOTIFICATION_REQUEST,
+) -> dict[str, Any]:
+    """The FORM of an llm letter -- types and field names, never what
+    the messages say (spec §14.2: comms does not read the letter). The
+    messages and the schema are handed to the model as they came.
+
+    Every refusal names a field or a position, never a value: the
+    reason is recorded under the product's key, and the letter's text
+    must not land there.
+    """
+    if not isinstance(letter, dict):
+        raise ValidationError(f"{event}: llm must be a JSON object")
+    unknown = sorted(str(k) for k in letter if k not in LLM_LETTER_FIELDS)
+    if unknown:
+        raise ValidationError(
+            f"{event}: llm has unknown field(s) "
+            f"{', '.join(map(repr, unknown))}; allowed: "
+            f"{', '.join(sorted(LLM_LETTER_FIELDS))}"
+        )
+    messages = _require(letter, "messages", f"{event}: llm")
+    if not isinstance(messages, list) or not messages:
+        raise ValidationError(
+            f"{event}: llm.messages must be a non-empty list of chat "
+            f"messages"
+        )
+    for index, message in enumerate(messages):
+        where = f"{event}: llm.messages[{index}]"
+        if not isinstance(message, dict):
+            raise ValidationError(f"{where} must be a JSON object")
+        role = message.get("role")
+        if not isinstance(role, str) or not role:
+            raise ValidationError(f"{where}.role must be a non-empty string")
+        if "content" not in message or not isinstance(
+            message["content"], (str, list),
+        ):
+            raise ValidationError(
+                f"{where}.content must be a string or a list of content "
+                f"parts"
+            )
+    if "response_format" in letter and not isinstance(
+        letter["response_format"], dict,
+    ):
+        raise ValidationError(
+            f"{event}: llm.response_format must be a JSON object"
+        )
+    if "params" in letter:
+        params = letter["params"]
+        if not isinstance(params, dict):
+            raise ValidationError(f"{event}: llm.params must be a JSON object")
+        reserved = sorted(str(k) for k in params if k in LLM_RESERVED_PARAMS)
+        if reserved:
+            raise ValidationError(
+                f"{event}: llm.params may not set "
+                f"{', '.join(map(repr, reserved))}: the transport writes "
+                f"them (the model is the key set's, the routing is the "
+                f"gateway's, the schema is llm.response_format)"
+            )
+    return letter
+
+
 def _validate_target(
     target_type: Any, target_value: Any, event: str
 ) -> tuple[str, str]:
@@ -528,6 +619,7 @@ _NOTIFICATION_REQUEST_FIELDS = frozenset({
     "title",
     "body",
     "action_data",
+    "llm",
 })
 
 
@@ -580,23 +672,31 @@ def _parse_notification_request(
         _require(data, "type", event), "type", event,
         max_len=MAX_TYPE_KEY_LEN,
     )
-    target_type, target_value = _validate_target(
-        _require(data, "target_type", event),
-        _require(data, "target_value", event),
-        event,
-    )
-    title = _string(
-        _require(data, "title", event), "title", event,
-        max_len=MAX_TITLE_LEN,
-    )
-    body = _string(
-        _require(data, "body", event), "body", event,
-        max_len=MAX_BODY_LEN,
-    )
+    # The address and the letter for people, or the model's letter --
+    # which of them is required is the TYPE's (create_notification);
+    # here each is checked for form when it is present.
+    target_type: str | None = None
+    target_value: str | None = None
+    if "target_type" in data or "target_value" in data:
+        target_type, target_value = _validate_target(
+            _require(data, "target_type", event),
+            _require(data, "target_value", event),
+            event,
+        )
+    title: str | None = None
+    if "title" in data:
+        title = _string(data["title"], "title", event, max_len=MAX_TITLE_LEN)
+    body: str | None = None
+    if "body" in data:
+        body = _string(data["body"], "body", event, max_len=MAX_BODY_LEN)
 
     action_data: dict[str, Any] | None = None
     if data.get("action_data") is not None:
         action_data = validate_action_data(data["action_data"])
+
+    llm: dict[str, Any] | None = None
+    if "llm" in data:
+        llm = validate_llm_letter(data["llm"])
 
     scheduled_at: datetime | None = None
     if data.get("scheduled_at") is not None:
@@ -628,6 +728,7 @@ def _parse_notification_request(
         title=title,
         body=body,
         action_data=action_data,
+        llm=llm,
     )
 
 

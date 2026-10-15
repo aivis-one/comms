@@ -33,10 +33,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.channels import (
     CHANNEL_SPECS,
+    ChannelSpec,
     ChannelState,
+    LLMKeySet,
     channel_env_keys,
     channel_optional_keys,
+    channel_spec,
     evaluate_channels,
+    parse_llm_key_sets,
 )
 from app.core.lanes import Lane
 
@@ -211,6 +215,13 @@ NUMERIC_BOUNDS: dict[str, Bound] = {
         1, 86_400, "0 does NOT mean 'every tick'; 'off' is "
         "THREAD_AUTO_CLOSE_DAYS=0",
     ),
+    "llm_deliver_timeout_seconds": Bound(
+        1, 600, "seconds one call of the llm channel to ONE key set may "
+        "take; a job's call over its whole list of sets is bounded by "
+        "this times the number of sets; above 600 an attempt holds its "
+        "job's row for ten minutes per set; and not at or below the llm "
+        "client's own timeout when the channel is live (checked below)",
+    ),
 }
 
 # Pairs where one setting must not fall below another: (low, high).
@@ -261,9 +272,14 @@ def deliver_timeout_problems(
     Where the client total is not a hard bound: KNOWN CEILING (client
     totals) in app/core/channels.py.
     """
+    # A channel with its own deliver timeout (P5-1: llm) is not bounded
+    # by the lanes, so it does not bound them either:
+    # own_deliver_timeout_problems holds it to its own number.
     clients = [
         spec for spec in CHANNEL_SPECS
-        if spec.name in set(live) and spec.client_timeouts
+        if spec.name in set(live)
+        and spec.client_timeouts
+        and not spec.own_deliver_timeout
     ]
     problems: list[str] = []
     for lane, timeout in timeouts.items():
@@ -281,6 +297,25 @@ def deliver_timeout_problems(
             f"'reached, no answer' stay apart. Set it to {floor} or more."
         )
     return problems
+
+
+def own_deliver_timeout_problems(
+    timeout: int, variable: str, spec: ChannelSpec, live: Iterable[str],
+) -> list[str]:
+    """The rule of deliver_timeout_problems for a channel that carries
+    its own deliver timeout (P5-1): the timeout must be above the
+    channel's client total, for the same reason a lane's must -- a call
+    has to time out inside its client first. Only when the channel is
+    live: an absent channel calls no client."""
+    if spec.name not in set(live) or timeout > spec.client_timeout_total:
+        return []
+    floor = math.floor(spec.client_timeout_total) + 1
+    return [
+        f"{variable}={timeout} is not above the client timeout of the live "
+        f"channel {spec.name} ({spec.client_timeout_total:g} s): a call "
+        f"must time out inside its client first, where 'never reached' "
+        f"and 'reached, no answer' stay apart. Set it to {floor} or more."
+    ]
 
 
 def lane_deliver_timeout_variable(lane: Lane) -> str:
@@ -380,6 +415,28 @@ class Settings(BaseSettings):
     # checked when spelled out: a closed set of two, so "eu-west" or
     # "europe" refuses startup instead of failing every send.
     email_mailgun_region: str = "eu"
+
+    # -- LLM (a channel key set, app/core/channels.py; P5-1) --
+    # One JSON object of named key sets -- {"llm.text": {"endpoint":
+    # ..., "key": ..., "model": ..., "gateway": true|false}}. Empty =
+    # this deploy has no llm; anything else must be whole and
+    # well-formed, or startup is refused naming the set and the field.
+    llm_key_sets: str = ""
+    # Seconds one call to ONE set may take; the job's call over its list
+    # of sets is bounded by this times the length of the list
+    # (app/engine/service.py). Not a lane's: a model writes for tens of
+    # seconds, and the lanes' 30 must stay what it is for email.
+    llm_deliver_timeout_seconds: int = 120
+
+    @property
+    def llm_sets(self) -> dict[str, LLMKeySet]:
+        """This deploy's llm key sets by name, in declaration order; {}
+        when the deploy has no llm. Only ever read on validated settings:
+        a malformed value refused startup, so nothing is lost here."""
+        if self.llm_key_sets == "":
+            return {}
+        sets, _ = parse_llm_key_sets(self.llm_key_sets)
+        return sets
 
     @property
     def email_api_base_url(self) -> str:
@@ -657,6 +714,7 @@ class Settings(BaseSettings):
             for key in channel_env_keys() + channel_optional_keys()
         })
         problems.extend(channel_problems)
+        problems.extend(self._free_route_problems())
 
         # P4-1: the worker's lanes -- a set that takes nothing, or names
         # something that is not a lane, must not start a worker that
@@ -702,17 +760,42 @@ class Settings(BaseSettings):
             ]
             if bound.lo <= timeout <= bound.hi:
                 in_bounds[lane] = timeout
-        numeric.extend(deliver_timeout_problems(
-            in_bounds,
-            [
-                name for name, state in channel_states.items()
-                if state == ChannelState.LIVE
-            ],
-        ))
+        live = [
+            name for name, state in channel_states.items()
+            if state == ChannelState.LIVE
+        ]
+        numeric.extend(deliver_timeout_problems(in_bounds, live))
+        # P5-1: a channel with its own deliver timeout -- the same rule,
+        # its own number. One outside its bound is not named twice.
+        llm_bound = NUMERIC_BOUNDS["llm_deliver_timeout_seconds"]
+        if llm_bound.lo <= self.llm_deliver_timeout_seconds <= llm_bound.hi:
+            numeric.extend(own_deliver_timeout_problems(
+                self.llm_deliver_timeout_seconds,
+                "LLM_DELIVER_TIMEOUT_SECONDS",
+                channel_spec("llm"),
+                live,
+            ))
         if numeric:
             raise ValueError("\n".join(numeric))
 
         return self
+
+    def _free_route_problems(self) -> list[str]:
+        """No free model route outside development (spec §12.1, the
+        third gateway condition: no free routes in production, debugging
+        included). A gateway marks a free route by the suffix `:free`
+        of the model id. Read only off well-formed sets: a malformed
+        value is refused by the channel rule already, naming its set."""
+        if self.is_dev or self.llm_key_sets == "":
+            return []
+        sets, _ = parse_llm_key_sets(self.llm_key_sets)
+        return [
+            f"LLM_KEY_SETS: set {name!r} names a free route (a model id "
+            f"ending in ':free'); free routes are refused outside "
+            f"development (APP_ENV={self.app_env})"
+            for name, key_set in sets.items()
+            if key_set.model.endswith(":free")
+        ]
 
     # extra="ignore" is a DECISION, not an oversight: a deploy's env is
     # shared with installers that write keys this service does not read

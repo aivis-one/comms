@@ -43,9 +43,12 @@
 # channel here has a builder in app/engine/formatters.py.
 # =============================================================================
 
+import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 from urllib.parse import urlsplit
 
 from aiogram.utils.token import TokenValidationError, validate_token
@@ -79,6 +82,14 @@ class ChannelSpec:
     # (app/core/config.py deliver_timeout_problems). Empty: the channel
     # has no network client (in_app -- its delivery is a row).
     client_timeouts: Mapping[str, float] = field(default_factory=dict)
+    # True: the channel's call is bounded by its OWN deliver timeout, not
+    # by the lane's (P5-1) -- a call that legitimately lasts minutes (a
+    # model writing its answer) would otherwise force every lane's
+    # timeout, the interactive email's included, above its client
+    # (app/core/config.py deliver_timeout_problems leaves such a channel
+    # out and holds the channel's own timeout above its client instead;
+    # app/engine/service.py takes the bound from it).
+    own_deliver_timeout: bool = False
 
     @property
     def client_timeout_total(self) -> float:
@@ -216,6 +227,208 @@ def _email_sender(value: str) -> str | None:
     return f"expected an address, or the form 'Name <address>' -- {complaint}"
 
 
+# -- llm --------------------------------------------------------------------
+#
+# ONE KEY FOR THE CHANNEL, A NAMED SET OF KEYS INSIDE IT (P5-1, spec
+# §14.12). A product routes an llm type to an ordered list of NAMED key
+# sets -- `llm.text`, `llm.text_backup` -- and the names are the product's,
+# so they cannot be fields of the settings class. LLM_KEY_SETS carries
+# them all as one JSON object: {"<set name>": {"endpoint": ..., "key":
+# ..., "model": ..., "gateway": true|false}}. The channel rule applies to
+# that one key unchanged: empty -> the deploy has no llm; set -> every
+# set in it must be whole and well-formed, or startup is refused naming
+# the set and the field -- never the value: the key is a secret.
+#
+# `gateway` HAS NO DEFAULT. A set that points at an aggregating gateway
+# carries the gateway's routing conditions in every request (spec §12.1:
+# no silent fallback of the gateway, no data collection); a set that
+# points straight at a vendor must not -- a vendor refuses a parameter
+# it does not know. Which one a set is, only the operator knows.
+
+# The fields of one set, sorted (the order every refusal lists them in).
+LLM_SET_FIELDS: tuple[str, ...] = ("endpoint", "gateway", "key", "model")
+_LLM_STRING_FIELDS: tuple[str, ...] = ("endpoint", "key", "model")
+# A set name: lower-case words joined by dots (`llm.text`), at most
+# MAX_LLM_SET_NAME_LEN (app/core/constants.py; not imported -- this
+# module imports nothing of comms, see the header) characters.
+_LLM_SET_NAME_RE = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*\Z")
+_LLM_SET_NAME_MAX = 64
+
+
+@dataclass(frozen=True)
+class LLMKeySet:
+    """One named set: where the model is, the key to it, which model,
+    and whether the address is a gateway. The key is kept out of repr:
+    a set that reaches a log line or a traceback must not carry it."""
+
+    name: str
+    endpoint: str
+    key: str = field(repr=False)
+    model: str
+    gateway: bool
+
+
+def _refuse_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """json object hook: a name written twice is a refusal, not "the
+    last one wins" -- which is what json.loads would do silently."""
+    seen: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in seen:
+            raise _DuplicateNameError(name)
+        seen[name] = value
+    return seen
+
+
+class _DuplicateNameError(ValueError):
+    """A JSON object of LLM_KEY_SETS names one key twice."""
+
+
+def _llm_endpoint(value: str) -> str | None:
+    """An https base URL with a host; no credentials, query or fragment
+    (the key travels in a header, never in the address)."""
+    parts = urlsplit(value)
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+    ):
+        return (
+            "expected an https base URL with a host and no credentials, "
+            "query or fragment (the adapter appends /chat/completions)"
+        )
+    return None
+
+
+def _is_set_name(name: str) -> bool:
+    return (
+        len(name) <= _LLM_SET_NAME_MAX
+        and _LLM_SET_NAME_RE.match(name) is not None
+    )
+
+
+# The longest word of a name a refusal repeats. A set or field name is
+# words (`llm.text_backup`); a key is one long run of random characters
+# -- one pasted into a name's place must not be repeated in the refusal.
+_QUOTABLE_WORD_MAX = 24
+
+
+def _quotable(name: str) -> str:
+    """A JSON name as a refusal may quote it: a field name, or a name of
+    set-name shape whose words are all short. Anything else may be a
+    value pasted into the wrong place -- a key among them -- and is not
+    repeated."""
+    if name in LLM_SET_FIELDS or (
+        _is_set_name(name)
+        and all(
+            len(word) <= _QUOTABLE_WORD_MAX
+            for word in re.split(r"[._]", name)
+        )
+    ):
+        return repr(name)
+    return "a name not repeated (it may be a secret)"
+
+
+def _llm_set_complaints(position: int, name: str, body: Any) -> list[str]:
+    """What is wrong with one set, each complaint naming the set and
+    the field -- never a value."""
+    if not _is_set_name(name):
+        return [
+            f"set #{position}: {_quotable(name)} is not a set name -- a set "
+            f"name is lower-case words joined by dots (e.g. 'llm.text'), "
+            f"at most {_LLM_SET_NAME_MAX} characters"
+        ]
+    quoted = _quotable(name)
+    where = f"set {quoted}" if quoted.startswith("'") else f"set #{position}"
+    if not isinstance(body, dict):
+        return [
+            f"{where}: expected an object with the fields "
+            f"{', '.join(LLM_SET_FIELDS)}"
+        ]
+    complaints: list[str] = []
+    missing = [f for f in LLM_SET_FIELDS if f not in body]
+    unknown = sorted(_quotable(str(f)) for f in body if f not in LLM_SET_FIELDS)
+    if missing:
+        complaints.append(f"{where}: missing {', '.join(missing)}")
+    if unknown:
+        complaints.append(
+            f"{where}: unknown field(s) {', '.join(unknown)}; the fields "
+            f"are {', '.join(LLM_SET_FIELDS)}"
+        )
+    for fname in _LLM_STRING_FIELDS:
+        if fname not in body:
+            continue
+        value = body[fname]
+        if not isinstance(value, str) or value.strip() == "":
+            complaints.append(f"{where}: {fname} must be a non-empty string")
+        elif any(ch.isspace() for ch in value):
+            complaints.append(f"{where}: {fname} must not contain spaces")
+        elif fname == "endpoint":
+            complaint = _llm_endpoint(value)
+            if complaint is not None:
+                complaints.append(f"{where}: endpoint: {complaint}")
+    if "gateway" in body and not isinstance(body["gateway"], bool):
+        complaints.append(
+            f"{where}: gateway must be a JSON boolean, true or false "
+            f"(no default: whether the address is a gateway decides what "
+            f"every request carries)"
+        )
+    return complaints
+
+
+def parse_llm_key_sets(
+    value: str,
+) -> tuple[dict[str, LLMKeySet], list[str]]:
+    """LLM_KEY_SETS -> (the sets by name, in declaration order;
+    complaints). The sets are returned only when there is no complaint
+    at all: a deploy with one broken set does not start, so no caller
+    ever needs the others."""
+    try:
+        doc = json.loads(value, object_pairs_hook=_refuse_duplicates)
+    except _DuplicateNameError as exc:
+        return {}, [f"the name {_quotable(exc.args[0])} is written twice"]
+    except json.JSONDecodeError as exc:
+        return {}, [
+            f"not JSON (line {exc.lineno}, column {exc.colno}: {exc.msg})"
+        ]
+    if not isinstance(doc, dict):
+        return {}, [
+            "expected a JSON object mapping set names to sets, "
+            '{"llm.text": {"endpoint": ..., "gateway": ..., "key": ..., '
+            '"model": ...}}'
+        ]
+    if not doc:
+        return {}, [
+            "names no set; leave LLM_KEY_SETS empty if this deploy has "
+            "no llm"
+        ]
+    complaints: list[str] = []
+    for position, (name, body) in enumerate(doc.items(), start=1):
+        complaints.extend(_llm_set_complaints(position, name, body))
+    if complaints:
+        return {}, complaints
+    sets = {
+        name: LLMKeySet(
+            name=name,
+            endpoint=body["endpoint"].rstrip("/"),
+            key=body["key"],
+            model=body["model"],
+            gateway=body["gateway"],
+        )
+        for name, body in doc.items()
+    }
+    return sets, []
+
+
+def _llm_key_sets(value: str) -> str | None:
+    """The channel-rule validator of LLM_KEY_SETS: every complaint about
+    every set, in one line."""
+    _, complaints = parse_llm_key_sets(value)
+    return "; ".join(complaints) if complaints else None
+
+
 CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
     ChannelSpec(name="in_app", keys=()),
     ChannelSpec(
@@ -263,6 +476,20 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
         # below httpx's 100 pooled connections a call never waits for
         # one. 29 in all, below the 30 s every lane defaults to.
         client_timeouts={"connect": 5.0, "read": 15.0, "write": 5.0, "pool": 4.0},
+    ),
+    ChannelSpec(
+        name="llm",
+        keys=("LLM_KEY_SETS",),
+        validators={"LLM_KEY_SETS": _llm_key_sets},
+        # One call to one set. read is the model writing its answer: a
+        # long answer of a slow model takes tens of seconds, and a read
+        # timeout here -- unlike a connect timeout -- may leave a paid
+        # answer behind (the next set is called). 114 in all, below the
+        # channel's own deliver timeout (LLM_DELIVER_TIMEOUT_SECONDS,
+        # default 120) -- the lanes' 30 never meets it
+        # (own_deliver_timeout).
+        client_timeouts={"connect": 5.0, "read": 100.0, "write": 5.0, "pool": 4.0},
+        own_deliver_timeout=True,
     ),
 )
 
