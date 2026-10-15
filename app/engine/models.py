@@ -387,12 +387,13 @@ class NotificationDelivery(UUIDMixin, Base):
         nullable=True,
     )
 
+    # Indexed with the job, (status, notification_id), by migration 0027
+    # -- not here: see app/core/schema_objects.py (H11).
     status: Mapped[str] = mapped_column(
         String(20),
         default=DeliveryStatus.PENDING,
         server_default=DeliveryStatus.PENDING.value,
         nullable=False,
-        index=True,
     )
 
     sent_at: Mapped[datetime | None] = mapped_column(

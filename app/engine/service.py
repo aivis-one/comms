@@ -1678,9 +1678,11 @@ async def rollup_notification(
     # A delivery still waiting decides alone (H9): the fold of any set
     # that holds a PENDING is "still open" (_fold), so the set is read
     # only once none waits. After every portion but the last (H7) one
-    # probe on ix_notification_deliveries_pending (migration 0025) --
-    # the job's waiting deliveries, nothing else -- instead of a read of
-    # every delivery of the job: the square H7 took off accepted_answers.
+    # probe on ix_notification_deliveries_status (status, notification_id),
+    # migration 0027 -- the job's waiting deliveries, nothing else, under
+    # any statistics (H11: with no index on status alone, no plan of it
+    # walks other jobs' waiting rows) -- instead of a read of every
+    # delivery of the job: the square H7 took off accepted_answers.
     still_waiting = await session.scalar(
         select(
             exists().where(

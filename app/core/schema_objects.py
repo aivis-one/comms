@@ -186,14 +186,18 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "'no_recipients'::character varying])::text[])))"
         ),
     ),
-    # A job's waiting deliveries (H9, migration 0025): the fold's probe
-    # "does any still wait?" (app/engine/service.py rollup_notification).
-    "ix_notification_deliveries_pending": IndexShape(
+    # The deliveries' status, keyed by job too (H11, migration 0027): the
+    # same name and leading column as the model's old index on status,
+    # and every query that names the job -- the fold's probe "does any
+    # still wait?" (app/engine/service.py rollup_notification), a
+    # portion's selection, the lane's "a delivery is due" -- bounded by
+    # it, whatever the planner's statistics say.
+    "ix_notification_deliveries_status": IndexShape(
         unique=False,
         definition=(
-            "CREATE INDEX ix_notification_deliveries_pending "
-            "ON public.notification_deliveries USING btree (notification_id) "
-            "WHERE ((status)::text = 'pending'::text)"
+            "CREATE INDEX ix_notification_deliveries_status "
+            "ON public.notification_deliveries USING btree "
+            "(status, notification_id)"
         ),
     ),
     # The llm answers past their term, for the purge (P5-1, migration

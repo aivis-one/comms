@@ -11,7 +11,10 @@
 #   M5  the probe asks for any delivery, not a waiting one -> TestTheFold
 #   M6  the warning line removed                          -> TestPartialLanes
 #   M7  the warning written for the full set too          -> TestPartialLanes
-#   I1  migration 0025's index gone (downgrade -1)        -> TestTheProbePlan
+#   I1  migration 0027 undone (an index on status alone again)
+#                                        -> TestTheProbePlan, by cost (H11)
+#   P1  mine's waiting delivery written before the other send's
+#                                        -> TestTheProbePlan, the premise
 # =============================================================================
 
 import ast
@@ -285,85 +288,124 @@ class TestTheFold:
         assert await _status(job.id) == NotificationStatus.NO_RECIPIENTS
 
 
-class TestTheProbePlan:
-    """правка 1 of the H9 gate: the probe the fold sends, captured and
-    explained with ANALYZE, on a job of 5000 deliveries of which one
-    waits, beside another send with 5000 waiting, among 20 000 finished
-    jobs (40 000 finished deliveries) -- by the pending index, a handful
-    of buffers.
-    I1."""
+# Two sends side by side: mine, 5000 deliveries of which ONE waits, and
+# another, 5000 waiting -- written BEFORE mine's waiting one, so on any
+# path that walks waiting deliveries in heap order (an index on status
+# alone: equal keys sit in TID order) the other send's 5000 come first.
+_MINE = UUID("00000000-0000-0000-0000-0000000000a1")
+_OTHER = UUID("00000000-0000-0000-0000-0000000000b2")
+# Finished sends around them, (jobs, deliveries each): the share of
+# waiting deliveries in the table comes to about 10 % and about 2.6 %.
+_AROUND = {"ten_percent": (8000, 5), "two_percent": (60000, 3)}
+# The probe's scan, in buffers. A path bounded by the job reads the
+# index's few pages and one heap page: 3-4 measured. A path through the
+# waiting deliveries of every job reads past the other send's 5000: 90
+# and more measured (H11 gate). The bound sits between, an order of
+# magnitude from each.
+_PROBE_BUFFERS = 10
 
-    async def test_by_the_pending_index(self) -> None:
+
+async def _sends(around: tuple[int, int], statistics: str) -> None:
+    jobs, each = around
+    async with get_session_factory()() as session:
+        await session.execute(text(
+            "INSERT INTO recipients (id, locale, version, snapshot_fingerprint) "
+            "SELECT gen_random_uuid(), 'en', 1, 'h11' FROM generate_series(1, 5000)"
+        ))
+        await session.execute(text(
+            "INSERT INTO notifications (id, type, title, body, target_type, "
+            "target_value, idempotency_key, fingerprint, channels, "
+            "expiry_layer, push_on, retry_max_attempts, "
+            "retry_backoff_seconds, recipient_schedule, lane, status, "
+            "scheduled_at) "
+            "SELECT id, 'unit_event', 'T', 'B', 'all', '*', key, "
+            "repeat('a', 64), '[\"in_app\"]'::jsonb, 'default', 'none', 3, "
+            "30, 'respect', lane, status, now() FROM (VALUES "
+            "(CAST(:mine AS uuid), 'h11-mine', 'bulk', 'processing'), "
+            "(CAST(:other AS uuid), 'h11-other', 'bulk', 'processing')) "
+            "AS v(id, key, lane, status) "
+            "UNION ALL "
+            "SELECT gen_random_uuid(), 'unit_event', 'T', 'B', 'all', '*', "
+            "'h11-done-' || g, repeat('a', 64), '[\"in_app\"]'::jsonb, "
+            "'default', 'none', 3, 30, 'respect', 'normal', 'sent', now() "
+            "FROM generate_series(1, :jobs) g"
+        ), {"mine": _MINE, "other": _OTHER, "jobs": jobs})
+        await session.execute(text(
+            "INSERT INTO notification_deliveries "
+            "(id, notification_id, recipient_id, channel, status) "
+            "SELECT gen_random_uuid(), n.id, (SELECT id FROM recipients "
+            "WHERE snapshot_fingerprint = 'h11' LIMIT 1), 'in_app', 'sent' "
+            "FROM notifications n, generate_series(1, :each) "
+            "WHERE n.idempotency_key LIKE 'h11-done-%'"
+        ), {"each": each})
+        if statistics == "taken_before_the_sends":
+            await session.execute(text("ANALYZE notification_deliveries"))
+        recipients = "FROM recipients WHERE snapshot_fingerprint = 'h11'"
+        await session.execute(text(
+            "INSERT INTO notification_deliveries "
+            "(id, notification_id, recipient_id, channel, status) "
+            f"SELECT gen_random_uuid(), :mine, id, 'in_app', 'sent' {recipients} "
+            "OFFSET 1"
+        ), {"mine": _MINE})
+        await session.execute(text(
+            "INSERT INTO notification_deliveries "
+            "(id, notification_id, recipient_id, channel, status) "
+            f"SELECT gen_random_uuid(), :other, id, 'in_app', 'pending' {recipients}"
+        ), {"other": _OTHER})
+        await session.execute(text(
+            "INSERT INTO notification_deliveries "
+            "(id, notification_id, recipient_id, channel, status) "
+            f"SELECT gen_random_uuid(), :mine, id, 'in_app', 'pending' {recipients} "
+            "LIMIT 1"
+        ), {"mine": _MINE})
+        if statistics == "taken_after_the_sends":
+            await session.execute(text("ANALYZE notification_deliveries"))
+        await session.commit()
+
+
+class TestTheProbePlan:
+    """H11: the fold's probe "does any delivery of this job still wait?"
+    is cheap whatever the planner believes -- held by what it COSTS, on
+    the order of rows that makes the costly path costly, under every
+    statistics the tables meet in a send:
+
+    - taken before the sends (the common case on a box: a send inserts
+      thousands of waiting rows between two autovacuum passes, and the
+      planner still believes 'pending' rare);
+    - taken after them;
+    - not taken by this test (whatever the suite left).
+
+    Until H11 this test held the plan by the NAME of migration 0025's
+    partial index, which was right while the planner preferred it; it
+    did with fresh statistics by 2.61 against 3.03 -- a coin CI tossed
+    (3.4.0, CI / image) -- and with statistics from before a send it
+    went by the index on status alone and read the other send's 5000
+    waiting deliveries: 92 buffers a probe. Migration 0027 left no index
+    on status alone (ix_notification_deliveries_status is now (status,
+    notification_id)), so no path of the probe walks other jobs' rows.
+    M1 (0027 undone) turns the "before" and "not taken" rows red by
+    cost, not by a name."""
+
+    @pytest.mark.parametrize("around", list(_AROUND), ids=list(_AROUND))
+    @pytest.mark.parametrize(
+        "statistics",
+        ["taken_before_the_sends", "taken_after_the_sends", "not_taken"],
+    )
+    async def test_a_handful_of_buffers_on_the_worst_order(
+        self, around: str, statistics: str,
+    ) -> None:
+        await _sends(_AROUND[around], statistics)
         async with get_session_factory()() as session:
-            await session.execute(text(
-                "INSERT INTO recipients (id, locale, version, snapshot_fingerprint) "
-                "SELECT gen_random_uuid(), 'en', 1, 'h9' FROM generate_series(1, 5000)"
-            ))
-            jobs: list[UUID] = []
-            for key in ("h9-probe-mine", "h9-probe-other"):
-                job = await create_notification(
-                    session, **{**intake_fields(), "idempotency_key": key},
-                    type="unit_event_in_app", title="T", body="B",
-                    target_type=TargetType.ALL, target_value="*",
-                )
-                job.status = NotificationStatus.PROCESSING
-                jobs.append(job.id)
-            await session.flush()
-            for job_id in jobs:
-                await session.execute(text(
-                    "INSERT INTO notification_deliveries "
-                    "(id, notification_id, recipient_id, channel, status) "
-                    "SELECT gen_random_uuid(), :j, id, 'in_app', 'pending' "
-                    "FROM recipients WHERE snapshot_fingerprint = 'h9'"
-                ), {"j": job_id})
-            # The table around them, as in life: a fortnight of finished
-            # sends -- 20 000 jobs, two deliveries each. On a table that
-            # held only these two sends the planner would take every
-            # job for a coin toss between them and expect thousands of
-            # matches; that is not the table the probe runs on. What it
-            # needs is the DISTINCTNESS of notification_id (20 000 jobs),
-            # not the row count: two deliveries a job give the planner
-            # the same n_distinct as ten at a fifth of the seed (review
-            # of 3.4.0: the call went from ~2 minutes to ~2 seconds).
-            await session.execute(text(
-                "INSERT INTO notifications (id, type, title, body, target_type, "
-                "target_value, idempotency_key, fingerprint, channels, "
-                "expiry_layer, push_on, retry_max_attempts, "
-                "retry_backoff_seconds, recipient_schedule, lane, status, "
-                "scheduled_at) "
-                "SELECT gen_random_uuid(), 'unit_event', 'T', 'B', 'all', '*', "
-                "'h9-done-' || g, repeat('a', 64), '[\"in_app\"]'::jsonb, "
-                "'default', 'none', 3, 30, 'respect', 'normal', 'sent', now() "
-                "FROM generate_series(1, 20000) g"
-            ))
-            await session.execute(text(
-                "INSERT INTO notification_deliveries "
-                "(id, notification_id, recipient_id, channel, status) "
-                "SELECT gen_random_uuid(), n.id, (SELECT id FROM recipients "
-                "WHERE snapshot_fingerprint = 'h9' LIMIT 1), 'in_app', 'sent' "
-                "FROM notifications n, generate_series(1, 2) "
-                "WHERE n.idempotency_key LIKE 'h9-done-%'"
-            ))
-            # Mine: all but one done.
-            await session.execute(text(
-                "UPDATE notification_deliveries SET status = 'sent' "
-                "WHERE notification_id = :j AND id <> (SELECT id FROM "
-                "notification_deliveries WHERE notification_id = :j "
-                "ORDER BY id DESC LIMIT 1)"
-            ), {"j": jobs[0]})
-            await session.commit()
-        # The 4999 deliveries just marked done leave dead entries in the
-        # partial index; in a send they die one per portion and the next
-        # probe marks each dead as it passes (btree kill_prior_tuple), so
-        # a probe meets a handful. Autovacuum's pass stands in for that
-        # history here; VACUUM runs outside a transaction.
-        async with get_engine().connect() as connection:
-            autocommit = await connection.execution_options(
-                isolation_level="AUTOCOMMIT",
-            )
-            await autocommit.execute(text("VACUUM ANALYZE notification_deliveries"))
-        async with get_session_factory()() as session:
-            mine = await session.get(Notification, jobs[0])
+            # The premise, checked: mine's waiting delivery lies after
+            # every waiting delivery of the other send in the heap.
+            behind = (await session.execute(text(
+                "SELECT (SELECT ctid FROM notification_deliveries "
+                "WHERE notification_id = :mine AND status = 'pending') > "
+                "(SELECT max(ctid) FROM notification_deliveries "
+                "WHERE notification_id = :other AND status = 'pending')"
+            ), {"mine": _MINE, "other": _OTHER})).scalar_one()
+            assert behind is True
+            mine = await session.get(Notification, _MINE)
             assert mine is not None
             with _statements() as seen:
                 await rollup_notification(session, mine)
@@ -372,14 +414,13 @@ class TestTheProbePlan:
             raw = await session.connection()
             plan = (await raw.exec_driver_sql(
                 "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + probe,
-                (jobs[0], DeliveryStatus.PENDING.value),
+                (_MINE, DeliveryStatus.PENDING.value),
             )).scalar_one()
             await session.rollback()
-        flat = json.dumps(plan)
-        assert "ix_notification_deliveries_pending" in flat, flat
-        assert "Seq Scan" not in flat
         top = plan[0]["Plan"]
-        assert top["Shared Hit Blocks"] + top.get("Shared Read Blocks", 0) <= 10
+        read = top["Shared Hit Blocks"] + top.get("Shared Read Blocks", 0)
+        assert read <= _PROBE_BUFFERS, json.dumps(plan)
+        assert top["Actual Rows"] == 1  # the pair: the probe answered
 
 
 # -----------------------------------------------------------------------------
