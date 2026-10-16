@@ -44,6 +44,7 @@ from app.engine.models import Notification
 from app.engine.processor import process_lane
 from app.engine.service import create_notification, rollup_notification
 from app.profile.registry import Decided, Layer, TypeRecord, registry
+from tests.conftest import analyze_with_nothing_waiting
 from tests.helpers import create_recipient, intake_fields
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -375,6 +376,8 @@ async def _sends(around: tuple[int, int], statistics: str) -> None:
         ), {"mine": _MINE})
         if statistics == "taken_after_the_sends":
             await session.execute(text("ANALYZE notification_deliveries"))
+        if statistics == "taken_with_nothing_waiting":
+            await analyze_with_nothing_waiting(session)
         await session.commit()
 
 
@@ -388,7 +391,10 @@ class TestTheProbePlan:
       thousands of waiting rows between two autovacuum passes, and the
       planner still believes 'pending' rare);
     - taken after them;
-    - none at all: a table nobody has analyzed, as on a new box.
+    - none at all: a table nobody has analyzed, as on a new box;
+    - taken when nothing waited, the waiting rows back since, with as
+      many dead entries beside them (H14 FIX: the statistics CI H13 met,
+      tests/conftest.py analyze_with_nothing_waiting).
 
     On tables as on a new box (pristine_tables, tests/conftest.py, H14):
     every run starts with no dead rows, no dead index entries, no free
@@ -416,7 +422,11 @@ class TestTheProbePlan:
     @pytest.mark.usefixtures("pristine_tables")
     @pytest.mark.parametrize("around", list(_AROUND), ids=list(_AROUND))
     @pytest.mark.parametrize(
-        "statistics", ["taken_before_the_sends", "taken_after_the_sends", "none"],
+        "statistics",
+        [
+            "taken_before_the_sends", "taken_after_the_sends", "none",
+            "taken_with_nothing_waiting",
+        ],
     )
     async def test_a_handful_of_buffers_on_the_worst_order(
         self, around: str, statistics: str,

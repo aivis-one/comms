@@ -331,6 +331,32 @@ async def make_tables_pristine(*, autovacuum: bool = False) -> None:
         await autocommit.execute(text("RESET lock_timeout"))
 
 
+async def analyze_with_nothing_waiting(session: Any) -> None:
+    """The statistics CI H13 met (H14 FIX): taken when no delivery was
+    waiting, then the waiting ones back -- the planner estimates ~1
+    waiting row while 5 001 are, and every index on status holds as many
+    dead `pending` entries beside them (the inbox index among them: the
+    plan H13 caught read 10 002). The waiting rows are flipped to sent,
+    ANALYZE runs, they are flipped back; the caller commits."""
+    # Row by row, in heap order: a new row version lies after the last
+    # one written, so the waiting rows keep the order the test laid them
+    # in (the premise of the worst order, checked by the caller).
+    await session.execute(text(
+        "CREATE TEMP TABLE h14_waiting ON COMMIT DROP AS "
+        "SELECT id, row_number() OVER (ORDER BY ctid) AS place "
+        "FROM notification_deliveries WHERE status = 'pending'"
+    ))
+    for status in ("sent", "pending"):
+        await session.execute(text(
+            "DO $$ DECLARE r record; BEGIN "
+            "FOR r IN SELECT id FROM h14_waiting ORDER BY place LOOP "
+            f"UPDATE notification_deliveries SET status = '{status}' "
+            "WHERE id = r.id; END LOOP; END $$"
+        ))
+        if status == "sent":
+            await session.execute(text("ANALYZE notification_deliveries"))
+
+
 @pytest.fixture
 async def pristine_tables(clean_db: None) -> AsyncGenerator[None, None]:
     """Tables as on a new box, for a test of a plan or a cost (H14).

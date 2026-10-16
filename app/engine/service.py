@@ -1110,7 +1110,10 @@ async def deliver_notification(
         # deliveries already in id order, so neither a walk of the primary
         # key past every other job's rows nor a sort of all of this job's.
         # The order itself carries no meaning (ids are uuid4); it keeps a
-        # portion the same from one attempt to the next.
+        # portion the same from one attempt to the next. If the planner
+        # does not take that index, the walk of the primary key IS its
+        # other path (up to 190 957 buffers, measured): KNOWN CEILING on
+        # first_waiting_delivery (H14 FIX), the full text there.
         .order_by(NotificationDelivery.id)
         .limit(portion)
     )
@@ -1734,9 +1737,48 @@ def first_waiting_delivery(
     against 4 (measured, H14 report). Correlated, an EXISTS can also be
     hashed: every waiting delivery of every job read once to build the
     hash (4 993 buffers on stale statistics, measured). Ordered and
-    limited, a scan must read and sort every match before the first row,
-    never cheaper than the index's first entry; and a scalar subquery is
-    not hashed. Every statistics measured gives the index (4-7 buffers).
+    limited, a sequential scan must read and sort every match before the
+    first row; and a scalar subquery is not hashed. On every statistics
+    measured -- 16 states, the one CI H13 met among them (statistics
+    taken when nothing waited, the waiting rows and as many dead entries
+    back since) -- the planner takes the status index: 4-7 buffers
+    (tests/test_h9_release.py TestTheProbePlan,
+    tests/test_waiting_probe.py).
+
+    KNOWN CEILING (acknowledged by design -- H14 FIX, the paths left when
+    the status index is not chosen):
+      1. Mechanics: the form holds its path only while the planner takes
+         ix_notification_deliveries_status. Its other paths, measured
+         with that index dropped in a rolled back transaction: with the
+         status an EQUALITY, status and notification_id are constants of
+         the query and the order reduces to id, which the primary key
+         gives -- a walk of the whole primary key, up to 50 209 buffers
+         here and 190 957 for the portion select (deliver_notification,
+         same mechanism); and ix_notification_deliveries_inbox (status
+         is its second column) -- every waiting delivery of every job,
+         up to 18 825 buffers. CI H13 caught the inbox one under EXISTS:
+         Bitmap Index Scan on the inbox index, Index Cond status =
+         'pending', Plan Rows 1, Total Cost 4.38; Bitmap Heap Scan Total
+         Cost 8.4, Rows Removed by Filter 5 000; 652 buffers. What made
+         the status index lose there is not established (H14 report,
+         FIX).
+      2. Status: acknowledged by design.
+      3. Backlog ref: H15 -- the inbox path, by a partial inbox index;
+         the primary key's walk: none yet, no form found (below).
+      4. Promotion trigger (observable): a plan of this probe, of a
+         lane's selection or depth (ready_now), or of the portion select
+         that is not on ix_notification_deliveries_status -- in a CI
+         plan test or an EXPLAIN on a box.
+      5. Agreed fix: the inbox path closes by a partial inbox index
+         (H15); the primary key's walk is open.
+      6. Rejected: the status as a closed range (status >= 'pending'
+         AND <= 'pending'), which keeps the order off the primary key
+         -- but ready_now on fresh statistics then takes
+         ix_notification_deliveries_notification_id (the job's every
+         delivery, 77-83 buffers against 4) and the portion select reads
+         47-53 buffers against 4 in ordinary conditions (the scan runs
+         past the job's rows into other jobs' waiting ones until the
+         portion is full); EXISTS (above).
     """
     return (
         select(NotificationDelivery.id)

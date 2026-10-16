@@ -115,7 +115,10 @@ _STATES = (
     [
         (f"h11-{around}-{statistics}", _seed_h11, around, statistics)
         for around in h11._AROUND
-        for statistics in ("taken_before_the_sends", "taken_after_the_sends", "none")
+        for statistics in (
+            "taken_before_the_sends", "taken_after_the_sends", "none",
+            "taken_with_nothing_waiting",
+        )
     ]
     + [
         (f"h12-{shape}-{statistics}", _seed_h12, shape, statistics)

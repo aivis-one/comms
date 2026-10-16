@@ -49,10 +49,16 @@ from sqlalchemy import event, text
 from app.core.database import get_engine, get_session_factory
 from app.core.lanes import Lane
 from app.engine.processor import process_lane
+from tests.conftest import analyze_with_nothing_waiting
 
 _BUFFERS = 10
 _SHAPES = ["few_waiting_last_by_id", "all_waiting_last_in_heap"]
-_STATISTICS = ["taken_before_the_sends", "taken_after_the_sends", "none"]
+_STATISTICS = [
+    "taken_before_the_sends", "taken_after_the_sends", "none",
+    # H14 FIX: taken when nothing waited, the waiting rows back since
+    # (tests/conftest.py analyze_with_nothing_waiting).
+    "taken_with_nothing_waiting",
+]
 
 
 async def _seed(shape: str, statistics: str) -> tuple[UUID, UUID]:
@@ -128,6 +134,8 @@ async def _seed(shape: str, statistics: str) -> tuple[UUID, UUID]:
             ), {"mine": mine})
         if statistics == "taken_after_the_sends":
             await session.execute(text("ANALYZE notification_deliveries"))
+        if statistics == "taken_with_nothing_waiting":
+            await analyze_with_nothing_waiting(session)
         await session.commit()
     return mine, other
 
