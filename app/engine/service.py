@@ -54,7 +54,18 @@ from typing import Any, cast
 from uuid import UUID
 
 import structlog
-from sqlalchemy import any_, delete, exists, func, or_, select, tuple_, update
+from sqlalchemy import (
+    ColumnElement,
+    Select,
+    any_,
+    delete,
+    exists,
+    func,
+    or_,
+    select,
+    tuple_,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1705,6 +1716,44 @@ def _answer_row(call: LLMCall, reply: LLMReply) -> LLMAnswer:
 # (tests/test_lock_order.py).
 
 
+def first_waiting_delivery(
+    notification_id: Any, *conditions: ColumnElement[bool],
+) -> Select[tuple[UUID]]:
+    """The id of a job's first waiting delivery, or no row: THE probe of
+    "does the job still wait?" (H14) -- the fold (rollup_notification)
+    and, correlated to the job row, a lane's selection and its depth
+    (app/engine/processor.py ready_now).
+
+    ORDERED BY THE COLUMNS OF ix_notification_deliveries_status (status,
+    notification_id, id), migrations 0027/0029, with LIMIT 1. The order
+    is what holds the path. An EXISTS lets the planner bet that a scan
+    meets a match early -- with fresh statistics on a send of 50 000
+    deliveries it estimates ~500 waiting rows of the job and prices a
+    sequential scan at 1/500 of the table, and on the worst order (the
+    job's waiting row last in the heap) it reads all of it: 720 buffers
+    against 4 (measured, H14 report). Correlated, an EXISTS can also be
+    hashed: every waiting delivery of every job read once to build the
+    hash (4 993 buffers on stale statistics, measured). Ordered and
+    limited, a scan must read and sort every match before the first row,
+    never cheaper than the index's first entry; and a scalar subquery is
+    not hashed. Every statistics measured gives the index (4-7 buffers).
+    """
+    return (
+        select(NotificationDelivery.id)
+        .where(
+            NotificationDelivery.notification_id == notification_id,
+            NotificationDelivery.status == DeliveryStatus.PENDING,
+            *conditions,
+        )
+        .order_by(
+            NotificationDelivery.status,
+            NotificationDelivery.notification_id,
+            NotificationDelivery.id,
+        )
+        .limit(1)
+    )
+
+
 async def rollup_notification(
     session: AsyncSession,
     notification: Notification,
@@ -1727,20 +1776,11 @@ async def rollup_notification(
     # A delivery still waiting decides alone (H9): the fold of any set
     # that holds a PENDING is "still open" (_fold), so the set is read
     # only once none waits. After every portion but the last (H7) one
-    # probe on ix_notification_deliveries_status (status, notification_id,
-    # id), migrations 0027/0029 -- the job's waiting deliveries, nothing else, under
-    # any statistics (H11: with no index on status alone, no plan of it
-    # walks other jobs' waiting rows) -- instead of a read of every
-    # delivery of the job: the square H7 took off accepted_answers.
-    still_waiting = await session.scalar(
-        select(
-            exists().where(
-                NotificationDelivery.notification_id == notification.id,
-                NotificationDelivery.status == DeliveryStatus.PENDING,
-            )
-        )
-    )
-    if still_waiting:
+    # probe -- first_waiting_delivery, the first entry of the job's
+    # waiting range of ix_notification_deliveries_status -- instead of a
+    # read of every delivery of the job: the square H7 took off
+    # accepted_answers.
+    if await session.scalar(first_waiting_delivery(notification.id)) is not None:
         return
 
     stmt = (

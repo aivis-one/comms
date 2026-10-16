@@ -19,11 +19,14 @@
 #   -> 40P01, every time.
 # With ORDER BY id both walk one order, so they queue on the first row
 # they share and never hold each other's next one. The harness checks
-# its own premise on every layout it builds: both scans, without ORDER
-# BY, give those two orders. Where an insert lands on the heap is
-# Postgres' choice (space freed by earlier tests is reused), so a layout
-# that does not cross is removed and laid again (_laid_out) -- the
-# harness builds the crossing, the code decides the colour.
+# its own premise on the layout it builds: both scans, without ORDER
+# BY, give those two orders. The layout is built ONCE, on tables as on a
+# new box (pristine_tables, tests/conftest.py, H14): rows lie in the
+# order they are written, and the plan is the one the statistics taken
+# here give. Until H14 a layout that did not cross was removed and laid
+# again, up to twenty times -- space and statistics earlier tests left
+# decided where a row landed and which index a scan walked; the harness
+# builds the crossing, the code decides the colour.
 #
 # MUTATIONS these tests were written against (each turns one red):
 #   M1  close_notifications without ORDER BY      -> TestCloseAgainstClose
@@ -41,7 +44,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import and_, delete, select, text
+from sqlalchemy import and_, select, text
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -137,32 +140,21 @@ async def _laid_out(
     premise: Callable[[dict[str, UUID], UUID, str], Awaitable[bool]],
 ) -> tuple[dict[str, UUID], UUID, str]:
     """Rows on which `premise` -- the crossing of the two unordered
-    scans -- holds. Where an insert lands on the heap is Postgres'
-    choice (space freed by earlier tests is reused), so a layout that
-    does not cross is removed and laid again; the harness builds its
-    crossing, the code under test decides the colour."""
+    scans -- holds, laid once on pristine tables (the caller's
+    pristine_tables): the rows lie in the order they are written, and
+    the plans are those of the statistics taken here. The premise is
+    checked, not retried."""
     mine, theirs = await _recipients()
-    for attempt in range(20):
-        if attempt:
-            # Fresh statistics: a plan picked on what an earlier test
-            # left behind (tens of thousands of rows since deleted)
-            # walks another index -- measured while building H7.
-            async with get_session_factory()() as session:
-                await session.execute(text("ANALYZE notifications"))
-                await session.commit()
-        shared = str(uuid4())
-        rows = await _placed(
-            {name: number + 1000 * attempt for name, number in ids.items()},
-            mine, theirs, shared,
-        )
-        if await premise(rows, mine, shared):
-            return rows, mine, shared
-        async with get_session_factory()() as session:
-            await session.execute(
-                delete(Notification).where(Notification.id.in_(rows.values()))
-            )
-            await session.commit()
-    raise AssertionError("the harness could not lay out a crossing in 20 tries")
+    shared = str(uuid4())
+    rows = await _placed(ids, mine, theirs, shared)
+    async with get_session_factory()() as session:
+        await session.execute(text("ANALYZE notifications"))
+        await session.commit()
+    assert await premise(rows, mine, shared), (
+        "the layout does not cross: the two unordered scans do not walk "
+        "a, m, b and b, n, a -- the harness's premise, not the code's"
+    )
+    return rows, mine, shared
 
 
 async def _order(condition: Any, plan: tuple[str, ...]) -> list[UUID]:
@@ -281,6 +273,7 @@ class TestTheDeadlockIsNotRetried:
         assert getattr(failure.orig, "sqlstate", None) == "40P01"
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestCloseAgainstClose:
     """done-when R-A (2): expiry and cancellation over overlapping sets
     at once -- both end, no 40P01, every job closed once. M1."""
@@ -329,6 +322,7 @@ class TestCloseAgainstClose:
         assert statuses <= {NotificationStatus.CANCELLED, NotificationStatus.EXPIRED}
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestWithdrawAgainstClose:
     """Forgetting against cancellation over overlapping jobs at once --
     both end, no 40P01. M2.

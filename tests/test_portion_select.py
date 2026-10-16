@@ -16,7 +16,13 @@
 #       row: a scan of the heap passes every other row first (656), a
 #       sort of the job's waiting deliveries reads all 5000 (96);
 #
-#   statistics taken before the sends / after them / not taken here.
+#   statistics taken before the sends / after them / none at all.
+#
+# On tables as on a new box (pristine_tables, tests/conftest.py, H14):
+# no dead rows or index entries, no free space, no statistics but the
+# ones taken here -- what this file built for itself until H14 (a
+# VACUUM FULL, ids of its own on every run) is the harness's now, and
+# "not taken here" (whatever the suite left) became "none".
 #
 # The bound, 10 buffers: the path bounded by the job, in id order off
 # ix_notification_deliveries_status (status, notification_id, id), reads
@@ -46,24 +52,16 @@ from app.engine.processor import process_lane
 
 _BUFFERS = 10
 _SHAPES = ["few_waiting_last_by_id", "all_waiting_last_in_heap"]
-_STATISTICS = ["taken_before_the_sends", "taken_after_the_sends", "not_taken"]
+_STATISTICS = ["taken_before_the_sends", "taken_after_the_sends", "none"]
 
 
 async def _seed(shape: str, statistics: str) -> tuple[UUID, UUID]:
-    """Mine and the other send, with ids of their own: clean_db deletes
-    rows but leaves their index entries until a vacuum, and a job id
-    shared between runs would make each run walk the last one's dead
-    entries -- the harness's cost, not the code's."""
+    """Mine and the other send, on pristine tables (the test's
+    pristine_tables): rows written now lie in the order they are written,
+    so "written last" is "last in the heap" -- the premise is still
+    checked."""
     mine, other = uuid4(), uuid4()
     recipients = "FROM recipients WHERE snapshot_fingerprint = 'h12'"
-    # A compacted table, so rows written now go after every row there is:
-    # space freed by earlier tests is otherwise reused, and "written last"
-    # would not be "last in the heap". The premise is still checked.
-    async with get_engine().connect() as connection:
-        autocommit = await connection.execution_options(
-            isolation_level="AUTOCOMMIT",
-        )
-        await autocommit.execute(text("VACUUM FULL notification_deliveries"))
     async with get_session_factory()() as session:
         await session.execute(text(
             "INSERT INTO recipients (id, locale, version, snapshot_fingerprint) "
@@ -181,6 +179,7 @@ class _Channel:
         return True
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestThePortionSelect:
     """done-when H12 (2)-(4)."""
 

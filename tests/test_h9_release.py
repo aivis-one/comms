@@ -219,6 +219,21 @@ def _statements() -> Iterator[list[str]]:
         event.remove(engine, "before_cursor_execute", record)
 
 
+def _is_probe(statement: str) -> bool:
+    """The fold's probe (app/engine/service.py first_waiting_delivery,
+    sent by rollup_notification): a SELECT of a delivery id ordered by
+    the columns of ix_notification_deliveries_status, LIMIT 1. Until H14
+    it was an EXISTS, and found by that word; a lane's selection carries
+    the same subquery correlated, inside a SELECT of notifications, and
+    is not the fold's."""
+    return statement.lstrip().startswith(
+        "SELECT notification_deliveries.id",
+    ) and (
+        "ORDER BY notification_deliveries.status, "
+        "notification_deliveries.notification_id, notification_deliveries.id"
+    ) in " ".join(statement.split())
+
+
 def _set_reads(statements: list[str]) -> int:
     return sum(
         1 for s in statements
@@ -266,7 +281,7 @@ class TestTheFold:
                     await process_lane(Lane.BULK)
                 reads.append(_set_reads(seen))
                 # The pair: the pass did fold-or-wait -- the probe ran.
-                assert any("EXISTS" in s for s in seen)
+                assert any(_is_probe(s) for s in seen)
         assert reads == [0, 0, 1]
         assert await _status(nid) == outcome
 
@@ -373,7 +388,18 @@ class TestTheProbePlan:
       thousands of waiting rows between two autovacuum passes, and the
       planner still believes 'pending' rare);
     - taken after them;
-    - not taken by this test (whatever the suite left).
+    - none at all: a table nobody has analyzed, as on a new box.
+
+    On tables as on a new box (pristine_tables, tests/conftest.py, H14):
+    every run starts with no dead rows, no dead index entries, no free
+    space and no statistics but the ones taken here. Until H14 the third
+    case was "not taken by this test (whatever the suite left)" -- right
+    as a reminder that a box's statistics are older than its send, but
+    not a state: in one process it was the statistics, dead entries and
+    free space of whichever test ran before, and the case measured them
+    (554 buffers through another index, H13 report; the premise below
+    false, H12 report). The old-statistics case of a box is held by
+    "taken before the sends"; "none" is the other end, made exact.
 
     Until H11 this test held the plan by the NAME of migration 0025's
     partial index, which was right while the planner preferred it; it
@@ -383,13 +409,14 @@ class TestTheProbePlan:
     waiting deliveries: 92 buffers a probe. Migration 0027 left no index
     on status alone (ix_notification_deliveries_status is now (status,
     notification_id)), so no path of the probe walks other jobs' rows.
-    M1 (0027 undone) turns the "before" and "not taken" rows red by
-    cost, not by a name."""
+    M1 (0027 undone) turned the "before" and "not taken" rows red by
+    cost, not by a name (H11; "not taken" is "none" since H14 -- M1 is
+    measured again in the H14 report)."""
 
+    @pytest.mark.usefixtures("pristine_tables")
     @pytest.mark.parametrize("around", list(_AROUND), ids=list(_AROUND))
     @pytest.mark.parametrize(
-        "statistics",
-        ["taken_before_the_sends", "taken_after_the_sends", "not_taken"],
+        "statistics", ["taken_before_the_sends", "taken_after_the_sends", "none"],
     )
     async def test_a_handful_of_buffers_on_the_worst_order(
         self, around: str, statistics: str,
@@ -410,11 +437,11 @@ class TestTheProbePlan:
             with _statements() as seen:
                 await rollup_notification(session, mine)
             assert mine.status == NotificationStatus.PROCESSING  # one waits
-            (probe,) = [s for s in seen if "EXISTS" in s]
+            (probe,) = [s for s in seen if _is_probe(s)]
             raw = await session.connection()
             plan = (await raw.exec_driver_sql(
                 "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + probe,
-                (_MINE, DeliveryStatus.PENDING.value),
+                (_MINE, DeliveryStatus.PENDING.value, 1),
             )).scalar_one()
             await session.rollback()
         top = plan[0]["Plan"]

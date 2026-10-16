@@ -155,6 +155,7 @@ class TestThePushWaits:
         assert await cleanup_expired_notifications() == 1
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestThePlan:
     """done-when R-B (3): the batch select still runs on the partial
     index of H5 and scans nothing of notifications outside it -- the

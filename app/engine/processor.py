@@ -116,6 +116,7 @@ from app.engine.service import (
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
+    first_waiting_delivery,
     forget_llm_letter,
     purge_llm_answers,
     resolve_notification,
@@ -226,18 +227,18 @@ def ready_now(now: datetime) -> ColumnElement[bool]:
     the next pass would select, its batch limit aside: pending, or
     processing with a delivery due; scheduled; past its pipeline gate
     (T12); not expired."""
-    ready_delivery = (
-        select(NotificationDelivery.id)
-        .where(
-            NotificationDelivery.notification_id == Notification.id,
-            NotificationDelivery.status == DeliveryStatus.PENDING,
-            or_(
-                NotificationDelivery.next_retry_at.is_(None),
-                NotificationDelivery.next_retry_at <= now,
-            ),
-        )
-        .exists()
-    )
+    # The job's first due waiting delivery, correlated to the job row:
+    # a scalar subquery of first_waiting_delivery, never an EXISTS -- an
+    # EXISTS under an OR is planned as a hashed subplan that reads every
+    # waiting delivery of every job (H14; the form's reasons are on
+    # first_waiting_delivery).
+    ready_delivery = first_waiting_delivery(
+        Notification.id,
+        or_(
+            NotificationDelivery.next_retry_at.is_(None),
+            NotificationDelivery.next_retry_at <= now,
+        ),
+    ).scalar_subquery().is_not(None)
     return and_(
         or_(
             Notification.status == NotificationStatus.PENDING,
