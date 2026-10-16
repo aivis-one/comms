@@ -338,23 +338,31 @@ async def analyze_with_nothing_waiting(session: Any) -> None:
     dead `pending` entries beside them (the inbox index among them: the
     plan H13 caught read 10 002). The waiting rows are flipped to sent,
     ANALYZE runs, they are flipped back; the caller commits."""
-    # Row by row, in heap order: a new row version lies after the last
-    # one written, so the waiting rows keep the order the test laid them
-    # in (the premise of the worst order, checked by the caller).
+    # Set-based, in heap order (H15; row by row until then, 2 x 5 001
+    # UPDATEs a case). With index scans off -- for THIS transaction only
+    # (SET LOCAL), and only for the order of the heap -- every statement
+    # here reads notification_deliveries sequentially, in ctid order: the
+    # waiting rows are captured in that order, and each UPDATE writes
+    # their new versions in that order at the table's end (no vacuum ran,
+    # the pages are full). So they keep the order the test laid them in
+    # -- the callers check that premise (behind). The caller commits; the
+    # queries the test measures then run with the planner's defaults
+    # (tests/test_harness_pristine.py TestNothingWaiting holds both).
+    await session.execute(text("SET LOCAL enable_indexscan = off"))
+    await session.execute(text("SET LOCAL enable_bitmapscan = off"))
     await session.execute(text(
         "CREATE TEMP TABLE h14_waiting ON COMMIT DROP AS "
-        "SELECT id, row_number() OVER (ORDER BY ctid) AS place "
-        "FROM notification_deliveries WHERE status = 'pending'"
+        "SELECT id FROM notification_deliveries WHERE status = 'pending'"
     ))
-    for status in ("sent", "pending"):
-        await session.execute(text(
-            "DO $$ DECLARE r record; BEGIN "
-            "FOR r IN SELECT id FROM h14_waiting ORDER BY place LOOP "
-            f"UPDATE notification_deliveries SET status = '{status}' "
-            "WHERE id = r.id; END LOOP; END $$"
-        ))
-        if status == "sent":
-            await session.execute(text("ANALYZE notification_deliveries"))
+    await session.execute(text(
+        "UPDATE notification_deliveries SET status = 'sent' "
+        "WHERE status = 'pending'"
+    ))
+    await session.execute(text("ANALYZE notification_deliveries"))
+    await session.execute(text(
+        "UPDATE notification_deliveries SET status = 'pending' "
+        "WHERE id IN (SELECT id FROM h14_waiting)"
+    ))
 
 
 @pytest.fixture

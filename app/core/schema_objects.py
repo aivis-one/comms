@@ -103,7 +103,7 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
     ),
     # The inbox keyset (D1 / R7, migration 0016): a page is an index
     # range scan in the keyset's own order, sent rows only. The badge
-    # count stays on ix_notification_deliveries_inbox (read_at keyed).
+    # count is ix_notification_deliveries_unread's (H15).
     "ix_deliveries_inbox_keyset": IndexShape(
         unique=False,
         definition=(
@@ -150,12 +150,18 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "ON public.messages USING btree (thread_id, created_at)"
         ),
     ),
-    "ix_notification_deliveries_inbox": IndexShape(
+    # The badge's rows and nothing else (H15, migration 0031): sent,
+    # unread, by recipient and channel -- get_unread_count and
+    # mark_all_read. No waiting delivery is in it, so no probe of
+    # "does the job still wait?" can walk it (H14 FIX, KNOWN CEILING on
+    # app/engine/service.py first_waiting_delivery).
+    "ix_notification_deliveries_unread": IndexShape(
         unique=False,
         definition=(
-            "CREATE INDEX ix_notification_deliveries_inbox "
+            "CREATE INDEX ix_notification_deliveries_unread "
             "ON public.notification_deliveries USING btree "
-            "(recipient_id, status, read_at)"
+            "(recipient_id, channel) "
+            "WHERE (((status)::text = 'sent'::text) AND (read_at IS NULL))"
         ),
     ),
     # Each lane's pick, in pick order (P4-1, migration 0024): equality on
