@@ -84,13 +84,18 @@ from app.core.lanes import Lane
 # lanes a worker takes chosen by the deploy) with H7 (row locks in one
 # order, a push outliving the expiry cleanup, one portion of deliveries
 # per attempt, connection pools by process) and H8 (comms' own errors
-# kept as class and place, every log line sanitized, the lanes' depth).
-#
-# PATCH bumps change no behaviour of comms: 3.4.1 is the base images'
-# newer digests under the same tags (python 3.12-slim, postgres 16,
-# redis 7-alpine) and CI's actions, brought by Dependabot.
+# kept as class and place, every log line sanitized, the lanes' depth);
+# 3.5.0 is phase 5 (the llm channel: a type routed to a model, named key
+# sets with transport fallback, the raw answer kept on the job for its
+# type's term and the letter gone at the outcome; and a letter's audio
+# body by signed link, fetched every attempt from a host LLM_BODY_HOSTS
+# names, never stored) with H11-H15 (the waiting probe and the portion
+# select hold their cost, an empty JSONB value is SQL NULL -- forgetting
+# a person who once had a schedule works again --, the badge's index
+# holds no waiting delivery) and the base images' newer digests and CI's
+# actions brought by Dependabot (3.4.1 was never released; it is here).
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.4.1"
+APP_VERSION = "3.5.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
