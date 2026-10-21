@@ -137,6 +137,10 @@ async def test_round_trip_on_every_form_of_row(at_head_afterwards: None) -> None
         "ck_recipients_telegram_id_not_zero",
         "ck_recipients_version_not_negative",
         "ck_recipients_tombstone",
+        # The upgrade goes to HEAD, and since H13 (migration 0030) the
+        # head carries one more CHECK on recipients: allowed_windows is
+        # never the JSON value null.
+        "ck_recipients_allowed_windows_not_json_null",
     }
 
     # -- downgrade: the documented inexact mappings --

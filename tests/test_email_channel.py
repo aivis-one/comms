@@ -351,8 +351,17 @@ class TestRegionIsDefaultedNotDeciding:
         assert getattr(_settings(**{name: ""}), name) == getattr(
             _settings(), name,
         )
-        # The pair: "the two agree" says nothing if both are "".
-        assert getattr(_settings(), name) != ""
+        # The pair: "the two agree" says nothing if both are "". Since
+        # P5-2 one defaulted key has "" AS its default -- LLM_BODY_HOSTS,
+        # where empty means "fetch nothing" -- so for it the pair is what
+        # the default MEANS, and that a written value is read.
+        if name == "llm_body_hosts":
+            assert _settings().llm_body_host_set == frozenset()
+            assert _settings(llm_body_hosts="store:9000").llm_body_host_set == {
+                ("store", 9000),
+            }
+        else:
+            assert getattr(_settings(), name) != ""
 
     def test_unknown_region_refuses_even_without_the_channel(self) -> None:
         """A typo in a defaulted value on a deploy that has NO email is

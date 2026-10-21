@@ -341,7 +341,8 @@ class TestValidator:
             load_profile(FileProfileSource(root))
         message = str(excinfo.value)
         assert "type 'unit_event': unknown field 'future_field'" in message
-        assert "expected one of: category, channels," in message
+        # P5-1: answer_keep sorts first among the fields.
+        assert "expected one of: answer_keep, category, channels," in message
 
 
 class TestLocaleFallbackChain:

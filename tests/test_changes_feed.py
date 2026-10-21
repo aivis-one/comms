@@ -549,6 +549,7 @@ class TestAuth:
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestCost:
     async def test_a_page_reads_the_index_on_100k_rows(self) -> None:
         jobs = await _jobs(20)

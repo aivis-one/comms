@@ -70,6 +70,26 @@ MAX_CATEGORY_LEN = 50
 MAX_TITLE_LEN = 500
 MAX_BODY_LEN = 5000
 
+# The largest letter of an llm job (P5-1): characters of its canonical
+# JSON (app/engine/service.py canonical_fingerprint encoding) -- the
+# chat messages, the response schema and the model parameters together.
+# A conversation with its instruction does not fit MAX_BODY_LEN; the
+# ceiling is ours, the product's own limit is the model's context.
+MAX_LLM_LETTER_CHARS = 200_000
+
+# The ceiling of a type's max_audio_bytes (P5-2): an audio body is held
+# in the attempt's memory whole, and once more as base64 in the request
+# -- 20 MiB is about 50 MiB of one attempt's memory.
+MAX_LLM_AUDIO_BYTES = 20 * 1024 * 1024
+
+# The longest signed link to a body (P5-2, `llm_audio.url`): a presigned
+# object URL of an S3-compatible store is a few hundred characters.
+MAX_LLM_AUDIO_URL_LEN = 4096
+
+# The longest name of an llm key set (LLM_KEY_SETS, app/core/channels.py)
+# -- the width of llm_calls / llm_answers columns that hold it.
+MAX_LLM_SET_NAME_LEN = 64
+
 # Width of notifications.idempotency_key -- the producer-supplied
 # dedup key of a stream-ingested notification request (Phase 3c).
 # 200 fits any sane producer key (outbox row uuid, composite string);

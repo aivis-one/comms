@@ -103,7 +103,7 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
     ),
     # The inbox keyset (D1 / R7, migration 0016): a page is an index
     # range scan in the keyset's own order, sent rows only. The badge
-    # count stays on ix_notification_deliveries_inbox (read_at keyed).
+    # count is ix_notification_deliveries_unread's (H15).
     "ix_deliveries_inbox_keyset": IndexShape(
         unique=False,
         definition=(
@@ -150,12 +150,18 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "ON public.messages USING btree (thread_id, created_at)"
         ),
     ),
-    "ix_notification_deliveries_inbox": IndexShape(
+    # The badge's rows and nothing else (H15, migration 0031): sent,
+    # unread, by recipient and channel -- get_unread_count and
+    # mark_all_read. No waiting delivery is in it, so no probe of
+    # "does the job still wait?" can walk it (H14 FIX, KNOWN CEILING on
+    # app/engine/service.py first_waiting_delivery).
+    "ix_notification_deliveries_unread": IndexShape(
         unique=False,
         definition=(
-            "CREATE INDEX ix_notification_deliveries_inbox "
+            "CREATE INDEX ix_notification_deliveries_unread "
             "ON public.notification_deliveries USING btree "
-            "(recipient_id, status, read_at)"
+            "(recipient_id, channel) "
+            "WHERE (((status)::text = 'sent'::text) AND (read_at IS NULL))"
         ),
     ),
     # Each lane's pick, in pick order (P4-1, migration 0024): equality on
@@ -186,14 +192,31 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "'no_recipients'::character varying])::text[])))"
         ),
     ),
-    # A job's waiting deliveries (H9, migration 0025): the fold's probe
-    # "does any still wait?" (app/engine/service.py rollup_notification).
-    "ix_notification_deliveries_pending": IndexShape(
+    # The deliveries' status, keyed by job (H11, migration 0027) and by
+    # delivery id (H12, migration 0029): the same name and leading column
+    # as the model's old index on status, and every query that names the
+    # job -- the fold's probe "does any still wait?"
+    # (app/engine/service.py rollup_notification), the lane's "a delivery
+    # is due" -- bounded by it, whatever the planner's statistics say;
+    # a portion's selection (deliver_notification, ORDER BY id LIMIT) is
+    # read off it in id order, with no sort and no walk of the primary key.
+    "ix_notification_deliveries_status": IndexShape(
         unique=False,
         definition=(
-            "CREATE INDEX ix_notification_deliveries_pending "
-            "ON public.notification_deliveries USING btree (notification_id) "
-            "WHERE ((status)::text = 'pending'::text)"
+            "CREATE INDEX ix_notification_deliveries_status "
+            "ON public.notification_deliveries USING btree "
+            "(status, notification_id, id)"
+        ),
+    ),
+    # The llm answers past their term, for the purge (P5-1, migration
+    # 0026): only rows that still carry a body
+    # (app/engine/service.py purge_llm_answers).
+    "ix_llm_answers_keep": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_llm_answers_keep "
+            "ON public.llm_answers USING btree (keep_until) "
+            "WHERE (body IS NOT NULL)"
         ),
     ),
     # A repeated resource call answers with the row it created (F1.4).
@@ -347,6 +370,24 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # A job's lane is one of the four Lane values, never NULL (P4-1,
     # migration 0024).
     "ck_notifications_lane",
+    # A job of an llm type has no letter for people and no audience; any
+    # other job has all four (P5-1, migration 0026).
+    "ck_notifications_letter_by_kind",
+    # Only the llm channel's delivery has no recipient (P5-1, migration
+    # 0026).
+    "ck_deliveries_recipient_by_channel",
+    # A signed link to an audio body never outlives its letter (P5-2,
+    # migration 0028).
+    "ck_llm_calls_audio_with_letter",
+    # A JSONB value is never the JSON value null -- empty is SQL NULL
+    # (H13, migration 0030; app/core/database.py JSON_VALUE).
+    "ck_notifications_channels_not_json_null",
+    "ck_notifications_action_data_not_json_null",
+    "ck_notification_deliveries_channel_options_not_json_null",
+    "ck_recipients_allowed_windows_not_json_null",
+    "ck_llm_calls_sets_not_json_null",
+    "ck_llm_calls_letter_not_json_null",
+    "ck_llm_calls_audio_not_json_null",
 })
 
 # Everything the schema must carry although the metadata never mentions

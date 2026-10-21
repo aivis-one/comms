@@ -73,7 +73,7 @@ from app.engine.wake import listen_for_wakes
 from app.engine.worker import run_engine_maintenance
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
 from app.notifier import consume_close_notifications
-from app.profile.loader import install_profile_from_settings
+from app.profile.loader import install_profile_from_settings, lanes_mixing_llm
 
 logger = structlog.get_logger()
 
@@ -283,6 +283,25 @@ async def run_worker_loop() -> None:
                 "another worker process of the deploy must take them "
                 "(COMMS_WORKER_LANES), or their jobs stay pending -- "
                 "GET /api/v1/lanes/depth shows them"
+            ),
+        )
+
+    for mix in lanes_mixing_llm():
+        # P5-1: a lane attempts its jobs one after another, and a model
+        # writes for up to LLM_DELIVER_TIMEOUT_SECONDS per key set -- the
+        # types for people of the same lane wait behind it. A lawful
+        # profile, so it starts; loud, one line per lane. KNOWN CEILING
+        # (the head of a lane) on app/engine/service.py _deliver_single.
+        logger.warning(
+            "lane_mixes_llm",
+            lane=mix.lane,
+            llm_types=list(mix.llm_types),
+            other_types=list(mix.other_types),
+            hint=(
+                "a lane attempts one job at a time: while a model writes "
+                "(up to LLM_DELIVER_TIMEOUT_SECONDS per key set), every "
+                "job of these other types waits behind it -- give the "
+                "llm types a lane of their own (deploy/INTEGRATION.md)"
             ),
         )
 

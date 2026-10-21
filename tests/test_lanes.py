@@ -597,6 +597,7 @@ def _nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestThePlan:
     async def test_the_lane_selection_runs_on_the_lane_index(self) -> None:
         """50 000 jobs over four lanes, most of them sent, 2 000 active:

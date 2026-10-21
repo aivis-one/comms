@@ -46,7 +46,7 @@ from app.core.database import (
     set_process_role,
 )
 from app.core.logging import setup_logging
-from app.engine.formatters import channel_map, close_formatters
+from app.engine.formatters import channel_map, close_formatters, llm_set_map
 from app.profile.loader import install_profile_from_settings
 
 logger = structlog.get_logger()
@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         version=APP_VERSION,
         env=settings.app_env,
         channels=channel_map(settings),
+        llm_sets=llm_set_map(settings),
     )
     yield
     await close_formatters()

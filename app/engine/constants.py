@@ -234,6 +234,11 @@ class DeliveryChannel(enum.StrEnum):
     EMAIL = "email"
     PUSH = "push"
     IN_APP = "in_app"
+    # A model behind a named key set (P5-1, spec §14). Its delivery has
+    # no recipient: a job of an llm type has exactly one delivery, on
+    # this channel, whose answer is the model's (app/engine/models.py
+    # LLMCall / LLMAnswer).
+    LLM = "llm"
 
 
 class TargetType(enum.StrEnum):

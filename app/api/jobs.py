@@ -30,7 +30,8 @@
 # come from the journal only -- sanitized, and cleared by forgetting.
 #
 # Adding a field is not a break (unknown fields are ignored by
-# contract): phase 5 adds the model's answer to `job` that way.
+# contract): phase 5 added the model's answer to `job` that way (P5-1,
+# `answer` -- null on a job for people).
 # =============================================================================
 
 from collections.abc import AsyncGenerator
@@ -54,6 +55,8 @@ from app.core.constants import MAX_IDEMPOTENCY_KEY_LEN
 from app.core.database import get_session_factory
 from app.engine.models import (
     IntakeOutcome,
+    LLMAnswer,
+    LLMCall,
     Notification,
     NotificationDelivery,
     NotificationTransition,
@@ -80,8 +83,17 @@ INTAKE_ITEM_FIELDS = ("outcome", "reason", "received_at", "notification_id")
 JOB_FIELDS = (
     "id", "type", "category", "target_type", "target_value", "correlation",
     "status", "created_at", "scheduled_at", "expiry_at", "pipeline",
-    "deliveries",
+    "deliveries", "answer",
 )
+# The model's answer on a job of the llm kind (P5-1). `state`: none (no
+# answer -- the job is active, or ended without one: its status says
+# which), kept (the body is here), purged (past keep_until: the body is
+# gone, the snapshot and the letter's hash stay).
+ANSWER_FIELDS = (
+    "state", "letter_hash", "audio_hash", "answered_by", "answered_at",
+    "keep_until", "body",
+)
+ANSWERED_BY_FIELDS = ("set", "provider", "model")
 PIPELINE_FIELDS = ("attempts", "step", "error", "retry_at")
 DELIVERY_COUNT_FIELDS = ("channel", "status", "count")
 DELIVERY_ITEM_FIELDS = (
@@ -99,6 +111,8 @@ FORMS: dict[str, tuple[str, ...]] = {
     "intake_item": INTAKE_ITEM_FIELDS,
     "job": JOB_FIELDS,
     "pipeline": PIPELINE_FIELDS,
+    "answer": ANSWER_FIELDS,
+    "answered_by": ANSWERED_BY_FIELDS,
     "delivery_count": DELIVERY_COUNT_FIELDS,
     "delivery_item": DELIVERY_ITEM_FIELDS,
     "path_item": PATH_ITEM_FIELDS,
@@ -134,7 +148,48 @@ def _intake_item(row: IntakeOutcome) -> dict[str, Any]:
     })
 
 
-def _job(job: Notification, counts: list[tuple[str, str, int]]) -> dict[str, Any]:
+class AnswerState:
+    """The values of `answer.state`."""
+
+    NONE = "none"
+    KEPT = "kept"
+    PURGED = "purged"
+
+
+def _answer(call: LLMCall, answer: LLMAnswer | None) -> dict[str, Any]:
+    """The model's answer as the product reads it: the raw body while it
+    is kept, and always who answered and to which letter."""
+    if answer is None:
+        state = AnswerState.NONE
+    elif answer.body is None:
+        state = AnswerState.PURGED
+    else:
+        state = AnswerState.KEPT
+    return _closed(ANSWER_FIELDS, {
+        "state": state,
+        "letter_hash": call.letter_hash,
+        # The audio body's hash (P5-2): the body is part of the question
+        # (spec §14.11). Known once the body was fetched and answered.
+        "audio_hash": None if answer is None else answer.audio_hash,
+        "answered_by": (
+            None if answer is None else _closed(ANSWERED_BY_FIELDS, {
+                "set": answer.answered_set,
+                "provider": answer.answered_provider,
+                "model": answer.answered_model,
+            })
+        ),
+        "answered_at": None if answer is None else _iso(answer.answered_at),
+        "keep_until": None if answer is None else _iso(answer.keep_until),
+        "body": None if answer is None else answer.body,
+    })
+
+
+def _job(
+    job: Notification,
+    counts: list[tuple[str, str, int]],
+    call: LLMCall | None = None,
+    answer: LLMAnswer | None = None,
+) -> dict[str, Any]:
     return _closed(JOB_FIELDS, {
         "id": str(job.id),
         "type": job.type,
@@ -158,12 +213,14 @@ def _job(job: Notification, counts: list[tuple[str, str, int]]) -> dict[str, Any
             })
             for channel, status, count in counts
         ],
+        "answer": None if call is None else _answer(call, answer),
     })
 
 
 def _delivery_item(row: NotificationDelivery) -> dict[str, Any]:
     return _closed(DELIVERY_ITEM_FIELDS, {
-        "recipient_id": str(row.recipient_id),
+        # null on the llm channel's delivery (P5-1): it has no recipient.
+        "recipient_id": _str(row.recipient_id),
         "channel": row.channel,
         "status": row.status,
         "attempts": row.attempts,
@@ -237,7 +294,8 @@ async def read_by_key(
         "idempotency_key": key,
         "intake": [_intake_item(row) for row in read.intake],
         "job": (
-            _job(read.job, read.delivery_counts) if read.job is not None else None
+            _job(read.job, read.delivery_counts, read.llm_call, read.llm_answer)
+            if read.job is not None else None
         ),
     })
 

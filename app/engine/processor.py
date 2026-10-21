@@ -116,6 +116,9 @@ from app.engine.service import (
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
+    first_waiting_delivery,
+    forget_llm_letter,
+    purge_llm_answers,
     resolve_notification,
     rollup_notification,
 )
@@ -224,18 +227,18 @@ def ready_now(now: datetime) -> ColumnElement[bool]:
     the next pass would select, its batch limit aside: pending, or
     processing with a delivery due; scheduled; past its pipeline gate
     (T12); not expired."""
-    ready_delivery = (
-        select(NotificationDelivery.id)
-        .where(
-            NotificationDelivery.notification_id == Notification.id,
-            NotificationDelivery.status == DeliveryStatus.PENDING,
-            or_(
-                NotificationDelivery.next_retry_at.is_(None),
-                NotificationDelivery.next_retry_at <= now,
-            ),
-        )
-        .exists()
-    )
+    # The job's first due waiting delivery, correlated to the job row:
+    # a scalar subquery of first_waiting_delivery, never an EXISTS -- an
+    # EXISTS under an OR is planned as a hashed subplan that reads every
+    # waiting delivery of every job (H14; the form's reasons are on
+    # first_waiting_delivery).
+    ready_delivery = first_waiting_delivery(
+        Notification.id,
+        or_(
+            NotificationDelivery.next_retry_at.is_(None),
+            NotificationDelivery.next_retry_at <= now,
+        ),
+    ).scalar_subquery().is_not(None)
     return and_(
         or_(
             Notification.status == NotificationStatus.PENDING,
@@ -550,6 +553,7 @@ async def _close_at_ceiling(
             # Nothing to fold: the resolve failed (branch (a) above).
             notification.status = NotificationStatus.FAILED
             journal.record_job(session, notification, JournalStep.CEILING)
+            await forget_llm_letter(session, notification)
             return 0
     closed = await close_waiting_deliveries(
         session,
@@ -646,6 +650,41 @@ async def cleanup_expired_notifications() -> int:
                 exception=sanitized_traceback(exc),
             )
             return total
+
+
+async def purge_expired_llm_answers() -> int:
+    """Clear the model answers past their term (P5-1), in batches of
+    _RETENTION_BATCH_SIZE, at most _EXPIRED_MAX_BATCHES_PER_PASS a pass
+    -- the expiry cleanup's shape, on the same maintenance loop. A
+    failing batch is rolled back and logged; the batches before it stay.
+
+    Returns:
+        Number of answers cleared in this pass.
+    """
+    factory = get_session_factory()
+    now = datetime.now(UTC)
+    total = 0
+    async with factory() as session:
+        try:
+            for _ in range(_EXPIRED_MAX_BATCHES_PER_PASS):
+                cleared = await purge_llm_answers(
+                    session, now=now, limit=_RETENTION_BATCH_SIZE,
+                )
+                await session.commit()
+                total += cleared
+                if cleared < _RETENTION_BATCH_SIZE:
+                    break
+        except Exception as exc:
+            await session.rollback()
+            logger.error(
+                "llm_answer_purge_error",
+                cleared=total,
+                exception=sanitized_traceback(exc),
+            )
+            return total
+    if total:
+        logger.info("llm_answers_purged", count=total)
+    return total
 
 
 # Phase 3a item 5: rows deleted per retention batch. One batch = one

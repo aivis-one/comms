@@ -408,7 +408,7 @@ async def once_more_on_insert_race[T](
     event: str,
     **fields: str,
 ) -> T:
-    """Run `apply` under a SAVEPOINT; on an IntegrityError run it once
+    """Run `apply` under a SAVEPOINT; on a UNIQUE VIOLATION run it once
     more, outside one.
 
     The SAVEPOINT keeps the caller's transaction usable after the
@@ -416,9 +416,16 @@ async def once_more_on_insert_race[T](
     INSERT waited on its lock), so the SAME rule run again finds the
     winner's row and decides against it: a replay, a stale or a newer
     version -- exactly as without the race. Once: a second collision
-    would mean the row both exists and does not, and it is raised. Any
-    IntegrityError is retried, not only the key's: one that is not the
-    race fails the second run the same way and is raised then.
+    would mean the row both exists and does not, and it is raised.
+
+    ONLY THE RACE IS RETRIED (H13): the race is two INSERTs of one key,
+    and its one signature is a unique violation (SQLSTATE 23505). Any
+    other IntegrityError -- a CHECK, a foreign key, a NOT NULL -- is a
+    row this write must not make, raised at once: no `<event>` line (it
+    is not a race, and a log saying so sent the reader of the
+    tombstone's CHECK violation after a race that never was) and no
+    second run that could only fail the same way. The caller's
+    transaction stays usable either way: the SAVEPOINT is rolled back.
 
     WHY THE NAME IS PUBLIC: the rule is one for every writer of the
     kind, and a second module needs it (app/audience/prefs.py,
@@ -430,9 +437,22 @@ async def once_more_on_insert_race[T](
     try:
         async with session.begin_nested():
             return await apply()
-    except IntegrityError:
+    except IntegrityError as exc:
+        if not is_unique_violation(exc):
+            raise
         logger.info(event, **fields)
         return await apply()
+
+
+# SQLSTATE of a unique violation -- the insert race's one signature.
+UNIQUE_VIOLATION = "23505"
+
+
+def is_unique_violation(exc: IntegrityError) -> bool:
+    """Whether an IntegrityError is a unique violation: by the SQLSTATE
+    the driver reports (`pgcode` of the DBAPI error), never by the
+    message text."""
+    return getattr(exc.orig, "pgcode", None) == UNIQUE_VIOLATION
 
 
 async def apply_snapshot(

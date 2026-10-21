@@ -352,9 +352,18 @@ class TestFormatterChoice:
     def test_unimplemented_channel_resolves_to_the_refusal(self) -> None:
         """SHORTFALL on the lookup: no implementation, so no deploy has
         the channel -- and the lookup still answers, for every value of
-        the enum."""
+        the enum.
+
+        P5-1 made this more exact: "every channel is a formatter" was
+        right while every channel was delivered to a person. The llm
+        channel is ASKED (app/engine/formatters.py ModelChannel), so it
+        is the registry's `model`, and every OTHER channel is a
+        formatter; absent, llm resolves to the same refusal."""
         registry = build_formatters(_settings(), _fake_factory)
-        assert set(registry.formatters) == {c.value for c in DeliveryChannel}
+        assert set(registry.formatters) == {
+            c.value for c in DeliveryChannel if c is not DeliveryChannel.LLM
+        }
+        assert isinstance(registry.model, UnavailableChannelFormatter)
         implemented = {spec.name for spec in CHANNEL_SPECS}
         for channel in DeliveryChannel:
             if channel.value in implemented:

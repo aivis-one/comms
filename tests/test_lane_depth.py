@@ -209,6 +209,7 @@ def _captured() -> Iterator[list[tuple[str, Any]]]:
         event.remove(engine, "before_cursor_execute", record)
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestThePlan:
     """done-when R-E (4): on 50 000 rows of realistic shape -- most jobs
     finished, a few active in every lane -- the statement the depth

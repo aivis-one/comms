@@ -187,15 +187,37 @@ class TestNotificationRequestSchema:
         with pytest.raises(ValidationError, match="idempotency_key"):
             parse_event(_envelope("notification_request", data))
 
-    @pytest.mark.parametrize("field", [
-        "type", "target_type", "target_value", "title", "body",
-    ])
+    @pytest.mark.parametrize("field", ["type", "target_type", "target_value"])
     def test_required_fields(self, field: str) -> None:
         """Was: every required field missing -> ValidationError. With a
-        readable key the refusal is recorded under it instead (F1.2)."""
+        readable key the refusal is recorded under it instead (F1.2).
+
+        title and body left this list in P5-1, and so did the address as
+        a whole: which of them a request carries is its TYPE's (an llm
+        type takes none of them), and the type is checked against the
+        live profile in create_notification -- the refusal of a type for
+        people without them is recorded under the key there
+        (tests/test_llm_channel.py, TestIntakeByKind). What stays here:
+        the type is always required, and the address is whole or
+        absent -- one half of it is still refused by the parser."""
         data = _request_data()
         del data[field]
         assert f"required field {field!r} is missing" in _rejected(data).reason
+
+    @pytest.mark.parametrize("field", ["title", "body"])
+    def test_the_letter_for_people_is_the_types_to_require(
+        self, field: str,
+    ) -> None:
+        """P5-1: the parser no longer decides that title and body are
+        required (see above); it parses the request without them, and
+        the field reads None. Its form is still checked when present."""
+        data = _request_data()
+        del data[field]
+        event = parse_event(_envelope("notification_request", data))
+        assert isinstance(event, NotificationRequest)
+        assert getattr(event, field) is None
+        data = _request_data(**{field: ""})
+        assert "must be a non-empty string" in _rejected(data).reason
 
     def test_user_target_must_be_uuid(self) -> None:
         assert "not a valid uuid" in _rejected(

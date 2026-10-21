@@ -225,9 +225,11 @@ class TestTheIndex:
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestThePlan:
     @pytest.fixture(autouse=True)
-    async def _realistic(self) -> None:
+    async def _realistic(self, pristine_tables: None) -> None:
+        # After pristine_tables, never before: it would truncate the seed.
         await _seed(total=50000, every=200)
 
     async def test_the_cleanup_batch_runs_on_the_index_and_the_pkey(self) -> None:

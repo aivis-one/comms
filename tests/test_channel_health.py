@@ -530,6 +530,7 @@ class TestHealthUnchanged:
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pristine_tables")
 class TestCost:
     async def test_the_window_reads_the_index_on_100k_rows(self) -> None:
         job = await _job()

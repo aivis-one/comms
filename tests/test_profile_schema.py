@@ -40,6 +40,7 @@ from app.profile.loader import (
     PUSH_ON,
     RECORD_FIELDS,
     SCHEMA_VERSION,
+    TEMPLATE_CHANNELS,
     FileProfileSource,
     RawProfile,
     install_profile,
@@ -261,10 +262,16 @@ class TestFieldTypes:
         type that does not wait for the recipient's schedule); the set
         stays closed, and every other name is still refused."""
         assert RECORD_FIELDS == (
+            # P5-1: how long a model's answer is kept (the llm kind).
+            "answer_keep",
             "category",
             "channels",
             "expires_after",
             "lane",
+            # P5-1: the llm kind's ordered key sets.
+            "llm_sets",
+            # P5-2: the largest audio body an llm job may link to.
+            "max_audio_bytes",
             "max_body_chars",
             "push_on",
             "recipient_schedule",
@@ -274,22 +281,54 @@ class TestFieldTypes:
 
     def test_every_field_declared_lands_on_the_profile_layer(self) -> None:
         """Every field of the record, declared -- recipient_schedule
-        included since H3 -- is decided by the profile layer."""
-        record = _parse(_doc({"t": {
-            "category": "c",
-            "channels": ["in_app", "telegram"],
-            "lane": "critical",
-            "push_on": "outcome_and_deferral",
-            "recipient_schedule": "bypass",
-            "expires_after": "7d",
-            "retry_max_attempts": 5,
-            "retry_backoff_seconds": 0,
-            "max_body_chars": 100,
-        }})).types["t"]
+        included since H3 -- is decided by the profile layer.
+
+        Since P5-1 no ONE type can declare every field: the person's
+        fields are refused on the llm kind and the llm kind's on a type
+        for people. So the claim is held over the two kinds together:
+        every field declared on the kind it belongs to lands on the
+        profile layer, and the two kinds cover the whole record."""
+        types = _parse(_doc({
+            "t": {
+                "category": "c",
+                "channels": ["in_app", "telegram"],
+                "lane": "critical",
+                "push_on": "outcome_and_deferral",
+                "recipient_schedule": "bypass",
+                "expires_after": "7d",
+                "retry_max_attempts": 5,
+                "retry_backoff_seconds": 0,
+                "max_body_chars": 100,
+            },
+            "m": {
+                "channels": ["llm"],
+                "llm_sets": ["llm.text", "llm.backup"],
+                "answer_keep": "2h",
+                "max_audio_bytes": 4096,
+                "lane": "bulk",
+                "push_on": "outcome",
+                "expires_after": "10m",
+                "retry_max_attempts": 2,
+                "retry_backoff_seconds": 5,
+            },
+        })).types
+        record = types["t"]
         assert record.value("channels") == ("in_app", "telegram")
         assert record.value("expires_after") == timedelta(days=7)
         assert record.value("retry_backoff_seconds") == 0
-        assert {d.layer for d in record.fields.values()} == {Layer.PROFILE}
+        model = types["m"]
+        assert model.value("llm_sets") == ("llm.text", "llm.backup")
+        assert model.value("answer_keep") == timedelta(hours=2)
+        declared = {
+            name for kind in (record, model)
+            for name, decided in kind.fields.items()
+            if decided.layer is Layer.PROFILE
+        }
+        assert declared == set(RECORD_FIELDS)
+        assert {
+            record.fields[f].layer
+            for f in ("llm_sets", "answer_keep", "max_audio_bytes")
+        } == {Layer.DEFAULT}
 
     @pytest.mark.parametrize("field", [f for f in RECORD_FIELDS if f != "category"])
     @pytest.mark.parametrize(
@@ -355,7 +394,8 @@ class TestFieldTypes:
     def test_channels_forms(self, value: Any, complaint: str) -> None:
         message = _refusal(_doc({"t": {"channels": value}}))
         assert complaint in message
-        assert "from: email, in_app, telegram" in message
+        # P5-1: llm joined the channels a type may route to.
+        assert "from: email, in_app, llm, telegram" in message
 
     @pytest.mark.parametrize(
         ("literal", "expected"),
@@ -716,18 +756,22 @@ class TestTemplateKeys:
             parse_profile(RawProfile(types=_doc(), templates_by_locale=templates))
         message = str(excinfo.value)
         assert "channel key 'telegramm' is not a channel" in message
+        # P5-1: llm is a channel but renders no template, so a sheet may
+        # not name it -- the list stays the channels that render.
         assert "expected one of: email, in_app, telegram" in message
 
     def test_known_channel_keys_pass(self) -> None:
+        # P5-1: every channel that renders -- llm renders nothing.
         templates = {"en": {"msg.thread_closed": {
-            name: {"body": "x"} for name in CHANNEL_NAMES
+            name: {"body": "x"} for name in TEMPLATE_CHANNELS
         }}}
         profile = parse_profile(
             RawProfile(types=_doc(), templates_by_locale=templates),
         )
         assert set(profile.templates["en"]["msg.thread_closed"]) == set(
-            CHANNEL_NAMES,
+            TEMPLATE_CHANNELS,
         )
+        assert set(TEMPLATE_CHANNELS) == set(CHANNEL_NAMES) - {"llm"}
 
 
 # -----------------------------------------------------------------------------
@@ -760,6 +804,11 @@ class TestShippedProfiles:
         record = profile.types["unit_routed"]
         layers = {name: d.layer for name, d in record.fields.items()}
         assert layers.pop("category") is Layer.DEFAULT
+        # P5-1: the llm kind's two fields are defaults on a type for
+        # people -- declaring them there is refused (_check_kinds).
+        assert layers.pop("llm_sets") is Layer.DEFAULT
+        assert layers.pop("answer_keep") is Layer.DEFAULT
+        assert layers.pop("max_audio_bytes") is Layer.DEFAULT  # P5-2
         assert set(layers.values()) == {Layer.PROFILE}
 
 
@@ -787,4 +836,11 @@ class TestLoaderText:
         assert "no conditions, no" in self._SOURCE
 
     def test_storage_class_line_is_present(self) -> None:
-        assert "STORAGE CLASS is not a field yet" in self._SOURCE
+        """Was: \"STORAGE CLASS is not a field yet\" -- true until the
+        storage of answers arrived (P5-1), which the line itself named as
+        the moment. The owner's decision (§14.12 item 5) is a TERM per
+        type, not a class; the header now says so, and why no class."""
+        assert "STORAGE CLASS is not a field yet" not in self._SOURCE
+        assert "The answer is kept by duration, not by a storage class" in (
+            " ".join(self._SOURCE.replace("#", " ").split())
+        )

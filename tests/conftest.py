@@ -94,7 +94,8 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete
+from sqlalchemy import delete, event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -104,6 +105,7 @@ from app.core.config import settings
 from app.core.database import (
     ProcessRole,
     dispose_engine,
+    get_engine,
     get_session_factory,
     set_process_role,
 )
@@ -244,6 +246,216 @@ async def clean_db(
         await session.execute(delete(Recipient))
         await session.commit()
     yield
+
+
+# -----------------------------------------------------------------------------
+# Tests of a plan or a cost (H14)
+# -----------------------------------------------------------------------------
+#
+# A test that reads a plan -- EXPLAIN -- answers for the code under test
+# only if the tables it explains are in a state THE TEST built. clean_db
+# deletes rows; it leaves their dead tuples, their dead index entries,
+# the space they freed and the planner statistics an earlier test took.
+# In one process (the stand's) a plan test then measured what the suite
+# left: the fold's probe read 554 buffers through another index, and a
+# premise about the order of rows in the heap failed (H12, H13 reports).
+#
+# pristine_tables gives such a test tables as on a new box: TRUNCATE of
+# every table of the schema (new files: no dead tuples, no dead index
+# entries, no free space -- rows lie in the order they are written) and
+# no planner statistics at all (pg_statistic emptied for them: TRUNCATE
+# and ANALYZE of an empty table both keep the old ones), with autovacuum
+# off on them until the test ends (its ANALYZE would come at a moment
+# no test chose). The test then takes exactly the statistics it means
+# to, by ANALYZE where it says.
+# The same again after the test: its tens of thousands of rows do not
+# become the next test's clean_db, which DELETEs (cheap on the small
+# tables of every other test -- 1 ms against TRUNCATE's 27, measured).
+#
+# CONTINUE IDENTITY, as DELETE: no test sees an identity restart.
+# Deleting from pg_statistic needs a superuser -- the test database's
+# role is one (the postgres image's POSTGRES_USER, CI and local alike);
+# a role that is not is refused loudly, never skipped.
+#
+# THE WATCHMAN, explain_needs_pristine below: a test that executes an
+# EXPLAIN without pristine_tables fails, whatever wrote the statement --
+# the test, a helper of another module, a raw driver call.
+
+_PRISTINE_LOCK_TIMEOUT = "5s"
+
+
+async def make_tables_pristine(*, autovacuum: bool = False) -> None:
+    """Truncate every table of the schema and drop their statistics;
+    autovacuum off on them (on again with autovacuum=True, at the end).
+
+    Autovacuum OFF while a plan test runs: its ANALYZE after a bulk seed
+    would come at a moment no test chose -- the "none" statistics turned
+    into whatever it took, mid-test."""
+    async with get_engine().connect() as connection:
+        autocommit = await connection.execution_options(
+            isolation_level="AUTOCOMMIT",
+        )
+        superuser = (await autocommit.execute(text(
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+        ))).scalar_one()
+        if not superuser:
+            pytest.fail(
+                "pristine_tables: the test database role is not a superuser, "
+                "so the planner statistics of the tables cannot be dropped "
+                "(pg_statistic); a plan test would read what the suite left"
+            )
+        tables = list((await autocommit.execute(text(
+            "SELECT quote_ident(tablename) FROM pg_tables "
+            "WHERE schemaname = 'public' AND tablename <> 'alembic_version' "
+            "ORDER BY tablename"
+        ))).scalars())
+        # A TRUNCATE that waits for another session's lock is a harness
+        # defect (a session a test left open): refused, loudly, by name.
+        await autocommit.execute(text(
+            f"SET lock_timeout = '{_PRISTINE_LOCK_TIMEOUT}'"
+        ))
+        await autocommit.execute(text(
+            f"TRUNCATE {', '.join(tables)} CONTINUE IDENTITY"
+        ))
+        await autocommit.execute(text(
+            "DELETE FROM pg_statistic WHERE starelid IN ("
+            "SELECT c.oid FROM pg_class c JOIN pg_namespace n "
+            "ON n.oid = c.relnamespace WHERE n.nspname = 'public')"
+        ))
+        for table in tables:
+            await autocommit.execute(text(
+                f"ALTER TABLE {table} RESET (autovacuum_enabled)"
+                if autovacuum else
+                f"ALTER TABLE {table} SET (autovacuum_enabled = false)"
+            ))
+        await autocommit.execute(text("RESET lock_timeout"))
+
+
+async def analyze_with_nothing_waiting(session: Any) -> None:
+    """The statistics CI H13 met (H14 FIX): taken when no delivery was
+    waiting, then the waiting ones back -- the planner estimates ~1
+    waiting row while 5 001 are, and every index on status holds as many
+    dead `pending` entries beside them (the inbox index among them: the
+    plan H13 caught read 10 002). The waiting rows are flipped to sent,
+    ANALYZE runs, they are flipped back; the caller commits."""
+    # Set-based, in heap order (H15; row by row until then, 2 x 5 001
+    # UPDATEs a case). With index scans off -- for THIS transaction only
+    # (SET LOCAL), and only for the order of the heap -- every statement
+    # here reads notification_deliveries sequentially, in ctid order: the
+    # waiting rows are captured in that order, and each UPDATE writes
+    # their new versions in that order at the table's end (no vacuum ran,
+    # the pages are full). So they keep the order the test laid them in
+    # -- the callers check that premise (behind). The caller commits; the
+    # queries the test measures then run with the planner's defaults
+    # (tests/test_harness_pristine.py TestNothingWaiting holds both).
+    await session.execute(text("SET LOCAL enable_indexscan = off"))
+    await session.execute(text("SET LOCAL enable_bitmapscan = off"))
+    await session.execute(text(
+        "CREATE TEMP TABLE h14_waiting ON COMMIT DROP AS "
+        "SELECT id FROM notification_deliveries WHERE status = 'pending'"
+    ))
+    await session.execute(text(
+        "UPDATE notification_deliveries SET status = 'sent' "
+        "WHERE status = 'pending'"
+    ))
+    await session.execute(text("ANALYZE notification_deliveries"))
+    await session.execute(text(
+        "UPDATE notification_deliveries SET status = 'pending' "
+        "WHERE id IN (SELECT id FROM h14_waiting)"
+    ))
+
+
+@pytest.fixture
+async def pristine_tables(clean_db: None) -> AsyncGenerator[None, None]:
+    """Tables as on a new box, for a test of a plan or a cost (H14).
+
+    clean_db has emptied the tables; a row found here was written by a
+    fixture that ran BEFORE this one -- an autouse seed of the test's
+    class, which pytest sets up ahead of a usefixtures mark -- and the
+    TRUNCATE would silently take the seed away. Refused, by name: the
+    seed must take pristine_tables as its argument."""
+    await refuse_rows_before_pristine()
+    await make_tables_pristine()
+    yield
+    await make_tables_pristine(autovacuum=True)
+
+
+async def refuse_rows_before_pristine() -> None:
+    """Fail the test if a table already holds a row (pristine_tables)."""
+    left = await _rows_left()
+    if left:
+        pytest.fail(
+            f"pristine_tables: rows written before it ({', '.join(left)}) "
+            f"-- a fixture seeding the test must depend on pristine_tables"
+        )
+
+
+async def _rows_left() -> list[str]:
+    """The tables of the schema that hold a row."""
+    async with get_engine().connect() as connection:
+        tables = list((await connection.execute(text(
+            "SELECT quote_ident(tablename) FROM pg_tables "
+            "WHERE schemaname = 'public' AND tablename <> 'alembic_version' "
+            "ORDER BY tablename"
+        ))).scalars())
+        left = [
+            table for table in tables
+            if (await connection.execute(text(
+                f"SELECT EXISTS (SELECT 1 FROM {table})"
+            ))).scalar_one()
+        ]
+        await connection.rollback()
+    return left
+
+
+class ExplainWatch:
+    """Every EXPLAIN executed through any engine while it listens."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def __call__(
+        self, conn: Any, cursor: Any, statement: str, parameters: Any,
+        context: Any, executemany: bool,
+    ) -> None:
+        if statement.lstrip()[:7].upper() == "EXPLAIN":
+            self.seen.append(" ".join(statement.split())[:120])
+
+    def __enter__(self) -> ExplainWatch:
+        event.listen(Engine, "before_cursor_execute", self)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        event.remove(Engine, "before_cursor_execute", self)
+
+
+@pytest.fixture(autouse=True)
+def explain_needs_pristine(
+    request: pytest.FixtureRequest,
+) -> Generator[None, None, None]:
+    """The watchman: an EXPLAIN in a test without pristine_tables fails it."""
+    if "pristine_tables" in request.fixturenames:
+        yield
+        return
+    with ExplainWatch() as watch:
+        yield
+    complaint = explain_complaint(
+        request.node.nodeid, request.fixturenames, watch.seen,
+    )
+    if complaint is not None:
+        pytest.fail(complaint)
+
+
+def explain_complaint(
+    nodeid: str, fixturenames: list[str], seen: list[str],
+) -> str | None:
+    """The watchman's verdict on one test: what it ran, with what."""
+    if not seen or "pristine_tables" in fixturenames:
+        return None
+    return (
+        f"{nodeid} reads a plan without pristine_tables "
+        f"(tests/conftest.py): {seen[0]}"
+    )
 
 
 @pytest.fixture(autouse=True)

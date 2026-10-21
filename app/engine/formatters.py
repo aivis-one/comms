@@ -51,14 +51,31 @@
 #   failure to build kills the worker before its loop, never on the
 #   first delivery.
 #
+# LLM (P5-1, spec §14):
+#   LLMFormatter -- ONE adapter for every OpenAI-compatible provider: the
+#   address is the key set's (app/core/channels.py LLM_KEY_SETS). It is
+#   ASKED, not delivered: it takes the product's letter and the job's
+#   ordered key sets and brings back the provider's answer raw
+#   (LLMReply), so it lives in the registry beside the formatters as the
+#   one ModelChannel (get_model_channel), not among them. It knows HOW to
+#   talk to a provider -- the request shape, the routing block of a
+#   gateway, where a provider hides a transport failure inside a 200 --
+#   and never WHAT is asked: it reads the response's envelope (error,
+#   choices, model, provider), never the content of the answer.
+#
 # PUSH:
 #   Not implemented -> absent on every deploy (not_implemented in the
 #   startup channel map).
 # =============================================================================
 
+import asyncio
+import base64
+import hashlib
+import json
 import re
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from html import escape
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 
@@ -66,7 +83,11 @@ import structlog
 
 from app.audience.models import Recipient
 from app.core.channels import (
+    LLM_BODY_CLIENT_TIMEOUTS,
+    LLM_BODY_DOWNLOAD_TIMEOUT,
     ChannelState,
+    LLMKeySet,
+    body_endpoint,
     channel_env_keys,
     channel_spec,
     evaluate_channels,
@@ -149,6 +170,14 @@ class EmailTransientError(Exception):
     """
 
 
+class LLMTransientError(Exception):
+    """Every key set of an llm call failed, and at least one of them in a
+    way a retry can fix (a 5xx, a timeout, a broken answer, a rate limit
+    without a named wait). Named, like EmailTransientError: the provider's
+    weather, not a defect of comms -- and its text is the provider's
+    answer, set by set, as the journal records it."""
+
+
 class ChannelFormatter(Protocol):
     """Protocol for channel-specific notification delivery."""
 
@@ -190,13 +219,14 @@ class InAppFormatter:
         recipient: Recipient,
     ) -> bool:
         """Log the delivery and return True -- the row is the inbox."""
+        # NEVER the letter in the line (spec §6.4, §0 of the line): the
+        # title is the letter -- it was here until P5-1.
         logger.info(
             "in_app_delivery",
             notification_id=str(notification.id),
             delivery_id=str(delivery.id),
             channel=delivery.channel,
             recipient_id=str(delivery.recipient_id),
-            title=notification.title,
         )
         return True
 
@@ -226,6 +256,23 @@ class UnavailableChannelFormatter:
             "delivery_channel_unavailable",
             notification_id=str(notification.id),
             delivery_id=str(delivery.id),
+            channel=self._channel,
+            reason=self._reason,
+        )
+        raise ConfigurationError(
+            f"channel '{self._channel}' is not available on this "
+            f"deploy: {self._reason}"
+        )
+
+    async def ask(
+        self,
+        letter: Mapping[str, Any],
+        set_names: Sequence[str],
+        audio: Mapping[str, Any] | None = None,
+    ) -> "LLMReply":
+        """The llm channel absent on this deploy: refused like deliver."""
+        logger.error(
+            "delivery_channel_unavailable",
             channel=self._channel,
             reason=self._reason,
         )
@@ -433,7 +480,7 @@ class TelegramFormatter:
         title = (
             rendered_title
             if rendered_title is not None
-            else f"<b>{escape(notification.title)}</b>"
+            else f"<b>{escape(notification.letter_text()[0])}</b>"
         )
         rendered_body = render(
             notification_type=notification.type,
@@ -445,7 +492,7 @@ class TelegramFormatter:
         body = (
             rendered_body
             if rendered_body is not None
-            else escape(notification.body)
+            else escape(notification.letter_text()[1])
         )
 
         text = f"{title}\n\n{body}"
@@ -736,7 +783,8 @@ class EmailFormatter:
         #      The type key is ugly and honest: never blank, never
         #      derived from the body, not invented copy in one language
         #      on a multi-locale service, and traceable to the producer.
-        subject = _clean_subject(rendered_subject or notification.title)
+        stored_title, stored_body = notification.letter_text()
+        subject = _clean_subject(rendered_subject or stored_title)
         if not subject:
             subject = notification.type
 
@@ -750,7 +798,7 @@ class EmailFormatter:
         # BODY FALLBACK goes to the STORED body and never to another
         # channel's template: the telegram body carries HTML markup,
         # which would arrive as raw characters in a text email.
-        body = rendered_body if rendered_body is not None else notification.body
+        body = rendered_body if rendered_body is not None else stored_body
         return subject, body
 
     # -- response handling --------------------------------------------
@@ -885,6 +933,454 @@ class EmailFormatter:
             f"provider refused on configuration ({status})"
             f"{_reason_tail(reason, 200)}"
         )
+
+
+# ===================================================================
+# LLMFormatter (P5-1)
+# ===================================================================
+
+
+@dataclass(frozen=True)
+class LLMReply:
+    """A model's answer as the provider gave it, and who gave it.
+
+    `body` is the provider's HTTP response body, decoded, untouched --
+    the product parses it (spec §14.8). `provider` and `model` are what
+    the RESPONSE names (spec §12.1, condition 4), None when it names
+    nothing -- never the requested model.
+    """
+
+    body: str = field(repr=False)
+    set_name: str
+    provider: str | None
+    model: str | None
+    # SHA-256 hex of the audio body sent with the letter (P5-2), or None.
+    audio_hash: str | None = None
+
+
+class ModelChannel(Protocol):
+    """The llm channel as the service calls it: asked with a letter and
+    the job's ordered key sets; an answer or a channel exception."""
+
+    async def ask(
+        self,
+        letter: Mapping[str, Any],
+        set_names: Sequence[str],
+        audio: Mapping[str, Any] | None = None,
+    ) -> LLMReply:
+        """Ask the model, going down the key sets on transport failures.
+        With `audio` (P5-2), the body is fetched first, once, and sent to
+        every set the call reaches.
+
+        Raises:
+            RateLimitedError: every set named a wait (the shortest).
+            LLMTransientError: some set failed in a retryable way.
+            MessageRejectedError: no set took this request.
+            ConfigurationError: every set refused on configuration.
+        """
+        ...
+
+
+# The routing block of a GATEWAY set (spec §12.1, conditions 1 and 2):
+# no silent fallback of the gateway to another provider, and only
+# providers that do not collect the data. In EVERY request of a gateway
+# set and in none of a direct set -- a vendor refuses a parameter it
+# does not know ("Unrecognized request argument", 400).
+LLM_GATEWAY_ROUTING: dict[str, Any] = {
+    "allow_fallbacks": False,
+    "data_collection": "deny",
+}
+
+# The path of the chat completions protocol under a set's endpoint.
+_LLM_PATH = "/chat/completions"
+
+# HTTP statuses that mean the SET is wrong, not this request: the key
+# (401, 403), the credit on the key (402 -- spec §14.12 item 6: "a
+# configuration failure, the channel is dead, fix the deploy"), the
+# model the set names (404). A redirect means the endpoint is wrong.
+_LLM_CONFIG_STATUSES = frozenset({401, 402, 403, 404})
+# Statuses a retry can fix besides 5xx.
+_LLM_TRANSIENT_STATUSES = frozenset({408, 409})
+
+
+class _SetOutcome(StrEnum):
+    """What one key set's call came to, short of an answer."""
+
+    RATE_LIMITED = "rate_limited"
+    TRANSIENT = "transient"
+    REJECTED = "rejected"
+    CONFIGURATION = "configuration"
+
+
+@dataclass(frozen=True)
+class _SetFailure:
+    set_name: str
+    outcome: _SetOutcome
+    # What the provider said, as the journal may keep it: the status and
+    # the provider's error code and type -- never its error message,
+    # which may quote the request, and the request is the letter.
+    text: str
+    retry_after: float | None = None
+
+
+def build_llm_request(
+    letter: Mapping[str, Any],
+    key_set: LLMKeySet,
+    audio: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    """The chat completions request for one key set.
+
+    The letter's parameters first; then what the TRANSPORT writes, over
+    them: the set's model, the messages and the schema as they came, and
+    the gateway's routing block on a gateway set. The parameters cannot
+    hold those names anyway -- intake refused them
+    (app/transport/events.py LLM_RESERVED_PARAMS). No `stream`: the
+    answer comes whole.
+    """
+    request: dict[str, Any] = dict(letter.get("params") or {})
+    request["model"] = key_set.model
+    request["messages"] = list(letter["messages"])
+    if audio is not None:
+        # THE BODY GOES AS ONE MORE MESSAGE, AT THE END (P5-2): nothing in
+        # the letter is searched or changed -- the list is appended to,
+        # as `model` is written. The product writes its prompt knowing
+        # the audio comes last. The data is base64 of the raw bytes, not
+        # a data URI (the input_audio part of the protocol).
+        data, audio_format = audio
+        request["messages"].append({
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": data, "format": audio_format},
+            }],
+        })
+    if "response_format" in letter:
+        request["response_format"] = letter["response_format"]
+    if key_set.gateway:
+        request["provider"] = dict(LLM_GATEWAY_ROUTING)
+    return request
+
+
+def _short(value: Any) -> str | None:
+    """A provider's code, type, model or provider name as a short
+    string, or None. Sanitized and cut: it is the provider's text."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if not isinstance(value, (str, int)):
+        return None
+    text = " ".join(sanitize_text(str(value)).split())[:200]
+    return text or None
+
+
+def _error_text(status: int, error: Any) -> str:
+    """The text "status N", with the provider's error code and type when it gave
+    them -- the classification's evidence, nothing of the request."""
+    parts = [f"status {status}"]
+    if isinstance(error, dict):
+        code = _short(error.get("code"))
+        if code is not None:
+            parts.append(f"error code {code}")
+        kind = _short(error.get("type"))
+        if kind is None and isinstance(error.get("metadata"), dict):
+            kind = _short(error["metadata"].get("error_type"))
+        if kind is not None:
+            parts.append(f"error type {kind}")
+    return "; ".join(parts)
+
+
+def _error_code(error: Any) -> int | None:
+    """The HTTP-like code a provider put in an error object (a gateway
+    reports a failure inside a 200 so -- its documented error shape is
+    {"error": {"code": <number>, "message": ...}})."""
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str) and code.isdigit():
+        return int(code)
+    return None
+
+
+def interpret_llm_response(
+    set_name: str, response: Any,
+) -> LLMReply | _SetFailure:
+    """One set's HTTP response -> an answer or a set failure.
+
+    THE BOUNDARY (spec §14.4, §14.5): ANY content the model gave is an
+    answer -- a refusal in words, a filtered or truncated answer, an
+    answer that does not fit the schema the product asked for (comms
+    does not read it). A failure is the transport's only: the status,
+    an error object inside a 200, an answer that is not a chat
+    completion at all.
+    """
+    status = int(response.status_code)
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+
+    if 200 <= status < 300:
+        if not isinstance(payload, dict):
+            return _SetFailure(
+                set_name, _SetOutcome.TRANSIENT,
+                f"status {status}; the answer is not a JSON object",
+            )
+        if error is not None:
+            # A transport failure inside a 200 (§14.5): classified by
+            # the code the provider put there.
+            code = _error_code(error)
+            text = f"{_error_text(status, error)} (inside the answer)"
+            if code in _LLM_CONFIG_STATUSES:
+                return _SetFailure(set_name, _SetOutcome.CONFIGURATION, text)
+            if code == 429:
+                return _SetFailure(
+                    set_name, _SetOutcome.RATE_LIMITED, text,
+                    retry_after=_retry_after_seconds(response),
+                )
+            return _SetFailure(set_name, _SetOutcome.TRANSIENT, text)
+        choices = payload.get("choices")
+        if (
+            not isinstance(choices, list)
+            or not choices
+            or not isinstance(choices[0], dict)
+            or not isinstance(choices[0].get("message"), dict)
+        ):
+            return _SetFailure(
+                set_name, _SetOutcome.TRANSIENT,
+                f"status {status}; the answer is not a chat completion "
+                f"(no choices[0].message)",
+            )
+        return LLMReply(
+            body=response.text,
+            set_name=set_name,
+            provider=_short(payload.get("provider")),
+            model=_short(payload.get("model")),
+        )
+
+    text = _error_text(status, error)
+    if status in _LLM_CONFIG_STATUSES or 300 <= status < 400:
+        return _SetFailure(set_name, _SetOutcome.CONFIGURATION, text)
+    if status == 429:
+        return _SetFailure(
+            set_name, _SetOutcome.RATE_LIMITED, text,
+            retry_after=_retry_after_seconds(response),
+        )
+    if status >= 500 or status in _LLM_TRANSIENT_STATUSES:
+        return _SetFailure(set_name, _SetOutcome.TRANSIENT, text)
+    return _SetFailure(set_name, _SetOutcome.REJECTED, text)
+
+
+def fold_llm_failures(failures: Sequence[_SetFailure]) -> Exception:
+    """The channel exception of a call whose every set failed.
+
+    Every set named a wait -> RateLimitedError with the SHORTEST (the
+    soonest any set takes a request again); any retryable failure, a
+    wait or not -> LLMTransientError; else any refusal of the request ->
+    MessageRejectedError; else every set refused on configuration ->
+    ConfigurationError. The text lists every set, in order.
+    """
+    summary = "; ".join(
+        f"set {failure.set_name!r} {failure.outcome.value}: {failure.text}"
+        for failure in failures
+    )
+    waits = [failure.retry_after for failure in failures]
+    if waits and all(
+        failure.outcome is _SetOutcome.RATE_LIMITED for failure in failures
+    ) and all(wait is not None for wait in waits):
+        return RateLimitedError(
+            min(wait for wait in waits if wait is not None), f": {summary}",
+        )
+    outcomes = {failure.outcome for failure in failures}
+    if outcomes & {_SetOutcome.TRANSIENT, _SetOutcome.RATE_LIMITED}:
+        return LLMTransientError(f"every key set failed: {summary}")
+    if _SetOutcome.REJECTED in outcomes:
+        return MessageRejectedError(f"no key set took the request: {summary}")
+    return ConfigurationError(
+        f"every key set refused on configuration: {summary}"
+    )
+
+
+def _body_status_failure(status: int) -> Exception:
+    """The store's answer to a body link that is not 200 (P5-2). Object
+    gone, link expired or refused (403 -- an S3 store's answer to an
+    expired signature), any other 4xx, a redirect (not followed): the
+    message's -- this body will not be fetched. 408, 429, 5xx: the
+    store's weather, transient."""
+    text = f"body download: status {status}"
+    if status >= 500 or status in (408, 429):
+        return LLMTransientError(text)
+    return MessageRejectedError(text)
+
+
+def _body_too_large(size: int, limit: int) -> MessageRejectedError:
+    return MessageRejectedError(
+        f"body download: larger than max_audio_bytes ({size} > {limit}; "
+        f"not read further)"
+    )
+
+
+class LLMFormatter:
+    """The llm channel: one OpenAI-compatible adapter (spec §14.12 item 2).
+
+    TRANSPORT FALLBACK IS HERE, MEANING FALLBACK IS NOT (§14.12 item 1):
+    the job's sets are tried in order, and the next one only when the
+    previous one FAILED as a transport -- a model that answered, whatever
+    it answered, ends the call. A bad answer is the product's to judge,
+    with a new letter.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: Any,
+        sets: Mapping[str, LLMKeySet],
+        body_client: Any = None,
+        body_hosts: frozenset[tuple[str, int]] = frozenset(),
+    ) -> None:
+        """Hold the HTTP clients, this deploy's key sets and the hosts a
+        body may be fetched from (LLM_BODY_HOSTS)."""
+        self._client = client
+        self._sets = dict(sets)
+        self._body_client = body_client
+        self._body_hosts = body_hosts
+
+    async def ask(
+        self,
+        letter: Mapping[str, Any],
+        set_names: Sequence[str],
+        audio: Mapping[str, Any] | None = None,
+    ) -> LLMReply:
+        """Ask through the sets in order; see ModelChannel.ask."""
+        body: tuple[str, str] | None = None
+        audio_hash: str | None = None
+        if audio is not None:
+            raw = await self._fetch_body(audio)
+            audio_hash = hashlib.sha256(raw).hexdigest()
+            body = (base64.b64encode(raw).decode("ascii"), audio["format"])
+            del raw
+        failures: list[_SetFailure] = []
+        for name in set_names:
+            key_set = self._sets.get(name)
+            if key_set is None:
+                # The job's snapshot names a set this deploy no longer
+                # has (startup refuses a PROFILE that does; a job
+                # accepted before a restart keeps its list).
+                failures.append(_SetFailure(
+                    name, _SetOutcome.CONFIGURATION,
+                    "not defined in LLM_KEY_SETS on this deploy",
+                ))
+                continue
+            outcome = await self._ask_one(letter, key_set, body)
+            if isinstance(outcome, LLMReply):
+                return replace(outcome, audio_hash=audio_hash)
+            logger.warning(
+                "llm_set_failed",
+                key_set=name,
+                outcome=outcome.outcome.value,
+                detail=outcome.text,
+            )
+            failures.append(outcome)
+        raise fold_llm_failures(failures)
+
+    async def _fetch_body(self, audio: Mapping[str, Any]) -> bytes:
+        """The audio body behind its signed link, whole, in memory (P5-2,
+        spec §5.10). Fetched on EVERY attempt -- never stored.
+
+        THE LINK IS USED AS IT CAME and named NOWHERE: not in an
+        exception, not in a log line (the HTTP client's own request
+        lines are held at WARNING, app/core/logging.py). Every failure
+        reads by status or by exception class only.
+
+        A failure of the BODY (refused, gone, expired, too large) is the
+        message's: no set is asked -- every one would get the same bad
+        body. A failure of the STORE is transient.
+        """
+        url: str = audio["url"]
+        limit: int = audio["max_bytes"]
+        if body_endpoint(url) not in self._body_hosts:
+            # Intake checked the host; the list changed since (a restart
+            # with another .env). The deploy's, not the message's.
+            raise ConfigurationError(
+                "body download: the link's host is not in LLM_BODY_HOSTS "
+                "on this deploy"
+            )
+        try:
+            async with asyncio.timeout(LLM_BODY_DOWNLOAD_TIMEOUT):
+                async with self._body_client.stream("GET", url) as response:
+                    status = int(response.status_code)
+                    if status != 200:
+                        raise _body_status_failure(status)
+                    declared = response.headers.get("content-length", "")
+                    if declared.isdigit() and int(declared) > limit:
+                        raise _body_too_large(int(declared), limit)
+                    received = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        received.extend(chunk)
+                        if len(received) > limit:
+                            raise _body_too_large(len(received), limit)
+        except TimeoutError:
+            logger.warning("llm_body_download_failed", outcome="timeout")
+            raise LLMTransientError(
+                "body download: the store did not answer in time"
+            ) from None
+        except PermanentDeliveryError as exc:
+            logger.warning(
+                "llm_body_download_failed",
+                outcome="refused",
+                detail=str(exc),
+            )
+            raise
+        except LLMTransientError as exc:
+            logger.warning(
+                "llm_body_download_failed", outcome="transient", detail=str(exc),
+            )
+            raise
+        except Exception as exc:
+            # Class only, never the text: an HTTP client's exception may
+            # carry the request, and the request is the signed link.
+            logger.warning(
+                "llm_body_download_failed",
+                outcome="transient",
+                error=type(exc).__name__,
+            )
+            raise LLMTransientError(
+                f"body download failed ({type(exc).__name__})"
+            ) from None
+        logger.info("llm_body_downloaded", size=len(received))
+        return bytes(received)
+
+    async def _ask_one(
+        self,
+        letter: Mapping[str, Any],
+        key_set: LLMKeySet,
+        body: tuple[str, str] | None,
+    ) -> LLMReply | _SetFailure:
+        content = json.dumps(
+            build_llm_request(letter, key_set, body), ensure_ascii=False,
+        ).encode("utf-8")
+        try:
+            response = await self._client.post(
+                f"{key_set.endpoint}{_LLM_PATH}",
+                content=content,
+                headers={
+                    "Authorization": f"Bearer {key_set.key}",
+                    "Content-Type": "application/json",
+                },
+            )
+        except Exception as exc:
+            # Transient by construction. Class only, never the text: an
+            # exception of the client may carry the request.
+            arrived = _request_may_have_arrived(exc)
+            return _SetFailure(
+                key_set.name, _SetOutcome.TRANSIENT,
+                f"request failed ({type(exc).__name__}"
+                f"{'; it may have reached the provider' if arrived else ''})",
+            )
+        return interpret_llm_response(key_set.name, response)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,8 +1597,7 @@ def build_variables(notification: Notification) -> dict[str, Any]:
         # the underscore reservation that guarded them is gone (F1.3).
         variables.update(notification.action_data)
     # Core fields always win over action_data.
-    variables["title"] = notification.title
-    variables["body"] = notification.body
+    variables["title"], variables["body"] = notification.letter_text()
     return variables
 
 
@@ -1129,6 +1624,11 @@ class ChannelRegistry:
     """
 
     formatters: dict[str, ChannelFormatter]
+    # The llm channel (P5-1): asked, not delivered, so it is not one of
+    # the formatters -- every other DeliveryChannel is. Live: the
+    # adapter; absent: UnavailableChannelFormatter, refusing like any
+    # absent channel.
+    model: ModelChannel
     closers: list[tuple[str, Closer]] = field(default_factory=list)
 
 
@@ -1156,10 +1656,37 @@ def channel_map(source: Settings) -> dict[str, str]:
 
 @dataclass
 class _Built:
-    """A live channel: its formatter and anything it must close."""
+    """A live channel: its formatter (or, for llm, its model channel)
+    and anything it must close."""
 
-    formatter: ChannelFormatter
+    formatter: ChannelFormatter | None = None
+    model: ModelChannel | None = None
     closers: list[tuple[str, Closer]] = field(default_factory=list)
+
+
+def _build_llm(source: Settings, factories: "_Factories") -> _Built:
+    client = factories.llm_http_client()
+
+    async def _close_client() -> None:
+        await client.aclose()
+
+    body_client = factories.llm_body_client()
+
+    async def _close_body_client() -> None:
+        await body_client.aclose()
+
+    return _Built(
+        model=LLMFormatter(
+            client=client,
+            sets=source.llm_sets,
+            body_client=body_client,
+            body_hosts=source.llm_body_host_set,
+        ),
+        closers=[
+            ("llm_http_client", _close_client),
+            ("llm_body_client", _close_body_client),
+        ],
+    )
 
 
 def _build_in_app(source: Settings, factories: "_Factories") -> _Built:
@@ -1207,6 +1734,8 @@ class _Factories:
 
     bot: BotFactory
     http_client: HttpClientFactory
+    llm_http_client: HttpClientFactory
+    llm_body_client: HttpClientFactory
 
 
 # One builder per implemented channel (app/core/channels.py
@@ -1215,6 +1744,7 @@ _BUILDERS: dict[str, Callable[[Settings, _Factories], _Built]] = {
     DeliveryChannel.IN_APP: _build_in_app,
     DeliveryChannel.TELEGRAM: _build_telegram,
     DeliveryChannel.EMAIL: _build_email,
+    DeliveryChannel.LLM: _build_llm,
 }
 
 _UNAVAILABLE_REASONS = {
@@ -1229,6 +1759,8 @@ def build_formatters(
     source: Settings,
     bot_factory: BotFactory,
     http_client_factory: HttpClientFactory | None = None,
+    llm_http_client_factory: HttpClientFactory | None = None,
+    llm_body_client_factory: HttpClientFactory | None = None,
 ) -> ChannelRegistry:
     """Build the formatter of every channel from validated settings.
 
@@ -1239,19 +1771,35 @@ def build_formatters(
     factories = _Factories(
         bot=bot_factory,
         http_client=http_client_factory or _real_http_client_factory,
+        llm_http_client=(
+            llm_http_client_factory or _real_llm_http_client_factory
+        ),
+        llm_body_client=(
+            llm_body_client_factory or _real_llm_body_client_factory
+        ),
     )
     formatters: dict[str, ChannelFormatter] = {}
+    model: ModelChannel | None = None
     closers: list[tuple[str, Closer]] = []
     for channel, state in channel_map(source).items():
         if state == ChannelState.LIVE:
             built = _BUILDERS[channel](source, factories)
-            formatters[channel] = built.formatter
+            if built.model is not None:
+                model = built.model
+            else:
+                assert built.formatter is not None
+                formatters[channel] = built.formatter
             closers.extend(built.closers)
         else:
-            formatters[channel] = UnavailableChannelFormatter(
+            unavailable = UnavailableChannelFormatter(
                 channel, _UNAVAILABLE_REASONS[state],
             )
-    return ChannelRegistry(formatters=formatters, closers=closers)
+            if channel == DeliveryChannel.LLM:
+                model = unavailable
+            else:
+                formatters[channel] = unavailable
+    assert model is not None  # DeliveryChannel.LLM is in every map
+    return ChannelRegistry(formatters=formatters, model=model, closers=closers)
 
 
 _registry: ChannelRegistry | None = None
@@ -1289,6 +1837,47 @@ def _real_http_client_factory() -> Any:
     return httpx.AsyncClient(timeout=httpx.Timeout(**timeouts))
 
 
+def _real_llm_http_client_factory() -> Any:
+    """The llm channel's HTTP client, one per process, timed by the
+    channel's spec (app/core/channels.py client_timeouts): a call times
+    out inside the client, below LLM_DELIVER_TIMEOUT_SECONDS, where a
+    connect failure (never reached) and a read timeout (may have been
+    answered and billed) stay apart."""
+    import httpx
+
+    timeouts = channel_spec(DeliveryChannel.LLM).client_timeouts
+    return httpx.AsyncClient(timeout=httpx.Timeout(**timeouts))
+
+
+def _real_llm_body_client_factory() -> Any:
+    """The client that fetches a letter's body by its link (P5-2).
+
+    trust_env=False: the link is fetched AS IT IS -- the same host and
+    port, over the internal network, never through a proxy the
+    environment names (HTTP(S)_PROXY), and with no credentials from a
+    .netrc. Redirects are not followed: a link that redirects is not the
+    object (app/core/channels.py LLM_BODY_HOSTS bounds where it may
+    point; a redirect would leave that bound). Its numbers are
+    LLM_BODY_CLIENT_TIMEOUTS.
+    """
+    import httpx
+
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(**LLM_BODY_CLIENT_TIMEOUTS),
+        trust_env=False,
+        follow_redirects=False,
+    )
+
+
+def llm_set_map(source: Settings) -> dict[str, dict[str, Any]]:
+    """The deploy's llm key sets for the startup log: the name, the
+    model and whether it is a gateway -- never the key or the address."""
+    return {
+        name: {"model": key_set.model, "gateway": key_set.gateway}
+        for name, key_set in source.llm_sets.items()
+    }
+
+
 def init_formatters() -> ChannelRegistry:
     """Build this process's registry once (worker startup).
 
@@ -1299,7 +1888,11 @@ def init_formatters() -> ChannelRegistry:
     global _registry
     if _registry is None:
         _registry = build_formatters(settings, _real_bot_factory)
-        logger.info("channel_formatters_built", channels=channel_map(settings))
+        logger.info(
+            "channel_formatters_built",
+            channels=channel_map(settings),
+            llm_sets=llm_set_map(settings),
+        )
     return _registry
 
 
@@ -1307,10 +1900,16 @@ def get_formatter(channel: str) -> ChannelFormatter:
     """Get the formatter for a delivery channel.
 
     Builds the registry on first use when the process has not built it
-    yet (the worker builds it at startup). Every DeliveryChannel has an
-    entry -- live or unavailable; there is no fallback.
+    yet (the worker builds it at startup). Every DeliveryChannel but llm
+    has an entry -- live or unavailable; there is no fallback. llm is
+    asked through get_model_channel.
     """
     return init_formatters().formatters[channel]
+
+
+def get_model_channel() -> ModelChannel:
+    """The llm channel: the adapter when live, a refusal otherwise."""
+    return init_formatters().model
 
 
 def reset_formatters() -> None:
