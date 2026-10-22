@@ -99,9 +99,16 @@ from app.core.lanes import Lane
 # lane; the lane's slots are shared by its jobs in work, and the
 # worker's pool grew with the places) and PO-1 (PROFILE_OVERLAY_DIR, a
 # text overlay replacing single texts of the profile field by field; a
-# broken overlay refuses the start).
+# broken overlay refuses the start);
+# 3.6.1 is hygiene (G1, G2): the dead column channel_options dropped, an
+# in_app template leaf refused at start, a repeated query key refused,
+# the reading session READ ONLY, the HTTP clients blind to proxy
+# variables, the render log naming the class, not the text; forgetting
+# against an attempt in flight proven and held by tests; the type record
+# described whole in the contract; `comms-deploy.sh test` runs the suite
+# on the image with the checkout, as CI does.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.1"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
