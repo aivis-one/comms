@@ -167,6 +167,9 @@ DEFAULT_LOCALE=en
 DEFAULT_TIMEZONE=UTC
 
 PROFILE_DIR=$PROFILE_DIR_DEFAULT
+# Text overlay (optional): a directory of {locale}.yaml files replacing
+# single texts of the profile. Empty = the profile's texts as they are.
+PROFILE_OVERLAY_DIR=
 
 # Token hand-over target: ABSOLUTE path of the PRODUCT backend's .env
 # on this VPS (per-product CONFIG, DD-8 -- the value for a concrete
@@ -213,6 +216,27 @@ seed_profile() {
         echo -e "${RED}✗ Failed to seed the smoke profile${NC}"
         exit 1
     fi
+}
+
+# The text overlay, checked on THIS side before every `up`: a
+# PROFILE_OVERLAY_DIR that is set must be an existing directory. The
+# compose file asks for the same (create_host_path: false), but some
+# compose releases create a missing bind source anyway, as an empty
+# directory -- and an empty overlay directory is legal, it means "no
+# overrides". A typo in the path would then start the service on the
+# profile's texts without a word. Empty is no overlay, and passes.
+check_overlay_dir() {
+    load_env
+    local overlay="${PROFILE_OVERLAY_DIR:-}"
+    if [ -z "$overlay" ]; then
+        return 0
+    fi
+    if [ ! -d "$overlay" ]; then
+        echo -e "${RED}✗ PROFILE_OVERLAY_DIR=$overlay is not an existing directory -- nothing started${NC}"
+        echo -e "${YELLOW}  Fix the path in $ENV_FILE, or empty it to run without a text overlay.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Text overlay at $overlay${NC}"
 }
 
 # Idempotent KEY=VALUE write into an env file: update in place when
@@ -336,6 +360,7 @@ cmd_install() {
     load_env
     seed_profile
     handover_token
+    check_overlay_dir
     echo "Building and starting the comms stack..."
     if ! $COMPOSE_CMD up -d --build; then
         echo -e "${RED}✗ compose up failed${NC}"
@@ -366,6 +391,7 @@ cmd_update() {
         echo -e "${RED}✗ image build failed -- containers left as they were${NC}"
         exit 1
     fi
+    check_overlay_dir
     # Recreated comms-app re-runs `alembic upgrade head` in its
     # command before serving -- the migration IS the restart path.
     # The three app containers are recreated ALWAYS, by name. Whether
@@ -413,6 +439,7 @@ cmd_update() {
 cmd_restart() {
     echo -e "${CYAN}== comms restart ==${NC}"
     cd_compose
+    check_overlay_dir
     if ! $COMPOSE_CMD up -d --force-recreate --no-deps comms-app comms-worker comms-consumer; then
         echo -e "${RED}✗ restart failed${NC}"
         show_app_log_tail
@@ -455,6 +482,7 @@ cmd_start() {
     # ensure_network) -- but on a machine that came up from cold, the
     # product's installer is not necessarily the one that ran first.
     ensure_network
+    check_overlay_dir
     if ! $COMPOSE_CMD up -d; then
         echo -e "${RED}✗ start failed${NC}"
         show_app_log_tail

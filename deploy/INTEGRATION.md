@@ -141,6 +141,77 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+### `PROFILE_OVERLAY_DIR` -- the text overlay
+
+One image and one profile can serve several installations whose
+wording differs. The difference lives in a second, optional directory:
+the **text overlay**. For comms it is a folder of texts and nothing
+more -- comms knows nothing of whose installation it is, and does not
+require it to cover every locale of the profile (that check is the
+product's).
+
+**Seam.** The same as `PROFILE_DIR`, on the same pass: the product
+installer writes `PROFILE_OVERLAY_DIR=<absolute host path>` into
+`/opt/comms/.env`; compose bind-mounts it read-only into the three
+comms processes as `TEMPLATES_OVERLAY_DIR=/profile-overlay`. Empty or
+absent -> no overlay, the profile's texts exactly as they are.
+`comms-deploy.sh` refuses `install`, `update`, `start` and `restart`
+when the variable is set and the path is not an existing directory.
+
+**Form.** `{locale}.yaml` files directly in the directory -- no
+`types.yaml`, no `templates/` -- each of the shape of
+`templates/{locale}.yaml`:
+
+    {type: {channel: {field: text}}}
+
+Every leaf replaces exactly the profile's leaf at the same locale,
+type, channel and field; every other text stays the profile's. One
+field alone is fine: a title from the overlay over the profile's body.
+
+**What it can change: the texts comms renders from a template, and
+nothing else.** Today that is the telegram `title`, `body` and
+`button_text`, and the email `subject` and `body` -- whichever of them
+the profile itself has for that type, channel and locale. **in_app has
+no template text**: the inbox shows the `title`/`body` the product
+sent, and so do the channels whenever the profile has no template for
+a field. Those stored texts are the product's; the overlay never
+touches them.
+
+**What it cannot change:** types, channels, lanes, schedules, retries
+-- any field of a type record lives in `types.yaml` only. Nor can it
+add a locale, a type, a channel or a field the profile does not have,
+or a presentation flag (`disable_preview`, `silent`).
+
+**Variables.** A text may use `{title}`, `{body}` and the variables
+the profile's own templates of that type use in any locale and
+channel. A type declares no variable list; the profile's texts are the
+record of what the product sends for it.
+
+**Startup refusals** -- comms does not start, and the log names the
+file and the place, every problem at once:
+
+- the directory does not exist, or is not a directory;
+- an entry that is not a `{locale}.yaml` file (a subdirectory, `.yml`,
+  a README, a dot-file);
+- unparseable YAML; an empty file; a file, type or channel that is not
+  a non-empty mapping; a key declared twice;
+- a locale with no `templates/{locale}.yaml` in the profile; a type,
+  channel or field the profile does not have there; the `in_app`
+  channel; a field that is a presentation flag;
+- a text that is not a string, is blank, fails the same checks as the
+  profile's templates (format spec, `{user.name}`, a domain literal),
+  or uses a variable the type does not have.
+
+A broken overlay is never dropped in favour of the profile's text. An
+existing **empty** directory is legal: zero overrides, and the startup
+log says so with the path (`profile_overlay_installed`, `overrides=0`).
+
+Example -- one type, one field, one locale (`en.yaml`):
+
+    order_ready:
+      telegram:
+        title: "Your booking for {title} is confirmed"
+
 ### `lane` -- which lane a type's jobs travel in
 
 comms delivers in four lanes, each with its own budget: its own

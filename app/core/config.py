@@ -484,6 +484,14 @@ class Settings(BaseSettings):
     # development (the Phase 1 stub-profile behavior for tests) --
     # see app/profile/loader.py: install_profile_from_settings.
     templates_dir: str = ""
+    # Directory with the TEXT OVERLAY (PO-1): {locale}.yaml files of the
+    # shape of templates/{locale}.yaml, each text replacing the base text
+    # at the same locale, type, channel and field. On the VPS it arrives
+    # as a bind-mount of PROFILE_OVERLAY_DIR (deploy/INTEGRATION.md
+    # section 3). Empty = no overlay, the base texts as they are; set to
+    # a directory that does not exist = the service does not start. See
+    # app/profile/loader.py, THE TEXT OVERLAY.
+    templates_overlay_dir: str = ""
 
     # -- Notification engine --
     notification_poll_interval_seconds: int = 5
