@@ -31,6 +31,8 @@
 #   M11 the texts off the code                  -> TestTheContract,
 #       tests/test_llm_channel.py TestTheLaneWarning
 #   M12 the failure recorded before the rollback -> TestTheConnectionGoesBack
+#   M13 the jobs in work dropped by the live set,
+#       not the one taken before the selection -> TestThePass
 # NOT BUILT: on_more called before the place is given back -- no await
 # lies between the two in _attempt, so in one event loop the order is
 # not observable; it matters only if an await is put there.
@@ -653,6 +655,78 @@ class TestThePass:
         await _until(nids)
         assert calls.count(nids[0]) == 1
         assert sorted(map(str, calls)) == sorted(map(str, nids))
+
+    async def test_a_job_that_ends_during_the_selection_is_not_new(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FIX (the stand, TestTheStorm 18 == 19): the jobs in work are
+        taken BEFORE the selection. Interactive, batch 3: the oldest job
+        is held in its call through the first pass; the second pass's
+        selection sees it due -- and the held call ends, the job SENT and
+        out of the lane's work, before its rows come back. It is still
+        dropped: the pass starts three NEW jobs, and the held job is
+        attempted once. M13 (dropped by the live set: the ended job
+        counted as one of the batch's new -- two new started, the last
+        job left behind)."""
+        monkeypatch.setattr(settings, "notification_lane_interactive_batch_size", 3)
+        _declare("unit_event_in_app", Lane.INTERACTIVE)
+        recipient = await _recipient()
+        nids = [await _job_to(recipient) for _ in range(6)]
+        spy = _Held()
+        spy.held.add(nids[0])
+        real_factory = processor.get_session_factory
+        armed: list[processor.LaneJobs] = []
+        ended = asyncio.Event()
+
+        def gapped_factory() -> Any:
+            factory = real_factory()
+
+            @asynccontextmanager
+            async def session_scope() -> AsyncIterator[Any]:
+                async with factory() as session:
+                    execute = session.execute
+
+                    async def execute_then_end(
+                        statement: Any, *a: Any, **k: Any,
+                    ) -> Any:
+                        result = await execute(statement, *a, **k)
+                        if armed and "ORDER BY" in str(statement):
+                            # The rows are read; the held call ends now.
+                            jobs = armed.pop()
+                            spy.release.set()
+                            async with asyncio.timeout(_BOUND):
+                                while nids[0] in jobs.in_work:
+                                    await ended.wait()
+                                    ended.clear()
+                        return result
+
+                    session.execute = execute_then_end
+                    yield session
+
+            return session_scope
+
+        async with _channel(spy), asyncio.TaskGroup() as group:
+            jobs = processor.LaneJobs(Lane.INTERACTIVE, group)
+            assert await process_lane(Lane.INTERACTIVE, jobs=jobs) == 3
+            await asyncio.wait_for(spy.started.wait(), _BOUND)
+            await _until(nids[1:3])
+            assert jobs.in_work == {nids[0]}
+            release = jobs.places.release
+
+            def released() -> None:
+                release()
+                ended.set()
+
+            monkeypatch.setattr(jobs.places, "release", released)
+            monkeypatch.setattr(processor, "get_session_factory", gapped_factory)
+            armed.append(jobs)
+            assert await process_lane(Lane.INTERACTIVE, jobs=jobs) == 3
+            # The pair: the gap was really opened -- the held job ended
+            # between the selection and the drop.
+            assert armed == []
+            assert (await _state(nids[0]))[0] == NotificationStatus.SENT
+        await _until(nids)
+        assert spy.calls == len(nids)
 
     async def test_with_every_place_taken_a_pass_does_not_select(
         self, monkeypatch: pytest.MonkeyPatch,

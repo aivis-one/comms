@@ -333,9 +333,9 @@ async def process_lane(
     place goes to the first job selected; each next job waits for a
     place to come free. An attempt keeps its place to its end, so a long
     call holds one place and the lane's other jobs go on in the rest.
-    The pass selects its batch PLUS the jobs the lane has in work, and
-    drops those: it takes a batch of jobs not in work, and never
-    attempts a job twice at once. The selection's statement is the
+    The pass selects its batch PLUS the jobs the lane has in work as it
+    starts the selection, and drops those: it takes a batch of jobs not
+    in work, and never attempts a job twice at once. The selection's statement is the
     same; only its LIMIT grows, by at most the places less one.
 
     TWO CALLERS, ONE PASS. With `jobs` -- the worker's lane loop
@@ -396,6 +396,13 @@ async def _pass(
     # backing off for the whole backoff window.
     await jobs.places.acquire()
     try:
+        # The jobs in work as the selection sees them, taken before it:
+        # one that ends while the selection runs is still in its snapshot,
+        # due, and has left the live set by the time the rows are back --
+        # dropped by THIS set, it is not counted as one of the batch's new
+        # (a SENT job attempted again, a new one left behind). Only this
+        # pass starts jobs of the lane, so no job enters it meanwhile.
+        in_work = set(jobs.in_work)
         now = datetime.now(UTC)
         async with factory() as session:
             stmt = (
@@ -407,14 +414,14 @@ async def _pass(
                 # Review 1.1: cap the batch -- the lane's own (P4-1); the
                 # tail is picked up on the lane's next pass. Larger by
                 # the jobs in work, which are dropped below (P5-L).
-                .limit(batch + len(jobs.in_work))
+                .limit(batch + len(in_work))
             )
             result = await session.execute(stmt)
             selected = [row[0] for row in result.all()]
     except BaseException:
         jobs.places.release()
         raise
-    fresh = [nid for nid in selected if nid not in jobs.in_work][:batch]
+    fresh = [nid for nid in selected if nid not in in_work][:batch]
     if not fresh:
         jobs.places.release()
         return None
