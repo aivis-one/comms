@@ -133,7 +133,12 @@ async def list_changes(
          (app/engine/service.py _deliver_single).
       4. Promotion trigger (observable): a feed read that returns
          `items: []` while pg_stat_activity shows a backend_xid older
-         than a minute.
+         than the lanes' own bound -- the places of a lane times its
+         deliver timeout, the largest over the lanes this deploy takes
+         (normal: 4 x 30 s = 2 minutes by default). Below that an open
+         transaction is a busy lane, not an anomaly: P5-L put the
+         lane's other jobs in the same slots, so a portion's calls wait
+         for theirs, a round for each place.
       5. Agreed fix: none agreed; the candidate is to shorten the
          transactions that hold it (the attempt), not to loosen the
          rule.

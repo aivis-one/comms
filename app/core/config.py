@@ -93,9 +93,15 @@ from app.core.lanes import Lane
 # select hold their cost, an empty JSONB value is SQL NULL -- forgetting
 # a person who once had a schedule works again --, the badge's index
 # holds no waiting delivery) and the base images' newer digests and CI's
-# actions brought by Dependabot (3.4.1 was never released; it is here).
+# actions brought by Dependabot (3.4.1 was never released; it is here);
+# 3.6.0 is P5-L (a lane attempts its places of jobs at once, so a long
+# call -- a model writing for a minute -- holds one place and not the
+# lane; the lane's slots are shared by its jobs in work, and the
+# worker's pool grew with the places) and PO-1 (PROFILE_OVERLAY_DIR, a
+# text overlay replacing single texts of the profile field by field; a
+# broken overlay refuses the start).
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
