@@ -186,7 +186,6 @@ def _delivery(**overrides: Any) -> NotificationDelivery:
         "id": UUID(int=2),
         "recipient_id": UUID(int=3),
         "channel": DeliveryChannel.EMAIL,
-        "channel_options": None,
     }
     defaults.update(overrides)
     return NotificationDelivery(**defaults)

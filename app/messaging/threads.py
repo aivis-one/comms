@@ -284,6 +284,12 @@ async def create_or_get_thread_detailed(
         idempotency_key=idempotency_key,
         fingerprint=fingerprint,
     )
+    # NOT the insert race's shared rule (app/core/database.py
+    # once_more_on_insert_race), on purpose (G1): a thread has two
+    # unique keys, and only the dedup indexes are this function's race.
+    # A collision on uq_threads_idempotency_key belongs to the caller
+    # (app/api/messaging.py create_thread replays the winner); the shared
+    # rule would run the whole find-or-create again on it.
     try:
         async with session.begin_nested():
             session.add(thread)

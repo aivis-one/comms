@@ -12,8 +12,10 @@
 #   secret sanitizer, bot session close
 # Phase 3a:
 #   item 1 (+fixes A/F) -- presentation keys on the template sheet
-#     (button_text / disable_preview / silent), priority sheet <
-#     channel_options, per-field locale fallback, plain-text button
+#     (button_text / disable_preview / silent) over the channel's
+#     defaults, per-field locale fallback, plain-text button (the
+#     per-delivery override, channel_options, is gone with its column:
+#     G1, migration 0032)
 #   item 2 (+fix G) -- composition rule: markup source follows the
 #     content source, per field (both paths + both mixed cases)
 #   item 3 -- deep-link encoding: one-parameter rule, charset/64
@@ -97,7 +99,7 @@ def _notification(**overrides: Any) -> Notification:
 
 def _delivery(**overrides: Any) -> NotificationDelivery:
     """Transient delivery row for formatter unit tests (no DB)."""
-    defaults: dict[str, Any] = {"channel": "telegram", "channel_options": None}
+    defaults: dict[str, Any] = {"channel": "telegram"}
     defaults.update(overrides)
     return NotificationDelivery(**defaults)
 
@@ -251,7 +253,7 @@ class TestTelegramDeliver:
         """Template path (Phase 3a item 2): both fields rendered from
         the sheet -> VERBATIM, no injected <b>; the sheet owns its
         markup. Flags fall to channel defaults (no sheet flags for
-        unit_event, no channel_options)."""
+        unit_event)."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
         recipient = _recipient()
@@ -269,6 +271,11 @@ class TestTelegramDeliver:
         assert call["reply_markup"] is None
 
     async def test_deep_link_becomes_inline_button(self) -> None:
+        """The button's label is the channel's default: unit_event's
+        sheet has no button_text. (It was a per-delivery "View" from
+        channel_options until G1 dropped that column -- migration 0032;
+        what this test is about, the deep link becoming the button,
+        stays as it was.)"""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
         notification = _notification(
@@ -277,29 +284,14 @@ class TestTelegramDeliver:
                 "params": {"practice_id": "p1"},
             },
         )
-        delivery = _delivery(channel_options={"button_text": "View"})
-
-        await fmt.deliver(notification, delivery, _recipient())
+        await fmt.deliver(notification, _delivery(), _recipient())
 
         (call,) = bot.calls
         keyboard = call["reply_markup"]
         assert keyboard is not None
         button = keyboard.inline_keyboard[0][0]
-        assert button.text == "View"
+        assert button.text == "Open"
         assert button.url == f"{BOT_URL}?startapp=open_practice__p1"
-
-    async def test_channel_options_overrides(self) -> None:
-        bot = _FakeBot()
-        fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
-        delivery = _delivery(
-            channel_options={"disable_preview": False, "silent": True},
-        )
-
-        await fmt.deliver(_notification(), delivery, _recipient())
-
-        (call,) = bot.calls
-        assert call["disable_web_page_preview"] is False
-        assert call["disable_notification"] is True
 
     async def test_template_rendered_for_locale(self) -> None:
         """ru recipient gets the ru template (registry-driven)."""
@@ -841,8 +833,10 @@ class TestComposition:
 
 
 class TestPresentationKeys:
-    """Phase 3a item 1 / fixes A+F: the sheet owns presentation;
-    channel_options is the per-delivery override (same keys)."""
+    """Phase 3a item 1 / fixes A+F: the sheet owns presentation, over
+    the channel's defaults. (A per-delivery override, channel_options,
+    stood above the sheet until G1: nothing ever wrote it, and the
+    column is gone -- migration 0032.)"""
 
     @staticmethod
     def _presented(**overrides: Any) -> Notification:
@@ -854,9 +848,9 @@ class TestPresentationKeys:
         return _notification(**defaults)
 
     async def test_sheet_supplies_button_and_flags(self) -> None:
-        """No channel_options: button label and both flags come from
-        the en fixture sheet (button_text "Open {title}",
-        disable_preview false, silent true)."""
+        """The button label and both flags come from the en fixture
+        sheet (button_text "Open {title}", disable_preview false, silent
+        true)."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
 
@@ -867,26 +861,6 @@ class TestPresentationKeys:
         assert button.text == "Open Hello"
         assert call["disable_web_page_preview"] is False
         assert call["disable_notification"] is True
-
-    async def test_channel_options_override_sheet(self) -> None:
-        """fix A: same keys, different source -- channel_options win
-        over the sheet for all three presentation keys."""
-        bot = _FakeBot()
-        fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
-        delivery = _delivery(
-            channel_options={
-                "button_text": "View",
-                "disable_preview": True,
-                "silent": False,
-            },
-        )
-
-        await fmt.deliver(self._presented(), delivery, _recipient())
-
-        (call,) = bot.calls
-        assert call["reply_markup"].inline_keyboard[0][0].text == "View"
-        assert call["disable_web_page_preview"] is True
-        assert call["disable_notification"] is False
 
     async def test_locale_chain_per_field(self) -> None:
         """ru recipient: button_text comes from the ru sheet, the

@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute, Recipient
 from app.audience.schedule import MINUTES_PER_DAY
-from app.audience.sync import once_more_on_insert_race
+from app.core.database import once_more_on_insert_race
 from app.core.exceptions import NotFoundError, ValidationError
 from app.profile.registry import registry
 

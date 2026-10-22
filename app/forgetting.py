@@ -25,6 +25,37 @@
 # and finished delivery rows (the delivery history; they carry the
 # product's id, no way to reach anyone).
 #
+# WHAT HOLDS THE WINDOW against an attempt in flight (G1 item 1, tests/
+# test_g1_forgetting_in_flight.py). An attempt resolves, delivers and
+# commits in one transaction; a forgetting that lands while it stands in
+# a channel call is ordered after it, never beside it:
+#   - the FIRST attempt of a job inserts its deliveries, and their
+#     foreign key takes FOR KEY SHARE on the recipient row until the
+#     attempt commits. The tombstone takes that row FOR UPDATE
+#     (sync._tombstone_once), which conflicts with KEY SHARE: forgetting
+#     waits, the letter goes while the person is still known, and
+#     withdraw_recipient then sees the committed deliveries and clears
+#     what they carry. withdraw_recipient on its own would not wait --
+#     it sees no committed delivery and returns 0; the tombstone is what
+#     waits, so the tombstone comes first.
+#   - a tombstone committed between the attempt's choice of ids and that
+#     insert is seen by the late activity gate of deliver_notification:
+#     it reads the recipient fresh, because resolve selects ids only and
+#     no Recipient of an earlier read sits in the attempt's identity map.
+#     A read of Recipient rows put into the attempt before that gate,
+#     with the objects still referenced (the identity map holds them
+#     weakly), would hand it a stale `active` and reopen the window.
+#   - a LATER attempt inserts no delivery and takes no lock on the
+#     recipient: the tombstone passes, and withdraw_recipient waits on
+#     the job row (FOR UPDATE against the attempt's FOR NO KEY UPDATE).
+#   - WHAT THIS STANDS ON: the journal's recipient_id carries no foreign
+#     key (app/engine/models.py NotificationTransition). The channel's
+#     answer is journaled from a second session while the attempt waits
+#     for it; with such a key that session would take KEY SHARE on the
+#     recipient, queue behind a tombstone that waits for the attempt, and
+#     the attempt would wait for it -- a cycle across two connections
+#     Postgres does not see. A foreign key there reopens this.
+#
 # A NEUTRAL MODULE, like app/notifier.py: it may import audience,
 # messaging and engine, which never import each other in this direction.
 # Callers commit.

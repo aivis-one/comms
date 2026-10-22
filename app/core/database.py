@@ -11,17 +11,22 @@
 #
 # SESSIONS:
 #   get_db_session() -- read-write: commits on success, rollback on error.
-#   get_db_reader()  -- read-only: always rolls back.
+#   get_db_reader()  -- read-only: a READ ONLY transaction, always
+#                       rolled back. A write inside it is refused by the
+#                       database (SQLSTATE 25006), not by convention.
 #
 # RULE (P-01): NEVER call session.commit() in routers.
 #   get_db_session() commits automatically after yield.
 # =============================================================================
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
+import structlog
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -31,6 +36,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+
+logger = structlog.get_logger()
 
 
 class Base(DeclarativeBase):
@@ -183,11 +190,81 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def get_db_reader() -> AsyncGenerator[AsyncSession, None]:
-    """Read-only session -- always rolls back."""
+    """Read-only session: its transaction is READ ONLY, and it always
+    rolls back.
+
+    SET TRANSACTION is the transaction's first statement -- it must be,
+    Postgres refuses it after any query -- so every statement the route
+    runs is in a transaction the database itself keeps from writing
+    (25006 read_only_sql_transaction). A reader that starts to write is
+    a failure where it is written, not a write that a rollback quietly
+    undoes.
+    """
     factory = get_session_factory()
     session = factory()
     try:
+        await session.execute(text("SET TRANSACTION READ ONLY"))
         yield session
     finally:
         await session.rollback()
         await session.close()
+
+
+# -----------------------------------------------------------------------------
+# The insert race (D1 / R2, H13) -- one rule for every writer of the kind
+# -----------------------------------------------------------------------------
+
+async def once_more_on_insert_race[T](
+    session: AsyncSession,
+    apply: Callable[[], Awaitable[T]],
+    *,
+    event: str,
+    **fields: str,
+) -> T:
+    """Run `apply` under a SAVEPOINT; on a UNIQUE VIOLATION run it once
+    more, outside one.
+
+    The SAVEPOINT keeps the caller's transaction usable after the
+    loser's INSERT fails. The winner has committed by then (the loser's
+    INSERT waited on its lock), so the SAME rule run again finds the
+    winner's row and decides against it: a replay, a stale or a newer
+    version -- exactly as without the race. Once: a second collision
+    would mean the row both exists and does not, and it is raised.
+
+    ONLY THE RACE IS RETRIED (H13): the race is two INSERTs of one key,
+    and its one signature is a unique violation (SQLSTATE 23505). Any
+    other IntegrityError -- a CHECK, a foreign key, a NOT NULL -- is a
+    row this write must not make, raised at once: no `<event>` line (it
+    is not a race, and a log saying so sent the reader of the
+    tombstone's CHECK violation after a race that never was) and no
+    second run that could only fail the same way. The caller's
+    transaction stays usable either way: the SAVEPOINT is rolled back.
+
+    WHERE IT LIVES, AND WHY HERE: the rule is one for every writer of
+    the kind -- app/audience/sync.py and prefs.py, app/messaging
+    sections.py and membership.py (G1). It stood in app/audience/sync.py
+    while audience alone used it, made public there rather than copied
+    (a private name imported across modules is what D1 / R7 forbids,
+    tests/test_hygiene_r7.py). Messaging never imports app.audience
+    (app/messaging/__init__.py, the package DAG), so the rule moved
+    below both, here, rather than into a copy.
+    """
+    try:
+        async with session.begin_nested():
+            return await apply()
+    except IntegrityError as exc:
+        if not is_unique_violation(exc):
+            raise
+        logger.info(event, **fields)
+        return await apply()
+
+
+# SQLSTATE of a unique violation -- the insert race's one signature.
+UNIQUE_VIOLATION = "23505"
+
+
+def is_unique_violation(exc: IntegrityError) -> bool:
+    """Whether an IntegrityError is a unique violation: by the SQLSTATE
+    the driver reports (`pgcode` of the DBAPI error), never by the
+    message text."""
+    return getattr(exc.orig, "pgcode", None) == UNIQUE_VIOLATION

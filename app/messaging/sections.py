@@ -12,9 +12,9 @@
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import once_more_on_insert_race
 from app.messaging.models import Section
 
 logger = structlog.get_logger()
@@ -42,32 +42,32 @@ async def get_or_create_section(
 
     Idempotent by key. The DATABASE is the arbiter under a race: the
     unique index uq_sections_key (migration 0006) turns a concurrent
-    second insert into an IntegrityError, caught here and resolved to
-    the row the other creator committed (same shape as the 3c dedup in
-    app/transport/handlers.py). An existing section is returned as-is;
-    `label` is not updated (create-or-find, not upsert).
+    second insert into a unique violation, and the insert race's one
+    rule (app/core/database.py once_more_on_insert_race) runs the same
+    find-or-create once more -- it finds the row the other creator
+    committed. Any other integrity error is raised at once. An existing
+    section is returned as-is; `label` is not updated (create-or-find,
+    not upsert).
     """
+    section, created = await once_more_on_insert_race(
+        session,
+        lambda: _get_or_create_once(session, key=key, label=label),
+        event="section_create_lost_race",
+        key=key,
+    )
+    if created:
+        logger.info("section_created", section_id=str(section.id), key=key)
+    return section
+
+
+async def _get_or_create_once(
+    session: AsyncSession, *, key: str, label: str,
+) -> tuple[Section, bool]:
+    """The section for `key` and whether THIS call created it."""
     existing = await get_section_by_key(session, key=key)
     if existing is not None:
-        return existing
-
+        return existing, False
     section = Section(key=key, label=label)
-    try:
-        # SAVEPOINT so a losing race rolls back only this insert and
-        # leaves the outer session usable for the caller's commit.
-        async with session.begin_nested():
-            session.add(section)
-            await session.flush()
-    except IntegrityError as exc:
-        # Only OUR unique index means "someone else created it first";
-        # any other integrity error is a real bug.
-        if "uq_sections_key" not in str(exc.orig):
-            raise
-        existing = await get_section_by_key(session, key=key)
-        if existing is None:
-            raise
-        logger.info("section_create_lost_race", key=key)
-        return existing
-
-    logger.info("section_created", section_id=str(section.id), key=key)
-    return section
+    session.add(section)
+    await session.flush()
+    return section, True

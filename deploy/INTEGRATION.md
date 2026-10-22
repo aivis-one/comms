@@ -121,6 +121,12 @@ templates are a per-product artifact (arch #15) that lives in the
 PRODUCT repo -- for velo, `comms-profile/` in the repo root
 (`types.yaml` + `templates/{locale}.yaml`).
 
+A template sheet names a channel that renders it: `telegram` or
+`email`. A sheet for `in_app` refuses the start, named: an in_app
+delivery is the inbox entry, which shows the `title`/`body` the product
+sent -- a template there would never be shown. Nor is there a sheet for
+`llm`: its letter is the product's own.
+
 It is delivered by BIND, not by a copy: the product installer writes
 `PROFILE_DIR=/opt/velo/repo/comms-profile` into `/opt/comms/.env` on
 the same seam as above, and compose bind-mounts that path read-only
@@ -503,6 +509,11 @@ the changes feed -- takes `limit` (1..100, default 20) and `cursor`
 `unread` badge beside them, and the changes feed's `next_cursor` is
 never `null` (section 9). A `limit` outside 1..100 is **refused**
 (422), not clamped, and so is a malformed cursor.
+
+**A query key given twice is refused**, on every route: 422
+`validation`, naming the key. `?limit=5&limit=500` is not read as its
+last value -- no route takes a list in its query, so a repeated key is
+never meaningful. Build the query from a mapping, one value per key.
 
 **Repeating a call.** A call that creates takes a required
 `Idempotency-Key` header (1..200 characters):

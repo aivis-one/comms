@@ -109,8 +109,6 @@ unit_event:
   email:
     subject: "COMMS: {title}"
     body: "{body} -- {extra}"
-  in_app:
-    title: "{title}"
 unit_presented:
   telegram:
     title: "{title}"
@@ -223,7 +221,7 @@ async def _telegram(locale: str = "en", **overrides: Any) -> dict[str, Any]:
     formatter = TelegramFormatter(bot=bot, bot_url=BOT_URL)
     await formatter.deliver(
         _notification(**overrides),
-        NotificationDelivery(channel="telegram", channel_options=None),
+        NotificationDelivery(channel="telegram"),
         Recipient(telegram_id=next_telegram_id(), locale=locale, active=True),
     )
     (call,) = bot.calls
@@ -246,7 +244,7 @@ async def _email(locale: str = "en") -> dict[str, str]:
     )
     await formatter.deliver(
         _notification(),
-        NotificationDelivery(channel=DeliveryChannel.EMAIL, channel_options=None),
+        NotificationDelivery(channel=DeliveryChannel.EMAIL),
         Recipient(email="user@example.test", locale=locale, active=True),
     )
     (request,) = requests
@@ -493,11 +491,16 @@ unit_event:
     def test_in_app_is_refused_by_name(
         self, base_dir: Path, overlay_dir: Path,
     ) -> None:
-        """The base HAS an in_app sheet for unit_event -- refused anyway,
-        it is never rendered."""
+        """An overlay sheet for in_app is refused by its own name, with
+        the reason -- not as "the base has no in_app sheet". (Until G1
+        this base carried an in_app sheet, to show the refusal held even
+        then; a base can no longer have one -- the same refusal stops it,
+        tests/test_g1_hygiene.py -- so the state is unreachable and the
+        test keeps its reachable half.)"""
         _write(overlay_dir, "en.yaml", 'unit_event: {in_app: {title: "x"}}')
         refusal = _refusal(base_dir, overlay_dir)
         assert "unit_event.in_app: in_app renders no template" in refusal
+        assert "base has no 'in_app' sheet" not in refusal
 
     def test_a_flag_is_not_a_text(
         self, base_dir: Path, overlay_dir: Path,

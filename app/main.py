@@ -24,12 +24,13 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.api.changes import router as changes_router
 from app.api.channels import router as channels_router
+from app.api.deps import refuse_repeated_query
 from app.api.errors import register_error_handlers
 from app.api.inbox import router as inbox_router
 from app.api.jobs import router as jobs_router
@@ -128,6 +129,9 @@ app = FastAPI(
     openapi_url=_DOCS["openapi_url"],
     docs_url=_DOCS["docs_url"],
     redoc_url=_DOCS["redoc_url"],
+    # Before every route: a key given twice is refused, not read as its
+    # last value (app/api/deps.py).
+    dependencies=[Depends(refuse_repeated_query)],
 )
 register_error_handlers(app)
 app.include_router(inbox_router)

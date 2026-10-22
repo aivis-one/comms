@@ -26,7 +26,7 @@
 # THE WIRE FORM IS A CLOSED FIELD SET per form (FORMS below), and
 # deploy/INTEGRATION.md section 8 carries one table per form; a test
 # holds the two to each other both ways. NEVER the letter: no title,
-# body, action_data, channel_options, error_message. A provider's words
+# body, action_data, error_message. A provider's words
 # come from the journal only -- sanitized, and cleared by forgetting.
 #
 # Adding a field is not a break (unknown fields are ignored by

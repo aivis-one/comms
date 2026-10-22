@@ -378,14 +378,6 @@ class NotificationDelivery(UUIDMixin, Base):
         nullable=False,
     )
 
-    # Channel-specific options, format varies by channel:
-    #   telegram: {button_text, disable_preview, silent}
-    #   in_app:   {action_url, dismissable}
-    channel_options: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON_VALUE,
-        nullable=True,
-    )
-
     # Indexed with the job, (status, notification_id), by migration 0027
     # -- not here: see app/core/schema_objects.py (H11).
     status: Mapped[str] = mapped_column(
@@ -588,7 +580,9 @@ class NotificationTransition(Base):
         nullable=False,
     )
     # No foreign key: a recipient is a tombstone, never deleted, and a
-    # second deletion path is what the journal must not have.
+    # second deletion path is what the journal must not have. Forgetting
+    # against an attempt in flight stands on it too (app/forgetting.py,
+    # WHAT HOLDS THE WINDOW).
     recipient_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
     channel: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # A JournalSubject value.

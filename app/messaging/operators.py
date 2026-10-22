@@ -432,6 +432,10 @@ async def retag_thread(
     try:
         # SAVEPOINT: a dedup collision rolls back only this UPDATE and
         # leaves the outer session usable for the caller's rollback.
+        # Not the insert race's shared rule (app/core/database.py
+        # once_more_on_insert_race), on purpose (G1): this is an UPDATE
+        # meeting a thread that already exists, not two inserts of one
+        # key -- there is no winner to find and nothing to run again.
         async with session.begin_nested():
             await session.flush()
     except IntegrityError as exc:

@@ -388,7 +388,7 @@ class TestLocaleFallbackChain:
             action_data=None,
         )
         delivery = NotificationDelivery(
-            channel="telegram", channel_options=None,
+            channel="telegram",
         )
         recipient = Recipient(
             telegram_id=next_phase2_telegram_id(), locale="ru", active=True,
