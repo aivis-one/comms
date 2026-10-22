@@ -147,6 +147,30 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+### The type record -- every field
+
+A type in `types.yaml` is a closed record: the fields below and keys in
+the reserved `x-` namespace, nothing else -- any other key refuses the
+start, named, with this list. Every field is optional; one not declared
+takes the value in the third column. This table is the one place the
+record is written down: the sections below and section 11 explain some
+fields further, and do not repeat them.
+
+| field | value | when not declared | what it does |
+|---|---|---|---|
+| `category` | a non-empty string, at most 50 characters -- the product's own key, never interpreted (not on an llm type) | none | the preference category: a recipient who muted it is not sent the type (section 6); a type without one is never muted |
+| `channels` | a non-empty list of distinct names from `email`, `in_app`, `llm`, `telegram`; `llm` goes alone | `[in_app]` | where the type is delivered; a request never names a channel |
+| `lane` | one of `interactive`, `critical`, `normal`, `bulk` | `normal` | the lane its jobs travel in (`lane`, below) |
+| `push_on` | one of `outcome`, `outcome_and_deferral`, `none` | `none` | what comes back on the push stream (section 10) |
+| `recipient_schedule` | one of `respect`, `bypass` (not on an llm type) | `respect` | whether its deliveries wait for the recipient's allowed periods (`recipient_schedule`, below) |
+| `expires_after` | a duration: a whole number and `s`, `m`, `h` or `d` -- `30s`, `15m`, `24h`, `7d` | none | how long a request of the type stays deliverable; a request's own `expiry_at` wins (section 7) |
+| `retry_max_attempts` | an integer, 1..100 | the deploy's `NOTIFICATION_MAX_DELIVERY_ATTEMPTS` | how many times one delivery is attempted -- a number, never a condition |
+| `retry_backoff_seconds` | an integer, 0..86400, not above the deploy's `NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS` | the deploy's `NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS` | the first wait between attempts, in seconds (0 = none); the waits grow from it up to that cap |
+| `max_body_chars` | an integer, 1..5000 (not on an llm type) | `5000` | the longest body a request of the type may carry; a longer one is refused at intake |
+| `llm_sets` | a list of key set names defined in `LLM_KEY_SETS` (the llm kind only, required there) | none | the key sets the model call goes through, in order (section 11) |
+| `answer_keep` | a duration, as `expires_after`, not longer than `NOTIFICATION_RETENTION_DAYS` (the llm kind only) | `24h` | how long the model's answer is kept after it came (section 11) |
+| `max_audio_bytes` | an integer, 1..20971520 (the llm kind only) | `2097152` | the largest audio body a job may link to, in bytes as fetched (section 11) |
+
 ### `PROFILE_OVERLAY_DIR` -- the text overlay
 
 One image and one profile can serve several installations whose
@@ -1349,17 +1373,13 @@ what they are for email and telegram.
 
 A type whose `channels` are exactly `[llm]` asks a model. `llm` goes
 alone: with another channel in the same type the start is refused.
-
-| field | value |
-|---|---|
-| `llm_sets` | required: the ordered list of key sets the call goes through, e.g. `[llm.text, llm.text_backup]` -- every one defined in `LLM_KEY_SETS`, or the start is refused |
-| `answer_keep` | how long the answer is kept after it came: a duration, `24h` when not declared; not longer than `NOTIFICATION_RETENTION_DAYS` |
-| `max_audio_bytes` | the largest audio body a job may link to, in bytes as fetched: 1..20971520 (20 MiB), `2097152` (2 MiB) when not declared |
-
-`category`, `recipient_schedule` and `max_body_chars` concern a person
-and are refused on an llm type; `answer_keep`, `llm_sets` and
-`max_audio_bytes` are refused on any other. `lane`, `push_on`, `expires_after`,
-`retry_max_attempts` and `retry_backoff_seconds` work as for any type.
+Its own fields -- `llm_sets` (required), `answer_keep` and
+`max_audio_bytes` -- are in the type record table (section 3), with
+their values and what they default to; they are refused on any other
+type. `category`, `recipient_schedule` and `max_body_chars` concern a
+person and are refused on an llm type. `lane`, `push_on`,
+`expires_after`, `retry_max_attempts` and `retry_backoff_seconds` work
+as for any type.
 
     support_reply_draft:
       channels: [llm]

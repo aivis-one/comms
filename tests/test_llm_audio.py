@@ -784,8 +784,26 @@ class TestTheContract:
         assert "`LLM_BODY_HOSTS`" in _section_11()
 
     def test_the_limits_numbers(self) -> None:
+        """max_audio_bytes' range and default, against the code, in the
+        row the type record table gives it (section 3); the download's
+        bound in section 11.
+
+        Until G2 the range and default were asserted in section 11's own
+        table of the llm fields; G2 made the section 3 table the one
+        place the record is written (section 11 refers to it), so the
+        row is read there -- and its numbers from the code, not a
+        literal."""
+        from app.profile.loader import _DEFAULT_MAX_AUDIO_BYTES, MAX_LLM_AUDIO_BYTES
+
+        section_3 = _DOC[_DOC.index("\n## 3. "):_DOC.index("\n## 3a. ")]
+        (row,) = [
+            line for line in section_3.splitlines()
+            if line.startswith("| `max_audio_bytes` |")
+        ]
+        cells = [cell.strip() for cell in row.split("|")[1:-1]]
+        assert f"1..{MAX_LLM_AUDIO_BYTES}" in cells[1]
+        assert cells[2] == f"`{_DEFAULT_MAX_AUDIO_BYTES}`"
         flat = " ".join(_section_11().split())
-        assert "1..20971520 (20 MiB), `2097152` (2 MiB)" in flat
         assert f"no answer in {int(LLM_BODY_DOWNLOAD_TIMEOUT)} s" in flat
 
     async def test_the_audio_hash_is_documented(self) -> None:

@@ -840,11 +840,36 @@ cmd_test() {
         exit 1
     fi
 
-    echo "Running the suite inside comms-app..."
-    if ! $COMPOSE_CMD exec -T \
-        -e DATABASE_URL="$test_db_url" \
+    # The suite runs as CI's image job runs it (.github/workflows/ci.yml,
+    # "The suite inside the image"): on the image comms-app runs -- its
+    # Python and packages -- with this checkout mounted over /app,
+    # read-only. The image ships app/, tests/ and migrations/ but not
+    # deploy/, scripts/, .github/ or .env.example, which the suite reads
+    # too; `exec` into comms-app ran without them, and in the app's own
+    # environment -- its channel keys and token -- where CI's suite has
+    # three variables. So: a one-off container, in comms-app's network
+    # namespace (it reaches comms-postgres by the same name), with CI's
+    # variables and the test database only.
+    local app_cid app_image
+    app_cid=$($COMPOSE_CMD ps -q comms-app)
+    if [ -z "$app_cid" ]; then
+        echo -e "${RED}✗ comms-app is not running (try '$0 start')${NC}"
+        exit 1
+    fi
+    app_image=$(docker inspect -f '{{.Image}}' "$app_cid")
+    if [ ! -f "$REPO_DIR/pyproject.toml" ] || [ ! -d "$REPO_DIR/tests" ]; then
+        echo -e "${RED}✗ no checkout at $REPO_DIR to run the suite from${NC}"
+        exit 1
+    fi
+
+    echo "Running the suite on comms-app's image, checkout $REPO_DIR..."
+    if ! docker run --rm \
+        --network "container:$app_cid" \
+        -v "$REPO_DIR:/app:ro" \
         -e APP_ENV=ci \
-        comms-app python -m pytest -q; then
+        -e DATABASE_URL="$test_db_url" \
+        -e COMMS_SERVICE_TOKEN=comms-test-not-a-secret-token \
+        "$app_image" python -m pytest -q -p no:cacheprovider; then
         echo -e "${RED}✗ tests failed${NC}"
         exit 1
     fi

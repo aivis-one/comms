@@ -26,7 +26,7 @@
 # become known. It carries no product vocabulary: the body is the same
 # six identity fields the wire contract already defines, and the
 # service function underneath is the same one the Redis consumer
-# calls (audience/sync.py::user_upserted, called AS-IS).
+# calls (app/audience/sync.py apply_snapshot, called AS-IS).
 #
 # SNAPSHOT DISCIPLINE (inherited from that contract, not invented
 # here): all six fields are REQUIRED in the body. A null is a value --
@@ -167,7 +167,7 @@ async def upsert_recipient(
 
     # The insert race of a brand-new id (this route against the stream,
     # or two product replicas) is survived inside the snapshot rule
-    # itself -- app/audience/sync.py, once_more_on_insert_race -- for
+    # itself -- app/core/database.py, once_more_on_insert_race -- for
     # every caller, not here (D1 / R2).
     recipient = await sync.apply_snapshot(
         session,

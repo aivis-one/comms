@@ -730,8 +730,9 @@ async def cleanup_expired_notifications() -> int:
         take the push with the job (delete_expired_notifications_batch)
 
     Suppressed, no-recipients and cancelled are outcomes like sent: an
-    expired one is as dead as an expired sent one. General retention of terminal
-    notifications (retention_days) is Phase 3 -- this cleanup only
+    expired one is as dead as an expired sent one. General retention of
+    terminal notifications by age (NOTIFICATION_RETENTION_DAYS) is the
+    other pass, cleanup_terminal_notifications -- this cleanup only
     covers rows that carry an explicit expiry_at.
 
     Deliveries are CASCADE-deleted automatically.
@@ -849,7 +850,7 @@ async def cleanup_terminal_notifications() -> int:
     disabled state loudly). The guard lives HERE, not only behind the
     worker's cadence gate, because tests call this function directly.
 
-    Scheduling lives in app/engine/worker.py (fix H): the pass runs on
+    Scheduling lives in app/worker.py (fix H): the pass runs on
     its own slow cadence (NOTIFICATION_RETENTION_INTERVAL_SECONDS),
     not on the worker tick. Every pass logs its duration -- that is
     the observable value of the BL-3 promotion trigger.

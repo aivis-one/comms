@@ -60,7 +60,7 @@ from app.engine.formatters import RateLimitedError
 from app.engine.models import NotificationDelivery, NotificationTransition
 from app.engine.service import create_notification, withdraw_recipient
 from app.forgetting import forget_recipient
-from tests.helpers import create_recipient, intake_fields
+from tests.helpers import create_recipient, intake_fields, sql_shape
 
 _BOUND = 10.0
 # The provider's words, quoting the address being forgotten. A sentinel:
@@ -202,7 +202,8 @@ class TestTheFirstAttempt:
         forgetting = asyncio.create_task(_forget(recipient_id, pid))
         waiting = await _until_waiting(pid)
         # The tombstone's own read of the recipient row, FOR UPDATE.
-        assert "FROM recipients" in waiting and "FOR UPDATE" in waiting
+        shape = sql_shape(waiting)
+        assert (shape.table, shape.lock) == ("recipients", "FOR UPDATE")
         assert not forgetting.done()
 
         fake.release.set()
@@ -306,8 +307,8 @@ class TestALaterAttempt:
         forgetting = asyncio.create_task(_forget(recipient_id, pid))
         waiting = await _until_waiting(pid)
         # withdraw_recipient's lock of the job rows.
-        assert "FROM notifications" in waiting and "FOR UPDATE" in waiting
-        assert "FROM recipients" not in waiting.split("WHERE", 1)[0]
+        shape = sql_shape(waiting)
+        assert (shape.table, shape.lock) == ("notifications", "FOR UPDATE")
         assert not forgetting.done()
 
         fake.release.set()

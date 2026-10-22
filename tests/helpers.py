@@ -4,19 +4,30 @@
 #
 # TEST-BAND RULE (handoff / dispatch plan §5):
 #   recipient.id = product user id -- the id-space is SHARED with the
-#   product. Every test telegram_id therefore comes from the band
-#   assigned to the phase:
-#
-#       80000-80999   comms Phase 1 (engine tests)
-#       81000-81999   comms Phase 2 (profile / prefs / gating tests)
-#       82000-82999   comms Phase 3a (presentation / retention tests)
+#   product. Every test telegram_id therefore comes from a band of the
+#   comms suite, one allocator per band below, each refusing to
+#   overflow it: 80xxx (Phase 1), 81xxx (Phase 2), 82xxx (Phase 3a),
+#   84xxx (Phase 3b), 85xxx (Phase 3c), 86xxx-88xxx (Phase 4a-4c), and
+#   the small bands from 92100 on (seam / task bands). The constants
+#   below are the list; this paragraph only names the shape.
 #
 #   83xxx and 89xxx belong to VELO's own suites -- never use them
-#   here. The band allocators below hand out ids and refuse to
-#   overflow their band.
+#   here.
+#
+#   ONE COUNTER PER BAND FOR THE WHOLE SUITE, and that is safe (G2): a
+#   counter runs on across the tests of one process, but no two tests
+#   ever see each other's ids -- the autouse clean_db fixture
+#   (tests/conftest.py) deletes every comms row before each test, and
+#   recipients.telegram_id has no unique index (ix_recipients_telegram_id
+#   is a plain one), so an id handed to an earlier test is gone, not
+#   taken. What the shared counter can do is run out: a band's range
+#   serves the whole process, and exhausting it raises RuntimeError
+#   loudly -- never a silent reuse.
 # =============================================================================
 
 import itertools
+import re
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -384,4 +395,130 @@ async def upsert_snapshot(session: AsyncSession, **fields: Any) -> Recipient:
     """apply_snapshot with the next version (see above)."""
     return await apply_snapshot(
         session, version=next_snapshot_version(), **fields,
+    )
+
+
+# -----------------------------------------------------------------------------
+# A statement's SHAPE -- how a test finds the statement it is about (G2)
+# -----------------------------------------------------------------------------
+#
+# Tests that capture SQL (before_cursor_execute, pg_stat_activity) pick
+# the statement they are about out of everything the code sent. They
+# used to pick it by a substring -- "FROM notifications" in s, "ORDER BY"
+# in s, a leading "SELECT notification_deliveries.id" -- and a substring
+# cannot tell the top-level FROM from a subquery's, or an ORDER BY of
+# the statement from one inside an EXISTS. sql_shape reads the clauses
+# AT THE TOP LEVEL (outside parentheses and quotes) once, here, and a
+# test matches fields of the shape.
+#
+# THE FRAGILITY, NAMED: the shape is read from the TEXT SQLAlchemy
+# compiles (or Postgres reports in pg_stat_activity.query) -- its
+# keyword spelling, `FROM t` / `ORDER BY a, b` layout, upper case. A
+# SQLAlchemy release that changes that layout breaks the tests that
+# find statements, all at once and here, in one place to change; it
+# breaks no test silently, because a test that finds no statement (or
+# two) fails on its own unpacking. tests/test_g2_hygiene.py holds that
+# no test searches SQL by substring outside this helper.
+
+_TOP_CLAUSES = re.compile(
+    r"\b(SELECT|UPDATE|DELETE FROM|INSERT INTO|EXPLAIN|WITH|FROM|WHERE|"
+    r"GROUP BY|HAVING|ORDER BY|LIMIT|OFFSET|RETURNING|SET|VALUES|"
+    r"FOR NO KEY UPDATE|FOR UPDATE|FOR KEY SHARE|FOR SHARE)\b"
+)
+_SOURCES = re.compile(
+    r"\b(?:FROM|JOIN|UPDATE|DELETE FROM|INSERT INTO)\s+([a-z_][a-z0-9_]*)"
+)
+
+
+@dataclass(frozen=True)
+class SqlShape:
+    """The top-level clauses of one SQL statement.
+
+    verb    -- the first keyword: SELECT, UPDATE, DELETE FROM,
+               INSERT INTO, EXPLAIN or WITH;
+    columns -- a SELECT's own select list;
+    table   -- the first table of the top-level FROM (the target of an
+               UPDATE, DELETE or INSERT), or None;
+    where, order_by -- the top-level clause's text, "" when absent;
+    limit   -- whether the statement itself has a LIMIT;
+    lock    -- "FOR UPDATE", "FOR NO KEY UPDATE", ... with " SKIP
+               LOCKED" when so, or None;
+    sources -- every table named after FROM / JOIN at any depth.
+    """
+
+    verb: str
+    columns: str
+    table: str | None
+    where: str
+    order_by: str
+    limit: bool
+    lock: str | None
+    sources: frozenset[str]
+
+    def compares(self, column: str) -> bool:
+        """Whether the top-level WHERE compares `column` (table.column)
+        with =, IN or an ordering operator."""
+        return bool(re.search(
+            rf"(?<![\w.]){re.escape(column)} (?:=|!=|<>|<=|>=|<|>|IN\b)",
+            self.where,
+        ))
+
+
+def _top_level(text: str) -> list[tuple[int, str]]:
+    """(position, keyword) of every clause keyword outside parentheses
+    and quotes."""
+    depth = 0
+    quote: str | None = None
+    outside: list[bool] = []
+    for char in text:
+        if quote is not None:
+            outside.append(False)
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        outside.append(depth == 0 and quote is None and char not in "()")
+    return [
+        (m.start(), m.group(1)) for m in _TOP_CLAUSES.finditer(text)
+        if outside[m.start()]
+    ]
+
+
+def sql_shape(statement: Any) -> SqlShape:
+    """The shape of a statement: SQL text, or a SQLAlchemy statement
+    (compiled with its default dialect by str())."""
+    text = " ".join(str(statement).split())
+    marks = _top_level(text)
+    clauses: dict[str, str] = {}
+    for index, (start, keyword) in enumerate(marks):
+        end = marks[index + 1][0] if index + 1 < len(marks) else len(text)
+        clauses.setdefault(keyword, text[start + len(keyword):end].strip())
+    verb = marks[0][1] if marks and marks[0][0] == 0 else ""
+    if verb in ("UPDATE", "DELETE FROM", "INSERT INTO"):
+        target = clauses.get(verb, "")
+        table = target.split()[0] if target else None
+    else:
+        source = clauses.get("FROM", "")
+        table = source.split()[0].rstrip(",") if source else None
+    lock = next(
+        (k for k in ("FOR NO KEY UPDATE", "FOR UPDATE", "FOR KEY SHARE",
+                     "FOR SHARE") if k in clauses),
+        None,
+    )
+    if lock is not None and clauses[lock].startswith("SKIP LOCKED"):
+        lock = f"{lock} SKIP LOCKED"
+    return SqlShape(
+        verb=verb,
+        columns=clauses.get("SELECT", "") if verb == "SELECT" else "",
+        table=table,
+        where=clauses.get("WHERE", ""),
+        order_by=clauses.get("ORDER BY", ""),
+        limit="LIMIT" in clauses,
+        lock=lock,
+        sources=frozenset(_SOURCES.findall(text)),
     )

@@ -88,7 +88,12 @@ from app.engine.service import (
 from app.engine.wake import wake_engine
 from app.profile.loader import _FIELDS, LANES
 from app.profile.registry import Decided, Layer, TypeRecord, registry
-from tests.helpers import create_recipient, intake_fields, notification_row_fields
+from tests.helpers import (
+    create_recipient,
+    intake_fields,
+    notification_row_fields,
+    sql_shape,
+)
 
 _REPO = Path(__file__).resolve().parents[1]
 _DOC = (_REPO / "deploy" / "INTEGRATION.md").read_text(encoding="utf-8")
@@ -626,7 +631,8 @@ class TestThePlan:
             await process_lane(Lane.BULK)
         (statement, parameters), = [
             (s, p) for s, p in seen
-            if "notifications.lane =" in s and "ORDER BY" in s
+            if (shape := sql_shape(s)).table == "notifications"
+            and shape.compares("notifications.lane") and shape.order_by
         ]
         async with get_session_factory()() as session:
             raw = await session.connection()

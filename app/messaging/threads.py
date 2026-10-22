@@ -342,8 +342,8 @@ async def create_or_get_thread(
 
     The CORE is create_or_get_thread_detailed, which the application
     calls (app/api/messaging.py -- the only app-side caller); this name
-    survives for the callers that do not need the flag, i.e. the 47
-    call sites across 12 test files of the closed messaging phases.
+    survives for the callers that do not need the flag: the test call
+    sites of the closed messaging phases.
 
     WHY two names rather than one tuple-returning function: the flag
     was added by a micro-delivery (H-T2-C1-rev, 2026-08-04) whose whole

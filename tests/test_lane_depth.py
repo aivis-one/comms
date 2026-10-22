@@ -39,7 +39,7 @@ from app.engine.constants import (
 )
 from app.engine.depth import lane_depth
 from app.engine.models import Notification, NotificationDelivery
-from tests.helpers import create_recipient, notification_row_fields
+from tests.helpers import create_recipient, notification_row_fields, sql_shape
 
 _URL = "/api/v1/lanes/depth"
 _DOC = (Path(__file__).resolve().parents[1] / "deploy" / "INTEGRATION.md").read_text(
@@ -251,7 +251,7 @@ class TestThePlan:
             with _captured() as seen:
                 await lane_depth(session)
             (statement, parameters), = [
-                (s, p) for s, p in seen if "FROM notifications" in s
+                (s, p) for s, p in seen if sql_shape(s).table == "notifications"
             ]
             raw = await session.connection()
             plan = (await raw.exec_driver_sql(

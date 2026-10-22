@@ -7,41 +7,16 @@
 #   version: 2          -- required; any other version refuses startup
 #   types:              -- a MAPPING {type_key: {field: value}}
 #
-# A type record is CLOSED: only the fields below, plus keys in the
-# reserved x- namespace. Any other key refuses startup by name -- a
-# typo must not read as "not declared". Every field is optional; an
-# omitted field takes the comms default, and the registry remembers
-# which layer decided (registry.explain).
+# A type record is CLOSED: the fields of deploy/INTEGRATION.md section 3,
+# "The type record -- every field" (held to the loader by
+# tests/test_g2_hygiene.py), plus keys in the reserved x- namespace.
+# That table is the one place the record is written down; this file
+# is a profile, not a second copy of it. Any other key refuses startup
+# by name -- a typo must not read as "not declared". Every field is
+# optional; an omitted field takes the comms default, and the registry
+# remembers which layer decided (registry.explain).
 #
-#   category              -- preference category for mute gating. Family
-#                            granularity: several types may share one
-#                            (see the unit_rem_* family below). A type
-#                            WITHOUT a category is exempt from mute gating.
-#   channels              -- non-empty list of channel names
-#                            (in_app, telegram, email, llm); default
-#                            [in_app]. llm goes alone: such a type asks
-#                            a model (none in this file -- the llm kind
-#                            is built by tests/test_llm_channel.py)
-#   lane                  -- interactive | critical | normal | bulk;
-#                            default normal
-#   push_on               -- outcome | outcome_and_deferral | none;
-#                            default none
-#   recipient_schedule    -- respect | bypass; default respect
-#   expires_after         -- duration literal: 30s, 15m, 24h, 7d;
-#                            default: no expiry
-#   retry_max_attempts    -- integer from 1 to 100; default from settings
-#   retry_backoff_seconds -- integer from 0 to 86400, not above
-#                            NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS;
-#                            default from settings
-#   max_body_chars        -- integer from 1 to MAX_BODY_LEN (the body
-#                            column width); default MAX_BODY_LEN
-#   llm_sets              -- the llm kind only: ordered list of key set
-#                            names (LLM_KEY_SETS); required there
-#   answer_keep           -- the llm kind only: duration literal; how
-#                            long the model's answer is kept; default 24h
-#   max_audio_bytes       -- the llm kind only: integer from 1 to
-#                            20971520; the largest audio body a job may
-#                            link to; default 2097152
+# The llm kind is built by tests/test_llm_channel.py, not here.
 # =============================================================================
 
 version: 2

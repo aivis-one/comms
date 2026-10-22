@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import event, text
@@ -45,7 +45,7 @@ from app.engine.processor import process_lane
 from app.engine.service import create_notification, rollup_notification
 from app.profile.registry import Decided, Layer, TypeRecord, registry
 from tests.conftest import analyze_with_nothing_waiting
-from tests.helpers import create_recipient, intake_fields
+from tests.helpers import create_recipient, intake_fields, sql_shape
 
 _REPO = Path(__file__).resolve().parents[1]
 _APP = _REPO / "app"
@@ -227,18 +227,24 @@ def _is_probe(statement: str) -> bool:
     it was an EXISTS, and found by that word; a lane's selection carries
     the same subquery correlated, inside a SELECT of notifications, and
     is not the fold's."""
-    return statement.lstrip().startswith(
-        "SELECT notification_deliveries.id",
-    ) and (
-        "ORDER BY notification_deliveries.status, "
-        "notification_deliveries.notification_id, notification_deliveries.id"
-    ) in " ".join(statement.split())
+    shape = sql_shape(statement)
+    return (
+        shape.verb == "SELECT"
+        and shape.columns == "notification_deliveries.id"
+        and shape.table == "notification_deliveries"
+        and shape.order_by == (
+            "notification_deliveries.status, "
+            "notification_deliveries.notification_id, notification_deliveries.id"
+        )
+        and shape.limit
+    )
 
 
 def _set_reads(statements: list[str]) -> int:
     return sum(
         1 for s in statements
-        if s.lstrip().startswith("SELECT DISTINCT notification_deliveries.status")
+        if (shape := sql_shape(s)).verb == "SELECT"
+        and shape.columns.startswith("DISTINCT notification_deliveries.status")
     )
 
 
@@ -308,8 +314,23 @@ class TestTheFold:
 # another, 5000 waiting -- written BEFORE mine's waiting one, so on any
 # path that walks waiting deliveries in heap order (an index on status
 # alone: equal keys sit in TID order) the other send's 5000 come first.
-_MINE = UUID("00000000-0000-0000-0000-0000000000a1")
-_OTHER = UUID("00000000-0000-0000-0000-0000000000b2")
+#
+# And in INDEX order too (G2): of two fresh ids, mine is the GREATER, so
+# in ix_notification_deliveries_status (status, notification_id, id)
+# the other send's 5000 waiting entries sort before mine's one -- a path
+# that walked that index by its first column alone would read them all.
+# Until G2 the two ids were fixed literals, ...a1 for mine and ...b2 for
+# the other: the BEST index order for mine, the opposite of the worst
+# order this test claims. No premise held on the literals themselves
+# (heap order comes from the order of the inserts, checked by ctid; and
+# since H14 no other test's rows are there to collide with), so they
+# are gone; the order they fixed is now chosen, and checked, as worst.
+
+
+def _sends_ids() -> tuple[UUID, UUID]:
+    """(mine, other): two fresh ids, mine the greater."""
+    first, second = uuid4(), uuid4()
+    return (first, second) if first > second else (second, first)
 # Finished sends around them, (jobs, deliveries each): the share of
 # waiting deliveries in the table comes to about 10 % and about 2.6 %.
 _AROUND = {"ten_percent": (8000, 5), "two_percent": (60000, 3)}
@@ -321,7 +342,9 @@ _AROUND = {"ten_percent": (8000, 5), "two_percent": (60000, 3)}
 _PROBE_BUFFERS = 10
 
 
-async def _sends(around: tuple[int, int], statistics: str) -> None:
+async def _sends(
+    around: tuple[int, int], statistics: str, mine: UUID, other: UUID,
+) -> None:
     jobs, each = around
     async with get_session_factory()() as session:
         await session.execute(text(
@@ -345,7 +368,7 @@ async def _sends(around: tuple[int, int], statistics: str) -> None:
             "'h11-done-' || g, repeat('a', 64), '[\"in_app\"]'::jsonb, "
             "'default', 'none', 3, 30, 'respect', 'normal', 'sent', now() "
             "FROM generate_series(1, :jobs) g"
-        ), {"mine": _MINE, "other": _OTHER, "jobs": jobs})
+        ), {"mine": mine, "other": other, "jobs": jobs})
         await session.execute(text(
             "INSERT INTO notification_deliveries "
             "(id, notification_id, recipient_id, channel, status) "
@@ -362,18 +385,18 @@ async def _sends(around: tuple[int, int], statistics: str) -> None:
             "(id, notification_id, recipient_id, channel, status) "
             f"SELECT gen_random_uuid(), :mine, id, 'in_app', 'sent' {recipients} "
             "OFFSET 1"
-        ), {"mine": _MINE})
+        ), {"mine": mine})
         await session.execute(text(
             "INSERT INTO notification_deliveries "
             "(id, notification_id, recipient_id, channel, status) "
             f"SELECT gen_random_uuid(), :other, id, 'in_app', 'pending' {recipients}"
-        ), {"other": _OTHER})
+        ), {"other": other})
         await session.execute(text(
             "INSERT INTO notification_deliveries "
             "(id, notification_id, recipient_id, channel, status) "
             f"SELECT gen_random_uuid(), :mine, id, 'in_app', 'pending' {recipients} "
             "LIMIT 1"
-        ), {"mine": _MINE})
+        ), {"mine": mine})
         if statistics == "taken_after_the_sends":
             await session.execute(text("ANALYZE notification_deliveries"))
         if statistics == "taken_with_nothing_waiting":
@@ -431,18 +454,22 @@ class TestTheProbePlan:
     async def test_a_handful_of_buffers_on_the_worst_order(
         self, around: str, statistics: str,
     ) -> None:
-        await _sends(_AROUND[around], statistics)
+        mine_id, other_id = _sends_ids()
+        await _sends(_AROUND[around], statistics, mine_id, other_id)
         async with get_session_factory()() as session:
             # The premise, checked: mine's waiting delivery lies after
-            # every waiting delivery of the other send in the heap.
-            behind = (await session.execute(text(
+            # every waiting delivery of the other send in the heap --
+            # and in the index, by the database's own uuid order.
+            behind, after_in_index = (await session.execute(text(
                 "SELECT (SELECT ctid FROM notification_deliveries "
                 "WHERE notification_id = :mine AND status = 'pending') > "
                 "(SELECT max(ctid) FROM notification_deliveries "
-                "WHERE notification_id = :other AND status = 'pending')"
-            ), {"mine": _MINE, "other": _OTHER})).scalar_one()
+                "WHERE notification_id = :other AND status = 'pending'), "
+                "CAST(:mine AS uuid) > CAST(:other AS uuid)"
+            ), {"mine": mine_id, "other": other_id})).one()
             assert behind is True
-            mine = await session.get(Notification, _MINE)
+            assert after_in_index is True
+            mine = await session.get(Notification, mine_id)
             assert mine is not None
             with _statements() as seen:
                 await rollup_notification(session, mine)
@@ -451,7 +478,7 @@ class TestTheProbePlan:
             raw = await session.connection()
             plan = (await raw.exec_driver_sql(
                 "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + probe,
-                (_MINE, DeliveryStatus.PENDING.value, 1),
+                (mine_id, DeliveryStatus.PENDING.value, 1),
             )).scalar_one()
             await session.rollback()
         top = plan[0]["Plan"]

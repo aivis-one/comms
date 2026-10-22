@@ -6,7 +6,7 @@
 # and inserts a key two writers can reach is a race -- a recipient id
 # (apply_snapshot, tombstone), a membership pair (group_changed), a
 # category mute (set_category_muted, D1-3). Every such insert goes
-# through app/audience/sync.py once_more_on_insert_race.
+# through app/core/database.py once_more_on_insert_race.
 #
 # Two real sessions, no mocks: session A runs the write and holds its
 # INSERT uncommitted; session B, in a task, reads (finds nothing, A has
