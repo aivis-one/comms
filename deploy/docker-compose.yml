@@ -50,6 +50,19 @@ name: comms
 # bind-mounted read-only and exposed to the service as
 # TEMPLATES_DIR=/profile.
 #
+# PROFILE_OVERLAY_DIR (optional, PO-1) points at the TEXT OVERLAY:
+# {locale}.yaml files replacing single texts of the profile
+# (deploy/INTEGRATION.md section 3). Set -> mounted read-only at
+# /profile-overlay and exposed as TEMPLATES_OVERLAY_DIR=/profile-overlay.
+# Empty or absent from .env -> TEMPLATES_OVERLAY_DIR is empty and the
+# service runs on the profile alone; the mount then carries PROFILE_DIR
+# only because a bind needs an existing source, and nothing reads it.
+# A set path that does not exist must refuse the start: the long syntax
+# with create_host_path: false says so to compose, and comms-deploy.sh
+# checks it before every `up` (check_overlay_dir) because some compose
+# releases create the path anyway -- an empty directory would then pass
+# for "no overrides".
+#
 # Usage (via the CLI next to this file):
 #   comms-deploy.sh install | update | logs | db | status
 # =============================================================================
@@ -65,6 +78,7 @@ services:
       # The in-container profile mount point; the host side is
       # PROFILE_DIR from .env (see volumes below).
       TEMPLATES_DIR: /profile
+      TEMPLATES_OVERLAY_DIR: ${PROFILE_OVERLAY_DIR:+/profile-overlay}
     # The ONLY migrator: schema first, then the server. `exec` hands
     # PID 1 to uvicorn (clean signal handling). Worker/consumer gate
     # on this container's health, so they never race the migration.
@@ -76,6 +90,12 @@ services:
     # reachable only inside "aivis-shared" as http://comms-app:8000.
     volumes:
       - ${PROFILE_DIR}:/profile:ro
+      - type: bind
+        source: ${PROFILE_OVERLAY_DIR:-${PROFILE_DIR}}
+        target: /profile-overlay
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       comms-postgres: { condition: service_healthy }
       comms-redis: { condition: service_healthy }
@@ -99,9 +119,16 @@ services:
       - ./.env
     environment:
       TEMPLATES_DIR: /profile
+      TEMPLATES_OVERLAY_DIR: ${PROFILE_OVERLAY_DIR:+/profile-overlay}
     command: ["python", "-m", "app.worker"]
     volumes:
       - ${PROFILE_DIR}:/profile:ro
+      - type: bind
+        source: ${PROFILE_OVERLAY_DIR:-${PROFILE_DIR}}
+        target: /profile-overlay
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       # Healthy app == migration done; the worker never touches an
       # unmigrated schema and never runs alembic itself.
@@ -127,9 +154,16 @@ services:
       - ./.env
     environment:
       TEMPLATES_DIR: /profile
+      TEMPLATES_OVERLAY_DIR: ${PROFILE_OVERLAY_DIR:+/profile-overlay}
     command: ["python", "-m", "app.consumer"]
     volumes:
       - ${PROFILE_DIR}:/profile:ro
+      - type: bind
+        source: ${PROFILE_OVERLAY_DIR:-${PROFILE_DIR}}
+        target: /profile-overlay
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       comms-app: { condition: service_healthy }
     healthcheck:

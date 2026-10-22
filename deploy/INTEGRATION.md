@@ -141,26 +141,108 @@ the running comms stack down. Recovery is to revert that commit and
 roll out again; `velo update` names the profile as the likely cause
 when the restart fails.
 
+### `PROFILE_OVERLAY_DIR` -- the text overlay
+
+One image and one profile can serve several installations whose
+wording differs. The difference lives in a second, optional directory:
+the **text overlay**. For comms it is a folder of texts and nothing
+more -- comms knows nothing of whose installation it is, and does not
+require it to cover every locale of the profile (that check is the
+product's).
+
+**Seam.** The same as `PROFILE_DIR`, on the same pass: the product
+installer writes `PROFILE_OVERLAY_DIR=<absolute host path>` into
+`/opt/comms/.env`; compose bind-mounts it read-only into the three
+comms processes as `TEMPLATES_OVERLAY_DIR=/profile-overlay`. Empty or
+absent -> no overlay, the profile's texts exactly as they are.
+`comms-deploy.sh` refuses `install`, `update`, `start` and `restart`
+when the variable is set and the path is not an existing directory.
+
+**Form.** `{locale}.yaml` files directly in the directory -- no
+`types.yaml`, no `templates/` -- each of the shape of
+`templates/{locale}.yaml`:
+
+    {type: {channel: {field: text}}}
+
+Every leaf replaces exactly the profile's leaf at the same locale,
+type, channel and field; every other text stays the profile's. One
+field alone is fine: a title from the overlay over the profile's body.
+
+**What it can change: the texts comms renders from a template, and
+nothing else.** Today that is the telegram `title`, `body` and
+`button_text`, and the email `subject` and `body` -- whichever of them
+the profile itself has for that type, channel and locale. **in_app has
+no template text**: the inbox shows the `title`/`body` the product
+sent, and so do the channels whenever the profile has no template for
+a field. Those stored texts are the product's; the overlay never
+touches them.
+
+**What it cannot change:** types, channels, lanes, schedules, retries
+-- any field of a type record lives in `types.yaml` only. Nor can it
+add a locale, a type, a channel or a field the profile does not have,
+or a presentation flag (`disable_preview`, `silent`).
+
+**Variables.** A text may use `{title}`, `{body}` and the variables
+the profile's own templates of that type use in any locale and
+channel. A type declares no variable list; the profile's texts are the
+record of what the product sends for it.
+
+**Startup refusals** -- comms does not start, and the log names the
+file and the place, every problem at once:
+
+- the directory does not exist, or is not a directory;
+- an entry that is not a `{locale}.yaml` file (a subdirectory, `.yml`,
+  a README, a dot-file);
+- unparseable YAML; an empty file; a file, type or channel that is not
+  a non-empty mapping; a key declared twice;
+- a locale with no `templates/{locale}.yaml` in the profile; a type,
+  channel or field the profile does not have there; the `in_app`
+  channel; a field that is a presentation flag;
+- a text that is not a string, is blank, fails the same checks as the
+  profile's templates (format spec, `{user.name}`, a domain literal),
+  or uses a variable the type does not have.
+
+A broken overlay is never dropped in favour of the profile's text. An
+existing **empty** directory is legal: zero overrides, and the startup
+log says so with the path (`profile_overlay_installed`, `overrides=0`).
+
+Example -- one type, one field, one locale (`en.yaml`):
+
+    order_ready:
+      telegram:
+        title: "Your booking for {title} is confirmed"
+
 ### `lane` -- which lane a type's jobs travel in
 
 comms delivers in four lanes, each with its own budget: its own
-selection of due jobs, its own number of jobs per pass, its own slots
-for channel calls, its own loop in the worker. A backlog or a slow
-channel in one lane takes nothing from another. A type declares its
+selection of due jobs, its own number of jobs per pass, its own number
+of jobs in work at once, its own slots for channel calls, its own loop
+in the worker. A backlog or a slow channel in one lane takes nothing
+from another. A type declares its
 lane in its record in `types.yaml`:
 
     lane: interactive
 
-| value | for | the type's jobs |
-|---|---|---|
-| `interactive` | someone waits for the answer right now (a login code) | small passes, a few slots of their own |
-| `critical` | a failure costs money | capacity no other lane can take |
-| `normal` | notifications | today's behavior -- the default, for a type that does not declare it |
-| `bulk` | large sends | may wait; one slot, so a mass send never holds anyone else's |
+| value | for | the type's jobs | jobs in work at once | channel calls at once |
+|---|---|---|---|---|
+| `interactive` | someone waits for the answer right now (a login code) | small passes, a few slots of their own | 2 | 2 |
+| `critical` | a failure costs money | capacity no other lane can take | 2 | 2 |
+| `normal` | notifications | today's behavior -- the default, for a type that does not declare it | 4 | 20 |
+| `bulk` | large sends | may wait; one slot, so a mass send never holds anyone else's | 1 | 1 |
 
 What a lane does: it ISOLATES. A bulk backlog of any size does not delay
 an `interactive` job by one pass, and a slow channel call in one lane
 does not hold another lane's loop.
+
+Inside a lane, several of its jobs are in work at once (the table's last
+two columns). Each holds one of the lane's places to the end of its
+attempt, and their channel calls share the lane's slots. A slow call
+holds one place, not the lane: the lane's other jobs go on in the rest,
+until every place is held by a slow call. `bulk` has one place: its jobs
+go strictly one after another. Jobs of one lane are started oldest
+first; those in work at once may end in any order -- two jobs of one
+lane to one person may arrive in either order. Each worker names these
+numbers in its startup line, `lane_budgets` (`jobs`, `concurrency`).
 
 What a lane does NOT do. It is not a priority: no lane is picked before
 another, each simply has its own. It passes no gate: a mute, the
@@ -1276,11 +1358,17 @@ and are refused on an llm type; `answer_keep`, `llm_sets` and
       answer_keep: 24h
       expires_after: 10m
 
-**Give llm types a lane of their own.** A lane attempts its jobs one
-after another, and a model writes for up to the bound above -- every job
-of a type for people in the same lane waits behind it. Such a profile
+**Where an llm type belongs: a lane that, on this box, carries no
+types for people and has more than one job in work at once** (the table
+under `lane`, section 3). A model writes for up to the bound above and
+holds one of its lane's places all that time: as many model calls as
+the lane has places hold the whole lane, and every job of a type for
+people in it waits behind them. In `bulk`, with one place, llm jobs go
+strictly one after another: a recording cut into ten pieces is ten
+calls end to end. A profile that mixes the two kinds in one lane
 starts, and the worker says so in one warning line, `lane_mixes_llm`,
-naming the lane and both sets of types.
+naming the lane, its jobs in work at once (`jobs`) and both sets of
+types.
 
 ### `llm` -- the letter
 

@@ -102,17 +102,17 @@ class TestTheSum:
         held = _budget()
         assert held == {
             "comms-app": 2 * 20,
-            "comms-worker": 30,
+            "comms-worker": 35,
             "comms-worker listener": 1,
             "comms-consumer": 10,
             "reserved": 3,
         }
-        assert sum(held.values()) == 84
+        assert sum(held.values()) == 89
         assert _max_connections() == 100
         assert sum(held.values()) <= _max_connections() - _SUPERUSER_RESERVED
 
     def test_one_more_api_worker_would_not(self) -> None:
-        """The edge, computed: a third uvicorn worker is 104 > 97 -- the
+        """The edge, computed: a third uvicorn worker is 109 > 97 -- the
         compose file cannot grow it without this test going red."""
         third = sum(_budget().values()) + POOLS[ProcessRole.API].capacity
         assert third > _max_connections() - _SUPERUSER_RESERVED

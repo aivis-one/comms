@@ -19,6 +19,12 @@
 #   - {type}.{channel}.{field} addressing granularity (cbshome base --
 #     richer than velo's per-type title/body, supports email subject).
 #   - Locale fallback chain: requested -> deploy default locale.
+#
+# TEXT OVERLAY (PO-1): the registry may hold texts of the base profile
+# and texts of the overlay that replaced single leaves of it. render()
+# does not tell them apart -- the overlay is merged leaf by leaf at
+# startup (app/profile/loader.py install_overlay); explain_texts() is
+# where the difference is visible, walking the SAME chain as render().
 # =============================================================================
 
 from typing import Any
@@ -26,7 +32,7 @@ from typing import Any
 import structlog
 
 from app.core.config import settings
-from app.profile.registry import registry
+from app.profile.registry import TextDecided, registry
 
 logger = structlog.get_logger()
 
@@ -41,6 +47,17 @@ class SafeDict(dict[str, Any]):
     def __missing__(self, key: str) -> str:
         """Return the key wrapped in braces for missing values."""
         return "{" + key + "}"
+
+
+def _locale_chain(locale: str | None) -> tuple[str, ...]:
+    """The locales a field is looked up in, in order: the requested
+    one, then the deploy default. One copy for render, resolve_flag and
+    explain_texts, so the explanation cannot walk another chain than
+    the delivery does."""
+    requested = locale or settings.default_locale
+    if requested == settings.default_locale:
+        return (requested,)
+    return (requested, settings.default_locale)
 
 
 def render(
@@ -77,14 +94,13 @@ def render(
     """
     requested = locale or settings.default_locale
 
-    template_str = registry.get_template(
-        requested, notification_type, channel, field,
-    )
-
-    if template_str is None and requested != settings.default_locale:
+    template_str = None
+    for step in _locale_chain(locale):
         template_str = registry.get_template(
-            settings.default_locale, notification_type, channel, field,
+            step, notification_type, channel, field,
         )
+        if template_str is not None:
+            break
 
     if template_str is None:
         logger.debug(
@@ -128,13 +144,45 @@ def resolve_flag(
     No third step: flags have no "stored" counterpart on the
     notification, the channel default is the end of the chain.
     """
-    requested = locale or settings.default_locale
+    for step in _locale_chain(locale):
+        value = registry.get_flag(step, notification_type, channel, field)
+        if value is not None:
+            return value
+    return None
 
-    value = registry.get_flag(requested, notification_type, channel, field)
 
-    if value is None and requested != settings.default_locale:
-        value = registry.get_flag(
-            settings.default_locale, notification_type, channel, field,
+def explain_texts(
+    notification_type: str,
+    channel: str,
+    locale: str | None = None,
+) -> dict[str, TextDecided]:
+    """Where every text a channel would read for a type comes from.
+
+    One entry per text field the locale chain resolves -- the same
+    chain render() walks, field by field: the text, its layer (base
+    profile or text overlay, PO-1), its file and the locale it was
+    found in. A field absent from the result has no template anywhere
+    in the chain, so the channel falls back to the stored title/body.
+
+    Raises LookupError for a type the installed profile does not
+    declare -- an unknown type must never read as "no templates".
+    """
+    if not registry.is_registered(notification_type):
+        raise LookupError(
+            f"type {notification_type!r} is not declared in the installed "
+            f"profile"
         )
-
-    return value
+    chain = _locale_chain(locale)
+    names: set[str] = set()
+    for step in chain:
+        names |= registry.text_fields(step, notification_type, channel)
+    result: dict[str, TextDecided] = {}
+    for name in sorted(names):
+        for step in chain:
+            decided = registry.text_origin(
+                step, notification_type, channel, name,
+            )
+            if decided is not None:
+                result[name] = decided
+                break
+    return result

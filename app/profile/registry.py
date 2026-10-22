@@ -32,6 +32,14 @@
 #   accessors (get_template / get_flag) so a bool can never leak into
 #   a rendered message as "True".
 #
+# TEXT LAYERS (PO-1): a template text comes from the base profile or
+# from the TEXT OVERLAY (TEMPLATES_OVERLAY_DIR, app/profile/loader.py)
+# -- a second directory of the same shape that replaces single texts of
+# the base. The registry keeps, for every text leaf, the layer and the
+# file it came from, so "where did this wording come from" has an answer
+# code can ask for (app/engine/template_engine.py explain_texts) -- the
+# twin of explain() for the type record.
+#
 # THREADING:
 #   Registration happens at startup / test setup, before the worker or
 #   API serve traffic; reads are lock-free dict lookups.
@@ -65,6 +73,20 @@ class Layer(StrEnum):
     PROFILE = "profile"
     # The profile left the field out; comms supplied the value.
     DEFAULT = "default"
+
+
+class TextLayer(StrEnum):
+    """Which layer a template TEXT came from (PO-1).
+
+    A separate enum from Layer on purpose: Layer answers for the fields
+    of a type record, where an overlay can never decide anything -- the
+    overlay replaces texts only (app/profile/loader.py parse_overlay).
+    """
+
+    # The base profile's templates/{locale}.yaml.
+    PROFILE = "profile"
+    # The text overlay's {locale}.yaml (TEMPLATES_OVERLAY_DIR).
+    OVERLAY = "overlay"
 
 
 class RecipientSchedule(StrEnum):
@@ -117,6 +139,21 @@ class Decided:
 
 
 @dataclass(frozen=True)
+class TextDecided:
+    """One template text as a channel would read it, and its origin.
+
+    `locale` is the locale the text was found in -- the requested one,
+    or the deploy default the chain fell back to; `source` names the
+    file (or says the text was registered without one).
+    """
+
+    template: str
+    layer: TextLayer
+    source: str
+    locale: str
+
+
+@dataclass(frozen=True)
 class TypeRecord:
     """Every field of one notification type, each with its layer.
 
@@ -148,6 +185,10 @@ class ProfileRegistry:
         # type installed from a profile has one: tests that register a
         # bare key directly get no record, and explain() says so.
         self._records: dict[str, TypeRecord] = {}
+        # (locale, type, channel, field) -> (layer, source) of every
+        # leaf (PO-1). Kept beside the tree rather than inside it, so
+        # the leaves stay what get_template / get_flag read.
+        self._origins: dict[tuple[str, str, str, str], tuple[TextLayer, str]] = {}
 
     # -- Types --
 
@@ -232,11 +273,21 @@ class ProfileRegistry:
 
     # -- Templates --
 
-    def register_templates(self, locale: str, tree: TemplateTree) -> None:
+    def register_templates(
+        self,
+        locale: str,
+        tree: TemplateTree,
+        *,
+        layer: TextLayer = TextLayer.PROFILE,
+        source: str = "registered without a file",
+    ) -> None:
         """Merge a template tree for a locale into the registry.
 
         Later registrations override earlier ones at the field level,
-        so a profile can be assembled from several fragments.
+        so a profile can be assembled from several fragments -- and the
+        text overlay replaces single texts of the base the same way
+        (PO-1). Every leaf records the layer and source that put it
+        there, the last registration winning like the leaf itself.
         """
         bucket = self._templates.setdefault(locale, {})
         for type_key, channels in tree.items():
@@ -244,9 +295,14 @@ class ProfileRegistry:
             for channel, fields in channels.items():
                 channel_bucket = type_bucket.setdefault(channel, {})
                 channel_bucket.update(fields)
+                for field in fields:
+                    self._origins[(locale, type_key, channel, field)] = (
+                        layer, source,
+                    )
         logger.info(
             "templates_registered",
             locale=locale,
+            layer=layer.value,
             types=sorted(tree.keys()),
         )
 
@@ -284,6 +340,34 @@ class ProfileRegistry:
         value = self._get_leaf(locale, type_key, channel, field)
         return value if isinstance(value, bool) else None
 
+    def text_origin(
+        self,
+        locale: str,
+        type_key: str,
+        channel: str,
+        field: str,
+    ) -> TextDecided | None:
+        """The text at exactly this locale and where it came from; None
+        when that locale holds no text there (a flag is not a text)."""
+        template = self.get_template(locale, type_key, channel, field)
+        if template is None:
+            return None
+        layer, source = self._origins[(locale, type_key, channel, field)]
+        return TextDecided(
+            template=template, layer=layer, source=source, locale=locale,
+        )
+
+    def text_fields(
+        self, locale: str, type_key: str, channel: str,
+    ) -> frozenset[str]:
+        """Names of the TEXT fields one sheet holds in one locale."""
+        sheet = self._templates.get(locale, {}).get(type_key, {}).get(
+            channel, {},
+        )
+        return frozenset(
+            name for name, leaf in sheet.items() if isinstance(leaf, str)
+        )
+
     def _get_leaf(
         self,
         locale: str,
@@ -307,6 +391,7 @@ class ProfileRegistry:
         self._templates.clear()
         self._categories.clear()
         self._records.clear()
+        self._origins.clear()
         logger.info("profile_registry_reset")
 
 

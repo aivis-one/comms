@@ -616,7 +616,16 @@ class TestTheAudioHash:
         self, deploy: _Deploy, bare_client: AsyncClient,
     ) -> None:
         other = b"\x00" * 300
-        deploy.store.on(deploy.store.body(), deploy.store.body(other))
+        bodies = {"a": deploy.store.body(), "b": deploy.store.body(other)}
+
+        def by_link(request: httpx.Request) -> Any:
+            # P5-L: the jobs of a lane are attempted side by side, so the
+            # store answers by the link it is asked, not by the order of
+            # the asks -- which was the order of the jobs while a lane
+            # attempted them one after another.
+            return bodies["b" if "voice/b" in str(request.url) else "a"](request)
+
+        deploy.store.on(by_link, by_link)
         deploy.provider.on(_GW_HOST, _ok(), _ok())
         first, second, plain = _key(), _key(), _key()
         await _send(_voice(first))

@@ -135,6 +135,39 @@
 #     the edge. Patterns are shared with scripts/check_domain_literals.py
 #     via app/core/constants.py (the image ships app/, not scripts/).
 #
+# THE TEXT OVERLAY (PO-1). A second, optional directory
+# (TEMPLATES_OVERLAY_DIR; PROFILE_OVERLAY_DIR on the host, see
+# deploy/INTEGRATION.md section 3) holding files of the same shape as
+# templates/{locale}.yaml, directly in its root. Each leaf of it
+# REPLACES exactly the base leaf at the same (locale, type, channel,
+# field); every other text stays the base's. It changes wording only:
+# a type, a channel, a lane, a schedule -- any field of a type record
+# -- exists in the base profile alone, and the overlay cannot add a
+# locale, a type, a channel or a field the base does not have.
+# For comms the overlay is a second folder of texts: who wrote it and
+# for which installation is not comms' business, and neither is
+# whether it covers every locale.
+# Checks, at startup, all collected into one refusal naming the file
+# and the place:
+#   - the directory exists and holds only {locale}.yaml files; an
+#     EMPTY directory is legal -- zero overrides, said in an info line
+#     with the path;
+#   - every file is a non-empty mapping {type: {channel: {field: str}}},
+#     every level non-empty, no key declared twice;
+#   - the coordinate exists in the base: locale, type, channel, field;
+#     the in_app channel is refused by name -- in_app renders no
+#     template, the inbox shows the stored title/body;
+#   - the base leaf is a TEXT (a presentation flag is not one);
+#   - the text passes the same leaf check and domain fence as the base,
+#     is not blank, and uses only variables the type already has:
+#     title, body, and the variables the base templates of that type
+#     use in any locale and channel. A type declares no variable list
+#     of its own, so the base's own texts are the record of what the
+#     product sends for it.
+# A broken overlay is never quietly dropped in favour of the base text:
+# the service does not start. The overlay is checked against the
+# PARSED base, so a broken base is reported alone, first.
+#
 # DESIGN: the loader is a SOCKET. The source of raw profile data is
 # abstracted behind ProfileSource (files today; a DB or an editor UI
 # later plug in without touching parsing/validation or the registry).
@@ -145,6 +178,7 @@
 # =============================================================================
 
 import re
+import string
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -179,6 +213,7 @@ from app.profile.registry import (
     PushOn,
     RecipientSchedule,
     TemplateTree,
+    TextLayer,
     TypeRecord,
     registry,
 )
@@ -285,14 +320,16 @@ class Violation:
         return f"{self.where}: {self.message}"
 
 
-def _raise_if_any(violations: list[Violation]) -> None:
+def _raise_if_any(
+    violations: list[Violation], subject: str = "The product profile",
+) -> None:
     """One refusal naming every violation, sorted."""
     if not violations:
         return
     ordered = sorted(set(violations))
     noun = "problem" if len(ordered) == 1 else "problems"
     raise ProfileError(
-        f"The product profile is invalid ({len(ordered)} {noun}); the "
+        f"{subject} is invalid ({len(ordered)} {noun}); the "
         f"service does not start until every one is fixed:\n"
         + "\n".join(f"  - {v.render()}" for v in ordered)
     )
@@ -1350,6 +1387,319 @@ def _leaf_complaint(fname: str, template: Any) -> str | None:
 
 
 # -----------------------------------------------------------------------------
+# The text overlay (PO-1): texts of the base, replaced leaf by leaf
+# -----------------------------------------------------------------------------
+
+# The variables every type has whatever its payload: the job's own
+# title and body (app/engine/formatters.py build_variables puts them
+# over action_data). Written here because this package sits below the
+# engine; tests/test_profile_overlay.py holds the two in step.
+CORE_VARIABLES: tuple[str, ...] = ("body", "title")
+
+# The one channel a sheet may name that renders no template: an in_app
+# delivery IS the inbox entry, which shows the stored title/body
+# (app/engine/formatters.py InAppFormatter, app/api/inbox.py).
+_UNRENDERED_CHANNEL = "in_app"
+
+_OVERLAY_SUFFIX = ".yaml"
+
+
+def _overlay_where(name: str) -> str:
+    """How a refusal names an overlay file."""
+    return f"overlay {name}"
+
+
+@dataclass(frozen=True)
+class RawOverlay:
+    """Unvalidated overlay data: locale -> whatever its file parsed to."""
+
+    root: str
+    by_locale: dict[str, Any] = field(default_factory=dict)
+
+
+class FileOverlaySource:
+    """Reads the text overlay from a directory of {locale}.yaml files."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def load(self) -> RawOverlay:
+        """Read and YAML-parse the overlay files; no shape validation.
+
+        A directory that is missing or is not a directory refuses at
+        once: there is nothing to check further. Anything in it that is
+        not a {locale}.yaml file -- a subdirectory, a .yml, a README, a
+        dot-file -- is refused by name: the overlay has one layout, and
+        a file placed beside it would otherwise be silently ignored.
+        """
+        root = self._root
+        hint = "Check TEMPLATES_OVERLAY_DIR (PROFILE_OVERLAY_DIR on the host)."
+        if not root.exists():
+            raise ProfileError(
+                f"Text overlay directory does not exist: {root}. {hint}"
+            )
+        if not root.is_dir():
+            raise ProfileError(
+                f"Text overlay path is not a directory: {root}. {hint}"
+            )
+        violations: list[Violation] = []
+        by_locale: dict[str, Any] = {}
+        for path in sorted(root.iterdir()):
+            name = path.name
+            if (
+                not path.is_file()
+                or path.suffix != _OVERLAY_SUFFIX
+                or name.startswith(".")
+            ):
+                kind = "directory" if path.is_dir() else "entry"
+                violations.append(Violation(
+                    _overlay_where(name), "", "",
+                    f"{kind} {name!r} is not a {{locale}}{_OVERLAY_SUFFIX} "
+                    f"file; the overlay holds only files of the shape of "
+                    f"templates/{{locale}}{_OVERLAY_SUFFIX}, directly in "
+                    f"its root",
+                ))
+                continue
+            by_locale[path.stem] = FileProfileSource._read_yaml(
+                path, _overlay_where(name), violations,
+            )
+        _raise_if_any(violations, _overlay_subject(root))
+        return RawOverlay(root=str(root), by_locale=by_locale)
+
+
+def _overlay_subject(root: Path | str) -> str:
+    """The subject line of an overlay refusal: which directory."""
+    return f"The text overlay at {root} (TEMPLATES_OVERLAY_DIR)"
+
+
+def _variable_roots(template: str) -> set[str]:
+    """The variable names a template reads, by their root.
+
+    {user[name]} reads `user`; a nested spec ({amount:{width}}) reads
+    `width` too. Only called on a template that passed the dry run, so
+    parsing cannot fail here and positional fields never get this far.
+    """
+    roots: set[str] = set()
+    for _, name, spec, _ in string.Formatter().parse(template):
+        if name is None:
+            continue
+        roots.add(re.split(r"[.\[]", name, maxsplit=1)[0])
+        if spec:
+            roots |= _variable_roots(spec)
+    return roots
+
+
+def _type_variables(profile: Profile) -> dict[str, frozenset[str]]:
+    """Per type: the core variables and every variable its base
+    templates use, in any locale and channel."""
+    used: dict[str, set[str]] = {}
+    for tree in profile.templates.values():
+        for type_key, channels in tree.items():
+            bucket = used.setdefault(type_key, set(CORE_VARIABLES))
+            for fields in channels.values():
+                for leaf in fields.values():
+                    if isinstance(leaf, str):
+                        bucket |= _variable_roots(leaf)
+    return {key: frozenset(names) for key, names in used.items()}
+
+
+def parse_overlay(raw: RawOverlay, base: Profile) -> dict[str, TemplateTree]:
+    """Validate the overlay against the parsed base; the leaves to apply.
+
+    Raises ProfileError once, listing every violation (header of
+    this module, THE TEXT OVERLAY).
+    """
+    violations: list[Violation] = []
+    variables = _type_variables(base)
+    result: dict[str, TemplateTree] = {}
+    for locale, doc in raw.by_locale.items():
+        tree = _parse_overlay_file(locale, doc, base, variables, violations)
+        if tree:
+            result[locale] = tree
+    _raise_if_any(violations, _overlay_subject(raw.root))
+    return result
+
+
+def _parse_overlay_file(
+    locale: str,
+    doc: Any,
+    base: Profile,
+    variables: Mapping[str, frozenset[str]],
+    violations: list[Violation],
+) -> TemplateTree:
+    """One overlay file: its leaves, each checked against the base."""
+    where = _overlay_where(f"{locale}{_OVERLAY_SUFFIX}")
+    shape = "{type: {channel: {field: str}}}"
+    if doc is None:
+        violations.append(Violation(
+            where, "", "",
+            "is empty; an overlay file replaces at least one text -- "
+            "delete the file when it has nothing to replace",
+        ))
+        return {}
+    if not isinstance(doc, dict) or not doc:
+        found = "an empty mapping" if doc == {} else type(doc).__name__
+        violations.append(Violation(
+            where, "", "",
+            f"must be a non-empty mapping {shape}, got {found}",
+        ))
+        return {}
+    base_tree = base.templates.get(locale)
+    if base_tree is None:
+        violations.append(Violation(
+            where, "", "",
+            f"locale {locale!r} has no templates in the base profile "
+            f"(templates/{locale}{_OVERLAY_SUFFIX}); the overlay only "
+            f"replaces texts the base has. Base locales: "
+            f"{', '.join(sorted(base.templates)) or 'none'}",
+        ))
+        return {}
+
+    tree: TemplateTree = {}
+    for type_key, channels in doc.items():
+        if not isinstance(type_key, str) or not type_key:
+            violations.append(Violation(
+                where, str(type_key), "",
+                f"type key must be a non-empty string, got {type_key!r}",
+            ))
+            continue
+        base_sheets = base_tree.get(type_key)
+        if base_sheets is None:
+            declared = (
+                "is not declared in types.yaml"
+                if type_key not in base.types
+                else f"has no templates in templates/{locale}"
+                     f"{_OVERLAY_SUFFIX}"
+            )
+            violations.append(Violation(
+                where, type_key, "",
+                f"type {type_key!r} {declared}; the overlay only replaces "
+                f"texts the base has",
+            ))
+            continue
+        if not isinstance(channels, dict) or not channels:
+            violations.append(Violation(
+                where, type_key, "",
+                f"{type_key} must be a non-empty mapping of channels to "
+                f"fields, got {_describe_overlay(channels)}",
+            ))
+            continue
+        tree_channels: dict[str, dict[str, str | bool]] = {}
+        for channel, fields in channels.items():
+            path = f"{type_key}.{channel}"
+            if channel == _UNRENDERED_CHANNEL:
+                violations.append(Violation(
+                    where, type_key, str(channel),
+                    f"{path}: {_UNRENDERED_CHANNEL} renders no template -- "
+                    f"the inbox shows the stored title/body the product "
+                    f"sent, so an overlay text there would never be shown",
+                ))
+                continue
+            base_fields = (
+                base_sheets.get(channel) if isinstance(channel, str) else None
+            )
+            if base_fields is None:
+                violations.append(Violation(
+                    where, type_key, str(channel),
+                    f"{path}: the base has no {channel!r} sheet for "
+                    f"{type_key} in {locale}; base channels: "
+                    f"{', '.join(sorted(base_sheets)) or 'none'}",
+                ))
+                continue
+            if not isinstance(fields, dict) or not fields:
+                violations.append(Violation(
+                    where, type_key, channel,
+                    f"{path} must be a non-empty mapping of fields to "
+                    f"texts, got {_describe_overlay(fields)}",
+                ))
+                continue
+            tree_fields: dict[str, str | bool] = {}
+            for fname, text in fields.items():
+                complaint = _overlay_leaf_complaint(
+                    fname, text, base_fields,
+                    variables.get(type_key, frozenset(CORE_VARIABLES)),
+                )
+                if complaint is not None:
+                    violations.append(Violation(
+                        where, type_key, f"{channel}.{fname}",
+                        f"{path}.{fname} {complaint}",
+                    ))
+                    continue
+                tree_fields[fname] = text
+            if tree_fields:
+                tree_channels[channel] = tree_fields
+        if tree_channels:
+            tree[type_key] = tree_channels
+    return tree
+
+
+def _describe_overlay(value: Any) -> str:
+    """'an empty mapping' or the type name -- for the shape refusals."""
+    return "an empty mapping" if value == {} else type(value).__name__
+
+
+def _overlay_leaf_complaint(
+    fname: Any,
+    text: Any,
+    base_fields: Mapping[str, str | bool],
+    variables: frozenset[str],
+) -> str | None:
+    """One overlay leaf against its base sheet; the complaint, or None."""
+    base_texts = sorted(
+        name for name, leaf in base_fields.items() if isinstance(leaf, str)
+    )
+    if not isinstance(fname, str) or fname not in base_fields:
+        return (
+            f"is not a field of the base sheet; base texts here: "
+            f"{', '.join(base_texts) or 'none'}"
+        )
+    if not isinstance(base_fields[fname], str):
+        return (
+            "is a presentation flag in the base, not a text; the overlay "
+            "replaces texts only"
+        )
+    complaint = _leaf_complaint(fname, text)
+    if complaint is not None:
+        return complaint
+    if not text.strip():
+        return "is blank; an overlay text replaces the base text with words"
+    domain = _domain_literal(text)
+    if domain is not None:
+        return domain
+    unknown = sorted(_variable_roots(text) - variables)
+    if unknown:
+        return (
+            f"uses {', '.join(f'{{{name}}}' for name in unknown)}, which "
+            f"the type does not have; its variables: "
+            f"{', '.join(sorted(variables))}"
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class TextOverlay:
+    """A validated text overlay: the leaves to merge over the base."""
+
+    root: str
+    templates: dict[str, TemplateTree]
+
+    def overrides(self) -> int:
+        """How many texts the overlay replaces."""
+        return sum(
+            len(fields)
+            for tree in self.templates.values()
+            for channels in tree.values()
+            for fields in channels.values()
+        )
+
+
+def load_overlay(source: FileOverlaySource, base: Profile) -> TextOverlay:
+    """Load and validate the text overlay against a parsed base."""
+    raw = source.load()
+    return TextOverlay(root=raw.root, templates=parse_overlay(raw, base))
+
+
+# -----------------------------------------------------------------------------
 # Installation
 # -----------------------------------------------------------------------------
 
@@ -1375,10 +1725,11 @@ class LaneMix:
 def lanes_mixing_llm(target: ProfileRegistry = registry) -> list[LaneMix]:
     """Every lane the installed profile gives both llm types and types
     for people, in lane order -- the input of the worker's startup
-    warning (app/worker.py). A lane attempts its jobs one after another
-    (app/engine/processor.py process_lane), so a model writing for a
-    minute holds every job of its lane behind it: the KNOWN CEILING on
-    app/engine/service.py _deliver_llm."""
+    warning (app/worker.py). A model writing for a minute holds one of
+    its lane's places (app/engine/service.py LANE_JOBS) all that time,
+    and as many models as the lane has places hold every job of the
+    lane behind them: the KNOWN CEILING on app/engine/service.py
+    _deliver_single."""
     by_lane: dict[str, tuple[list[str], list[str]]] = {
         lane: ([], []) for lane in LANES
     }
@@ -1424,7 +1775,9 @@ def install_profile(
             type_key, category=record.value("category"), record=record,
         )
     for locale, tree in profile.templates.items():
-        target.register_templates(locale, tree)
+        target.register_templates(
+            locale, tree, source=f"{_TEMPLATES_SUBDIR}/{locale}.yaml",
+        )
     logger.info(
         "profile_installed",
         types=len(profile.types),
@@ -1432,16 +1785,47 @@ def install_profile(
     )
 
 
+def install_overlay(
+    overlay: TextOverlay,
+    target: ProfileRegistry = registry,
+) -> None:
+    """Merge a validated text overlay over the installed base, leaf by
+    leaf; the info line names the directory and the count, zero
+    included -- an empty overlay directory is legal and says so."""
+    for locale, tree in overlay.templates.items():
+        target.register_templates(
+            locale, tree,
+            layer=TextLayer.OVERLAY,
+            source=_overlay_where(f"{locale}{_OVERLAY_SUFFIX}"),
+        )
+    logger.info(
+        "profile_overlay_installed",
+        path=overlay.root,
+        overrides=overlay.overrides(),
+        locales=sorted(overlay.templates),
+    )
+
+
 def install_profile_from_settings() -> bool:
-    """Startup entry point: load the profile from TEMPLATES_DIR.
+    """Startup entry point: load the profile from TEMPLATES_DIR, then
+    the text overlay from TEMPLATES_OVERLAY_DIR when it is set.
 
     Returns True when a profile was installed. An empty TEMPLATES_DIR
     is tolerated ONLY in development (mirrors the DATABASE_URL
     policy): the service starts with an empty registry and tests /
     local experiments register what they need. Anywhere else a
-    missing profile is a deploy error -> ProfileError. Routes are
-    cross-checked against this deploy's channel states.
+    missing profile is a deploy error -> ProfileError. An overlay
+    without a base is refused everywhere: it replaces base texts, and
+    there are none. Routes are cross-checked against this deploy's
+    channel states. Nothing is installed until base and overlay both
+    passed.
     """
+    if settings.templates_overlay_dir and not settings.templates_dir:
+        raise ProfileError(
+            "TEMPLATES_OVERLAY_DIR is set but TEMPLATES_DIR is empty: the "
+            "text overlay replaces texts of the base profile, and there "
+            "is no base profile."
+        )
     if not settings.templates_dir:
         if settings.is_dev:
             logger.warning(
@@ -1458,5 +1842,14 @@ def install_profile_from_settings() -> bool:
         channel_states=deploy_channel_states(),
         llm_set_names=tuple(settings.llm_sets),
     )
+    overlay = (
+        load_overlay(
+            FileOverlaySource(Path(settings.templates_overlay_dir)), profile,
+        )
+        if settings.templates_overlay_dir
+        else None
+    )
     install_profile(profile)
+    if overlay is not None:
+        install_overlay(overlay)
     return True

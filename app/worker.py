@@ -29,6 +29,13 @@
 # lanes of the process come from COMMS_WORKER_LANES (all four when
 # unset): one image, any set of lanes (spec §8.6).
 #
+# A LANE'S JOBS SIDE BY SIDE (P5-L): each lane loop owns a task group
+# and the lane's places in it (_lane_loop, engine.processor.LaneJobs).
+# A pass starts its jobs' attempts there and returns without waiting
+# for them, so a job in a long call holds one of the lane's places, not
+# its loop: the next pass -- woken by intake, by a full portion, or at
+# the interval -- selects beside it.
+#
 # BACKOFF, per loop: a pass with no work -> that loop's interval doubles
 # (up to NOTIFICATION_MAX_BACKOFF_SECONDS); work found -> back to
 # NOTIFICATION_POLL_INTERVAL_SECONDS; a pass that raised -> the maximum.
@@ -45,12 +52,14 @@
 # interval. A job that becomes due later is noticed by the poll (the
 # KNOWN CEILING in app/engine/wake.py).
 #
-# SHUTDOWN: SIGTERM/SIGINT cancel the loops. An attempt in flight is
-# cancelled at its current await and rolled back with its session;
-# what its channel calls already journaled stays (app/engine/journal.py).
-# A loop that ends any other way ends the process: the task group
-# cancels the others and the error propagates -- the container restarts
-# with every lane, instead of running on with some of them.
+# SHUTDOWN: SIGTERM/SIGINT cancel the loops. Cancelling a lane loop
+# cancels its task group, and with it every attempt the lane has in
+# work: each is cancelled at its current await and rolled back with its
+# session; what its channel calls already journaled stays
+# (app/engine/journal.py). A loop -- or an attempt in its group -- that
+# ends any other way ends the process: the task groups cancel the rest
+# and the error propagates -- the container restarts with every lane,
+# instead of running on with some of them.
 # =============================================================================
 
 import asyncio
@@ -67,8 +76,12 @@ from app.core.lanes import Lane
 from app.core.logging import setup_logging
 from app.core.sanitize import sanitized_traceback
 from app.engine.formatters import close_formatters, init_formatters
-from app.engine.processor import cleanup_terminal_notifications, process_lane
-from app.engine.service import LANE_CONCURRENCY
+from app.engine.processor import (
+    LaneJobs,
+    cleanup_terminal_notifications,
+    process_lane,
+)
+from app.engine.service import LANE_CONCURRENCY, LANE_JOBS
 from app.engine.wake import listen_for_wakes
 from app.engine.worker import run_engine_maintenance
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
@@ -104,7 +117,7 @@ def reset_auto_close_gate() -> None:
 # another, each in one session at a time (the expiry sweep, the expired
 # cleanup, the close-notify consumer, retention, auto-close). Counted
 # with the lanes' against the pool (app/engine/service.py
-# LANE_CONCURRENCY; tests/test_lanes.py holds the sum).
+# LANE_CONCURRENCY, LANE_JOBS; tests/test_lanes.py holds the sum).
 MAINTENANCE_SESSIONS = 1
 
 
@@ -208,17 +221,33 @@ async def _poll_loop(
 
 
 def _lane_pass(
-    lane: Lane, wake: asyncio.Event,
+    lane: Lane, wake: asyncio.Event, jobs: LaneJobs,
 ) -> Callable[[], Awaitable[int]]:
-    """One pass of `lane`; a pass that left a job with a full portion
-    sets the lane's own wake (H7), so the next portion goes at once --
-    the pass clears the event before it starts (_poll_loop), and this is
-    set after it ends, so it is kept for the sleep that follows."""
+    """One pass of `lane` over the lane's jobs in work (P5-L); an
+    attempt that ended with a full portion sets the lane's own wake
+    (H7), so the next portion goes at once -- the pass clears the event
+    before it starts (_poll_loop), so a wake set while it runs or after
+    it ends is kept for the sleep that follows."""
 
     async def run_pass() -> int:
-        return await process_lane(lane, on_more=wake.set)
+        return await process_lane(lane, on_more=wake.set, jobs=jobs)
 
     return run_pass
+
+
+async def _lane_loop(lane: Lane, wake: asyncio.Event) -> None:
+    """The loop of `lane`: its passes (_poll_loop), and the task group
+    the attempts they start run in -- with the lane's places and slots
+    (engine.processor.LaneJobs), one set for the process's life.
+    Cancelling the loop cancels its attempts and waits for their
+    rollback; an attempt that raises past its own handling (only a
+    BaseException does) ends the loop."""
+    async with asyncio.TaskGroup() as attempts:
+        await _poll_loop(
+            _lane_pass(lane, wake, LaneJobs(lane, attempts)),
+            wake,
+            lane=lane.value,
+        )
 
 
 async def run_worker_loop() -> None:
@@ -240,6 +269,7 @@ async def run_worker_loop() -> None:
         lane_budgets={
             lane.value: {
                 "batch_size": settings.lane_batch_size(lane),
+                "jobs": LANE_JOBS[lane],
                 "concurrency": LANE_CONCURRENCY[lane],
                 "deliver_timeout": settings.lane_deliver_timeout(lane),
             }
@@ -287,21 +317,27 @@ async def run_worker_loop() -> None:
         )
 
     for mix in lanes_mixing_llm():
-        # P5-1: a lane attempts its jobs one after another, and a model
-        # writes for up to LLM_DELIVER_TIMEOUT_SECONDS per key set -- the
-        # types for people of the same lane wait behind it. A lawful
+        # P5-1, P5-L: a model writes for up to LLM_DELIVER_TIMEOUT_SECONDS
+        # per key set and holds one of its lane's places all that time;
+        # as many models as the lane has places hold the lane, and the
+        # types for people of the same lane wait behind them. A lawful
         # profile, so it starts; loud, one line per lane. KNOWN CEILING
-        # (the head of a lane) on app/engine/service.py _deliver_single.
+        # (the places of a lane) on app/engine/service.py _deliver_single.
+        jobs = LANE_JOBS[Lane(mix.lane)]
         logger.warning(
             "lane_mixes_llm",
             lane=mix.lane,
+            jobs=jobs,
             llm_types=list(mix.llm_types),
             other_types=list(mix.other_types),
             hint=(
-                "a lane attempts one job at a time: while a model writes "
-                "(up to LLM_DELIVER_TIMEOUT_SECONDS per key set), every "
-                "job of these other types waits behind it -- give the "
-                "llm types a lane of their own (deploy/INTEGRATION.md)"
+                f"this lane attempts {jobs} job(s) at a time: a model "
+                "holds one of them while it writes (up to "
+                "LLM_DELIVER_TIMEOUT_SECONDS per key set), and while "
+                f"{jobs} model(s) write, every job of these other types "
+                "waits behind them -- give the llm types a lane without "
+                "types for people and with more than one job at a time "
+                "(deploy/INTEGRATION.md)"
             ),
         )
 
@@ -309,13 +345,7 @@ async def run_worker_loop() -> None:
     try:
         async with asyncio.TaskGroup() as group:
             for lane in lanes:
-                group.create_task(
-                    _poll_loop(
-                        _lane_pass(lane, wakes[lane.value]),
-                        wakes[lane.value],
-                        lane=lane.value,
-                    ),
-                )
+                group.create_task(_lane_loop(lane, wakes[lane.value]))
             group.create_task(
                 _poll_loop(
                     run_maintenance_pass, asyncio.Event(), loop="maintenance",

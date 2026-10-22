@@ -132,31 +132,56 @@ IDEMPOTENCY_INDEX_NAME = "uq_notifications_idempotency_key"
 # enough to decorrelate, still the same order as the server's ask.
 _RATE_LIMIT_JITTER_MAX_FRACTION = 0.5
 
-# Concurrent formatter.deliver() calls of one job, by the job's lane
-# (P4-1, spec §8.2): each lane's own slots, which no other lane can
-# take. One semaphore per job IS one per lane: a lane's loop attempts
-# its jobs one after another (app/engine/processor.py process_lane), so
-# at most one job of a lane is in flight in a process. Constants, like
-# the one number they replaced, because they share the worker's
-# connection pool: every call writes the channel's answer in its own
-# session while it holds its slot (journal.record_channel_answer), so
-# the sum of these, plus one attempt session per lane and the
-# maintenance loop's session, must fit the pool
-# (app/core/database.py POOLS, the worker's) -- a call that
-# waits for a connection widens the accepted window of
-# record_channel_answer. tests/test_lanes.py holds the sum. The wake
-# listener's connection is not in it: it has its own engine, outside
-# the pool (app/engine/wake.py).
+# THE LANE'S BUDGET IN A PROCESS (P4-1, P5-L; spec §8.2): two numbers
+# per lane, each the lane's own, which no other lane can take.
+#
+# LANE_CONCURRENCY -- the lane's SLOTS: concurrent channel calls
+# (formatter.deliver(), the model's ask) over ALL the lane's jobs in
+# work -- one semaphore per lane in a process (app/engine/processor.py
+# LaneJobs.slots), handed to every attempt of the lane
+# (deliver_notification). A job's portion is one round of them
+# (delivery_portion).
 #   normal 20 -- the number every job had before lanes: the default lane
-#                behaves exactly as the one queue did;
+#                behaves as the one queue did;
 #   interactive, critical 2 -- a person or a payment is one recipient,
 #                rarely more; two slots keep a second one from queueing;
 #   bulk 1 -- a send that may wait; the slot it cannot exceed is what
 #                keeps it off everyone else's.
+#
+# LANE_JOBS -- the lane's PLACES: jobs attempted at once
+# (app/engine/processor.py process_lane). A job holds one place for its
+# whole attempt, so a long call -- a model writing for a minute -- holds
+# one place and one slot, not the lane; the lane's other jobs go on in
+# the rest. Never above the lane's slots: a place beyond them is a job
+# holding a connection while it waits for a slot.
+#   interactive, critical 2 -- one long call leaves the other place;
+#   normal 4 -- the lane every type without a declared lane goes to;
+#   bulk 1 -- its one slot takes one call at a time whatever the
+#                places, so a second place would only hold a connection
+#                waiting: bulk attempts its jobs one after another.
+#
+# Constants, not settings, because both are counted against the
+# worker's connection pool: an attempt holds one connection for its
+# whole transaction (a pass's selection takes a place first, so it is
+# one of them), and every call writes the channel's answer in its own
+# session while it holds its slot (journal.record_channel_answer). The
+# slots and the places of every lane, plus the maintenance loop's
+# session, must fit the pool (app/core/database.py POOLS, the worker's)
+# -- a call that waits for a connection widens the accepted window of
+# record_channel_answer. tests/test_lanes.py holds the sum. The wake
+# listener's connection is not in it: it has its own engine, outside
+# the pool (app/engine/wake.py).
 LANE_CONCURRENCY: dict[Lane, int] = {
     Lane.INTERACTIVE: 2,
     Lane.CRITICAL: 2,
     Lane.NORMAL: 20,
+    Lane.BULK: 1,
+}
+
+LANE_JOBS: dict[Lane, int] = {
+    Lane.INTERACTIVE: 2,
+    Lane.CRITICAL: 2,
+    Lane.NORMAL: 4,
     Lane.BULK: 1,
 }
 
@@ -171,12 +196,15 @@ def delivery_portion(lane: Lane) -> int:
     job wait for it. Over every due delivery of a job at once that is
     ceil(N / slots) channel calls end to end: a bulk send to a thousand
     people, one slot, was a thousand calls in one transaction. Over one
-    round it is ONE call's time, the lane's deliver timeout at most. The
-    rest of the job goes in the lane's next passes, each its own
-    attempt; a pass whose portion was full wakes its own loop
-    (app/worker.py), so there is no sleep between portions. The number
-    is the slots, not one of its own: a round fills them once, and a
-    larger portion would only lengthen the transaction again.
+    round it is one round of calls -- but the slots are the lane's, not
+    the job's (P5-L): the lane's other jobs in work call in the same
+    slots, so a portion's calls may wait for theirs, at most a round for
+    each of the lane's places (LANE_JOBS). The rest of the job goes in
+    the lane's next passes, each its own attempt; an attempt whose
+    portion was full wakes its own loop (app/worker.py), so there is no
+    sleep between portions. The number is the slots, not one of its
+    own: a round fills them once, and a larger portion would only
+    lengthen the transaction again.
     """
     return LANE_CONCURRENCY[lane]
 
@@ -1015,6 +1043,7 @@ async def resolve_notification(
 async def deliver_notification(
     session: AsyncSession,
     notification: Notification,
+    slots: asyncio.Semaphore | None = None,
 ) -> bool:
     """Deliver pending deliveries for a notification via formatters --
     ONE PORTION of them (H7, delivery_portion): the due ones, in id
@@ -1072,8 +1101,10 @@ async def deliver_notification(
       shortest window of the three, not worth threading the
       notification through _apply_transient_failure for one log
       field.)
-    - Concurrent delivery via asyncio.gather + Semaphore, sized by the
-      job's lane (LANE_CONCURRENCY).
+    - Concurrent delivery via asyncio.gather in the lane's slots: the
+      semaphore the lane's jobs in work share (`slots`, P5-L) -- or,
+      for a caller attempting one job outside a lane's run, slots of its
+      own, of the lane's size (LANE_CONCURRENCY).
     - asyncio.wait_for with timeout per formatter call: the job's
       lane's (P4-3), around the call and not around the wait for a slot.
     - PermanentDeliveryError -> immediate FAILED with its FailureClass,
@@ -1089,6 +1120,8 @@ async def deliver_notification(
     Args:
         session: Active DB session (caller commits).
         notification: The notification whose deliveries to process.
+        slots: The lane's slots, shared with its other jobs in work
+            (app/engine/processor.py LaneJobs); None -- this job's own.
 
     Returns:
         Whether the portion was full.
@@ -1153,8 +1186,8 @@ async def deliver_notification(
     if category is not None and people:
         muted = await muted_recipient_ids(session, category, list(people))
 
-    # -- Concurrent delivery via gather + the lane's slots (P4-1) --
-    semaphore = asyncio.Semaphore(
+    # -- Concurrent delivery via gather + the lane's slots (P4-1, P5-L) --
+    semaphore = slots or asyncio.Semaphore(
         LANE_CONCURRENCY[Lane(notification.lane)],
     )
     tasks = []
@@ -1490,29 +1523,36 @@ async def _deliver_single(
     list: the lanes' 30 is email's and telegram's, and a model writes for
     longer (app/core/channels.py own_deliver_timeout).
 
-    KNOWN CEILING (acknowledged by design -- P5-1, the head of a lane):
-      1. Mechanics: a lane attempts its jobs one after another
-         (app/engine/processor.py process_lane), and an llm call may run
-         up to LLM_DELIVER_TIMEOUT_SECONDS for each set of its list. Every
-         job of the same lane behind it -- a login code by email, if the
-         profile put both in one lane -- waits that long.
+    KNOWN CEILING (acknowledged by design -- P5-1, P5-L, the places of a
+    lane):
+      1. Mechanics: an llm call holds one of its lane's places
+         (LANE_JOBS) and one of its slots for up to
+         LLM_DELIVER_TIMEOUT_SECONDS for each set of its list. The
+         lane's other jobs go on in the rest -- until as many model
+         calls as the lane has places are in work at once: then every
+         job of the lane waits behind them, a login code by email too,
+         if the profile put both kinds in one lane. In bulk (one place)
+         that is a single call.
       2. Status: acknowledged by design.
-      3. Backlog ref: none -- parallel jobs inside a lane are a separate
-         task (the owner's answer at the P5-1 gate).
+      3. Backlog ref: none -- the choice of lane is the product's, and
+         deploy/INTEGRATION.md tells it where an llm type belongs.
       4. Promotion trigger (observable): the worker's startup line
          `lane_mixes_llm` (app/worker.py), which names every lane that
-         carries llm types beside types for people; or a
-         notifications_processed line of such a lane whose duration_ms
-         is above its poll interval.
-      5. Agreed fix: jobs of a lane attempted concurrently, within the
-         lane's slots.
+         carries llm types beside types for people, together with an
+         `oldest_ready_seconds` of that lane (GET /api/v1/lanes/depth)
+         above its poll interval.
+      5. Agreed fix: the product moves its llm types to a lane without
+         types for people and with more than one place
+         (deploy/INTEGRATION.md).
       6. Rejected: refusing a lane that mixes the two at startup (a red
          start on a valid profile; the choice of lane is the product's);
          raising the lanes' timeouts to the model's (the interactive
          email would wait minutes for a dead provider); a lane of comms'
-         own for llm (the lanes are a closed set, spec §8).
-    deploy/INTEGRATION.md tells the product to keep llm types in a lane
-    without types for people.
+         own for llm (the lanes are a closed set, spec §8); places of a
+         lane kept apart for llm calls (a decision by the job's kind
+         inside a lane's run -- the lane is the product's one word on
+         that, spec §8.3); more places than slots (a place beyond the
+         slots holds a connection waiting for one).
 
     Runs formatter.deliver() under semaphore with the timeout of the
     job's lane (P4-3, spec §8.5) -- inside the slot, so a call waiting
@@ -1690,8 +1730,8 @@ def _answer_row(call: LLMCall, reply: LLMReply) -> LLMAnswer:
 # yet (PENDING, not resolved) takes EXPIRED / CANCELLED directly.
 #
 # IN FLIGHT: an attempt runs inside the worker's transaction under a
-# row lock on the notification (processor.py, FOR NO KEY UPDATE -- the
-# lock rule is written at the selection). Expiry, cancellation and
+# row lock on the notification (processor.py _attempt_job, FOR NO KEY
+# UPDATE -- the lock rule is written at the lock). Expiry, cancellation and
 # forgetting lock the same row FOR UPDATE, waiting, not skipping; the
 # two modes conflict, so these apply to the state AFTER the attempt:
 # what was sent stays sent, what is still waiting is closed -- and a

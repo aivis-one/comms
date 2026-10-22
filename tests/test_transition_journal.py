@@ -1003,8 +1003,9 @@ _POINTS: dict[tuple[str, str], str] = {
     ),
     # Not a transition: the gate that let a successful attempt through
     # is cleared; the attempt's transitions are recorded by its steps.
-    # (The attempt moved into the lane's pass in P4-1.)
-    ("app/engine/processor.py", "process_lane"): ("not a transition"),
+    # (The attempt moved into the lane's pass in P4-1, and into a task
+    # of its own, one per job in work, in P5-L.)
+    ("app/engine/processor.py", "_attempt_job"): ("not a transition"),
     # Thread statuses (messaging), not jobs or deliveries.
     ("app/messaging/status.py", "set_status"): "thread",
     ("app/messaging/status.py", "apply_client_message_reopen"): "thread",
@@ -1093,11 +1094,12 @@ class TestEveryPointRecords:
 
 
 async def _poisoned_after_deliver(
-    session: AsyncSession, notification: Notification
+    session: AsyncSession, notification: Notification, slots: Any = None,
 ) -> None:
     """deliver runs for real -- the channel takes the letter -- and the
-    step then tears before the attempt can commit."""
-    await _REAL_DELIVER(session, notification)
+    step then tears before the attempt can commit. P5-L: the attempt
+    hands deliver its lane's slots; forwarded."""
+    await _REAL_DELIVER(session, notification, slots)
     raise _PlantedDefectError("after the channel")
 
 

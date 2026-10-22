@@ -295,15 +295,18 @@ async def _running(
     real_process_lane = worker.process_lane
 
     async def counted(
-        lane: Lane, on_more: Callable[[], None] | None = None,
+        lane: Lane,
+        on_more: Callable[[], None] | None = None,
+        jobs: Any = None,
     ) -> int:
         # H7: the worker hands each pass its lane's wake as `on_more`
-        # (a pass with a full portion wakes its own loop); forwarded.
+        # (a pass with a full portion wakes its own loop), and P5-L the
+        # lane's jobs in work; both forwarded.
         running.passes[lane.value] += 1
         if running.held == lane.value:
             running.entered.set()
             await running.release.wait()
-        return await real_process_lane(lane, on_more=on_more)
+        return await real_process_lane(lane, on_more=on_more, jobs=jobs)
 
     async def idle() -> int:
         return 0

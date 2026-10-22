@@ -86,9 +86,10 @@ class Pool:
 # whichever process asked next, under load, where it is hardest to see.
 # tests/test_connection_budget.py holds the sum against the compose
 # file, the uvicorn --workers count included.
-#   worker 10 + 20 -- its lanes' slots each hold a journal session while
-#       they call (app/engine/service.py LANE_CONCURRENCY), each lane's
-#       attempt holds one, the maintenance loop holds one: 25 + 4 + 1,
+#   worker 10 + 25 -- its lanes' slots each hold a journal session while
+#       they call (app/engine/service.py LANE_CONCURRENCY), each of its
+#       lanes' places holds an attempt's session or a pass's selection
+#       (LANE_JOBS, P5-L), the maintenance loop holds one: 25 + 9 + 1,
 #       the whole of it at once (tests/test_lanes.py). Its wake listener
 #       holds one more, on its own engine outside this pool
 #       (app/engine/wake.py).
@@ -97,7 +98,7 @@ class Pool:
 #       relay beside it, one session at a time (app/transport): two.
 POOLS: dict[ProcessRole, Pool] = {
     ProcessRole.API: Pool(size=10, overflow=10),
-    ProcessRole.WORKER: Pool(size=10, overflow=20),
+    ProcessRole.WORKER: Pool(size=10, overflow=25),
     ProcessRole.CONSUMER: Pool(size=5, overflow=5),
 }
 

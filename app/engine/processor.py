@@ -26,9 +26,17 @@
 #
 # LANES (P4-1, spec §8): a job carries the lane of its type
 # (notifications.lane, snapshotted at intake). Each lane is selected by
-# its own query with its own batch size, and its jobs deliver in its own
-# slots (app/engine/service.py LANE_CONCURRENCY) -- a backlog or a slow
-# channel in one lane takes nothing from another.
+# its own query with its own batch size, its jobs are attempted in its
+# own places and deliver in its own slots (app/engine/service.py
+# LANE_JOBS, LANE_CONCURRENCY) -- a backlog or a slow channel in one
+# lane takes nothing from another.
+#
+# JOBS OF A LANE SIDE BY SIDE (P5-L): a lane attempts up to its places
+# of jobs at once (LaneJobs), so a long call -- a model writing for a
+# minute -- holds one place, not the lane. In the worker a pass does not
+# wait for the attempts it starts: they run in the lane loop's task
+# group (app/worker.py _lane_loop), and the next pass selects beside
+# them, dropping the ones still in work.
 #
 # SESSION MANAGEMENT:
 #   Each notification is processed in its own session/transaction.
@@ -38,9 +46,12 @@
 #   SELECT ... FOR NO KEY UPDATE SKIP LOCKED prevents double-processing
 #   when multiple worker instances -- or several lane loops of one
 #   instance -- run concurrently (the lock rule is written at the lock
-#   itself, in process_lane). A job is in exactly one lane, so two lane
-#   loops of one process never select the same row; the pair they form
-#   is the one two worker processes already formed.
+#   itself, in _attempt_job). A job is in exactly one lane, so two lane
+#   loops of one process never select the same row; a lane does not
+#   attempt again a job it has in work (LaneJobs.in_work). The attempts
+#   of one lane run side by side, each on its own job row, as the
+#   attempts of two lanes or of two worker processes already did: the
+#   pair they form is the one those formed.
 #
 # RETRY:
 #   Selects both PENDING and PROCESSING notifications. PROCESSING
@@ -88,6 +99,7 @@
 import asyncio
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -110,6 +122,8 @@ from app.engine.constants import (
 from app.engine.journal import pipeline_error_of
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
+    LANE_CONCURRENCY,
+    LANE_JOBS,
     close_notifications,
     close_waiting_deliveries,
     delete_expired_notifications_batch,
@@ -256,38 +270,122 @@ def ready_now(now: datetime) -> ColumnElement[bool]:
     )
 
 
+class LaneJobs:
+    """The jobs one lane has in work in this process (P5-L): its places
+    (app/engine/service.py LANE_JOBS), its slots (LANE_CONCURRENCY), the
+    ids of its jobs in work, and the task group their attempts run in.
+
+    Whoever owns `attempts` owns this: the worker's lane loop keeps one
+    for the process's life (app/worker.py _lane_loop), so an attempt
+    outlives the pass that started it and is cancelled with the loop;
+    process_lane given none builds its own and waits for its attempts.
+    """
+
+    def __init__(self, lane: Lane, attempts: asyncio.TaskGroup) -> None:
+        self.lane = lane
+        self.attempts = attempts
+        self.places = asyncio.Semaphore(LANE_JOBS[lane])
+        self.slots = asyncio.Semaphore(LANE_CONCURRENCY[lane])
+        self.in_work: set[UUID] = set()
+
+
+@dataclass
+class _PassTally:
+    """What one pass started, counted as its attempts end; the last one
+    to end logs the pass."""
+
+    lane: Lane
+    total: int
+    started: float
+    processed: int = 0
+    ended: int = 0
+
+    def end(self, processed: bool) -> None:
+        self.processed += processed
+        self.ended += 1
+        if self.ended < self.total:
+            return
+        # Every pass with work logs its lane and duration -- from its
+        # selection to the end of its last attempt: a pass far longer
+        # than the poll interval is a lane whose channel is slow --
+        # visible per lane, and no longer anyone else's wait.
+        logger.info(
+            "notifications_processed",
+            lane=self.lane.value,
+            total=self.total,
+            processed=self.processed,
+            duration_ms=round((time.monotonic() - self.started) * 1000, 1),
+        )
+
+
 async def process_lane(
-    lane: Lane, on_more: Callable[[], None] | None = None,
+    lane: Lane,
+    on_more: Callable[[], None] | None = None,
+    jobs: LaneJobs | None = None,
 ) -> int:
     """One pass of one lane: select its due jobs, at most the lane's
-    batch size, and attempt them one after another, each in its own
-    session/transaction. Pipeline per notification: resolve -> deliver
-    -> rollup.
+    batch size, and attempt them, up to the lane's places at once
+    (LaneJobs), each in its own session/transaction. Pipeline per
+    notification: resolve -> deliver -> rollup.
 
-    ONE PORTION PER JOB PER PASS (H7): an attempt delivers at most one
-    round of the lane's slots (app/engine/service.py delivery_portion)
-    and commits, so it never holds the job's row, a connection and the
-    change feed's xmin for a whole audience. A job with more due goes on
-    in the lane's NEXT pass, selected afresh -- expiry, cancellation and
-    forgetting get the row between two portions, and a job accepted
-    meanwhile is selected beside it. When any attempt of the pass had
-    its portion full, `on_more` is called once, after the pass: the
-    worker passes the lane's wake (app/worker.py), so the next pass
-    follows at once instead of after the interval.
+    THE PLACES (P5-L): the selection itself takes a place first -- its
+    session is one of the connections a place stands for -- and that
+    place goes to the first job selected; each next job waits for a
+    place to come free. An attempt keeps its place to its end, so a long
+    call holds one place and the lane's other jobs go on in the rest.
+    The pass selects its batch PLUS the jobs the lane has in work as it
+    starts the selection, and drops those: it takes a batch of jobs not
+    in work, and never attempts a job twice at once. The selection's statement is the
+    same; only its LIMIT grows, by at most the places less one.
+
+    TWO CALLERS, ONE PASS. With `jobs` -- the worker's lane loop
+    (app/worker.py _lane_loop) -- the pass does NOT wait for its
+    attempts: it returns once the last job it selected has started,
+    and the attempts run on in the loop's task group; the next pass
+    selects beside them. Without -- process_pending_notifications, a
+    caller that wants everything due done once -- the pass builds its
+    own places and waits for every attempt it started.
+
+    ONE PORTION PER JOB PER ATTEMPT (H7): an attempt delivers at most
+    one round of the lane's slots (app/engine/service.py
+    delivery_portion) and commits, so it never holds the job's row, a
+    connection and the change feed's xmin for a whole audience. A job
+    with more due goes on in a NEXT pass, selected afresh -- expiry,
+    cancellation and forgetting get the row between two portions, and a
+    job accepted meanwhile is selected beside it. When an attempt ends
+    with its portion full, `on_more` is called -- after the job has left
+    the lane's work and given its place back, so the pass it starts
+    selects it again: the worker passes the lane's wake (app/worker.py),
+    so the next pass follows at once instead of after the interval.
 
     THE LANE'S BUDGET (P4-1, spec §8.2): the selection names the lane,
-    so another lane's backlog never takes its places; the deliveries of
-    a job run in the lane's own slots (app/engine/service.py
-    LANE_CONCURRENCY), and the lane's jobs go one at a time, so one
-    lane never holds more than its slots. Isolation, not priority: no
-    lane is picked before another -- each has its own loop.
+    so another lane's backlog never takes its places; the attempts run
+    in the lane's places and their deliveries in the lane's slots
+    (app/engine/service.py LANE_JOBS, LANE_CONCURRENCY), so one lane
+    never holds more than its own. Isolation, not priority: no lane is
+    picked before another -- each has its own loop.
 
     Returns:
-        Number of notifications processed.
+        With `jobs`: the attempts this pass started (the loop's backoff
+        reads it; the attempts' outcome is in the pass's log line).
+        Without: the notifications processed.
     """
+    if jobs is not None:
+        tally = await _pass(lane, jobs, on_more)
+        return 0 if tally is None else tally.total
+    async with asyncio.TaskGroup() as attempts:
+        tally = await _pass(lane, LaneJobs(lane, attempts), on_more)
+    return 0 if tally is None else tally.processed
+
+
+async def _pass(
+    lane: Lane, jobs: LaneJobs, on_more: Callable[[], None] | None,
+) -> _PassTally | None:
+    """Select and start; None when there was nothing to start. See
+    process_lane."""
     factory = get_session_factory()
-    now = datetime.now(UTC)
     started = time.monotonic()
+    batch = settings.lane_batch_size(lane)
 
     # -- Step 1: Collect IDs of the lane's notifications to process --
     # Review 1.2: PENDING rows are always ready (not yet resolved).
@@ -296,108 +394,143 @@ async def process_lane(
     # gated notification would be locked and no-op'ed every pass, and
     # the no-op "processed" count would keep the lane's loop from
     # backing off for the whole backoff window.
-    async with factory() as session:
-        stmt = (
-            select(Notification.id)
-            .where(Notification.lane == lane.value, ready_now(now))
-            # Oldest due first within the lane. Priority left the
-            # ordering with the column (F1.4); isolation is the lane's.
-            .order_by(Notification.scheduled_at)
-            # Review 1.1: cap the batch -- the lane's own (P4-1); the
-            # tail is picked up on the lane's next pass.
-            .limit(settings.lane_batch_size(lane))
-        )
-        result = await session.execute(stmt)
-        notification_ids = [row[0] for row in result.all()]
-
-    if not notification_ids:
-        return 0
-
-    # -- Step 2: Process each notification in its own session --
-    processed = 0
-    more = False
-    for notif_id in notification_ids:
-        step = PipelineStep.LOCK
+    await jobs.places.acquire()
+    try:
+        # The jobs in work as the selection sees them, taken before it:
+        # one that ends while the selection runs is still in its snapshot,
+        # due, and has left the live set by the time the rows are back --
+        # dropped by THIS set, it is not counted as one of the batch's new
+        # (a SENT job attempted again, a new one left behind). Only this
+        # pass starts jobs of the lane, so no job enters it meanwhile.
+        in_work = set(jobs.in_work)
+        now = datetime.now(UTC)
         async with factory() as session:
-            try:
-                # THE LOCK RULE. The attempt holds the job's row FOR NO KEY
-                # UPDATE for its whole transaction (resolve -> deliver ->
-                # rollup -> commit), skipping a row another worker holds.
-                # NOT FOR UPDATE: every channel answer is journaled from a
-                # SECOND session while this lock is held, and that
-                # insert's foreign key takes FOR KEY SHARE on this row.
-                # FOR UPDATE conflicts with KEY SHARE -- the journal
-                # session would wait for the attempt and the attempt, in
-                # its await, for the journal session; Postgres sees no
-                # deadlock across the two connections and the worker
-                # hangs. FOR NO KEY UPDATE does not conflict with KEY
-                # SHARE and still conflicts with FOR UPDATE, which is
-                # what expiry, cancellation and forgetting take
-                # (app/engine/service.py, IN FLIGHT): they stay mutually
-                # exclusive with the attempt.
-                lock_stmt = (
-                    select(Notification)
-                    .where(Notification.id == notif_id)
-                    .with_for_update(skip_locked=True, key_share=True)
-                )
-                lock_result = await session.execute(lock_stmt)
-                notification = lock_result.scalar_one_or_none()
+            stmt = (
+                select(Notification.id)
+                .where(Notification.lane == lane.value, ready_now(now))
+                # Oldest due first within the lane. Priority left the
+                # ordering with the column (F1.4); isolation is the lane's.
+                .order_by(Notification.scheduled_at)
+                # Review 1.1: cap the batch -- the lane's own (P4-1); the
+                # tail is picked up on the lane's next pass. Larger by
+                # the jobs in work, which are dropped below (P5-L).
+                .limit(batch + len(in_work))
+            )
+            result = await session.execute(stmt)
+            selected = [row[0] for row in result.all()]
+    except BaseException:
+        jobs.places.release()
+        raise
+    fresh = [nid for nid in selected if nid not in in_work][:batch]
+    if not fresh:
+        jobs.places.release()
+        return None
 
-                if notification is None:
-                    # Another worker is processing this one.
-                    continue
+    # -- Step 2: Attempt each in its own task, session and place --
+    tally = _PassTally(lane=lane, total=len(fresh), started=started)
+    for n, notif_id in enumerate(fresh):
+        if n:
+            await jobs.places.acquire()
+        jobs.in_work.add(notif_id)
+        jobs.attempts.create_task(_attempt(notif_id, jobs, tally, on_more))
+    return tally
 
-                # Skip if status changed since our initial query.
-                if notification.status not in (
-                    NotificationStatus.PENDING,
-                    NotificationStatus.PROCESSING,
-                ):
-                    continue
 
-                # resolve (idempotent -- skips if deliveries exist)
-                step = PipelineStep.RESOLVE
-                await resolve_notification(session, notification)
-
-                # deliver -- one portion
-                step = PipelineStep.DELIVER
-                portion_full = await deliver_notification(session, notification)
-
-                # rollup
-                step = PipelineStep.ROLLUP
-                await rollup_notification(session, notification)
-
-                # A gate that let this attempt through has done its job;
-                # the failure record (attempts, step, error) stays.
-                notification.pipeline_retry_at = None
-
-                step = PipelineStep.COMMIT
-                await session.commit()
-                processed += 1
-                more = more or portion_full
-
-            except Exception as exc:
-                await session.rollback()
-                logger.error(
-                    "notification_pipeline_error",
-                    notification_id=str(notif_id),
-                    step=step.value,
-                    exception=sanitized_traceback(exc),
-                )
-                await _record_pipeline_failure(notif_id, step, exc)
-
-    # Every pass with work logs its lane and duration: a pass far longer
-    # than the poll interval is a lane whose channel is slow -- visible
-    # per lane, and no longer anyone else's wait.
-    logger.info(
-        "notifications_processed",
-        lane=lane.value,
-        total=len(notification_ids),
-        processed=processed,
-        duration_ms=round((time.monotonic() - started) * 1000, 1),
-    )
-    if more and on_more is not None:
+async def _attempt(
+    notif_id: UUID,
+    jobs: LaneJobs,
+    tally: _PassTally,
+    on_more: Callable[[], None] | None,
+) -> None:
+    """One job's attempt in its place: the place and the job's mark of
+    work are given back when it ends, however it ends; then the pass is
+    told, and a full portion wakes the lane (process_lane)."""
+    try:
+        processed, portion_full = await _attempt_job(notif_id, jobs.slots)
+    finally:
+        jobs.in_work.discard(notif_id)
+        jobs.places.release()
+    tally.end(processed)
+    if portion_full and on_more is not None:
         on_more()
-    return processed
+
+
+async def _attempt_job(
+    notif_id: UUID, slots: asyncio.Semaphore,
+) -> tuple[bool, bool]:
+    """Lock, resolve, deliver one portion in the lane's `slots`, roll up
+    and commit one job. Returns (processed, portion full); a pipeline
+    failure is recorded on the job (_record_pipeline_failure)."""
+    factory = get_session_factory()
+    step = PipelineStep.LOCK
+    async with factory() as session:
+        try:
+            # THE LOCK RULE. The attempt holds the job's row FOR NO KEY
+            # UPDATE for its whole transaction (resolve -> deliver ->
+            # rollup -> commit), skipping a row another worker holds.
+            # NOT FOR UPDATE: every channel answer is journaled from a
+            # SECOND session while this lock is held, and that
+            # insert's foreign key takes FOR KEY SHARE on this row.
+            # FOR UPDATE conflicts with KEY SHARE -- the journal
+            # session would wait for the attempt and the attempt, in
+            # its await, for the journal session; Postgres sees no
+            # deadlock across the two connections and the worker
+            # hangs. FOR NO KEY UPDATE does not conflict with KEY
+            # SHARE and still conflicts with FOR UPDATE, which is
+            # what expiry, cancellation and forgetting take
+            # (app/engine/service.py, IN FLIGHT): they stay mutually
+            # exclusive with the attempt.
+            lock_stmt = (
+                select(Notification)
+                .where(Notification.id == notif_id)
+                .with_for_update(skip_locked=True, key_share=True)
+            )
+            lock_result = await session.execute(lock_stmt)
+            notification = lock_result.scalar_one_or_none()
+
+            if notification is None:
+                # Another worker is processing this one.
+                return False, False
+
+            # Skip if status changed since our initial query.
+            if notification.status not in (
+                NotificationStatus.PENDING,
+                NotificationStatus.PROCESSING,
+            ):
+                return False, False
+
+            # resolve (idempotent -- skips if deliveries exist)
+            step = PipelineStep.RESOLVE
+            await resolve_notification(session, notification)
+
+            # deliver -- one portion, in the lane's slots
+            step = PipelineStep.DELIVER
+            portion_full = await deliver_notification(
+                session, notification, slots,
+            )
+
+            # rollup
+            step = PipelineStep.ROLLUP
+            await rollup_notification(session, notification)
+
+            # A gate that let this attempt through has done its job;
+            # the failure record (attempts, step, error) stays.
+            notification.pipeline_retry_at = None
+
+            step = PipelineStep.COMMIT
+            await session.commit()
+            return True, portion_full
+
+        except Exception as exc:
+            await session.rollback()
+            logger.error(
+                "notification_pipeline_error",
+                notification_id=str(notif_id),
+                step=step.value,
+                exception=sanitized_traceback(exc),
+            )
+            await _record_pipeline_failure(notif_id, step, exc)
+            return False, False
 
 
 def _pipeline_backoff(attempts: int) -> timedelta:
