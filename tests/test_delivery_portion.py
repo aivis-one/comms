@@ -255,7 +255,7 @@ class TestNoSleepBetweenPortions:
         started = time.monotonic()
         async with _channel(spy):
             loop = asyncio.ensure_future(
-                worker._poll_loop(worker._lane_pass(Lane.BULK, wake), wake),
+                worker._lane_loop(Lane.BULK, wake),
             )
             try:
                 await asyncio.wait_for(third.wait(), _BOUND)

@@ -144,23 +144,34 @@ when the restart fails.
 ### `lane` -- which lane a type's jobs travel in
 
 comms delivers in four lanes, each with its own budget: its own
-selection of due jobs, its own number of jobs per pass, its own slots
-for channel calls, its own loop in the worker. A backlog or a slow
-channel in one lane takes nothing from another. A type declares its
+selection of due jobs, its own number of jobs per pass, its own number
+of jobs in work at once, its own slots for channel calls, its own loop
+in the worker. A backlog or a slow channel in one lane takes nothing
+from another. A type declares its
 lane in its record in `types.yaml`:
 
     lane: interactive
 
-| value | for | the type's jobs |
-|---|---|---|
-| `interactive` | someone waits for the answer right now (a login code) | small passes, a few slots of their own |
-| `critical` | a failure costs money | capacity no other lane can take |
-| `normal` | notifications | today's behavior -- the default, for a type that does not declare it |
-| `bulk` | large sends | may wait; one slot, so a mass send never holds anyone else's |
+| value | for | the type's jobs | jobs in work at once | channel calls at once |
+|---|---|---|---|---|
+| `interactive` | someone waits for the answer right now (a login code) | small passes, a few slots of their own | 2 | 2 |
+| `critical` | a failure costs money | capacity no other lane can take | 2 | 2 |
+| `normal` | notifications | today's behavior -- the default, for a type that does not declare it | 4 | 20 |
+| `bulk` | large sends | may wait; one slot, so a mass send never holds anyone else's | 1 | 1 |
 
 What a lane does: it ISOLATES. A bulk backlog of any size does not delay
 an `interactive` job by one pass, and a slow channel call in one lane
 does not hold another lane's loop.
+
+Inside a lane, several of its jobs are in work at once (the table's last
+two columns). Each holds one of the lane's places to the end of its
+attempt, and their channel calls share the lane's slots. A slow call
+holds one place, not the lane: the lane's other jobs go on in the rest,
+until every place is held by a slow call. `bulk` has one place: its jobs
+go strictly one after another. Jobs of one lane are started oldest
+first; those in work at once may end in any order -- two jobs of one
+lane to one person may arrive in either order. Each worker names these
+numbers in its startup line, `lane_budgets` (`jobs`, `concurrency`).
 
 What a lane does NOT do. It is not a priority: no lane is picked before
 another, each simply has its own. It passes no gate: a mute, the
@@ -1276,11 +1287,17 @@ and are refused on an llm type; `answer_keep`, `llm_sets` and
       answer_keep: 24h
       expires_after: 10m
 
-**Give llm types a lane of their own.** A lane attempts its jobs one
-after another, and a model writes for up to the bound above -- every job
-of a type for people in the same lane waits behind it. Such a profile
+**Where an llm type belongs: a lane that, on this box, carries no
+types for people and has more than one job in work at once** (the table
+under `lane`, section 3). A model writes for up to the bound above and
+holds one of its lane's places all that time: as many model calls as
+the lane has places hold the whole lane, and every job of a type for
+people in it waits behind them. In `bulk`, with one place, llm jobs go
+strictly one after another: a recording cut into ten pieces is ten
+calls end to end. A profile that mixes the two kinds in one lane
 starts, and the worker says so in one warning line, `lane_mixes_llm`,
-naming the lane and both sets of types.
+naming the lane, its jobs in work at once (`jobs`) and both sets of
+types.
 
 ### `llm` -- the letter
 

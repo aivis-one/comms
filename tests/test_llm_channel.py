@@ -73,7 +73,11 @@ from app.engine.processor import (
     process_lane,
     purge_expired_llm_answers,
 )
-from app.engine.service import close_notifications, llm_letter_encoding
+from app.engine.service import (
+    LANE_JOBS,
+    close_notifications,
+    llm_letter_encoding,
+)
 from app.profile.loader import (
     FileProfileSource,
     install_profile,
@@ -1442,7 +1446,15 @@ class TestTheLaneWarning:
         (line,) = [e for e in logs if e["event"] == "lane_mixes_llm"]
         assert line["lane"] == "normal"
         assert line["llm_types"] == ["ask.model", "ask.solo"]
-        assert "a lane attempts one job at a time" in line["hint"]
+        # Until P5-L the hint said "a lane attempts one job at a time" --
+        # true while a lane's jobs went one after another. Since, a model
+        # holds one of the lane's places; the line names how many there
+        # are, and the hint says when the lane is held: as many models.
+        assert line["jobs"] == LANE_JOBS[Lane.NORMAL] == 4
+        assert "this lane attempts 4 job(s) at a time" in line["hint"]
+        assert "while 4 model(s) write, every job of these other types" in (
+            line["hint"]
+        )
 
 
 # =============================================================================

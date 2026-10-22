@@ -1375,10 +1375,11 @@ class LaneMix:
 def lanes_mixing_llm(target: ProfileRegistry = registry) -> list[LaneMix]:
     """Every lane the installed profile gives both llm types and types
     for people, in lane order -- the input of the worker's startup
-    warning (app/worker.py). A lane attempts its jobs one after another
-    (app/engine/processor.py process_lane), so a model writing for a
-    minute holds every job of its lane behind it: the KNOWN CEILING on
-    app/engine/service.py _deliver_llm."""
+    warning (app/worker.py). A model writing for a minute holds one of
+    its lane's places (app/engine/service.py LANE_JOBS) all that time,
+    and as many models as the lane has places hold every job of the
+    lane behind them: the KNOWN CEILING on app/engine/service.py
+    _deliver_single."""
     by_lane: dict[str, tuple[list[str], list[str]]] = {
         lane: ([], []) for lane in LANES
     }

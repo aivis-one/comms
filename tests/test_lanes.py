@@ -80,6 +80,7 @@ from app.engine.processor import (
 )
 from app.engine.service import (
     LANE_CONCURRENCY,
+    LANE_JOBS,
     close_notifications,
     create_notification,
     resolve_notification,
@@ -677,16 +678,23 @@ class TestTheBudgets:
 
         H7: pools are sized per process role; the sum is held to the
         WORKER's pool (it was the one pool every process had), and it
-        fills it exactly -- 25 + 4 + 1 = 10 + 20 -- so a slot added to
-        a lane without its connection fails here. The engine a worker
-        builds is that pool (the pair).
+        fills it exactly, so a slot or a place added to a lane without
+        its connection fails here. The engine a worker builds is that
+        pool (the pair).
+
+        P5-L: a lane attempts up to its places of jobs at once
+        (LANE_JOBS), each attempt -- or the pass's selection, which takes
+        a place first -- in its own session. The sum counted ONE attempt
+        session per lane (`len(Lane)`) while a lane attempted its jobs
+        one after another; with places it counts each place: 25 + 9 + 1
+        = 10 + 25.
         """
         held = (
             sum(LANE_CONCURRENCY.values())
-            + len(Lane)
+            + sum(LANE_JOBS.values())
             + worker.MAINTENANCE_SESSIONS
         )
-        assert held == 30
+        assert held == 35
         assert held <= POOLS[ProcessRole.WORKER].capacity
         assert get_engine().pool.size() == POOLS[ProcessRole.WORKER].size
         assert worker.MAINTENANCE_SESSIONS >= 1
@@ -885,11 +893,13 @@ class TestTheLoops:
             log for log in logs if log["event"] == "notification_worker_started"
         ]
         assert line["lanes"] == ["critical", "bulk"]
-        # P4-3 added each lane's deliver timeout to its budget; the
-        # line was complete before it, and is again with it.
+        # P4-3 added each lane's deliver timeout to its budget, P5-L its
+        # places (jobs); the line was complete before each, and is again
+        # with it.
         assert line["lane_budgets"] == {
             "critical": {
                 "batch_size": settings.notification_lane_critical_batch_size,
+                "jobs": LANE_JOBS[Lane.CRITICAL],
                 "concurrency": LANE_CONCURRENCY[Lane.CRITICAL],
                 "deliver_timeout": (
                     settings.notification_lane_critical_deliver_timeout_seconds
@@ -897,6 +907,7 @@ class TestTheLoops:
             },
             "bulk": {
                 "batch_size": settings.notification_lane_bulk_batch_size,
+                "jobs": LANE_JOBS[Lane.BULK],
                 "concurrency": LANE_CONCURRENCY[Lane.BULK],
                 "deliver_timeout": (
                     settings.notification_lane_bulk_deliver_timeout_seconds

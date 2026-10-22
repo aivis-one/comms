@@ -119,10 +119,13 @@ async def _open_gates() -> None:
 def _poisoned_deliver(poisoned: set[UUID], message: str = "planted defect"):  # type: ignore[no-untyped-def]
     """deliver that raises for the poisoned jobs and is real for the rest."""
 
-    async def deliver(session: AsyncSession, notification: Notification) -> None:
+    async def deliver(
+        session: AsyncSession, notification: Notification, slots: Any = None,
+    ) -> None:
+        # P5-L: the attempt hands deliver its lane's slots; forwarded.
         if notification.id in poisoned:
             raise _PlantedDefectError(message)
-        await _REAL_DELIVER(session, notification)
+        await _REAL_DELIVER(session, notification, slots)
 
     return deliver
 
