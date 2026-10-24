@@ -112,8 +112,14 @@ from app.core.lanes import Lane
 # render failure's class and not its text, describes the type record
 # whole in the contract, and runs `comms-deploy.sh test` on the image
 # with the checkout, as CI does (3.6.1 was never released; it is here).
+#
+# PATCH bumps change nothing a deploy does: 3.7.1 is the suite reading
+# pg_stat_activity and pg_locks of its own database only and killing only
+# its own backends -- on a box `comms test` shares the server with the
+# live worker, whose wake listener the suite used to see (and could kill).
+# Only tests change.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.7.1"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
