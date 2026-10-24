@@ -127,6 +127,13 @@ delivery is the inbox entry, which shows the `title`/`body` the product
 sent -- a template there would never be shown. Nor is there a sheet for
 `llm`: its letter is the product's own.
 
+**A variable the job does not carry is not printed.** A template field
+that names a variable absent from the job -- or a path into one that
+does not resolve, `{user[name]}` with no `user` or no `name` in it --
+does not render: the field comes out as it does with no template for
+it (see "What it can change" under `PROFILE_OVERLAY_DIR` below, and
+"What email reads from the profile" in §3a).
+
 It is delivered by BIND, not by a copy: the product installer writes
 `PROFILE_DIR=/opt/velo/repo/comms-profile` into `/opt/comms/.env` on
 the same seam as above, and compose bind-mounts that path read-only

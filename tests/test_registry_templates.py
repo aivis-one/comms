@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import ValidationError
 from app.engine.constants import TargetType
 from app.engine.service import create_notification
-from app.engine.template_engine import SafeDict, render
+from app.engine.template_engine import render
 from app.profile.registry import registry
 from tests.helpers import intake_fields
 
@@ -104,8 +104,14 @@ class TestTemplateEngine:
             is None
         )
 
-    def test_safedict_keeps_missing_placeholders(self) -> None:
-        """Missing variables render as literal placeholders, no KeyError."""
+    def test_missing_variable_falls_back_without_raising(self) -> None:
+        """A missing variable: no KeyError out of render, and no literal
+        placeholder either -- None, the stored-text fallback.
+
+        It asserted "hello [{extra}]": right while SafeDict printed a
+        missing variable back as "{extra}". G5 removed SafeDict -- the
+        literal reached the person -- and "no KeyError" now holds by
+        the fallback. The pair: with `extra` the sheet renders."""
         text = render(
             notification_type="unit_event",
             channel="telegram",
@@ -113,7 +119,14 @@ class TestTemplateEngine:
             locale="en",
             variables={"body": "hello"},
         )
-        assert text == "hello [{extra}]"
+        assert text is None
+        assert render(
+            notification_type="unit_event",
+            channel="telegram",
+            field="body",
+            locale="en",
+            variables={"body": "hello", "extra": "e"},
+        ) == "hello [e]"
 
     def test_broken_format_spec_returns_none(self) -> None:
         """Review 1.1: a config error in the template must not raise --
@@ -133,9 +146,25 @@ class TestTemplateEngine:
             is None
         )
 
-    def test_safedict_direct(self) -> None:
-        """SafeDict returns '{key}' for missing keys."""
-        assert "{missing}".format_map(SafeDict()) == "{missing}"
+    def test_a_missing_variable_is_not_printed_back(self) -> None:
+        """"{missing}" with no `missing` renders to None -- never to
+        "{missing}".
+
+        It replaces test_safedict_direct, which asserted that SafeDict
+        returns "{key}" for a missing key: true of the class, and the
+        reason a template typo reached the person as braces. G5 deleted
+        the class with its behaviour (no legacy); the property now
+        asserted is render's own, on the rendered value."""
+        registry.register_templates(
+            "en", {"unit_event": {"telegram": {"body": "{missing}"}}},
+        )
+        assert render(
+            notification_type="unit_event",
+            channel="telegram",
+            field="body",
+            locale="en",
+            variables={},
+        ) is None
 
     def test_field_granularity(self) -> None:
         """{type}.{channel}.{field} addressing (email subject)."""

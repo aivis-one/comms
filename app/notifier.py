@@ -92,7 +92,7 @@ def _open_thread_action_data(
     Edit 3: `params` carries EXACTLY the one deep-link parameter
     (thread_id). Presentation variables (sender) are TOP-LEVEL keys --
     the engine's build_variables exposes them as template variables
-    (SafeDict) for rendering channels; they are NOT deep-link params
+    for rendering channels; they are NOT deep-link params
     and never enter `params`.
     """
     data: dict[str, object] = {

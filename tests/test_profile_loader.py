@@ -400,11 +400,22 @@ class TestLocaleFallbackChain:
         assert "Stored body" in call["text"]
 
     def test_missing_placeholder_does_not_break_send(self) -> None:
-        """SafeDict keeps unknown placeholders literal, render survives."""
+        """A variable the job does not carry does not break the send:
+        render returns None, the caller's stored-text fallback takes the
+        field, and no braces reach the person.
+
+        It asserted "B [{extra}]" -- right while SafeDict printed a
+        missing variable back as "{extra}" and the send survived that
+        way. G5 removed SafeDict: surviving is still the property, but
+        by the fallback, not by a literal."""
         assert render(
             "unit_event", "telegram", "body",
             locale="en", variables={"body": "B"},
-        ) == "B [{extra}]"
+        ) is None
+        assert render(
+            "unit_event", "telegram", "body",
+            locale="en", variables={"body": "B", "extra": "E"},
+        ) == "B [E]"
 
 
 class TestFormatSpecProbing:

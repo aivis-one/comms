@@ -52,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.constants import PAGE_LIMIT_DEFAULT
+from app.core.database import is_unique_violation_of
 from app.core.exceptions import (
     NotFoundError,
     RecipientDeletedError,
@@ -69,8 +70,10 @@ logger = structlog.get_logger()
 _recipients = table("recipients", column("id"), column("deleted_at"))
 
 # Names of the two dedup indexes (migration 0006). Matched against the
-# IntegrityError so ONLY a dedup collision is treated as "already
-# exists" -- any other integrity violation is a real bug and re-raises.
+# constraint name the driver reports for the IntegrityError (never its
+# text -- app/core/database.py is_unique_violation_of) so ONLY a dedup
+# collision is treated as "already exists" -- any other integrity
+# violation is a real bug and re-raises.
 _DEDUP_INDEX_NAMES = ("uq_threads_dedup_subject", "uq_threads_dedup_dm")
 
 
@@ -199,8 +202,7 @@ async def _select_by_dedup_key(
 
 def is_dedup_violation(exc: IntegrityError) -> bool:
     """True iff the IntegrityError is one of OUR dedup indexes firing."""
-    message = str(exc.orig)
-    return any(name in message for name in _DEDUP_INDEX_NAMES)
+    return is_unique_violation_of(exc, *_DEDUP_INDEX_NAMES)
 
 
 async def create_or_get_thread_detailed(

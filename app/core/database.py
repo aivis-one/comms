@@ -268,3 +268,40 @@ def is_unique_violation(exc: IntegrityError) -> bool:
     the driver reports (`pgcode` of the DBAPI error), never by the
     message text."""
     return getattr(exc.orig, "pgcode", None) == UNIQUE_VIOLATION
+
+
+def is_unique_violation_of(exc: IntegrityError, *names: str) -> bool:
+    """Whether an IntegrityError is a unique violation of one of
+    `names` -- the writer's OWN unique indexes: the insert race of its
+    key, and nothing else.
+
+    By the SQLSTATE and by the name of the violated constraint as the
+    driver reports it in a field, never by the message text (G5). The
+    text carries the DETAIL, and the DETAIL carries VALUES: a key, a
+    subject id, a whole failing row for a CHECK or a NOT NULL. A value
+    that spells one of our index names would make another violation
+    read as our race -- the replay would find no winner, or worse, a
+    holder that has nothing to do with this error.
+
+    WHERE THE NAME COMES FROM -- an adapter behaviour, not its API.
+    `exc.orig` is SQLAlchemy's asyncpg adapter error; it copies the
+    SQLSTATE (`pgcode`) but not the constraint name. The name is on the
+    asyncpg exception the adapter chains as `__cause__` (`raise
+    translated_error from error`, sqlalchemy/dialects/postgresql/
+    asyncpg.py _handle_exception), as `constraint_name` -- filled for a
+    unique INDEX as well as a UNIQUE constraint (measured on the pinned
+    asyncpg 0.31.0 / SQLAlchemy 2.0.54, requirements.lock). An upgrade
+    that stops chaining it turns every race into a raised error, loud,
+    never into a swallowed one: each writer's own-race test on a real
+    session (tests/test_race_by_constraint.py) is the sentinel.
+
+    No name (an error without that cause, or a cause without the field)
+    is not our race: the error is raised -- red is better than silently
+    wrong.
+    """
+    if not names:
+        raise ValueError("is_unique_violation_of needs at least one name")
+    if not is_unique_violation(exc):
+        return False
+    cause = getattr(exc.orig, "__cause__", None)
+    return getattr(cause, "constraint_name", None) in names
