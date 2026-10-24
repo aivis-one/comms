@@ -129,8 +129,15 @@ from app.core.lanes import Lane
 # original is never touched; comms translates nothing and reads neither
 # the message nor the model's answer. Without ?locale= the feed is as it
 # was, byte for byte.
+#
+# 3.9.0 is MSG-1: GET /threads?client= -- the threads where a person is the
+# client, in the operator list's order, cursor and with_unread (counted for
+# the client); with_last_message=true puts each row's last message in both
+# lists, and with ?locale= its variant and variant_state, decided by the
+# same code as the feed. Without the new parameters the answers are as
+# they were, byte for byte. Index ix_threads_client_activity (0034).
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.8.0"
+APP_VERSION = "3.9.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
