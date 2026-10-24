@@ -869,7 +869,7 @@ cmd_test() {
         -e APP_ENV=ci \
         -e DATABASE_URL="$test_db_url" \
         -e COMMS_SERVICE_TOKEN=comms-test-not-a-secret-token \
-        "$app_image" python -m pytest -q -p no:cacheprovider; then
+        "$app_image" python -m pytest -q; then
         echo -e "${RED}✗ tests failed${NC}"
         exit 1
     fi

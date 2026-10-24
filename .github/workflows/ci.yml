@@ -188,4 +188,4 @@ jobs:
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
-            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q -p no:cacheprovider"
+            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q"

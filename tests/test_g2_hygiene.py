@@ -373,6 +373,14 @@ class TestTheTestVerb:
     def test_the_suite_runs_on_the_apps_image_with_the_checkout(
         self, tmp_path: Path,
     ) -> None:
+        """The exact `docker run`, to its last argument.
+
+        Its tail was the suite with pytest's cache plugin switched off by
+        a flag, until G3: that held while nobody owned the cache, and it
+        left the cache_dir setting of pyproject.toml without its plugin --
+        "Unknown config option" in every run. G3 removed the flag; the
+        cache goes where pyproject.toml says (TestThePytestCache), and the
+        tail is the suite as written, nothing after `-q`."""
         done, args, calls = _run_test_verb(tmp_path)
         assert done.returncode == 0, done.stdout + done.stderr
         repo = tmp_path / "repo"
@@ -389,8 +397,7 @@ class TestTheTestVerb:
         # CI's variables and nothing else: three -e, no env file.
         assert args.count("-e") == 3 and "--env-file" not in args
         assert args[args.index("sha256:image-of-the-app"):] == [
-            "sha256:image-of-the-app", "python", "-m", "pytest", "-q", "-p",
-            "no:cacheprovider",
+            "sha256:image-of-the-app", "python", "-m", "pytest", "-q",
         ]
         # The pair: the suite does not run inside the live app.
         assert "compose exec -T comms-app python" not in calls
@@ -407,6 +414,228 @@ class TestTheTestVerb:
         assert done.returncode == 1
         assert "no checkout at" in done.stdout
         assert args == []
+
+
+# ---------------------------------------------------------------------------
+# G3 -- the suite runs with pytest's cache; its cache_dir has an owner
+# ---------------------------------------------------------------------------
+#
+# Both runs of the suite on the image (CI's `image` job, `comms test` on a
+# box) once switched pytest's cache plugin off by a flag. pyproject.toml
+# sets cache_dir all the same, and with no plugin to register it every run
+# said "Unknown config option". The plugin now runs and the cache goes
+# where pyproject.toml says -- /tmp, writable under USER comms with the
+# checkout mounted read-only. THE REASON LIVES IN ONE PLACE, pyproject.toml:
+# no run copies the setting, and no text in the tree names the flag.
+#
+# What is read: every text file of the checkout by a walk of the file
+# system -- no `git ls-files`, the image has no git -- never through a
+# symbolic link (deploy/.env on a box points at /opt/comms/.env: broken in
+# the container, secrets outside it), and never under a path .gitignore
+# ignores: .gitignore IS the list of what is not the tree's own text.
+#
+# The needles are put together at run time, so this file does not find
+# itself.
+
+_PLUGIN = "cache" + "provider"
+_SETTING = "cache" + "_dir"
+_SETTING_COPY = re.compile(
+    rf"(?:{_SETTING}\s*=|-o\s*{_SETTING})"
+)
+
+
+def _ignored_by(root: Path) -> list[tuple[str, bool, bool]]:
+    """.gitignore's patterns as (pattern, anchored, directory only).
+    Comments and blank lines are not patterns; the tree's .gitignore has
+    no negation, and one would be refused here rather than misread."""
+    patterns = []
+    for raw in (root / ".gitignore").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        assert not line.startswith("!"), f"a negation in .gitignore: {line}"
+        anchored = line.startswith("/")
+        directory = line.endswith("/")
+        patterns.append((line.strip("/"), anchored, directory))
+    return patterns
+
+
+def _is_ignored(
+    relative: Path, is_dir: bool, patterns: list[tuple[str, bool, bool]],
+) -> bool:
+    from fnmatch import fnmatch
+
+    for pattern, anchored, directory in patterns:
+        if directory and not is_dir:
+            continue
+        if anchored or "/" in pattern:
+            if fnmatch(relative.as_posix(), pattern):
+                return True
+        elif fnmatch(relative.name, pattern):
+            return True
+    return False
+
+
+def tree_texts(root: Path) -> list[tuple[Path, str]]:
+    """(relative path, text) of every UTF-8 file of the tree: not .git,
+    not what .gitignore ignores, and nothing through a symbolic link --
+    a link is neither read nor walked into, broken or not."""
+    patterns = _ignored_by(root)
+    found: list[tuple[Path, str]] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        for entry in sorted(directory.iterdir()):
+            relative = entry.relative_to(root)
+            if entry.is_symlink() or entry.name == ".git":
+                continue
+            if entry.is_dir():
+                if not _is_ignored(relative, True, patterns):
+                    pending.append(entry)
+                continue
+            if _is_ignored(relative, False, patterns):
+                continue
+            try:
+                found.append((relative, entry.read_text(encoding="utf-8")))
+            except UnicodeDecodeError:
+                continue
+    return found
+
+
+def plugin_switched_off(texts: list[tuple[Path, str]]) -> list[str]:
+    return [str(path) for path, text in texts if _PLUGIN in text]
+
+
+def setting_copies(texts: list[tuple[Path, str]]) -> list[str]:
+    """Every assignment of the setting outside pyproject.toml -- `x =`,
+    `x=`, `-o x`, `-ox`; the name in prose is not a copy."""
+    return [
+        f"{path}:{text.count(chr(10), 0, match.start()) + 1}"
+        for path, text in texts if str(path) != "pyproject.toml"
+        for match in _SETTING_COPY.finditer(text)
+    ]
+
+
+def _declared(root: Path) -> Any:
+    import tomllib
+
+    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    return config["tool"]["pytest"]["ini_options"].get(_SETTING)
+
+
+class TestThePytestCache:
+    """The flag that switched the cache plugin off is gone from every text
+    of the tree -- the pair: the cache setting is in pyproject.toml, a
+    non-empty absolute path outside the checkout, and the plugin runs and
+    writes there. Without the second half, dropping the setting would put
+    the cache back into a read-only /app."""
+
+    def test_no_text_switches_the_plugin_off(
+        self, pytestconfig: pytest.Config,
+    ) -> None:
+        root = pytestconfig.rootpath
+        texts = tree_texts(root)
+        read = {str(path) for path, _ in texts}
+        assert {".github/workflows/ci.yml", "deploy/comms-deploy.sh",
+                "pyproject.toml"} <= read
+        assert plugin_switched_off(texts) == []
+
+    def test_the_setting_has_one_place(
+        self, pytestconfig: pytest.Config,
+    ) -> None:
+        texts = tree_texts(pytestconfig.rootpath)
+        assert setting_copies(texts) == []
+        (pyproject,) = [text for path, text in texts
+                        if str(path) == "pyproject.toml"]
+        assert len(_SETTING_COPY.findall(pyproject)) == 1
+
+    def test_the_setting_is_outside_the_checkout(
+        self, pytestconfig: pytest.Config,
+    ) -> None:
+        root = pytestconfig.rootpath
+        declared = _declared(root)
+        assert isinstance(declared, str) and declared.strip(), declared
+        place = Path(declared)
+        assert place.is_absolute(), declared
+        assert not place.resolve().is_relative_to(root.resolve()), declared
+
+    def test_the_plugin_runs_and_writes_there(
+        self, pytestconfig: pytest.Config,
+    ) -> None:
+        """The live half: the plugin is loaded (a flag in PYTEST_ADDOPTS
+        would unload it) and makes its directories under the declared
+        place, not in the checkout."""
+        cache = getattr(pytestconfig, "cache", None)
+        assert cache is not None, "pytest's cache plugin is not running"
+        made = cache.mkdir("g3-probe")
+        declared = Path(_declared(pytestconfig.rootpath)).resolve()
+        assert made.resolve().is_relative_to(declared)
+        assert not made.resolve().is_relative_to(pytestconfig.rootpath.resolve())
+
+
+class TestTheCacheWatchmanItself:
+    """The instrument's twins: each form is found in a planted tree, and
+    what is not the tree's own text is not read."""
+
+    def _tree(self, root: Path, files: dict[str, str]) -> Path:
+        (root / ".gitignore").write_text(
+            (_REPO / ".gitignore").read_text(encoding="utf-8"),
+        )
+        for name, text in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        return root
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            "python -m pytest -q -p no:{p}",
+            "python -m pytest -q -pno:{p}",
+            '["python", "-m", "pytest", "-p", "no:{p}"]',
+            'PYTEST_ADDOPTS="-p no:{p}"',
+            '[tool.pytest.ini_options]\naddopts = "-p no:{p}"',
+            "# runs with no:{p} -- a comment retelling it",
+        ],
+    )
+    def test_every_form_is_found(self, tmp_path: Path, form: str) -> None:
+        root = self._tree(tmp_path, {"deploy/x.sh": form.format(p=_PLUGIN)})
+        assert plugin_switched_off(tree_texts(root)) == ["deploy/x.sh"]
+
+    @pytest.mark.parametrize(
+        ("text", "copies"),
+        [
+            ("pytest -o {s}=/tmp/x", 1),
+            ("pytest -o{s}=/tmp/x", 1),
+            ("{s} = '/tmp/x'", 1),
+            ("{s}=/tmp/x", 1),
+            ("# the {s} setting lives in pyproject.toml", 0),
+            ('config["{s}"]', 0),
+        ],
+    )
+    def test_a_copy_of_the_setting_is_an_assignment(
+        self, tmp_path: Path, text: str, copies: int,
+    ) -> None:
+        root = self._tree(tmp_path, {"deploy/x.sh": text.format(s=_SETTING)})
+        assert len(setting_copies(tree_texts(root))) == copies
+
+    def test_ignored_paths_and_links_are_not_read(self, tmp_path: Path) -> None:
+        """A needle under .venv/, build/ or a cache -> not read; a broken
+        link -> no error, not read; a link to a file holding the needle
+        -> not read. The pair: the same needle in an ordinary file is
+        found."""
+        needle = f"-p no:{_PLUGIN}"
+        root = self._tree(tmp_path, {
+            ".venv/lib/x.py": needle, "build/x.txt": needle,
+            ".pytest_cache/v/x": needle, "x.egg-info/PKG-INFO": needle,
+            "docs/x.md": needle, "deploy/plain.sh": needle,
+        })
+        outside = tmp_path.parent / f"{tmp_path.name}-outside.env"
+        outside.write_text(needle)
+        (root / "deploy" / ".env").symlink_to(outside)
+        (root / "deploy" / "broken").symlink_to(root / "nowhere")
+        (root / "linked").symlink_to(root / "deploy", target_is_directory=True)
+        assert plugin_switched_off(tree_texts(root)) == ["deploy/plain.sh"]
 
 
 # ---------------------------------------------------------------------------
