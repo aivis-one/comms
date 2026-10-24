@@ -330,7 +330,8 @@ async def _waiting_deleters(exclude: int | None = None) -> list[int]:
     async with get_session_factory()() as observer:
         rows = (await observer.execute(text(
             "SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-            "AND query ILIKE 'DELETE FROM notifications%'"
+            "AND query ILIKE 'DELETE FROM notifications%' "
+            "AND datname = current_database()"
         ))).scalars().all()
     return [pid for pid in rows if pid != exclude]
 

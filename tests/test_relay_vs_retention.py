@@ -101,7 +101,10 @@ async def _pid(session: AsyncSession) -> int:
 async def _waiting(pid: int) -> bool:
     async with get_session_factory()() as observer:
         kind = (await observer.execute(
-            text("SELECT wait_event_type FROM pg_stat_activity WHERE pid = :pid"),
+            text(
+                "SELECT wait_event_type FROM pg_stat_activity "
+                "WHERE pid = :pid AND datname = current_database()"
+            ),
             {"pid": pid},
         )).scalar_one_or_none()
     return kind == "Lock"

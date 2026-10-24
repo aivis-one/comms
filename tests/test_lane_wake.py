@@ -40,7 +40,7 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, make_url, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -193,7 +193,7 @@ class TestPostgresFacts:
             pid = driver.get_server_pid()
             async with get_session_factory()() as session:
                 terminated = (await session.execute(
-                    text("SELECT pg_terminate_backend(:pid)"), {"pid": pid},
+                    text(_TERMINATE_OWN), {"pid": pid},
                 )).scalar_one()
             assert terminated is True
             async with asyncio.timeout(5.0):
@@ -270,10 +270,28 @@ class _Worker:
             before = Counter(self.passes)
 
 
+# Terminates the backend ONLY if it is a session of this database: the
+# pid comes through pg_stat_activity filtered by datname, so a pid of
+# another database yields no row -- scalar_one() fails the test instead
+# of killing someone else's connection on a shared server.
+_TERMINATE_OWN = (
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+    "WHERE pid = :pid AND datname = current_database()"
+)
+
+
 async def listener_pid() -> int | None:
+    """The wake listener of THIS database, or None.
+
+    By application_name AND datname: a box runs the suite against
+    <db>_test on the same server as the live worker, whose listener
+    carries the same application_name in <db> (3.7.0 -- fix). Without
+    the database the live listener was "seen" here, and a test that
+    drops the listener could have terminated it."""
     async with get_session_factory()() as session:
         pids = (await session.execute(text(
-            "SELECT pid FROM pg_stat_activity WHERE application_name = :name"
+            "SELECT pid FROM pg_stat_activity WHERE application_name = :name "
+            "AND datname = current_database()"
         ), {"name": WAKE_APPLICATION_NAME})).scalars().all()
     assert len(pids) <= 1, pids
     return pids[0] if pids else None
@@ -674,7 +692,7 @@ class TestALostWake:
             assert dropped is not None
             async with get_session_factory()() as session:
                 assert (await session.execute(
-                    text("SELECT pg_terminate_backend(:pid)"), {"pid": dropped},
+                    text(_TERMINATE_OWN), {"pid": dropped},
                 )).scalar_one() is True
             lost = _request(_INTERACTIVE, recipient)
             await _accept(lost)
@@ -697,6 +715,50 @@ class TestALostWake:
 _DOC = (
     Path(__file__).resolve().parents[1] / "deploy" / "INTEGRATION.md"
 ).read_text(encoding="utf-8")
+
+
+class TestOnASharedServer:
+    """A box runs the suite against <db>_test on the server where the
+    live worker listens in <db>, under the same application_name. The
+    suite must neither see that listener nor be able to kill it (3.7.0
+    -- fix: 15 failures on both boxes, and listener_pid() had a live
+    listener's pid in hand). Built here with a connection to the
+    server's `postgres` database -- there on every Postgres, and
+    reachable without creating anything."""
+
+    async def test_another_databases_listener_is_neither_seen_nor_killed(
+        self,
+    ) -> None:
+        other_url = make_url(settings.database_url).set(database="postgres")
+        engine = create_async_engine(
+            other_url,
+            poolclass=NullPool,
+            connect_args={
+                "server_settings": {"application_name": WAKE_APPLICATION_NAME},
+            },
+        )
+        try:
+            async with engine.connect() as other:
+                driver = (await other.get_raw_connection()).driver_connection
+                assert driver is not None
+                other_pid = driver.get_server_pid()
+                async with get_session_factory()() as session:
+                    # The pair: it IS on the server, under the listener's
+                    # name, in another database -- the state of a box.
+                    seen = (await session.execute(text(
+                        "SELECT datname FROM pg_stat_activity "
+                        "WHERE pid = :pid AND application_name = :name"
+                    ), {"pid": other_pid, "name": WAKE_APPLICATION_NAME})).one()
+                    assert seen == ("postgres",)
+                    assert await listener_pid() is None
+                    killed = (await session.execute(
+                        text(_TERMINATE_OWN), {"pid": other_pid},
+                    )).all()
+                    assert killed == []
+                assert not driver.is_closed()
+                assert (await other.execute(text("SELECT 1"))).scalar_one() == 1
+        finally:
+            await engine.dispose()
 
 
 class TestTheContract:
