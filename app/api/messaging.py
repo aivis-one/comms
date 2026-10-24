@@ -125,7 +125,11 @@ from app.api.paging import (
     page_limit,
 )
 from app.core.constants import MAX_IDEMPOTENCY_KEY_LEN, PAGE_LIMIT_MAX
-from app.core.database import get_db_reader, get_db_session
+from app.core.database import (
+    get_db_reader,
+    get_db_session,
+    is_unique_violation_of,
+)
 from app.core.exceptions import (
     AuthorizationError,
     ClaimTakenError,
@@ -214,6 +218,14 @@ participants_router = APIRouter(
     dependencies=[Depends(require_service_auth)],
 )
 
+
+# The unique index of each writer's Idempotency-Key (migration 0014): a
+# unique violation of exactly this one is a concurrent request with the
+# same key, and its winner is replayed (create_thread,
+# post_thread_message). Recognized by the driver's constraint name,
+# never by the error text (app/core/database.py is_unique_violation_of).
+_THREADS_KEY_INDEX = "uq_threads_idempotency_key"
+_MESSAGES_KEY_INDEX = "uq_messages_idempotency_key"
 
 # One page of a chat list, matched to the list endpoint's own page
 # ceiling (PAGE_LIMIT_MAX, app/api/paging.py): the batch exists to serve
@@ -644,7 +656,7 @@ async def create_thread(
                 fingerprint=fingerprint,
             )
     except IntegrityError as exc:
-        if "uq_threads_idempotency_key" not in str(exc.orig):
+        if not is_unique_violation_of(exc, _THREADS_KEY_INDEX):
             raise
         # A concurrent request with this key won the insert.
         winner = await _replay(session, Thread, key, fingerprint)
@@ -930,7 +942,7 @@ async def post_thread_message(
                 fingerprint=fingerprint,
             )
     except IntegrityError as exc:
-        if "uq_messages_idempotency_key" not in str(exc.orig):
+        if not is_unique_violation_of(exc, _MESSAGES_KEY_INDEX):
             raise
         # A concurrent request with this key won: its message, no ping.
         winner = await _replay(session, Message, key, fingerprint)

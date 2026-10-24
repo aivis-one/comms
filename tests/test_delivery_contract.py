@@ -146,11 +146,14 @@ class TestTheTemplatesCarryTheContract:
     deploy works without them -- which is exactly why they have to be
     written down, or the other side has to read our source to learn
     what to match.
+
+    Until G4 the names were asserted in two templates, the deploy's and
+    the root .env.example; G4 left one (the root copy had drifted from
+    the deploy's and is gone), so the parameter has one value. Every
+    other variable of the deploy is held by tests/test_env_template.py.
     """
 
-    @pytest.mark.parametrize(
-        "template", ["deploy/.env.example", ".env.example"],
-    )
+    @pytest.mark.parametrize("template", ["deploy/.env.example"])
     @pytest.mark.parametrize(
         "key", ["COMMS_EVENTS_STREAM", "COMMS_CONSUMER_GROUP"],
     )

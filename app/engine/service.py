@@ -76,6 +76,7 @@ from app.audience.schedule import recipient_deferred_until
 from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT, body_endpoint
 from app.core.config import settings
 from app.core.constants import MAX_LLM_LETTER_CHARS
+from app.core.database import is_unique_violation_of
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.lanes import Lane
 from app.core.sanitize import sanitize_text, sanitized_traceback
@@ -316,8 +317,11 @@ async def accept_notification(
             )
     except IntegrityError as exc:
         # Only OUR index means "key taken"; any other violation is a
-        # real bug and must not be swallowed as a replay.
-        if IDEMPOTENCY_INDEX_NAME not in str(exc.orig):
+        # real bug and must not be swallowed as a replay. By the
+        # driver's SQLSTATE and constraint name, never by the text: the
+        # text carries the failing row, our key included
+        # (app/core/database.py is_unique_violation_of).
+        if not is_unique_violation_of(exc, IDEMPOTENCY_INDEX_NAME):
             raise
         holder = (
             await session.execute(

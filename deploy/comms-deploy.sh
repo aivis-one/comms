@@ -844,8 +844,8 @@ cmd_test() {
     # "The suite inside the image"): on the image comms-app runs -- its
     # Python and packages -- with this checkout mounted over /app,
     # read-only. The image ships app/, tests/ and migrations/ but not
-    # deploy/, scripts/, .github/ or .env.example, which the suite reads
-    # too; `exec` into comms-app ran without them, and in the app's own
+    # deploy/, scripts/ or .github/, which the suite reads too; `exec`
+    # into comms-app ran without them, and in the app's own
     # environment -- its channel keys and token -- where CI's suite has
     # three variables. So: a one-off container, in comms-app's network
     # namespace (it reaches comms-postgres by the same name), with CI's
@@ -869,7 +869,7 @@ cmd_test() {
         -e APP_ENV=ci \
         -e DATABASE_URL="$test_db_url" \
         -e COMMS_SERVICE_TOKEN=comms-test-not-a-secret-token \
-        "$app_image" python -m pytest -q -p no:cacheprovider; then
+        "$app_image" python -m pytest -q; then
         echo -e "${RED}✗ tests failed${NC}"
         exit 1
     fi

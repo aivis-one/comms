@@ -24,7 +24,8 @@
 #   M10 the wait for a slot inside the timeout -- unkillable since H7: a
 #       portion is one round of the slots, no call waits for one
 #       (TestTheSlotIsNotTimed holds what stays)
-#   M11 a key out of .env.example / the sentence out of INTEGRATION.md
+#   M11 a key out of deploy/.env.example / the sentence out of
+#       INTEGRATION.md
 #                                                   -> TestTheContract
 # NOT BUILT: a call that ends exactly AT the lane's timeout -- which of
 # wait_for and the call wins there is the loop's, not the code's.
@@ -78,7 +79,7 @@ from tests.helpers import create_recipient, intake_fields
 
 _REPO = Path(__file__).resolve().parents[1]
 _DOC = (_REPO / "deploy" / "INTEGRATION.md").read_text(encoding="utf-8")
-_ENV_EXAMPLE = (_REPO / ".env.example").read_text(encoding="utf-8")
+_ENV_EXAMPLE = (_REPO / "deploy" / ".env.example").read_text(encoding="utf-8")
 _FORMATTERS = _REPO / "app" / "engine" / "formatters.py"
 
 # in_app types of the fixture profile. The second has two channels
@@ -614,8 +615,14 @@ class TestTheTelegramTimeoutIsTotal:
 
 
 class TestTheContract:
-    """done-when 3: the four settings in .env.example with their
-    defaults, and the rule said once in INTEGRATION.md. M11."""
+    """done-when 3: the four settings in the deploy's template with
+    their defaults, and the rule said once in INTEGRATION.md. M11.
+
+    Until G4 the four were read in the root .env.example as live lines
+    (`VARIABLE=30`). G4 made deploy/.env.example the one template (the
+    root copy had drifted from it and is gone), where a defaulted knob
+    is a commented line holding its default -- so the line may carry
+    the comment mark; the number is still the default, still 30."""
 
     def test_the_variables_are_the_settings_both_ways(self) -> None:
         """The lanes' deliver timeouts are the settings named by lane --
@@ -632,7 +639,7 @@ class TestTheContract:
     @pytest.mark.parametrize("lane", list(Lane))
     def test_env_example_has_the_default(self, lane: Lane) -> None:
         variable = lane_deliver_timeout_variable(lane)
-        written = re.search(rf"^{variable}=(\d+)$", _ENV_EXAMPLE, re.M)
+        written = re.search(rf"^#?{variable}=(\d+)$", _ENV_EXAMPLE, re.M)
         assert written is not None, variable
         default = Settings.model_fields[variable.lower()].default
         assert int(written.group(1)) == default == 30

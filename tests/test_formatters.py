@@ -253,19 +253,29 @@ class TestTelegramDeliver:
         """Template path (Phase 3a item 2): both fields rendered from
         the sheet -> VERBATIM, no injected <b>; the sheet owns its
         markup. Flags fall to channel defaults (no sheet flags for
-        unit_event)."""
+        unit_event).
+
+        The job now carries `extra`, the one variable of the sheet's
+        body that is not a core field. It used to be left out, and the
+        test expected the body as "World [{extra}]": right while the
+        engine printed a missing variable back as "{extra}" (SafeDict).
+        G5 removed that -- a missing variable makes the field fall back
+        to the stored text (tests/test_template_missing_variable.py) --
+        so without `extra` the body would no longer come from the sheet
+        and this test would not be about the template path at all."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
         recipient = _recipient()
 
-        ok = await fmt.deliver(_notification(), _delivery(), recipient)
+        ok = await fmt.deliver(
+            _notification(action_data={"extra": "x"}), _delivery(), recipient,
+        )
 
         assert ok is True
         (call,) = bot.calls
         assert call["chat_id"] == recipient.telegram_id
-        # en fixture sheet: title "{title}", body "{body} [{extra}]";
-        # missing {extra} stays literal (SafeDict).
-        assert call["text"] == "Hello\n\nWorld [{extra}]"
+        # en fixture sheet: title "{title}", body "{body} [{extra}]".
+        assert call["text"] == "Hello\n\nWorld [x]"
         assert call["disable_web_page_preview"] is True
         assert call["disable_notification"] is False
         assert call["reply_markup"] is None
@@ -773,14 +783,22 @@ class TestComposition:
 
     async def test_both_from_template_verbatim(self) -> None:
         """Template path: no injected markup at all -- the sheet's own
-        markup (here: none) is the whole story."""
+        markup (here: none) is the whole story.
+
+        The job carries `extra` now. Without it the body was
+        "World [{extra}]" from the sheet while a missing variable was
+        printed back literally (SafeDict); since G5 it makes the body
+        fall back to the stored text, which would turn this "both from
+        the template" case into a mixed one."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
 
-        await fmt.deliver(_notification(), _delivery(), _recipient())
+        await fmt.deliver(
+            _notification(action_data={"extra": "x"}), _delivery(), _recipient(),
+        )
 
         (call,) = bot.calls
-        assert call["text"] == "Hello\n\nWorld [{extra}]"
+        assert call["text"] == "Hello\n\nWorld [x]"
         assert "<b>" not in call["text"]
 
     async def test_both_stored_keeps_service_presentation(self) -> None:

@@ -136,8 +136,17 @@ from app.core.lanes import Lane
 # lists, and with ?locale= its variant and variant_state, decided by the
 # same code as the feed. Without the new parameters the answers are as
 # they were, byte for byte. Index ix_threads_client_activity (0034).
+#
+# 3.10.0 is G3-G5, a MINOR: a dead letter keeps the envelope without the
+# letter and without llm_audio, the fingerprint of data and a reason that
+# is never an exception's text -- a narrowing for a deploy that read the
+# DLQ; an entry that is not UTF-8 is dead-lettered instead of stopping
+# the consumer; deploy/.env.example is the one template; the insert race
+# is told by SQLSTATE and the driver's constraint name; a template
+# variable the job does not carry is never printed; the suite on the
+# image runs with pytest's cache.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.10.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
