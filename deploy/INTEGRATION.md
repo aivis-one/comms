@@ -1660,6 +1660,68 @@ A client writes in German to a support operator who reads English.
    `variant_state: ready`. With `?locale=de` -- the client's own feed --
    `M` is `not_needed`: the model found it written in German.
 
+## 13. The thread list -- for the operator and for the client
+
+`GET /api/v1/threads` lists **one reader's** threads, most recently
+active first: an **operator's** -- the threads they may see -- or a
+**client's** -- the threads in which they are the client, their
+conversations with the other side and with support in one list.
+Exactly one reader per call.
+
+**Trust (spec §10.11): `operator`, `client` and `is_supervisor` are
+taken on faith.** comms checks the service token, not who is asking.
+Your proxy derives the reader from its session and never forwards one
+the user sent: a client the user chose is the user reading someone
+else's conversations, and the fault is the proxy's.
+
+| parameter | value |
+|---|---|
+| `operator` | uuid -- the operator whose visible threads are listed: assigned to them, or unassigned in a section they serve |
+| `client` | uuid -- the person whose threads as the client are listed; never one where they are the operator |
+| `is_supervisor` | `true` widens an operator's read to every thread; with `client` it is 422 |
+| `with_unread` | `true`: each row the reader takes part in carries `unread` -- their unread messages in it |
+| `with_last_message` | `true`: each row carries `last_message` |
+| `locale` | the reader's language (section 12's form); only with `with_last_message`, else 422 |
+| `limit` | page size, 1..100 (section 5) |
+| `cursor` | the previous page's `next_cursor` (section 5) |
+
+Both readers, or none, is 422 `validation`; so is a parameter given
+twice. The order is `COALESCE(last_message_at, created_at)`
+descending, then `id` descending -- a message moves its thread up --
+and the cursor walks it the same way for both readers.
+
+**A row** is the thread: `id`, `client`, `operator_kind`,
+`operator_value`, `assignee`, `kind`, `status`, `subject_type`,
+`subject_id`, `title`, `priority`, `last_message_at`, `created_at`.
+Opt-in keys are added to it, never anything else:
+
+| key | when | value |
+|---|---|---|
+| `unread` | `with_unread=true`, on a row the reader takes part in | an integer: messages not sent by the reader, newer than their read pointer (`POST /threads/{id}/read`). On the client's list every row has it; on an operator's, an unclaimed section thread in their pool has none -- not theirs, which a zero would hide |
+| `last_message` | `with_last_message=true`, on every row | `id`, `sender`, `body`, `created_at`; with `locale` also `variant` and `variant_state`; `null` when the thread has no message |
+
+**Without these parameters every row is exactly what it was.**
+
+`last_message` is the message the thread's feed gives first: the
+newest by `created_at`, and of two of the same instant the one with
+the greater `id`. It is what is stored -- comms translates nothing and
+keeps no copy for you.
+
+### The preview in the reader's language
+
+With `locale`, `last_message` carries `variant` and `variant_state`
+exactly as an item of the feed in that language does (section 12) --
+the same decision, made by the same code. A person who must never see
+an answer in a language they do not read should be shown by this:
+
+| `variant_state` | show in the row |
+|---|---|
+| `ready` | `variant.body` -- the message in the reader's language |
+| `not_needed` | `body` -- the message is already in the reader's language |
+| `preparing` | not `body`: a translation is on its way |
+| `impossible` | not `body` silently: there will be no translation -- your decision what to say |
+| `not_requested` | not `body`: **nothing has been translated yet -- do not show the original as if it were the reader's language**; decide whether to ask a model (section 12) |
+
 ## Operating the comms stack
 
 What an operator needs on the box, collected here because every item

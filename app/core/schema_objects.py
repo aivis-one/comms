@@ -276,6 +276,16 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "id DESC)"
         ),
     ),
+    # The client's thread list (MSG-1, migration 0034): the client's
+    # threads in the list's own order -- measured, not assumed.
+    "ix_threads_client_activity": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_threads_client_activity ON public.threads "
+            "USING btree (client, COALESCE(last_message_at, created_at) DESC, "
+            "id DESC)"
+        ),
+    ),
     "ix_threads_close_notify_pending": IndexShape(
         unique=False,
         definition=(

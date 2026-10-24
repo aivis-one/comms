@@ -25,6 +25,7 @@ from uuid import UUID
 import structlog
 from sqlalchemy import (
     ColumnElement,
+    Select,
     and_,
     func,
     or_,
@@ -329,8 +330,6 @@ async def list_visible_threads(
     next_cursor is None on the final page. The opaque base64 wire form
     of the cursor lives at the API edge (parallel to the inbox codec).
     """
-    activity = func.coalesce(Thread.last_message_at, Thread.created_at)
-
     stmt = select(Thread)
     if not is_supervisor:
         stmt = stmt.where(
@@ -346,6 +345,40 @@ async def list_visible_threads(
                 ),
             )
         )
+    return await _activity_page(session, stmt, limit=limit, cursor=cursor)
+
+
+async def list_client_threads(
+    session: AsyncSession,
+    *,
+    client: UUID,
+    limit: int = PAGE_LIMIT_DEFAULT,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> tuple[Sequence[Thread], tuple[datetime, UUID] | None]:
+    """The threads in which `client` IS THE CLIENT, most-recently-active
+    first (MSG-1) -- their conversations with masters and with support,
+    one list. Exactly that role: a thread where the same person is the
+    assignee or the operator is not theirs AS A CLIENT and is not here.
+
+    The same order, keyset and cursor as list_visible_threads (one
+    _activity_page). TRUSTED like `operator`: the product's proxy puts
+    the client from its session; comms takes it on faith (spec §10.11).
+    """
+    stmt = select(Thread).where(Thread.client == client)
+    return await _activity_page(session, stmt, limit=limit, cursor=cursor)
+
+
+async def _activity_page(
+    session: AsyncSession,
+    stmt: Select[tuple[Thread]],
+    *,
+    limit: int,
+    cursor: tuple[datetime, UUID] | None,
+) -> tuple[Sequence[Thread], tuple[datetime, UUID] | None]:
+    """One keyset page of `stmt` in the activity order -- the operator's
+    list and the client's share it, so the order and the cursor cannot
+    drift apart."""
+    activity = func.coalesce(Thread.last_message_at, Thread.created_at)
     if cursor is not None:
         # Row-value comparison against the (activity, id) cursor: the
         # next page is strictly "older" in the DESC order. The
