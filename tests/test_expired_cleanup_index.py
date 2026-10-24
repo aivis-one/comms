@@ -58,7 +58,7 @@ from app.engine.service import (
     delete_expired_notifications_batch,
     delete_terminal_notifications_batch,
 )
-from tests.helpers import notification_row_fields
+from tests.helpers import notification_row_fields, sql_shape
 from tests.test_recipient_schedule_field import (
     _channel,
     _declare,
@@ -167,7 +167,7 @@ async def _plan_of(batch: Any, **kwargs: Any) -> dict[str, Any]:
             await batch(session, **kwargs)
         await session.rollback()
         (statement, parameters), = [
-            (s, p) for s, p in seen if s.lstrip().upper().startswith("DELETE")
+            (s, p) for s, p in seen if sql_shape(s).verb == "DELETE FROM"
         ]
         raw = await session.connection()
         rows = await raw.exec_driver_sql(

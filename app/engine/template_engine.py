@@ -116,13 +116,18 @@ def render(
     try:
         return template_str.format_map(safe_vars)
     except (ValueError, TypeError, IndexError, AttributeError) as exc:
+        # The exception's CLASS, never its text (H8): a nested spec
+        # ({amount:{width}}) puts a value of the letter into the text
+        # ("Invalid format specifier '<value>' ..."). Its place is the
+        # coordinates below -- str.format_map raises from C, so the
+        # traceback's place would be this line for every template.
         logger.warning(
             "template_render_error",
             type=notification_type,
             channel=channel,
             field=field,
             locale=requested,
-            error=str(exc)[:200],
+            error_class=type(exc).__name__,
         )
         return None
 

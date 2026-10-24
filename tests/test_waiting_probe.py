@@ -37,6 +37,7 @@ from app.core.lanes import Lane
 from app.engine.depth import lane_depth
 from app.engine.processor import process_lane
 from tests.conftest import make_tables_pristine
+from tests.helpers import sql_shape
 
 # The probe's whole budget, buffers -- TestTheProbePlan's for the fold.
 _BUDGET = 10
@@ -74,8 +75,8 @@ async def _statements() -> list[tuple[str, Any]]:
             await lane_depth(session)
     probing = [
         (statement, parameters) for statement, parameters in seen
-        if "notification_deliveries" in statement
-        and "FROM notifications" in statement
+        if (shape := sql_shape(statement)).table == "notifications"
+        and "notification_deliveries" in shape.sources
     ]
     assert len(probing) >= 2, "the selection and the depth both probe"
     return probing
@@ -104,7 +105,7 @@ def _buffers(node: dict[str, Any]) -> int:
 
 
 async def _seed_h11(around: str, statistics: str) -> None:
-    await h11._sends(h11._AROUND[around], statistics)
+    await h11._sends(h11._AROUND[around], statistics, *h11._sends_ids())
 
 
 async def _seed_h12(shape: str, statistics: str) -> None:

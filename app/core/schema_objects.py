@@ -133,8 +133,10 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "subject_id) WHERE (subject_type IS NOT NULL)"
         ),
     ),
-    # Arbitrates the race when two callers create the same section;
-    # the service catches the IntegrityError BY THIS NAME.
+    # Arbitrates the race when two callers create the same section:
+    # the loser's insert fails on it with a unique violation, which the
+    # insert race's one rule (app/core/database.py
+    # once_more_on_insert_race) recognizes by its SQLSTATE.
     "uq_sections_key": IndexShape(
         unique=True,
         definition=(
@@ -383,7 +385,6 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # (H13, migration 0030; app/core/database.py JSON_VALUE).
     "ck_notifications_channels_not_json_null",
     "ck_notifications_action_data_not_json_null",
-    "ck_notification_deliveries_channel_options_not_json_null",
     "ck_recipients_allowed_windows_not_json_null",
     "ck_llm_calls_sets_not_json_null",
     "ck_llm_calls_letter_not_json_null",

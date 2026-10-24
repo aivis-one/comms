@@ -108,8 +108,8 @@ class TestNoProbeWalksTheBadgesIndex:
         self, kind: str, form: str, statistics: str,
     ) -> None:
         if kind == "h11":
-            await h11._sends(h11._AROUND[form], statistics)
-            job: Any = h11._MINE
+            job, other = h11._sends_ids()
+            await h11._sends(h11._AROUND[form], statistics, job, other)
         else:
             job, _ = await h12._seed(form, statistics)
         for name, statement in _queries(job).items():
@@ -127,7 +127,7 @@ class TestTheBadgeAndForgetting:
     async def _seed(self) -> str:
         """A recipient of the other send (one waiting delivery) given a
         long read history of the done sends and three unread."""
-        await h11._sends(h11._AROUND["two_percent"], "none")
+        await h11._sends(h11._AROUND["two_percent"], "none", *h11._sends_ids())
         async with get_session_factory()() as session:
             recipient: str = (await session.execute(text(
                 "SELECT recipient_id FROM notification_deliveries "
@@ -193,7 +193,7 @@ class TestNothingWaiting:
         """The index scans are off only for the seed's transaction
         (SET LOCAL): after its commit, the session plans with the
         defaults -- the queries the tests measure see the real planner."""
-        await h11._sends(h11._AROUND["two_percent"], "none")
+        await h11._sends(h11._AROUND["two_percent"], "none", *h11._sends_ids())
         async with get_session_factory()() as session:
             await analyze_with_nothing_waiting(session)
             assert (await session.execute(
@@ -206,7 +206,7 @@ class TestNothingWaiting:
                 )).scalar_one() == "on", setting
 
     async def test_the_statistics_say_nothing_waits_and_the_rows_do(self) -> None:
-        await h11._sends(h11._AROUND["ten_percent"], "none")
+        await h11._sends(h11._AROUND["ten_percent"], "none", *h11._sends_ids())
         async with get_session_factory()() as session:
             await analyze_with_nothing_waiting(session)
             await session.commit()

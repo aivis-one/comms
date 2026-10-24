@@ -1482,14 +1482,34 @@ class TestTheContract:
     def test_the_letter_is_its_fields(self) -> None:
         assert set(_table("`llm`")) == LLM_LETTER_FIELDS
 
-    def test_the_type_is_its_two_fields(self) -> None:
-        """The llm kind's own fields, documented in order: two in P5-1,
-        three since P5-2 added max_audio_bytes."""
+    def test_the_type_is_its_three_fields(self) -> None:
+        """The llm kind's own fields: in the ONE table of the type record
+        (section 3), marked "the llm kind only" -- and section 11 names
+        the same three, without a second copy of their values.
+
+        Until G2 section 11 carried its own table of the three, and this
+        test read it (two fields in P5-1, three since P5-2 added
+        max_audio_bytes); G2 made the section 3 table the one place the
+        record is written, so the three are read from there."""
         from app.profile.loader import RECORD_FIELDS
 
-        documented = _table("The type")
-        assert documented == ["llm_sets", "answer_keep", "max_audio_bytes"]
-        assert set(documented) <= set(RECORD_FIELDS)
+        section_3 = _DOC[_DOC.index("\n## 3. "):_DOC.index("\n## 3a. ")]
+        record = section_3.split("\n### The type record -- every field", 1)[1]
+        rows = [
+            line for line in record.split("\n### ")[0].splitlines()
+            if line.startswith("| `")
+        ]
+        llm_only = [
+            re.findall(r"`([^`]+)`", row.split("|")[1])[0]
+            for row in rows if "(the llm kind only" in row
+        ]
+        assert llm_only == ["llm_sets", "answer_keep", "max_audio_bytes"]
+        assert set(llm_only) <= set(RECORD_FIELDS)
+        kind = _section_11().split("\n### The type -- for the product's profile")[1]
+        kind = kind.split("\n### ")[0]
+        assert "| field |" not in kind
+        for name in llm_only:
+            assert f"`{name}`" in kind
 
     def test_the_reserved_params_are_listed(self) -> None:
         start = _section_11().index("`params` may not name")

@@ -284,6 +284,12 @@ async def create_or_get_thread_detailed(
         idempotency_key=idempotency_key,
         fingerprint=fingerprint,
     )
+    # NOT the insert race's shared rule (app/core/database.py
+    # once_more_on_insert_race), on purpose (G1): a thread has two
+    # unique keys, and only the dedup indexes are this function's race.
+    # A collision on uq_threads_idempotency_key belongs to the caller
+    # (app/api/messaging.py create_thread replays the winner); the shared
+    # rule would run the whole find-or-create again on it.
     try:
         async with session.begin_nested():
             session.add(thread)
@@ -336,8 +342,8 @@ async def create_or_get_thread(
 
     The CORE is create_or_get_thread_detailed, which the application
     calls (app/api/messaging.py -- the only app-side caller); this name
-    survives for the callers that do not need the flag, i.e. the 47
-    call sites across 12 test files of the closed messaging phases.
+    survives for the callers that do not need the flag: the test call
+    sites of the closed messaging phases.
 
     WHY two names rather than one tuple-returning function: the flag
     was added by a micro-delivery (H-T2-C1-rev, 2026-08-04) whose whole

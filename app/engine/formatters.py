@@ -19,8 +19,8 @@
 #   TelegramFormatter -- aiogram Bot.send_message.
 #
 # TELEGRAM (merged):
-#   - Message building, inline deep-link button, channel_options
-#     handling and the injected-Bot constructor come from velo
+#   - Message building, inline deep-link button and the
+#     injected-Bot constructor come from velo
 #     (the richer donor for the send path).
 #   - format_deep_link enforces the ONE-PARAMETER encoding rule
 #     (Phase 3a item 3, arch doc §2.6): the whole ?startapp= value is
@@ -191,7 +191,7 @@ class ChannelFormatter(Protocol):
 
         Args:
             notification: The parent notification (title, body, action_data).
-            delivery: The delivery record (channel, channel_options).
+            delivery: The delivery record (channel).
             recipient: The recipient (telegram_id, email, locale).
 
         Returns:
@@ -430,9 +430,9 @@ class TelegramFormatter:
         the seam between two fields.
 
         PRESENTATION (Phase 3a item 1): button_text / disable_preview
-        / silent resolve template sheet (localizable default) <
-        channel_options (per-delivery override); the deep-link button
-        appears when action_data carries an action.
+        / silent come from the template sheet (localizable default),
+        else the channel's default; the deep-link button appears when
+        action_data carries an action.
 
         Raises:
             PermanentDeliveryError: If the recipient has no telegram_id,
@@ -499,15 +499,12 @@ class TelegramFormatter:
 
         # Build inline keyboard if a deep link is available.
         deep_link = self.format_deep_link(notification.action_data)
-        channel_options = delivery.channel_options
         keyboard = None
         if deep_link:
             # BUTTON TEXT (Phase 3a item 1 / fix A), priority low ->
             # high: hardcoded "Open" < template sheet field
             # "button_text" (localizable default, same locale chain as
-            # title/body) < channel_options["button_text"]. Same key
-            # on both sides on purpose: the override is literal --
-            # same key, different source, channel_options win.
+            # title/body).
             #
             # THIRD RENDERING MODE (fix F) -- do NOT "fix" this by
             # escaping: title/body enter ParseMode.HTML and take
@@ -517,10 +514,6 @@ class TelegramFormatter:
             # Escaping here would show a literal "&amp;" to the user;
             # there is no injection surface -- markup is not
             # interpreted, and the URL is validated separately.
-            # Asymmetry, on purpose: the SHEET value is a TEMPLATE
-            # (rendered per locale, dry-run checked at startup); the
-            # channel_options value is a per-delivery LITERAL from the
-            # producer and is not format_map'ed.
             button_text = "Open"
             rendered_button = render(
                 notification_type=notification.type,
@@ -531,8 +524,6 @@ class TelegramFormatter:
             )
             if rendered_button is not None:
                 button_text = rendered_button
-            if channel_options and "button_text" in channel_options:
-                button_text = channel_options["button_text"]
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text=button_text, url=deep_link)]
@@ -541,8 +532,7 @@ class TelegramFormatter:
 
         # PRESENTATION FLAGS (Phase 3a item 1), priority low -> high:
         # channel default < template sheet flag (bool leaf, resolved
-        # through the same per-field locale chain as the texts) <
-        # channel_options override.
+        # through the same per-field locale chain as the texts).
         sheet_preview = resolve_flag(
             notification.type, DeliveryChannel.TELEGRAM,
             "disable_preview", locale,
@@ -552,11 +542,6 @@ class TelegramFormatter:
             notification.type, DeliveryChannel.TELEGRAM, "silent", locale,
         )
         silent = False if sheet_silent is None else sheet_silent
-        if channel_options:
-            disable_preview = channel_options.get(
-                "disable_preview", disable_preview,
-            )
-            silent = channel_options.get("silent", silent)
 
         try:
             await self._bot.send_message(
@@ -1830,11 +1815,19 @@ def _real_http_client_factory() -> Any:
     sent) versus read timed out (the message may be on its way). A
     timeout swallowed by the lane's wait_for (app/engine/service.py)
     arrives as a bare TimeoutError with that distinction lost.
+
+    trust_env=False (G1): the provider is called AS CONFIGURED -- no
+    proxy, netrc or CA bundle taken from the process environment, the
+    same rule as the body client below. No deploy of comms sets one;
+    an environment that grew one would otherwise reroute every letter
+    silently.
     """
     import httpx
 
     timeouts = channel_spec(DeliveryChannel.EMAIL).client_timeouts
-    return httpx.AsyncClient(timeout=httpx.Timeout(**timeouts))
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(**timeouts), trust_env=False,
+    )
 
 
 def _real_llm_http_client_factory() -> Any:
@@ -1842,11 +1835,14 @@ def _real_llm_http_client_factory() -> Any:
     channel's spec (app/core/channels.py client_timeouts): a call times
     out inside the client, below LLM_DELIVER_TIMEOUT_SECONDS, where a
     connect failure (never reached) and a read timeout (may have been
-    answered and billed) stay apart."""
+    answered and billed) stay apart. trust_env=False, as for the email
+    client above."""
     import httpx
 
     timeouts = channel_spec(DeliveryChannel.LLM).client_timeouts
-    return httpx.AsyncClient(timeout=httpx.Timeout(**timeouts))
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(**timeouts), trust_env=False,
+    )
 
 
 def _real_llm_body_client_factory() -> Any:

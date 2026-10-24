@@ -35,10 +35,10 @@ from uuid import UUID
 
 import structlog
 from sqlalchemy import ColumnElement, or_, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
+from app.core.database import once_more_on_insert_race
 from app.core.exceptions import NotFoundError
 from app.messaging.models import SectionMember
 from app.messaging.sections import get_or_create_section
@@ -158,42 +158,24 @@ async def set_membership(
     if member:
         if existing is not None:
             return
-        if not await recipient_exists(session, operator_id):
-            raise NotFoundError(
-                f"Cannot add unknown recipient {operator_id} to section "
-                f"{section_key!r}: the identity sync must precede the "
-                f"membership sync"
-            )
-        try:
-            # SAVEPOINT: a concurrent identical event loses the insert
-            # race, and that must not poison the caller's transaction.
-            async with session.begin_nested():
-                session.add(
-                    SectionMember(
-                        section_id=section.id, operator_id=operator_id
-                    )
-                )
-                await session.flush()
-        except IntegrityError:
-            duplicate = await session.scalar(
-                select(SectionMember).where(
-                    SectionMember.section_id == section.id,
-                    SectionMember.operator_id == operator_id,
-                )
-            )
-            if duplicate is None:
-                # Not our composite key: a real integrity fault, not a
-                # concurrent identical event. The unknown-recipient case
-                # was already turned into a retryable NotFoundError
-                # above, so anything arriving here is a bug worth
-                # surfacing rather than retrying.
-                raise
-            return
-        logger.info(
-            "section_member_added",
+        added = await once_more_on_insert_race(
+            session,
+            lambda: _add_member_once(
+                session,
+                section_id=section.id,
+                section_key=section_key,
+                operator_id=operator_id,
+            ),
+            event="section_member_add_raced",
             section_key=section_key,
             operator_id=str(operator_id),
         )
+        if added:
+            logger.info(
+                "section_member_added",
+                section_key=section_key,
+                operator_id=str(operator_id),
+            )
         return
 
     if existing is None:
@@ -205,3 +187,39 @@ async def set_membership(
         section_key=section_key,
         operator_id=str(operator_id),
     )
+
+
+async def _add_member_once(
+    session: AsyncSession,
+    *,
+    section_id: UUID,
+    section_key: str,
+    operator_id: UUID,
+) -> bool:
+    """Add the operator to the section's roster; whether THIS call did.
+
+    Run by the insert race's one rule (app/core/database.py
+    once_more_on_insert_race): a concurrent identical event that loses
+    the insert on the composite key runs this once more and finds the
+    winner's row; any other integrity error is raised at once. The
+    operator is not created: an unknown one is a NotFoundError, which
+    the consumer retries until the identity sync catches up (see
+    set_membership).
+    """
+    existing = await session.scalar(
+        select(SectionMember).where(
+            SectionMember.section_id == section_id,
+            SectionMember.operator_id == operator_id,
+        )
+    )
+    if existing is not None:
+        return False
+    if not await recipient_exists(session, operator_id):
+        raise NotFoundError(
+            f"Cannot add unknown recipient {operator_id} to section "
+            f"{section_key!r}: the identity sync must precede the "
+            f"membership sync"
+        )
+    session.add(SectionMember(section_id=section_id, operator_id=operator_id))
+    await session.flush()
+    return True

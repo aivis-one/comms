@@ -5,8 +5,9 @@
 # Every "is it empty?" here is asked of the DATABASE (`col IS NULL`), not
 # of the model: the ORM reads JSON `null` and SQL NULL alike, as None,
 # and that is exactly how the trap hid. The watchman walks the models'
-# metadata, and its pair is that it finds the seven columns -- a walk
-# over nothing would be green on any code.
+# metadata, and its pair is that it finds the six columns -- a walk
+# over nothing would be green on any code. (Seven until G1 dropped
+# notification_deliveries.channel_options, migration 0032.)
 # =============================================================================
 
 from __future__ import annotations
@@ -35,9 +36,14 @@ import app.engine.models
 import app.messaging.models  # noqa: F401 -- every model on the metadata
 from app.audience.models import Recipient
 from app.audience.prefs import set_schedule
-from app.audience.sync import is_unique_violation, once_more_on_insert_race
 from app.core.config import settings
-from app.core.database import Base, dispose_engine, get_session_factory
+from app.core.database import (
+    Base,
+    dispose_engine,
+    get_session_factory,
+    is_unique_violation,
+    once_more_on_insert_race,
+)
 from app.engine.models import LLMCall, Notification, NotificationDelivery
 from app.transport.consumer import StreamConsumer
 from tests.helpers import create_recipient, notification_row_fields
@@ -46,10 +52,13 @@ _REPO = Path(__file__).resolve().parents[1]
 _MIGRATION = _REPO / "migrations" / "versions" / "2026_10_15_0030_json_null_is_null.py"
 _BEFORE = "0029_status_index_with_id"
 _SUBJECT = "0030_json_null_is_null"
+_DROPPED = (
+    _REPO / "migrations" / "versions" / "2026_10_22_0032_drop_channel_options.py"
+)
 
 
-def _migration_module() -> Any:
-    spec = importlib.util.spec_from_file_location("m0030", _MIGRATION)
+def _migration_module(path: Path = _MIGRATION) -> Any:
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -98,15 +107,23 @@ class TestTheWatchman:
             f"JSON_VALUE): {missing}"
         )
 
-    def test_it_sees_the_seven(self) -> None:
-        """The pair: the walk finds the columns -- the ones the migration
-        lists, nullable as it says."""
+    def test_it_sees_the_six(self) -> None:
+        """The pair: the walk finds the columns -- the ones 0030 lists,
+        nullable as it says, less the ones a later migration dropped.
+
+        It was "the seven, exactly 0030's list" until G1: 0032 dropped
+        notification_deliveries.channel_options, and 0030, a migration
+        in main, is not edited -- so the list is 0030's minus 0032's
+        DROPPED_JSONB_COLUMNS, and that set is not empty either."""
         columns = _json_columns()
+        dropped = set(_migration_module(_DROPPED).DROPPED_JSONB_COLUMNS)
         listed = {
             (table, column): nullable
             for table, column, nullable in _migration_module().JSONB_COLUMNS
+            if (table, column) not in dropped
         }
-        assert len(columns) == 7
+        assert dropped == {("notification_deliveries", "channel_options")}
+        assert len(columns) == 6
         assert {k: c.nullable for k, c in columns.items()} == listed
 
     async def test_each_has_its_check_in_the_database(self) -> None:
@@ -180,22 +197,6 @@ class TestNoneIsNull:
         await db_session.commit()
         assert await _is_null("notifications", "action_data", "id", valued.id)
 
-    async def test_channel_options(self, db_session: AsyncSession) -> None:
-        empty = await _delivery(db_session, channel_options=None)
-        valued = await _delivery(db_session, channel_options={"silent": True})
-        await db_session.commit()
-        assert await _is_null(
-            "notification_deliveries", "channel_options", "id", empty.id,
-        )
-        assert not await _is_null(
-            "notification_deliveries", "channel_options", "id", valued.id,
-        )
-        valued.channel_options = None
-        await db_session.commit()
-        assert await _is_null(
-            "notification_deliveries", "channel_options", "id", valued.id,
-        )
-
     async def test_allowed_windows(self, db_session: AsyncSession) -> None:
         recipient = await create_recipient(db_session)
         await db_session.commit()
@@ -251,14 +252,12 @@ class TestTheDatabaseRefusesJsonNull:
     async def _rows(self) -> dict[tuple[str, str], tuple[str, Any]]:
         async with get_session_factory()() as session:
             job = await _job(session)
-            delivery = await _delivery(session)
             recipient = await create_recipient(session)
             call = await _llm_call(session)
             await session.commit()
         return {
             ("notifications", "channels"): ("id", job.id),
             ("notifications", "action_data"): ("id", job.id),
-            ("notification_deliveries", "channel_options"): ("id", delivery.id),
             ("recipients", "allowed_windows"): ("id", recipient.id),
             ("llm_calls", "sets"): ("notification_id", call.notification_id),
             ("llm_calls", "letter"): ("notification_id", call.notification_id),

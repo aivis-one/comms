@@ -43,18 +43,17 @@
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
 from app.core.config import settings
+from app.core.database import once_more_on_insert_race
 from app.core.exceptions import (
     NotFoundError,
     RecipientDeletedError,
@@ -396,63 +395,13 @@ async def _group_changed_once(
 # nothing; the loser's INSERT then fails on the primary key. Before D1
 # only the PUT route survived that (it held its own SAVEPOINT); on the
 # stream the IntegrityError reached the consumer's catch-all and the
-# event went to the dead-letter stream. The rule now lives here, once,
-# for every caller -- and for every write that inserts a key two
-# writers can reach, not only a new recipient id: the category mute of
-# app/audience/prefs.py is the fourth (D1-3).
-
-async def once_more_on_insert_race[T](
-    session: AsyncSession,
-    apply: Callable[[], Awaitable[T]],
-    *,
-    event: str,
-    **fields: str,
-) -> T:
-    """Run `apply` under a SAVEPOINT; on a UNIQUE VIOLATION run it once
-    more, outside one.
-
-    The SAVEPOINT keeps the caller's transaction usable after the
-    loser's INSERT fails. The winner has committed by then (the loser's
-    INSERT waited on its lock), so the SAME rule run again finds the
-    winner's row and decides against it: a replay, a stale or a newer
-    version -- exactly as without the race. Once: a second collision
-    would mean the row both exists and does not, and it is raised.
-
-    ONLY THE RACE IS RETRIED (H13): the race is two INSERTs of one key,
-    and its one signature is a unique violation (SQLSTATE 23505). Any
-    other IntegrityError -- a CHECK, a foreign key, a NOT NULL -- is a
-    row this write must not make, raised at once: no `<event>` line (it
-    is not a race, and a log saying so sent the reader of the
-    tombstone's CHECK violation after a race that never was) and no
-    second run that could only fail the same way. The caller's
-    transaction stays usable either way: the SAVEPOINT is rolled back.
-
-    WHY THE NAME IS PUBLIC: the rule is one for every writer of the
-    kind, and a second module needs it (app/audience/prefs.py,
-    set_category_muted). A private name imported across modules is what
-    D1 / R7 forbids (tests/test_hygiene_r7.py); the precedent there is
-    to make the name public where it lives, not to copy the rule or to
-    move it to a module of its own.
-    """
-    try:
-        async with session.begin_nested():
-            return await apply()
-    except IntegrityError as exc:
-        if not is_unique_violation(exc):
-            raise
-        logger.info(event, **fields)
-        return await apply()
-
-
-# SQLSTATE of a unique violation -- the insert race's one signature.
-UNIQUE_VIOLATION = "23505"
-
-
-def is_unique_violation(exc: IntegrityError) -> bool:
-    """Whether an IntegrityError is a unique violation: by the SQLSTATE
-    the driver reports (`pgcode` of the DBAPI error), never by the
-    message text."""
-    return getattr(exc.orig, "pgcode", None) == UNIQUE_VIOLATION
+# event went to the dead-letter stream. The rule lives once, for every
+# caller -- and for every write that inserts a key two writers can
+# reach, not only a new recipient id: the category mute of
+# app/audience/prefs.py is the fourth (D1-3), the sections and their
+# rosters of app/messaging the fifth and sixth (G1). It sits in
+# app/core/database.py, below both packages: messaging never imports
+# app.audience (app/messaging/__init__.py, the package DAG).
 
 
 async def apply_snapshot(

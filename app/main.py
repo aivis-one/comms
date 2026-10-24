@@ -2,11 +2,12 @@
 # COMMS Service -- Application Entry Point
 # =============================================================================
 #
-# Minimal FastAPI application: /health and /ready (unversioned,
+# FastAPI application: /health and /ready (unversioned,
 # UNAUTHENTICATED -- installer/docker healthchecks carry no secret)
-# plus the internal product-facing API under /api/v1 (app/api/):
-# inbox (the in-app bell) and the E8 preferences facade, both guarded
-# by the service-to-service bearer token (Phase 3b).
+# plus the internal product-facing API under /api/v1 (app/api/), every
+# router guarded by the service-to-service bearer token (Phase 3b). The
+# routers are the include_router block below -- that block is the list;
+# deploy/INTEGRATION.md is the contract.
 #
 # The notification worker does NOT run inside this process (unlike the
 # donors, which ticked daemons in the API lifespan). It is a separate
@@ -24,12 +25,13 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.api.changes import router as changes_router
 from app.api.channels import router as channels_router
+from app.api.deps import refuse_repeated_query
 from app.api.errors import register_error_handlers
 from app.api.inbox import router as inbox_router
 from app.api.jobs import router as jobs_router
@@ -96,8 +98,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # of their own -- require_service_auth guards the routers, not these --
 # and what they publish is every route's docstring. Those docstrings
 # are written for us: they carry KNOWN CEILING blocks, release markers
-# and, on one route, the sentence describing a read-authz bypass. Five
-# of the twenty-one operations carry such text today.
+# and, on one route, the sentence describing a read-authz bypass --
+# text for the next developer, published to anyone who asks.
 #
 # An integrator does not need them: deploy/INTEGRATION.md is the
 # contract, and it is written for that reader. So outside development
@@ -128,6 +130,9 @@ app = FastAPI(
     openapi_url=_DOCS["openapi_url"],
     docs_url=_DOCS["docs_url"],
     redoc_url=_DOCS["redoc_url"],
+    # Before every route: a key given twice is refused, not read as its
+    # last value (app/api/deps.py).
+    dependencies=[Depends(refuse_repeated_query)],
 )
 register_error_handlers(app)
 app.include_router(inbox_router)

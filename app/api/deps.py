@@ -1,5 +1,5 @@
 # =============================================================================
-# COMMS Service -- API Dependencies (service-to-service auth)
+# COMMS Service -- API Dependencies (service-to-service auth; one query)
 # =============================================================================
 #
 # Phase 3b item 1. The comms API is internal (arch decision 14): its
@@ -29,14 +29,25 @@
 #   - development -> auth is DISABLED (local dev without the bearer
 #     ceremony); app/main.py logs a loud warning at startup so an open
 #     API is visible, not silent.
+#
+# A REPEATED QUERY PARAMETER IS REFUSED (G1), on every route
+# (refuse_repeated_query, an application-level dependency in
+# app/main.py). FastAPI reads a scalar parameter given twice --
+# ?limit=5&limit=500 -- as its LAST value, silently: the request that
+# runs is not the one that was sent, the class app/api/paging.py
+# refuses for a limit out of bounds. No route of comms takes a list in
+# its query, so a key given twice is never meaningful: 422, class
+# `validation`, naming the key.
 # =============================================================================
 
 import secrets
+from collections import Counter
 
 import structlog
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
 
 from app.core.config import settings
+from app.core.exceptions import ValidationError
 
 logger = structlog.get_logger()
 
@@ -77,3 +88,14 @@ async def require_service_auth(
         # a secret (e.g. the prod token hitting the test deploy).
         logger.warning("service_auth_failed", reason="token_mismatch")
         raise _UNAUTHORIZED
+
+
+async def refuse_repeated_query(request: Request) -> None:
+    """Refuse a request whose query names a key more than once."""
+    counts = Counter(key for key, _ in request.query_params.multi_items())
+    repeated = sorted(key for key, count in counts.items() if count > 1)
+    if repeated:
+        raise ValidationError(
+            f"query parameter given more than once: {', '.join(repeated)}; "
+            f"each is read once -- send it once"
+        )

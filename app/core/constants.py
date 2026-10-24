@@ -156,11 +156,12 @@ FINGERPRINT_LEN = 64
 # -----------------------------------------------------------------------------
 # Recipient snapshot widths (R-2 item 1)
 # -----------------------------------------------------------------------------
-# THREE consumers each, which is why they live here and not next to
-# the columns: the column itself (app/audience/models.py), the
+# More than one consumer each, which is why they live here and not next
+# to the columns: of the column itself (app/audience/models.py), the
 # synchronous HTTP surface (app/api/recipients.py) and the event
-# envelope (app/transport/events.py). Before this, each of the three
-# carried its own number, and two of them disagreed with the column --
+# envelope (app/transport/events.py), every width below is read by at
+# least two. Before this, each place carried its own number, and two
+# of them disagreed with the column --
 # an over-long locale passed the envelope and died on the INSERT, which
 # is the defect class this release closes. A width that only one place
 # knows is a width the other places will get wrong.

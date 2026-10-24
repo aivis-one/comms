@@ -26,8 +26,6 @@ unit_event: &unit_event_sheet
 #   disable_preview -- YAML BOOLEAN (unquoted true/false; a quoted
 #                      "true" is a string and fails validation);
 #   silent          -- YAML BOOLEAN, Telegram disable_notification.
-# channel_options with the SAME keys override these per delivery
-# (priority: sheet < channel_options).
 unit_presented:
   telegram:
     title: "{title}"

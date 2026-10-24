@@ -114,6 +114,7 @@ from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
 from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.profile.loader import FileProfileSource, install_profile, load_profile
 from app.profile.registry import registry
+from tests.helpers import sql_shape
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -418,7 +419,7 @@ class ExplainWatch:
         self, conn: Any, cursor: Any, statement: str, parameters: Any,
         context: Any, executemany: bool,
     ) -> None:
-        if statement.lstrip()[:7].upper() == "EXPLAIN":
+        if sql_shape(statement).verb == "EXPLAIN":
             self.seen.append(" ".join(statement.split())[:120])
 
     def __enter__(self) -> ExplainWatch:

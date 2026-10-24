@@ -27,7 +27,7 @@
 #   a monotone sequence -- "seq:{n}": a job's path, ordered by the
 #       journal's identity (P2-2; timestamps tie inside a transaction);
 #   a commit position -- "chg:{xact}:{id}:{read_at}": the changes feed
-#       (P2-3, app/engine/service.py list_changes) -- the journal's
+#       (P2-3, app/engine/changes.py list_changes) -- the journal's
 #       (writing transaction, identity) and the moment it was read.
 # Each decoder refuses the others' cursors (422): a cursor carried from
 # one listing to another is malformed, not silently reinterpreted.
@@ -147,7 +147,7 @@ class ChangesCursor:
     product was given -- (0, 0) before the first. read_at is the
     database clock of the read that handed the cursor out: what tells a
     cursor that outlived the retention period from one that saw nothing
-    new (app/engine/service.py list_changes).
+    new (app/engine/changes.py list_changes).
     """
 
     xact: int

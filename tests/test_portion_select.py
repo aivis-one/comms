@@ -50,6 +50,7 @@ from app.core.database import get_engine, get_session_factory
 from app.core.lanes import Lane
 from app.engine.processor import process_lane
 from tests.conftest import analyze_with_nothing_waiting
+from tests.helpers import sql_shape
 
 _BUFFERS = 10
 _SHAPES = ["few_waiting_last_by_id", "all_waiting_last_in_heap"]
@@ -212,8 +213,8 @@ class TestThePortionSelect:
         assert channel.delivered == [first]
         (statement, parameters), = [
             (s, p) for s, p in seen
-            if "FROM notification_deliveries" in s
-            and "ORDER BY notification_deliveries.id" in s
+            if (shape := sql_shape(s)).table == "notification_deliveries"
+            and shape.order_by.startswith("notification_deliveries.id")
         ]
         async with get_session_factory()() as session:
             raw = await session.connection()

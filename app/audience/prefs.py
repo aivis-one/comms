@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute, Recipient
 from app.audience.schedule import MINUTES_PER_DAY
-from app.audience.sync import once_more_on_insert_race
+from app.core.database import once_more_on_insert_race
 from app.core.exceptions import NotFoundError, ValidationError
 from app.profile.registry import registry
 
@@ -117,7 +117,7 @@ async def set_category_muted(
 
     A MUTE INSERTS A KEY TWO WRITERS CAN REACH: two concurrent PATCHes
     muting one category both read "not muted" and both insert. The mute
-    goes through the insert-race rule (app/audience/sync.py,
+    goes through the insert-race rule (app/core/database.py
     once_more_on_insert_race): the loser's INSERT fails inside a
     SAVEPOINT, the rule runs once more and finds the winner's row. Before
     D1-3 the loser answered 500 and its transaction -- every other toggle

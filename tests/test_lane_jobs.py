@@ -78,7 +78,7 @@ from app.engine.service import (
 from app.profile.loader import FileProfileSource, install_profile, load_profile
 from app.profile.registry import Decided, Layer, TypeRecord, registry
 from tests.conftest import make_tables_pristine
-from tests.helpers import create_recipient, intake_fields
+from tests.helpers import create_recipient, intake_fields, sql_shape
 from tests.test_waiting_probe import _captured as h12_capture
 
 _BOUND = 10.0
@@ -253,6 +253,17 @@ class TestCancellingTheLoop:
 _IN_WORK = LANE_JOBS[Lane.NORMAL] - 1
 
 
+def _is_the_selection(statement: str) -> bool:
+    """A lane's selection of due jobs: from notifications, by lane,
+    ordered (tests/helpers.py sql_shape)."""
+    shape = sql_shape(statement)
+    return (
+        shape.table == "notifications"
+        and shape.compares("notifications.lane")
+        and bool(shape.order_by)
+    )
+
+
 async def _normal_selection() -> tuple[str, Any]:
     """The normal lane's selection as the code sends it, captured on the
     empty pristine tables."""
@@ -262,7 +273,7 @@ async def _normal_selection() -> tuple[str, Any]:
         await process_lane(Lane.NORMAL)
     (statement, parameters), = [
         (s, p) for s, p in seen
-        if "notifications.lane =" in s and "ORDER BY" in s
+        if _is_the_selection(s)
     ]
     return statement, parameters
 
@@ -690,7 +701,7 @@ class TestThePass:
                         statement: Any, *a: Any, **k: Any,
                     ) -> Any:
                         result = await execute(statement, *a, **k)
-                        if armed and "ORDER BY" in str(statement):
+                        if armed and sql_shape(statement).order_by:
                             # The rows are read; the held call ends now.
                             jobs = armed.pop()
                             spy.release.set()
@@ -750,14 +761,20 @@ class TestThePass:
                     process_lane(Lane.INTERACTIVE, jobs=jobs),
                 )
                 await asyncio.sleep(0.5)
-                selections = [s for s, _ in seen if "notifications.lane =" in s]
+                selections = [
+                    s for s, _ in seen
+                    if sql_shape(s).compares("notifications.lane")
+                ]
                 assert selections == []
                 assert not waiting.done()
                 spy.held.clear()
                 spy.release.set()
                 assert await asyncio.wait_for(waiting, _BOUND) == 1
                 # The pair: the pass did select, once a place was free.
-                assert len([s for s, _ in seen if "notifications.lane =" in s]) == 1
+                assert len([
+                    s for s, _ in seen
+                    if sql_shape(s).compares("notifications.lane")
+                ]) == 1
         await _until([first, second, third])
 
 

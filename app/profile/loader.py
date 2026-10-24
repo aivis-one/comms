@@ -255,11 +255,30 @@ CHANNEL_NAMES: tuple[str, ...] = tuple(
     sorted(spec.name for spec in CHANNEL_SPECS)
 )
 
+# The channel a sheet may not name although it carries text: an in_app
+# delivery IS the inbox entry, which shows the stored title/body the
+# product sent (app/engine/formatters.py InAppFormatter, app/api/
+# inbox.py). A sheet for it -- in the base profile or in the text
+# overlay -- would be text no one is ever shown, so both refuse it by
+# name, with the one explanation below (G1 item 4).
+_UNRENDERED_CHANNEL = "in_app"
+
+
+def _unrendered_complaint(path: str) -> str:
+    """Why a sheet for in_app is refused -- base and overlay alike."""
+    return (
+        f"{path}: {_UNRENDERED_CHANNEL} renders no template -- the inbox "
+        f"shows the stored title/body the product sent, so a text there "
+        f"would never be shown"
+    )
+
+
 # The channels a template sheet may name: every channel but llm, whose
-# letter is the product's own and never rendered (P5-1) -- a sheet for
-# it would be a template no delivery ever reads.
+# letter is the product's own and never rendered (P5-1), and in_app,
+# which shows the stored title/body -- a sheet for either would be a
+# template no delivery ever reads.
 TEMPLATE_CHANNELS: tuple[str, ...] = tuple(
-    name for name in CHANNEL_NAMES if name != "llm"
+    name for name in CHANNEL_NAMES if name not in ("llm", _UNRENDERED_CHANNEL)
 )
 
 # Lanes (spec §8.3): a closed set comms offers, the product picks one per
@@ -1243,6 +1262,12 @@ def _parse_template_tree(
             continue
         tree_channels: dict[str, dict[str, str | bool]] = {}
         for channel, fields in channels.items():
+            if channel == _UNRENDERED_CHANNEL:
+                violations.append(Violation(
+                    where, type_key, channel,
+                    _unrendered_complaint(f"{type_key}.{channel}"),
+                ))
+                continue
             if not isinstance(channel, str) or channel not in TEMPLATE_CHANNELS:
                 violations.append(Violation(
                     where, type_key, str(channel),
@@ -1395,11 +1420,6 @@ def _leaf_complaint(fname: str, template: Any) -> str | None:
 # over action_data). Written here because this package sits below the
 # engine; tests/test_profile_overlay.py holds the two in step.
 CORE_VARIABLES: tuple[str, ...] = ("body", "title")
-
-# The one channel a sheet may name that renders no template: an in_app
-# delivery IS the inbox entry, which shows the stored title/body
-# (app/engine/formatters.py InAppFormatter, app/api/inbox.py).
-_UNRENDERED_CHANNEL = "in_app"
 
 _OVERLAY_SUFFIX = ".yaml"
 
@@ -1589,10 +1609,7 @@ def _parse_overlay_file(
             path = f"{type_key}.{channel}"
             if channel == _UNRENDERED_CHANNEL:
                 violations.append(Violation(
-                    where, type_key, str(channel),
-                    f"{path}: {_UNRENDERED_CHANNEL} renders no template -- "
-                    f"the inbox shows the stored title/body the product "
-                    f"sent, so an overlay text there would never be shown",
+                    where, type_key, str(channel), _unrendered_complaint(path),
                 ))
                 continue
             base_fields = (

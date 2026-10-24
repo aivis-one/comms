@@ -392,7 +392,7 @@ async def intake_outcomes_for(
 #
 # NEVER the letter: these return ORM rows, and the wire form
 # (app/api/jobs.py) is a closed field set that names no title, body,
-# action_data, channel_options or error_message (the last can carry the
+# action_data or error_message (the last can carry the
 # text of a comms exception -- service._deliver_single).
 
 
@@ -1978,7 +1978,11 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     it (close_waiting_deliveries) -- and each affected job is folded
     (THE FOLD).
     The jobs are locked FOR UPDATE and the lock is WAITED for, like
-    expiry and cancellation: an attempt in flight finishes first. EVERY
+    expiry and cancellation: an attempt in flight on a job with
+    committed deliveries of theirs finishes first. The FIRST attempt of
+    a job has none committed, so this lock does not see it: what orders
+    forgetting after that attempt is the tombstone, which runs before
+    this function (app/forgetting.py, WHAT HOLDS THE WINDOW). EVERY
     job the mass updates below reach is locked -- finished ones too, in
     ascending id (THE ORDER OF ROW LOCKS): those updates touch the
     deliveries and journal rows of finished jobs that retention and the

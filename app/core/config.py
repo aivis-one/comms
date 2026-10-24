@@ -99,9 +99,21 @@ from app.core.lanes import Lane
 # lane; the lane's slots are shared by its jobs in work, and the
 # worker's pool grew with the places) and PO-1 (PROFILE_OVERLAY_DIR, a
 # text overlay replacing single texts of the profile field by field; a
-# broken overlay refuses the start).
+# broken overlay refuses the start);
+# 3.7.0 is hygiene (G1, G2), and a MINOR because it NARROWS three things
+# a deploy may have been doing: a profile with an in_app template sheet
+# no longer starts (delete the sheet -- the inbox shows the stored
+# title/body, so its text was never rendered), a request that gives a
+# query key twice is refused 422 instead of silently taking the last
+# value, and notification_deliveries.channel_options is dropped (nothing
+# ever wrote it). It also proves and holds forgetting against an attempt
+# in flight, makes the reading session READ ONLY in the database, blinds
+# the HTTP clients to the process's proxy and CA variables, logs the
+# render failure's class and not its text, describes the type record
+# whole in the contract, and runs `comms-deploy.sh test` on the image
+# with the checkout, as CI does (3.6.1 was never released; it is here).
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

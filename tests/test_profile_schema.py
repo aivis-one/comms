@@ -757,8 +757,10 @@ class TestTemplateKeys:
         message = str(excinfo.value)
         assert "channel key 'telegramm' is not a channel" in message
         # P5-1: llm is a channel but renders no template, so a sheet may
-        # not name it -- the list stays the channels that render.
-        assert "expected one of: email, in_app, telegram" in message
+        # not name it -- the list stays the channels that render. G1:
+        # neither does in_app (the inbox shows the stored title/body),
+        # so the list lost it too.
+        assert "expected one of: email, telegram" in message
 
     def test_known_channel_keys_pass(self) -> None:
         # P5-1: every channel that renders -- llm renders nothing.
@@ -771,7 +773,10 @@ class TestTemplateKeys:
         assert set(profile.templates["en"]["msg.thread_closed"]) == set(
             TEMPLATE_CHANNELS,
         )
-        assert set(TEMPLATE_CHANNELS) == set(CHANNEL_NAMES) - {"llm"}
+        # Was CHANNEL_NAMES - {"llm"} until G1: in_app renders no
+        # template either, and a sheet for it is refused by name
+        # (tests/test_g1_hygiene.py).
+        assert set(TEMPLATE_CHANNELS) == set(CHANNEL_NAMES) - {"llm", "in_app"}
 
 
 # -----------------------------------------------------------------------------
