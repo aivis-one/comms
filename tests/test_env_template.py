@@ -3,7 +3,8 @@
 # =============================================================================
 #
 # deploy/.env.example is the ONE template (the root copy drifted from it
-# and is gone). It is held to the code both ways:
+# and is gone). It is held to the code both ways, and to the compose file
+# both ways:
 #
 #   forward  every setting of app/core/config.py is a variable line,
 #            except what docker-compose.yml sets itself for the comms
@@ -13,6 +14,13 @@
 #   reverse  every variable line is a setting, or a variable comms'
 #            compose file or installer reads, each found in that file in
 #            the form it is read;
+#   compose  every name compose substitutes from the environment
+#            (${NAME}, ${NAME:-x}, ${NAME-x}, ${NAME:+x}, ${NAME:?x},
+#            $NAME; $$ is an escape, not a substitution) is a variable
+#            line -- compose takes it from the generated .env, so a name
+#            the template does not document is a knob nobody can find
+#            (review 3.10.0: until the fix a new ${NAME} in compose
+#            passed every test above);
 #   values   a line commented out, and an operator's line, holds the
 #            setting's default (an example only for a setting whose
 #            default is "unset", and the comment says so);
@@ -23,11 +31,15 @@
 #   M12 a variable line taken out           -> test_every_setting_is_there
 #   M13 BOGUS_VAR= added                    -> test_every_variable_is_read
 #   M14 #NOTIFICATION_RETENTION_DAYS=91     -> test_the_values_are_the_defaults
+#   M17 ${EXTRA_ASSETS_DIR} into compose    -> test_every_name_compose_
+#                                              substitutes_is_there
+#   M18 $EXTRA_ASSETS_DIR into compose      -> the same
 # =============================================================================
 
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from app.core.config import Settings
@@ -86,6 +98,24 @@ def _generate_env() -> str:
     match = re.search(r"^generate_env\(\) \{\n.*?^\}\n", _INSTALLER, re.S | re.M)
     assert match, "generate_env not found at column zero"
     return match.group(0)
+
+
+# A name compose substitutes: `$` and a name, braced or bare (compose's
+# own name pattern). `$$` is the escape for a literal `$` -- read first,
+# so `$${NAME}` and `$$NAME` are never a substitution.
+_SUBSTITUTION = re.compile(
+    r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)|\$([A-Za-z_][A-Za-z0-9_]*)",
+)
+
+
+def _compose_substituted(text: str) -> set[str]:
+    """Every name compose takes from the environment in `text`, in every
+    form of substitution, nested defaults included (`${A:-${B}}`)."""
+    return {
+        match.group(1) or match.group(2)
+        for match in _SUBSTITUTION.finditer(text)
+        if match.group(0) != "$$"
+    }
 
 
 def _code_lines(text: str) -> str:
@@ -150,6 +180,38 @@ class TestBothWays:
             name in {n for _c, n, _v, _i in _variables(_TEMPLATE)}
             for name in _NOT_SETTINGS
         )
+
+    def test_every_name_compose_substitutes_is_there(self) -> None:
+        substituted = _compose_substituted(_code_lines(_COMPOSE))
+        written = {name for _c, name, _v, _i in _variables(_TEMPLATE)}
+        assert substituted - written == set()
+        # The pair: the scan found names, the two compose reads for the
+        # profile among them.
+        assert {"PROFILE_DIR", "PROFILE_OVERLAY_DIR"} <= substituted
+
+    @pytest.mark.parametrize(
+        ("text", "names"),
+        [
+            ("x: ${NAME}", {"NAME"}),
+            ("x: ${NAME:-default}", {"NAME"}),
+            ("x: ${NAME-default}", {"NAME"}),
+            ("x: ${NAME:+alternative}", {"NAME"}),
+            ("x: ${NAME:?it is required}", {"NAME"}),
+            ("x: $NAME/sub", {"NAME"}),
+            ("x: ${A:-${B}}", {"A", "B"}),
+            ("x: $${NAME}", set()),
+            ("x: $$NAME", set()),
+            ("x: $$$NAME", {"NAME"}),
+            ("# x: ${NAME}\n  # $NAME", set()),
+        ],
+        ids=[
+            "braced", "default_if_unset_or_empty", "default_if_unset",
+            "alternative", "required", "bare", "nested",
+            "escaped_braced", "escaped_bare", "escape_then_bare", "comment",
+        ],
+    )
+    def test_every_form_of_substitution(self, text: str, names: set[str]) -> None:
+        assert _compose_substituted(_code_lines(text)) == names
 
     def test_every_variable_is_written_once(self) -> None:
         names = [name for _c, name, _v, _i in _variables(_TEMPLATE)]
