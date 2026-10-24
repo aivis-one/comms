@@ -251,7 +251,7 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
         definition=(
             "CREATE UNIQUE INDEX uq_message_variant_requests_job "
             "ON public.message_variant_requests USING btree "
-            "(message_id, locale, job_key)"
+            "(message_id, locale, job_id)"
         ),
     ),
     "uq_message_variant_requests_idempotency_key": IndexShape(

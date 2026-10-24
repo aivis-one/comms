@@ -388,9 +388,12 @@ class MessageVariantRequest(UUIDMixin, Base):
     for the same language names another job, and the latest one is
     the one the feed reads (app/variants.py).
 
-    `job_key` is the job's Idempotency-Key as a STRING, not a foreign
-    key: retention deletes jobs, while this row lives as long as its
-    message. A request whose job is gone reads as "impossible".
+    `job_key` is the job's Idempotency-Key, as the product named it;
+    `job_id` is the job it named THEN -- what the state is read by
+    (3.8.0 -- fix). Neither is a foreign key: retention deletes jobs,
+    while this row lives as long as its message. And retention frees
+    the key: a later job under it is another job, and does not change
+    this request -- whose job, gone, reads as "impossible".
     """
 
     __tablename__ = "message_variant_requests"
@@ -403,6 +406,7 @@ class MessageVariantRequest(UUIDMixin, Base):
     job_key: Mapped[str] = mapped_column(
         String(MAX_IDEMPOTENCY_KEY_LEN), nullable=False,
     )
+    job_id: Mapped[UUID] = mapped_column(nullable=False)
     # The caller's Idempotency-Key and its request's digest -- as on
     # messages (F1.4): the same key with the same digest answers with
     # this row, another digest is a conflict.

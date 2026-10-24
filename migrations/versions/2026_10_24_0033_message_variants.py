@@ -27,6 +27,11 @@ A language is an opaque token of a form, 1..8 of [A-Za-z0-9_-]
 byte. Each table carries the caller's Idempotency-Key and its request's
 digest, as `messages` does (F1.4). The job is named by its key, a
 string: retention deletes jobs, the variant lives with its message.
+
+A REQUEST REMEMBERS ITS JOB BY ID (3.8.0 -- fix): `job_id`, without a
+foreign key for the same reason. Retention frees a job's key, and a
+later job under the same key is ANOTHER job; the request's state is
+its own job's, read by id. One request per (message, locale, job).
 """
 
 from collections.abc import Sequence
@@ -65,6 +70,7 @@ def upgrade() -> None:
     op.create_table(
         "message_variant_requests",
         *_common(),
+        sa.Column("job_id", sa.UUID(), nullable=False),
         sa.CheckConstraint(
             f"locale ~ {_LOCALE}",
             name="ck_message_variant_requests_locale",
@@ -77,7 +83,7 @@ def upgrade() -> None:
     op.create_index(
         "uq_message_variant_requests_job",
         "message_variant_requests",
-        ["message_id", "locale", "job_key"],
+        ["message_id", "locale", "job_id"],
         unique=True,
     )
     op.create_index(

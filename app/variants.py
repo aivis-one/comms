@@ -29,7 +29,9 @@
 #                        none needed         -> NOT_NEEDED
 #   2. another variant of the message whose source_locale is L
 #                                            -> NOT_NEEDED
-#   3. the latest request in L, by its job's status:
+#   3. the latest request in L, by ITS job's status -- the job it named
+#      when it was written, by id (3.8.0 -- fix: retention frees a key,
+#      and a later job under the same key is another job):
 #        pending / processing / sent         -> PREPARING
 #        failed / expired / cancelled, or the job gone with retention
 #                                            -> IMPOSSIBLE
@@ -73,7 +75,9 @@ from app.messaging.constants import VariantState
 from app.messaging.models import Message, MessageVariant, MessageVariantRequest
 
 # Step 3: a request's job status -> the reader's state. Only the
-# statuses an llm job can have (see the header).
+# statuses an llm job can have (see the header); tests/
+# test_message_variants.py TestTheStatusTable holds the table to
+# NotificationStatus minus the three an llm job never reaches.
 _BY_JOB_STATUS: dict[str, VariantState] = {
     NotificationStatus.PENDING: VariantState.PREPARING,
     NotificationStatus.PROCESSING: VariantState.PREPARING,
@@ -171,12 +175,12 @@ async def write_request(
     if replayed is not None:
         return replayed
     await _message_of_thread(session, thread_id, message_id)
-    await _llm_job(session, job_key)
+    job = await _llm_job(session, job_key)
     what = f"the request for {locale!r} by job {job_key!r}"
     taken = await session.scalar(select(MessageVariantRequest).where(
         MessageVariantRequest.message_id == message_id,
         MessageVariantRequest.locale == locale,
-        MessageVariantRequest.job_key == job_key,
+        MessageVariantRequest.job_id == job.id,
     ))
     if taken is not None:
         raise VariantExistsError(f"{what} is already written")
@@ -184,7 +188,7 @@ async def write_request(
         session,
         MessageVariantRequest(
             message_id=message_id, locale=locale, job_key=job_key,
-            idempotency_key=key, fingerprint=fingerprint,
+            job_id=job.id, idempotency_key=key, fingerprint=fingerprint,
         ),
         _Existing(session, MessageVariantRequest, key, fingerprint, what),
     )
@@ -248,7 +252,8 @@ def decide_state(
     """The reader's state for one message (the order in the header).
 
     `variants` are ALL of the message's variants; `job_status` is the
-    status of the latest request's job, None when it is gone."""
+    status of the latest request's own job (by id), None when it is
+    gone."""
     mine = next((v for v in variants if v.locale == locale), None)
     if mine is not None:
         if mine.body is not None:
@@ -261,7 +266,13 @@ def decide_state(
     if latest_request is not None:
         if job_status is None:
             return VariantState.IMPOSSIBLE, None
-        return _BY_JOB_STATUS[job_status], None
+        # .get, not [...]: the request's job is read by id, so it is the
+        # llm job it named and its status is in the table -- but a feed
+        # is no place to fail on a status nobody foresaw (3.8.0 -- fix:
+        # read by key, a person's job under a reused key gave KeyError
+        # 'partial_sent', a 500). Unforeseen is no variant: IMPOSSIBLE.
+        # TestTheStatusTable is where an unforeseen status shows.
+        return _BY_JOB_STATUS.get(job_status, VariantState.IMPOSSIBLE), None
     return VariantState.NOT_REQUESTED, None
 
 
@@ -271,7 +282,7 @@ async def reader_states(
     """The state of every message of a feed page for a reader in
     `locale`: three queries for the page, whatever its size -- the
     variants of its messages, their requests in `locale`, and those
-    requests' jobs, each by a unique index."""
+    requests' jobs by id, each by a unique index."""
     if not message_ids:
         return {}
     ids = list(message_ids)
@@ -293,19 +304,19 @@ async def reader_states(
         )
     )).all():
         latest.setdefault(request.message_id, request)
-    statuses: dict[str, str] = {}
-    keys = sorted({request.job_key for request in latest.values()})
-    if keys:
+    statuses: dict[UUID, str] = {}
+    jobs = sorted({request.job_id for request in latest.values()})
+    if jobs:
         statuses = dict((await session.execute(
-            select(Notification.idempotency_key, Notification.status)
-            .where(Notification.idempotency_key.in_(keys))
+            select(Notification.id, Notification.status)
+            .where(Notification.id.in_(jobs))
         )).tuples().all())
     return {
         message_id: decide_state(
             locale,
             variants.get(message_id, []),
             latest.get(message_id),
-            statuses.get(latest[message_id].job_key)
+            statuses.get(latest[message_id].job_id)
             if message_id in latest else None,
         )
         for message_id in ids

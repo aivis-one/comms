@@ -32,6 +32,12 @@
 #   M11 declined read as not_needed                 -> test_the_order_row_2,
 #                                                      test_a_model_that_
 #                                                      refused_in_words
+#   3.8.0 -- fix:
+#   M12 the feed reads the job by key, not by id    -> TestAKeyOutlivesItsJob
+#   M13 a status removed from _BY_JOB_STATUS        -> TestTheStatusTable
+#   M14 [...] instead of .get in decide_state       -> (killed only with M12:
+#                                                      read by id, the status
+#                                                      is in the table)
 # =============================================================================
 
 import asyncio
@@ -520,6 +526,96 @@ class TestTheOrder:
         assert await _state(client, thread, "en") == VariantState.IMPOSSIBLE
 
 
+class TestAKeyOutlivesItsJob:
+    """3.8.0 -- fix: a request names its job by KEY, and retention frees
+    the key. A later job under the same key is another job; the
+    request's state is its own job's -- gone -> IMPOSSIBLE -- whatever
+    the key names now. Reproduced by review over HTTP: a person-kind
+    job there gave KeyError 'partial_sent' (a 500 on ?locale=), a new
+    llm job brought the finished request back to PREPARING."""
+
+    async def _request_whose_job_retention_deleted(
+        self, client: AsyncClient,
+    ) -> tuple[str, str]:
+        thread, message, _ = await _conversation(client)
+        job = await _job(NotificationStatus.FAILED, answered=False)
+        assert (await _request(client, thread, message, "en", job)).status_code == 200
+        async with get_session_factory()() as session:
+            await session.execute(
+                delete(Notification).where(Notification.idempotency_key == job)
+            )
+            await session.commit()
+        return thread, job
+
+    async def _job_under(
+        self, key: str, *, llm: bool, status: str,
+    ) -> None:
+        async with get_session_factory()() as session:
+            fields = notification_row_fields(
+                channels=["llm"] if llm else ["in_app"],
+            )
+            fields["idempotency_key"] = key
+            job = Notification(
+                type="ask.model" if llm else "unit_event",
+                title=None if llm else "t", body=None if llm else "b",
+                target_type=None if llm else "user",
+                target_value=None if llm else "*",
+                status=status, **fields,
+            )
+            session.add(job)
+            await session.flush()
+            if llm:
+                session.add(LLMCall(
+                    notification_id=job.id, sets=["llm.gw"], letter=None,
+                    letter_hash="a" * 64, answer_keep_seconds=60,
+                ))
+            await session.commit()
+
+    async def test_the_job_gone(self, client: AsyncClient) -> None:
+        thread, _ = await self._request_whose_job_retention_deleted(client)
+        assert await _state(client, thread, "en") == VariantState.IMPOSSIBLE
+
+    async def test_a_person_job_under_the_same_key(
+        self, client: AsyncClient,
+    ) -> None:
+        """A status no llm job has -- and no 500."""
+        thread, key = await self._request_whose_job_retention_deleted(client)
+        await self._job_under(key, llm=False, status=NotificationStatus.PARTIAL_SENT)
+        assert await _state(client, thread, "en") == VariantState.IMPOSSIBLE
+
+    async def test_a_new_llm_job_under_the_same_key(
+        self, client: AsyncClient,
+    ) -> None:
+        """The old request stays what its own job made it. The pair: a
+        request for the NEW job -- the same key -- is a new request, and
+        it is the one that prepares."""
+        thread, key = await self._request_whose_job_retention_deleted(client)
+        await self._job_under(key, llm=True, status=NotificationStatus.PENDING)
+        assert await _state(client, thread, "en") == VariantState.IMPOSSIBLE
+        message = (await _feed(client, thread, None)).json()["items"][0]["id"]
+        renewed = await _request(client, thread, message, "en", key)
+        assert renewed.status_code == 200, renewed.text
+        assert await _state(client, thread, "en") == VariantState.PREPARING
+
+
+class TestTheStatusTable:
+    def test_every_status_an_llm_job_can_have(self) -> None:
+        """_BY_JOB_STATUS names every status an llm job can reach: all
+        of NotificationStatus but the three only a job for people can
+        end in -- an llm job has ONE delivery without a recipient, so
+        app/engine/service.py _fold never gives it partial_sent (two
+        deliveries), suppressed or no_recipients (a person muted or
+        gone). The .get default in the feed is for a status this test
+        did not foresee; this test is where it shows."""
+        from app.variants import _BY_JOB_STATUS
+
+        assert set(_BY_JOB_STATUS) == set(NotificationStatus) - {
+            NotificationStatus.PARTIAL_SENT,
+            NotificationStatus.SUPPRESSED,
+            NotificationStatus.NO_RECIPIENTS,
+        }
+
+
 class TestWithoutLocale:
     async def test_the_feed_is_what_it_was(self, client: AsyncClient) -> None:
         """Without `locale`: the shape the feed always had, and the same
@@ -731,10 +827,12 @@ class TestTheCostOfThePage:
                 ), {"thread": UUID(thread)})
             await session.execute(text(
                 "INSERT INTO message_variant_requests (id, message_id, locale, "
-                "job_key, idempotency_key, fingerprint) "
-                "SELECT gen_random_uuid(), id, 'ar', "
-                "'seed:job:' || idempotency_key, 'seed:r:' || id, "
-                "repeat('f', 64) FROM messages WHERE thread_id = :thread"
+                "job_key, job_id, idempotency_key, fingerprint) "
+                "SELECT gen_random_uuid(), m.id, 'ar', n.idempotency_key, n.id, "
+                "'seed:r:' || m.id, repeat('f', 64) FROM messages m "
+                "JOIN notifications n "
+                "ON n.idempotency_key = 'seed:job:' || m.idempotency_key "
+                "WHERE m.thread_id = :thread"
             ), {"thread": UUID(thread)})
             await session.commit()
         async with get_engine().connect() as connection:

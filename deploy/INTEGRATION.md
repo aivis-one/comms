@@ -1548,6 +1548,12 @@ Several requests for one language are fine -- after a failed job,
 queue another and request again; the feed reads the latest. The same
 job for the same language twice under another key is 409 `conflict`.
 
+**A request is tied to the job its key named when it was written.**
+Retention deletes a job (`NOTIFICATION_RETENTION_DAYS`) and frees its
+key: a later job under the same key is another job, and it does **not**
+change the request -- whose own job is gone, so it reads `impossible`.
+Want the new job to count? Write a new request for it.
+
 **`POST /api/v1/threads/{tid}/messages/{mid}/variants`** -- write it
 when you have read the model's answer. One per language, **never
 replaced**: a second variant in a language is 409 `conflict`.
@@ -1597,7 +1603,7 @@ The state, decided in this order -- the first that holds:
 | 3 | the variant in the reader's language, none needed | `not_needed` |
 | 4 | another variant whose `source_locale` is the reader's language | `not_needed` |
 | 5 | the latest request in the reader's language, its job queued, in work or answered | `preparing` |
-| 6 | the latest request in the reader's language, its job failed, expired or cancelled -- or deleted by retention | `impossible` |
+| 6 | the latest request in the reader's language, its job failed, expired or cancelled -- or deleted by retention, whatever its key names now | `impossible` |
 | 7 | none of these | `not_requested` |
 
 **`impossible` has two sources**, and both mean "there will be no
