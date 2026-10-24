@@ -229,6 +229,38 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "ON public.messages USING btree (idempotency_key)"
         ),
     ),
+    # A message in another language (P5-4, migration 0033): one variant
+    # per (message, language); a request per (message, language, job);
+    # a repeated write answers with the row it created (F1.4).
+    "uq_message_variants_message_locale": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_message_variants_message_locale "
+            "ON public.message_variants USING btree (message_id, locale)"
+        ),
+    ),
+    "uq_message_variants_idempotency_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_message_variants_idempotency_key "
+            "ON public.message_variants USING btree (idempotency_key)"
+        ),
+    ),
+    "uq_message_variant_requests_job": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_message_variant_requests_job "
+            "ON public.message_variant_requests USING btree "
+            "(message_id, locale, job_key)"
+        ),
+    ),
+    "uq_message_variant_requests_idempotency_key": IndexShape(
+        unique=True,
+        definition=(
+            "CREATE UNIQUE INDEX uq_message_variant_requests_idempotency_key "
+            "ON public.message_variant_requests USING btree (idempotency_key)"
+        ),
+    ),
     "uq_threads_idempotency_key": IndexShape(
         unique=True,
         definition=(
@@ -389,6 +421,16 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_llm_calls_sets_not_json_null",
     "ck_llm_calls_letter_not_json_null",
     "ck_llm_calls_audio_not_json_null",
+    # A variant and its request (P5-4, migration 0033): a language is a
+    # token of one form; a job key is never blank; a variant is exactly
+    # one of its three forms, and its text is never blank.
+    "ck_message_variant_requests_locale",
+    "ck_message_variant_requests_job_key",
+    "ck_message_variants_locale",
+    "ck_message_variants_source_locale",
+    "ck_message_variants_job_key",
+    "ck_message_variants_body",
+    "ck_message_variants_form",
 })
 
 # Everything the schema must carry although the metadata never mentions

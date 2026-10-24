@@ -84,6 +84,12 @@ class ClaimTakenError(ConflictError):
     """The thread is already assigned to another operator."""
 
 
+class VariantExistsError(ConflictError):
+    """A variant of the message in that language is already written --
+    or the request for it by that job is (P5-4). Insert only: a second
+    one is not a replacement."""
+
+
 def conflict_class(exc: ConflictError) -> str:
     """The wire name of a conflict's class -- ONE mapping, shared by the
     API error body (app/api/errors.py) and the consumer's log line."""
@@ -96,4 +102,5 @@ _CONFLICT_CLASSES: dict[type[ConflictError], str] = {
     RecipientDeletedError: "recipient_deleted",
     IdempotencyConflictError: "conflict",
     ClaimTakenError: "conflict",
+    VariantExistsError: "conflict",
 }

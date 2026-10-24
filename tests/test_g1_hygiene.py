@@ -132,6 +132,14 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         _NOT_A_JOB + "a thread's title",
     ("app/api/messaging.py", "create_thread", "title"):
         _NOT_A_JOB + "a thread's title being created",
+    ("app/api/messaging.py", "VariantIn._one_form", "body"):
+        _NOT_A_JOB + "a message variant's form, checked (P5-4)",
+    ("app/api/messaging.py", "_variant_out", "body"):
+        _NOT_A_JOB + "a message variant, returned to the product (P5-4)",
+    ("app/api/messaging.py", "post_variant", "body"):
+        _NOT_A_JOB + "a message variant being written (P5-4)",
+    ("app/variants.py", "decide_state", "body"):
+        _NOT_A_JOB + "whether a message variant has text (P5-4)",
 }
 
 

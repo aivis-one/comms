@@ -19,8 +19,12 @@
 #   GET  /api/v1/threads?operator=&is_supervisor=&limit=&cursor=
 #                                             -> 200 {items, next_cursor}
 #   POST /api/v1/threads/{tid}/messages       -> 200 <message>  (+ notify)
-#   GET  /api/v1/threads/{tid}/messages?limit=&cursor=
+#   GET  /api/v1/threads/{tid}/messages?limit=&cursor=&locale=
 #                                             -> 200 {items, next_cursor}
+#   POST /api/v1/threads/{tid}/messages/{mid}/variant-requests
+#                                             -> 200 <variant request>
+#   POST /api/v1/threads/{tid}/messages/{mid}/variants
+#                                             -> 200 <variant>
 #   POST /api/v1/threads/{tid}/read           -> 200 {unread}   (fresh badge)
 #   GET  /api/v1/threads/{tid}/unread-count?participant=
 #                                             -> 200 {unread}
@@ -70,6 +74,11 @@
 #     race. ADDITIVE to the frozen 3b shape (seam T2 / ID-10, precedent
 #     reminder_cancel) -- every pre-existing field is unchanged, and no
 #     OTHER endpoint gained the key;
+#   - A MESSAGE IN ANOTHER LANGUAGE (P5-4, app/variants.py): the two
+#     variant routes are insert-only records the product writes; with
+#     `locale` the feed adds `variant` and `variant_state` to every item,
+#     WITHOUT it the feed is exactly what it was -- deploy/INTEGRATION.md
+#     section 12;
 #   - limit / cursor: the one paging scheme (app/api/paging.py) -- out
 #     of 1..100 or a malformed cursor -> 422 `validation`;
 #   - a bad status transition / half subject_ref -> 422; an absent
@@ -87,6 +96,7 @@
 # read-only), NOT identity -- it is orthogonal to this trust model.
 # =============================================================================
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -110,13 +120,14 @@ from app.api.paging import (
     page,
     page_limit,
 )
-from app.core.constants import PAGE_LIMIT_MAX
+from app.core.constants import MAX_IDEMPOTENCY_KEY_LEN, PAGE_LIMIT_MAX
 from app.core.database import get_db_reader, get_db_session
 from app.core.exceptions import (
     AuthorizationError,
     ClaimTakenError,
     IdempotencyConflictError,
     NotFoundError,
+    ValidationError,
 )
 from app.messaging.constants import (
     MAX_MESSAGE_BODY_LEN,
@@ -127,11 +138,18 @@ from app.messaging.constants import (
     MAX_THREAD_PRIORITY,
     MAX_THREAD_TITLE_LEN,
     MIN_THREAD_PRIORITY,
+    VARIANT_LOCALE_PATTERN,
     OperatorKind,
     ThreadKind,
     ThreadStatus,
 )
-from app.messaging.models import Message, Section, Thread
+from app.messaging.models import (
+    Message,
+    MessageVariant,
+    MessageVariantRequest,
+    Section,
+    Thread,
+)
 from app.messaging.operators import (
     KEEP,
     KeepSubject,
@@ -157,6 +175,7 @@ from app.messaging.threads import (
     post_message,
 )
 from app.notifier import notify_new_message
+from app.variants import reader_states, write_request, write_variant
 
 router = APIRouter(
     prefix="/api/v1/threads",
@@ -240,6 +259,49 @@ def _message_out(message: Message) -> dict[str, Any]:
     }
 
 
+# The closed field sets of the variant records (P5-4) -- the contract's
+# tables in deploy/INTEGRATION.md section 12 are held to these.
+VARIANT_REQUEST_FIELDS = ("message_id", "locale", "job_key", "created_at")
+VARIANT_FIELDS = (
+    "message_id", "locale", "source_locale", "body", "declined", "job_key",
+    "answered_provider", "answered_model", "created_at",
+)
+# What a feed item in a reader's language carries besides the message's
+# own fields: the variant (READY only, else null) and the state.
+FEED_VARIANT_FIELDS = (
+    "locale", "source_locale", "body", "job_key", "answered_provider",
+    "answered_model", "created_at",
+)
+
+
+def _variant_request_out(row: MessageVariantRequest) -> dict[str, Any]:
+    return {
+        "message_id": str(row.message_id),
+        "locale": row.locale,
+        "job_key": row.job_key,
+        "created_at": _iso(row.created_at),
+    }
+
+
+def _variant_out(row: MessageVariant) -> dict[str, Any]:
+    return {
+        "message_id": str(row.message_id),
+        "locale": row.locale,
+        "source_locale": row.source_locale,
+        "body": row.body,
+        "declined": row.declined,
+        "job_key": row.job_key,
+        "answered_provider": row.answered_provider,
+        "answered_model": row.answered_model,
+        "created_at": _iso(row.created_at),
+    }
+
+
+def _feed_variant_out(row: MessageVariant) -> dict[str, Any]:
+    full = _variant_out(row)
+    return {name: full[name] for name in FEED_VARIANT_FIELDS}
+
+
 # ---------------------------------------------------------------------------
 # Request bodies
 # ---------------------------------------------------------------------------
@@ -289,6 +351,86 @@ class SectionIn(BaseModel):
 
     key: str = Field(min_length=1, max_length=MAX_SECTION_KEY_LEN)
     label: str = Field(min_length=1, max_length=MAX_SECTION_LABEL_LEN)
+
+
+_LOCALE_FIELD = Field(pattern=VARIANT_LOCALE_PATTERN)
+_JOB_KEY_FIELD = Field(min_length=1, max_length=MAX_IDEMPOTENCY_KEY_LEN)
+
+
+def _not_blank(name: str, value: str) -> str:
+    if not value.strip():
+        raise ValueError(f"{name} must contain a non-whitespace character")
+    return value
+
+
+class VariantRequestIn(BaseModel):
+    """'A variant of this message in `locale` was asked for, by the job
+    `job_key`' (P5-4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    locale: str = _LOCALE_FIELD
+    job_key: str = _JOB_KEY_FIELD
+
+    @field_validator("job_key")
+    @classmethod
+    def _job_key_not_blank(cls, value: str) -> str:
+        return _not_blank("job_key", value)
+
+
+class VariantIn(BaseModel):
+    """The variant in `locale`, in exactly one of three forms (P5-4):
+      - the text: `body`, and `source_locale` -- the language the
+        model found the message written in -- other than `locale`;
+      - none is needed: `source_locale` equal to `locale`, no body;
+      - declined: `declined: true`, no body; `source_locale` may be
+        given, never equal to `locale`.
+    Any other combination is a 422 naming what is wrong."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    locale: str = _LOCALE_FIELD
+    job_key: str = _JOB_KEY_FIELD
+    source_locale: str | None = Field(default=None, pattern=VARIANT_LOCALE_PATTERN)
+    body: str | None = Field(
+        default=None, min_length=1, max_length=MAX_MESSAGE_BODY_LEN,
+    )
+    declined: bool = Field(default=False, strict=True)
+
+    @field_validator("job_key")
+    @classmethod
+    def _job_key_not_blank(cls, value: str) -> str:
+        return _not_blank("job_key", value)
+
+    @field_validator("body")
+    @classmethod
+    def _body_not_blank(cls, value: str | None) -> str | None:
+        return None if value is None else _not_blank("body", value)
+
+    @model_validator(mode="after")
+    def _one_form(self) -> "VariantIn":
+        same = self.source_locale == self.locale
+        if self.declined:
+            if self.body is not None:
+                raise ValueError("a declined variant has no body")
+            if same:
+                raise ValueError(
+                    "declined and source_locale equal to locale contradict: "
+                    "a message in the reader's language needs no variant"
+                )
+        elif self.source_locale is None:
+            raise ValueError(
+                "source_locale is required: the language the model found "
+                "the message written in"
+            )
+        elif same and self.body is not None:
+            raise ValueError(
+                "source_locale equal to locale means no variant is needed: "
+                "send no body"
+            )
+        elif not same and self.body is None:
+            raise ValueError("body is required for a variant in another language")
+        return self
 
 
 class MessageIn(BaseModel):
@@ -698,14 +840,87 @@ async def get_thread_feed(
     thread_id: UUID,
     limit: int = Query(default=PAGE_LIMIT_DEFAULT),
     cursor: str | None = Query(default=None),
+    locale: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_reader),
 ) -> dict[str, Any]:
-    """A thread's messages, newest-first, keyset-paginated."""
+    """A thread's messages, newest-first, keyset-paginated.
+
+    With `locale` -- the reader's language, a token of the variant form
+    -- every item also carries `variant` and `variant_state` (P5-4,
+    app/variants.py); the page is selected exactly as without it.
+    Without `locale` the response is what it always was."""
+    if locale is not None and not re.fullmatch(VARIANT_LOCALE_PATTERN, locale):
+        raise ValidationError(
+            f"locale must match {VARIANT_LOCALE_PATTERN}, got {locale!r}"
+        )
     messages, next_cursor = await list_thread_messages(
         session, thread_id=thread_id, limit=page_limit(limit),
         cursor=decode_cursor(cursor),
     )
-    return page(messages, next_cursor, _message_out)
+    if locale is None:
+        return page(messages, next_cursor, _message_out)
+    states = await reader_states(session, [m.id for m in messages], locale)
+
+    def _in_locale(message: Message) -> dict[str, Any]:
+        state, variant = states[message.id]
+        return {
+            **_message_out(message),
+            "variant": _feed_variant_out(variant) if variant else None,
+            "variant_state": state.value,
+        }
+
+    return page(messages, next_cursor, _in_locale)
+
+
+@router.post("/{thread_id}/messages/{message_id}/variant-requests")
+async def post_variant_request(
+    request: Request,
+    thread_id: UUID,
+    message_id: UUID,
+    payload: VariantRequestIn = Body(...),
+    idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Record that a variant of the message in `locale` was asked for,
+    by the llm job `job_key` (P5-4). Insert only, idempotent under its
+    key; pings nobody."""
+    row = await write_request(
+        session,
+        thread_id=thread_id,
+        message_id=message_id,
+        locale=payload.locale,
+        job_key=payload.job_key,
+        key=require_key(idempotency_key),
+        fingerprint=await request_fingerprint(request),
+    )
+    return _variant_request_out(row)
+
+
+@router.post("/{thread_id}/messages/{message_id}/variants")
+async def post_variant(
+    request: Request,
+    thread_id: UUID,
+    message_id: UUID,
+    payload: VariantIn = Body(...),
+    idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Write the variant of the message in `locale` (P5-4): one per
+    language, never replaced; the original is not touched. Idempotent
+    under its key; pings nobody."""
+    row = await write_variant(
+        session,
+        thread_id=thread_id,
+        message_id=message_id,
+        locale=payload.locale,
+        job_key=payload.job_key,
+        source_locale=payload.source_locale,
+        body=payload.body,
+        declined=payload.declined,
+        key=require_key(idempotency_key),
+        fingerprint=await request_fingerprint(request),
+    )
+    return _variant_out(row)
 
 
 # ---------------------------------------------------------------------------
