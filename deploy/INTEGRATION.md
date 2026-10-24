@@ -595,7 +595,8 @@ language, time zone, schedule, groups, mutes, sections, read pointers --
 and closes their waiting deliveries as `recipient_inactive`. The row
 stays as a tombstone with the id alone, because the threads and messages
 they were part of stay: a conversation belongs to both sides, and what
-happens to message bodies is the product's decision. A deletion is
+happens to message bodies -- and to their variants (section 12) -- is
+the product's decision. A deletion is
 final -- a person who returns gets a new id in the product. A
 recipient deactivated or deleted after a job was resolved is not sent
 to either: their delivery ends `recipient_inactive`, which is neither a
@@ -1502,6 +1503,163 @@ as often as needed within it -- and then deleted (`state: purged`); who
 answered and the letter's hash stay with the job, which general
 retention deletes like any other.
 
+## 12. A message in another language -- variants
+
+Translation in a thread is **your** use of the llm channel (section
+11): you decide who reads which language, you ask a model with your
+prompt and your schema, you read its answer. **comms does not
+translate, does not decide who needs a translation, and reads neither
+the message nor the model's answer.** What it gives is a place for the
+result -- a **variant** next to the message -- and the thread feed in
+the reader's language, which says for every message the variant or why
+there is none.
+
+**The original is never changed.** A variant is a separate record; no
+call edits or replaces the author's text. One mechanism for both
+directions -- the client writing to an operator and back: what differs
+is your type (its sets, its lane), not the record.
+
+**A language** is an opaque token: 1..8 characters of `[A-Za-z0-9_-]`,
+compared byte for byte -- `pt-BR` and `pt_br` are two languages to
+comms. It never comes from the person's settings (`recipients.locale`
+says what they want to read, not what they wrote): the language a
+message is written in is the one **the model found**.
+
+### Two records, both yours, both insert-only
+
+Both take the `Idempotency-Key` header (section 5): the same key with
+the same request answers with the same record; the same key with
+another request is 409 `conflict`. Neither pings anyone. A message that
+does not exist, or is not in that thread, is 404.
+
+**`POST /api/v1/threads/{tid}/messages/{mid}/variant-requests`** --
+write it when you queue the model: "a variant in this language was
+asked for, by this job". It is how the feed can say `preparing`: the
+link between your job and the message is yours, and comms is told it,
+never guesses it from your keys.
+
+| field | in the body | value |
+|---|---|---|
+| `locale` | required | the language asked for |
+| `job_key` | required | the `Idempotency-Key` of your llm job (section 11); a key that names no llm job is 422 |
+
+The answer carries `message_id`, `locale`, `job_key`, `created_at`.
+Several requests for one language are fine -- after a failed job,
+queue another and request again; the feed reads the latest. The same
+job for the same language twice under another key is 409 `conflict`.
+
+**A request is tied to the job its key named when it was written.**
+Retention deletes a job (`NOTIFICATION_RETENTION_DAYS`) and frees its
+key: a later job under the same key is another job, and it does **not**
+change the request -- whose own job is gone, so it reads `impossible`.
+Want the new job to count? Write a new request for it.
+
+**`POST /api/v1/threads/{tid}/messages/{mid}/variants`** -- write it
+when you have read the model's answer. One per language, **never
+replaced**: a second variant in a language is 409 `conflict`.
+
+| field | in the body | value |
+|---|---|---|
+| `locale` | required | the variant's language |
+| `job_key` | required | the llm job that answered; one without an answer is 422 |
+| `source_locale` | see the forms | the language the model found the message written in |
+| `body` | see the forms | the text in `locale`: 1..5000 characters, not blank |
+| `declined` | optional, `false` | `true`: you read the answer and write no variant |
+
+Exactly one of three forms -- anything else is 422, naming what is
+wrong:
+
+- **the text**: `body`, and `source_locale` other than `locale`;
+- **none is needed**: `source_locale` equal to `locale`, no `body` --
+  the message is already in that language;
+- **declined**: `declined: true`, no `body`; `source_locale` may be
+  given, never equal to `locale`. The model answered and could not --
+  in its words, which comms does not read: only you can say it.
+
+The answer carries `message_id`, `locale`, `source_locale`, `body`,
+`declined`, `job_key`, `answered_provider`, `answered_model`,
+`created_at`. **`answered_provider` / `answered_model` are not yours to
+send**: comms copies them from the job's answer (section 11) -- the
+provider and model that answered -- and keeps them with the variant
+after the job is gone.
+
+### The feed in the reader's language
+
+`GET /api/v1/threads/{tid}/messages?locale=<language>` pages exactly as
+without it. Every item carries the message as always, and two more
+keys:
+
+| key | value |
+|---|---|
+| `variant` | when `variant_state` is `ready`: `locale`, `source_locale`, `body`, `job_key`, `answered_provider`, `answered_model`, `created_at`; otherwise `null` |
+| `variant_state` | one of the five below, never empty |
+
+The state, decided in this order -- the first that holds:
+
+| | what is recorded for the message | `variant_state` |
+|---|---|---|
+| 1 | the variant in the reader's language, with text | `ready` |
+| 2 | the variant in the reader's language, declined | `impossible` |
+| 3 | the variant in the reader's language, none needed | `not_needed` |
+| 4 | another variant whose `source_locale` is the reader's language | `not_needed` |
+| 5 | the latest request in the reader's language, its job queued, in work or answered | `preparing` |
+| 6 | the latest request in the reader's language, its job failed, expired or cancelled -- or deleted by retention, whatever its key names now | `impossible` |
+| 7 | none of these | `not_requested` |
+
+**`impossible` has two sources**, and both mean "there will be no
+variant unless you ask again": the transport's -- the job ended without
+an answer (row 6) -- and the content's -- you read the answer and
+declined (row 2). A job that **answered** is `preparing` until you
+write the variant: an answer saying "I can't" is still an answer
+(comms does not read it), and `declined` is how you say so.
+
+**`not_requested` is where you decide**: nothing was asked for that
+language and nothing says the message is in it -- queue the model if
+the reader needs it. The feed never queues anything by itself.
+
+Without `locale` the feed is **exactly** what it was: no `variant`, no
+`variant_state`.
+
+### How long a variant lives
+
+As long as its message: a message's variants and requests go with it.
+comms deletes no message today: retention removes notifications,
+closing a thread is a status change. **Forgetting a person keeps the
+variants, as it keeps the bodies of their messages** (section 5) --
+what happens to a forgotten person's words in a shared conversation is
+your decision, for the variants as for the bodies.
+
+### End to end
+
+A client writes in German to a support operator who reads English.
+
+1. The message is posted as always: `POST /threads/T/messages`, its id
+   `M`.
+2. You decide the operator needs English and queue your llm type
+   (section 11) with your prompt, the text of `M` you read, and your
+   schema -- `Idempotency-Key: translate:M:en`, a key of yours.
+3. You record it:
+
+       POST /api/v1/threads/T/messages/M/variant-requests
+       Idempotency-Key: request:M:en
+       {"locale": "en", "job_key": "translate:M:en"}
+
+   The operator's feed with `?locale=en` says `preparing` for `M`.
+4. The job's outcome is pushed (section 10); you read the job by its
+   key (section 8), parse the answer with your schema: the text, and
+   the language the model found -- `de`.
+5. You write the variant:
+
+       POST /api/v1/threads/T/messages/M/variants
+       Idempotency-Key: variant:M:en
+       {"locale": "en", "job_key": "translate:M:en",
+        "source_locale": "de", "body": "I can't log in since yesterday"}
+
+6. The feed with `?locale=en` gives `M` as written, its `variant` in
+   English with the provider and model that answered, and
+   `variant_state: ready`. With `?locale=de` -- the client's own feed --
+   `M` is `not_needed`: the model found it written in German.
+
 ## Operating the comms stack
 
 What an operator needs on the box, collected here because every item
@@ -1612,6 +1770,9 @@ variable). A model's answer is kept by its type.
   **30**. A thread with no activity for that long is closed by the
   same worker. Closing is a status change -- the thread, its messages
   and the participants' read pointers stay.
+- **A message's variants** (section 12): as long as the message --
+  comms deletes none -- and forgetting a person keeps them, as it keeps
+  the bodies of their messages.
 
 A deploy that wants either behaviour off sets the value to 0. A
 product that needs history kept longer than comms keeps it should

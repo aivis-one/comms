@@ -105,3 +105,42 @@ MAX_MESSAGE_BODY_LEN = 5000
 # the INSERT and returns as a database error.
 MIN_THREAD_PRIORITY = -(2**31)
 MAX_THREAD_PRIORITY = 2**31 - 1
+
+
+# -----------------------------------------------------------------------------
+# A message in another language -- variants (P5-4)
+# -----------------------------------------------------------------------------
+# A language is an OPAQUE TOKEN of a form, never interpreted: 1..8
+# characters of [A-Za-z0-9_-] -- as wide as recipients.locale
+# (MAX_LOCALE_LEN) -- compared byte for byte, never normalized ("pt-BR"
+# and "pt_br" are two languages to comms). The check is in the
+# migration (0033) and at the API, from this one pattern.
+VARIANT_LOCALE_PATTERN = r"^[A-Za-z0-9_-]{1,8}$"
+
+
+class VariantState(enum.StrEnum):
+    """What a reader in one language gets for one message, besides the
+    original (P5-4, spec §13.10). Five answers, never folded into one
+    empty string: "no variant" has four different reasons, and a product
+    acts differently on each.
+
+    The order in which the feed decides is in app/variants.py
+    (decide_state); this enum is the vocabulary only.
+    """
+
+    # A variant in the reader's language: the product wrote its text.
+    READY = "ready"
+    # None is needed: the language the model found the message written
+    # in IS the reader's.
+    NOT_NEEDED = "not_needed"
+    # The product asked a model (a variant request names the job) and
+    # has not written the variant yet.
+    PREPARING = "preparing"
+    # There will be none: the job ended without an answer (failed,
+    # expired, cancelled, or gone with retention) -- or the product,
+    # having read the answer, wrote that it declines.
+    IMPOSSIBLE = "impossible"
+    # Nothing was asked for this language, and nothing says the
+    # message is in it: the product decides whether to ask.
+    NOT_REQUESTED = "not_requested"
+

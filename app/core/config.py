@@ -118,8 +118,19 @@ from app.core.lanes import Lane
 # its own backends -- on a box `comms test` shares the server with the
 # live worker, whose wake listener the suite used to see (and could kill).
 # Only tests change.
+#
+# 3.8.0 is P5-4, the last of phase 5: a message's variant in another
+# language. The product writes two insert-only records with an
+# idempotency key -- "a variant into a locale is being made by this llm
+# job" and the variant itself (a text, "not needed", or "declined"), its
+# provider and model copied from the job's snapshot -- and the thread's
+# feed read with ?locale= carries each message's variant or one of five
+# states (ready, not_needed, preparing, impossible, not_requested). The
+# original is never touched; comms translates nothing and reads neither
+# the message nor the model's answer. Without ?locale= the feed is as it
+# was, byte for byte.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.7.1"
+APP_VERSION = "3.8.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

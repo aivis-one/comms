@@ -35,10 +35,14 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.constants import FINGERPRINT_LEN, MAX_IDEMPOTENCY_KEY_LEN
+from app.core.constants import (
+    FINGERPRINT_LEN,
+    MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_LOCALE_LEN,
+)
 from app.core.database import Base
 from app.core.mixins import TimestampMixin, UUIDMixin
 from app.messaging.constants import (
@@ -375,3 +379,102 @@ class SectionMember(Base):
             f"<SectionMember section={self.section_id} "
             f"operator={self.operator_id}>"
         )
+
+
+class MessageVariantRequest(UUIDMixin, Base):
+    """"A variant of this message in this language was asked for, by
+    this job" -- the product's record, written when it queues the
+    translation (P5-4). Insert only, never changed: a second request
+    for the same language names another job, and the latest one is
+    the one the feed reads (app/variants.py).
+
+    `job_key` is the job's Idempotency-Key, as the product named it;
+    `job_id` is the job it named THEN -- what the state is read by
+    (3.8.0 -- fix). Neither is a foreign key: retention deletes jobs,
+    while this row lives as long as its message. And retention frees
+    the key: a later job under it is another job, and does not change
+    this request -- whose job, gone, reads as "impossible".
+    """
+
+    __tablename__ = "message_variant_requests"
+
+    message_id: Mapped[UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    locale: Mapped[str] = mapped_column(String(MAX_LOCALE_LEN), nullable=False)
+    job_key: Mapped[str] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN), nullable=False,
+    )
+    job_id: Mapped[UUID] = mapped_column(nullable=False)
+    # The caller's Idempotency-Key and its request's digest -- as on
+    # messages (F1.4): the same key with the same digest answers with
+    # this row, another digest is a conflict.
+    idempotency_key: Mapped[str] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN), nullable=False,
+    )
+    fingerprint: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class MessageVariant(UUIDMixin, Base):
+    """A message in another language, as the product wrote it (P5-4).
+
+    The ORIGINAL IS UNTOUCHED: this is a separate row next to the
+    message, never a change of it. Insert only, one per (message,
+    locale): a second variant for a language is a conflict, not a
+    replacement. Three forms, held by
+    ck_message_variants_form (migration 0033):
+      - the text: `body`, and the language the model found the
+        message written in, `source_locale`, another than `locale`;
+      - "none is needed": no body, `source_locale` = `locale`;
+      - "declined": no body, `declined` -- the product read the
+        model's answer and will write no variant (its words, its
+        decision; comms does not read the answer).
+    `answered_provider` / `answered_model` are COPIED from the job's
+    answer snapshot (llm_answers) when the variant is written -- the
+    provider and model that answered, never what the product says --
+    and stay when retention deletes the job.
+    """
+
+    __tablename__ = "message_variants"
+
+    message_id: Mapped[UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    locale: Mapped[str] = mapped_column(String(MAX_LOCALE_LEN), nullable=False)
+    source_locale: Mapped[str | None] = mapped_column(
+        String(MAX_LOCALE_LEN), nullable=True,
+    )
+    body: Mapped[str | None] = mapped_column(
+        String(MAX_MESSAGE_BODY_LEN), nullable=True,
+    )
+    declined: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    job_key: Mapped[str] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN), nullable=False,
+    )
+    answered_provider: Mapped[str | None] = mapped_column(
+        String(200), nullable=True,
+    )
+    answered_model: Mapped[str | None] = mapped_column(
+        String(200), nullable=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(MAX_IDEMPOTENCY_KEY_LEN), nullable=False,
+    )
+    fingerprint: Mapped[str] = mapped_column(
+        String(FINGERPRINT_LEN), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+

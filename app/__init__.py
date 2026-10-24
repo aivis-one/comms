@@ -12,7 +12,8 @@
 #   rank 1  profile                      the product's types and templates
 #   rank 2  audience, messaging          recipients and groups; threads
 #   rank 3  engine                       intake, pipeline, journal
-#   rank 4  forgetting, notifier         across engine, audience, messaging
+#   rank 4  forgetting, notifier,        across engine, audience, messaging
+#           variants
 #   rank 5  api, transport               HTTP in, the stream in and out
 #   rank 6  main, worker, consumer       the processes
 #
