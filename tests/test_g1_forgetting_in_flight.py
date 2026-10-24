@@ -131,7 +131,8 @@ async def _waiting_statement(pid: list[int]) -> str | None:
     async with get_session_factory()() as session:
         query: str | None = (await session.execute(text(
             "SELECT query FROM pg_stat_activity "
-            "WHERE pid = :pid AND wait_event_type = 'Lock'"
+            "WHERE pid = :pid AND wait_event_type = 'Lock' "
+            "AND datname = current_database()"
         ), {"pid": pid[0]})).scalar_one_or_none()
         return query
 

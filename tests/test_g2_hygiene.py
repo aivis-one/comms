@@ -29,6 +29,10 @@
 #   M7 sql_shape takes the first FROM at any depth       -> TestSqlShape
 #   M8 (tests/test_h9_release.py) the greater id given   -> the premise check
 #      to the other send                                    there
+#   FIX (3.7.0, a box's suite saw the live worker's listener):
+#   M9 a pg_stat_activity query without datname          -> test_every_
+#                                                           activity_query_is_
+#                                                           this_databases
 # =============================================================================
 
 import ast
@@ -556,3 +560,110 @@ class TestSqlShape:
             "SELECT", "notifications", True,
         )
         assert shape.order_by == "notifications.created_at"
+
+
+# ---------------------------------------------------------------------------
+# FIX (3.7.0) -- the suite looks at its own database only
+# ---------------------------------------------------------------------------
+#
+# On a box `comms-deploy.sh test` runs the suite against <db>_test on
+# the server where the live comms-worker works in <db>. A query to
+# pg_stat_activity / pg_locks without the database sees that worker's
+# sessions: listener_pid() found the live wake listener (15 failures on
+# both boxes), and a pid taken there could be terminated. In CI no live
+# worker is beside the suite, so CI could not see it.
+
+_ACTIVITY = re.compile(r"\b(pg_stat_activity|pg_locks)\b")
+_OWN_DATABASE = "datname = current_database()"
+
+
+# A query that looks at ANOTHER database on purpose -- (file, function)
+# -> why. It filters by datname too, only not by its own.
+OTHER_DATABASE_ON_PURPOSE: dict[tuple[str, str], str] = {
+    ("tests/test_lane_wake.py",
+     "test_another_databases_listener_is_neither_seen_nor_killed"):
+        "the pair of the shared-server test: it proves the other "
+        "database's listener is there, by its datname",
+}
+
+
+def scan_activity_queries(
+    source: str, path: str,
+) -> list[tuple[str, str, int, bool]]:
+    """(path, function, line, limited to this database) of every SQL
+    string that reads pg_stat_activity or pg_locks. Adjacent literals
+    are one string to the parser, so a query split over lines is read
+    whole; docstrings are prose and are not read."""
+    tree = ast.parse(source)
+    docs: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                docs.add(id(first.value))
+    found: list[tuple[str, str, int, bool]] = []
+
+    def visit(node: ast.AST, scope: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = scope
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inner = child.name
+            if (
+                isinstance(child, ast.Constant) and isinstance(child.value, str)
+                and id(child) not in docs and _ACTIVITY.search(child.value)
+            ):
+                found.append(
+                    (path, inner, child.lineno, _OWN_DATABASE in child.value),
+                )
+            visit(child, inner)
+
+    visit(tree, "<module>")
+    return found
+
+
+class TestOwnDatabaseOnly:
+    def test_every_activity_query_is_this_databases(self) -> None:
+        """Every query of pg_stat_activity / pg_locks in tests/ carries
+        datname = current_database(). The pair: the scan finds the known
+        queries -- the wake listener's among them."""
+        found = [
+            hit for path in sorted((_REPO / "tests").glob("*.py"))
+            if path.name != Path(__file__).name
+            for hit in scan_activity_queries(
+                path.read_text(encoding="utf-8"),
+                str(path.relative_to(_REPO)),
+            )
+        ]
+        files = {path for path, _, _, _ in found}
+        assert "tests/test_lane_wake.py" in files and len(found) >= 10
+        unlimited = [
+            (path, scope, line) for path, scope, line, own in found
+            if not own and (path, scope) not in OTHER_DATABASE_ON_PURPOSE
+        ]
+        assert unlimited == [], f"not limited to this database: {unlimited}"
+        on_purpose = {(path, scope) for path, scope, _, own in found if not own}
+        assert on_purpose == set(OTHER_DATABASE_ON_PURPOSE)
+
+    def test_the_scanner_sees_a_split_query(self) -> None:
+        source = """
+def a():
+    return text(
+        "SELECT pid FROM pg_stat_activity "
+        "WHERE application_name = :name"
+    )
+
+def b():
+    return text(
+        "SELECT pid FROM pg_stat_activity "
+        "WHERE pid = :pid AND datname = current_database()"
+    )
+
+def c():
+    \"\"\"pg_stat_activity in a docstring is prose.\"\"\"
+"""
+        assert [
+            (scope, own) for _, scope, _, own in scan_activity_queries(source, "m.py")
+        ] == [("a", False), ("b", True)]
+

@@ -406,6 +406,7 @@ class TestWithdrawAgainstCleanup:
                         "SELECT l.relation::regclass::text FROM pg_locks l "
                         "JOIN pg_stat_activity a ON a.pid = l.pid "
                         "WHERE a.wait_event_type = 'Lock' "
+                        "AND a.datname = current_database() "
                         "AND a.query ILIKE 'DELETE FROM notifications%' "
                         "AND l.locktype = 'tuple' AND l.granted"
                     ))).scalar_one_or_none()

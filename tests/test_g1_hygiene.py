@@ -479,7 +479,8 @@ async def _until_waiting(pid: list[int]) -> None:
             async with get_session_factory()() as session:
                 waiting = (await session.execute(text(
                     "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE pid = :pid AND wait_event_type = 'Lock'"
+                    "WHERE pid = :pid AND wait_event_type = 'Lock' "
+                    "AND datname = current_database()"
                 ), {"pid": pid[0]})).scalar_one()
             if waiting:
                 return
