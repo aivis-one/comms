@@ -44,8 +44,19 @@
 # acks or acknowledging on read would do exactly that.
 #   unexpected (any other exception) -> log with a redacted traceback + DLQ +
 #              XACK: an unknown bug in ONE event must not wedge the
-#              whole stream (poison-pill rule) -- the DLQ preserves
-#              the evidence.
+#              whole stream (poison-pill rule) -- the DLQ keeps what
+#              the investigation needs (DEAD LETTERS below).
+#
+# DEAD LETTERS -- for the investigation, never a replay. Nothing reads
+# the DLQ back into the stream: the product resends from its outbox, the
+# source of the request (deploy/INTEGRATION.md, "How long comms keeps
+# things"). So a dead letter keeps the ADDRESS of the entry, never its
+# letter: the event name, the keys of `data` named by the event's own
+# field set (dead_letter_fields), the fingerprint and length of the
+# `data` bytes -- by which the product finds the event at home -- the
+# names of everything dropped, the reason, the attempts and the source
+# entry id. The stream lives in the shared redis with no expiry; a
+# letter kept there would outlive every promise of the contract.
 #
 # KNOWN CEILING -- head-of-line blocking on the ordering retry (BL-4).
 # Mechanics: a group_changed that arrived before its user_upserted is
@@ -81,8 +92,19 @@ from app.core.exceptions import (
     conflict_class,
 )
 from app.core.sanitize import sanitize_text, sanitized_traceback
+from app.engine.journal import pipeline_error_of
+from app.engine.service import stream_fingerprint
 from app.transport.connection import redis_client
-from app.transport.events import parse_event
+from app.transport.events import (
+    ENVELOPE_DATA_FIELD,
+    ENVELOPE_EVENT_FIELD,
+    EVENT_FIELDS,
+    EVENT_NOTIFICATION_REQUEST,
+    NOTIFICATION_REQUEST_ENVELOPE_FIELDS,
+    NOTIFICATION_REQUEST_FRAME_FIELDS,
+    entry_field_name,
+    parse_event,
+)
 from app.transport.handlers import HandleResult, handle_event
 
 logger = structlog.get_logger()
@@ -96,6 +118,30 @@ _BACKOFF_DELAYS: tuple[float, ...] = (0.2, 0.4, 0.8, 1.6, 3.2)
 # Redis has already waited server-side (BLOCK), so this only guards
 # against clients whose blocking read returns immediately.
 _IDLE_SLEEP_SECONDS = 0.05
+
+# The fields of a dead letter -- the contract's list
+# (deploy/INTEGRATION.md, "How long comms keeps things"), held to this
+# tuple both ways by tests/test_dlq_no_letter.py. Every name the
+# consumer adds carries the _dlq_ prefix; `event` is the entry's own.
+DLQ_FIELDS: tuple[str, ...] = (
+    ENVELOPE_EVENT_FIELD,
+    "_dlq_data",
+    "_dlq_data_fingerprint",
+    "_dlq_data_bytes",
+    "_dlq_dropped",
+    "_dlq_error",
+    "_dlq_attempts",
+    "_dlq_source_entry_id",
+)
+
+# Withheld from a dead letter although it is a field of the envelope:
+# llm_audio is the SIGNED link to a recording of a person's voice.
+# deploy/INTEGRATION.md section 11 promises the link is in no answer,
+# path, log line or error text and the body in no dead letter of comms;
+# a link kept in a stream without expiry would be the key to that body
+# for as long as the object lives. The one place this exception is
+# written.
+_DLQ_WITHHELD_ENVELOPE_FIELDS = frozenset({"llm_audio"})
 
 
 class StreamConsumer:
@@ -269,9 +315,13 @@ class StreamConsumer:
                         attempts=attempt,
                         error=sanitize_text(str(exc)),
                     )
+                    # The class and the place, never the text: an
+                    # OperationalError's text is its SQL and bound
+                    # parameters -- the letter, on a job's insert. The
+                    # text stays in the log line above (redacted).
                     await self._to_dlq(
                         entry_id, fields,
-                        reason=f"retries exhausted: {exc}",
+                        reason=f"retries exhausted: {pipeline_error_of(exc)}",
                         attempts=attempt,
                     )
                     await self._ack(entry_id)
@@ -299,7 +349,7 @@ class StreamConsumer:
                 )
                 await self._to_dlq(
                     entry_id, fields,
-                    reason=f"unexpected: {type(exc).__name__}: {exc}",
+                    reason=f"unexpected: {pipeline_error_of(exc)}",
                     attempts=attempt,
                 )
                 await self._ack(entry_id)
@@ -318,36 +368,27 @@ class StreamConsumer:
         reason: str,
         attempts: int,
     ) -> None:
-        """Dead-letter the original entry with diagnostics attached.
-
-        The DLQ entry carries the ORIGINAL envelope fields verbatim
-        (re-ingestable after a fix) plus error metadata under the
-        _dlq_ prefix (review 3c.1): un-prefixed names could collide
-        with fields of a thoroughly broken producer's entry and
-        silently overwrite them -- breaking the "verbatim" promise
-        exactly on the records where the evidence matters most. The
-        prefix also self-documents which fields the CONSUMER added.
-        The stream is capped (approximate MAXLEN) so a misbehaving
-        producer cannot grow it without bound.
+        """Dead-letter the entry's address with diagnostics attached --
+        DEAD LETTERS in the module header; the fields are
+        dead_letter_fields'.
 
         The reason is redacted HERE, the one point every dead-letter
-        path passes: the DLQ is a stream in the shared redis, and a
-        reason is an exception's text (an OperationalError's is its SQL
-        and bound parameters). The envelope fields are the producer's
-        own and stay verbatim.
+        path passes. It is a refusal of comms' own (a ValidationError:
+        field names and the address, never the letter) or the class and
+        place of an exception (pipeline_error_of), never an exception's
+        text. The stream is capped (approximate MAXLEN) so a
+        misbehaving producer cannot grow it without bound.
         """
         reason = sanitize_text(reason)
+        payload = dead_letter_fields(
+            fields, reason=reason, attempts=attempts, entry_id=_id_str(entry_id),
+        )
         # redis-py's FieldT alias is invariant in dict params, so a
         # plain dict[str, str] does not satisfy it; alias it exactly.
-        payload: dict[FieldT, EncodableT] = {
-            _field_str(k): _field_str(v) for k, v in fields.items()
-        }
-        payload["_dlq_error"] = reason
-        payload["_dlq_attempts"] = str(attempts)
-        payload["_dlq_source_entry_id"] = _id_str(entry_id)
+        entry: dict[FieldT, EncodableT] = dict(payload.items())
         await self._redis.xadd(
             self._dlq,
-            payload,
+            entry,
             maxlen=settings.dlq_maxlen,
             approximate=True,
         )
@@ -360,20 +401,105 @@ class StreamConsumer:
         )
 
 
+def dlq_kept_data_fields(event: str | None) -> frozenset[str] | None:
+    """The keys of `data` a dead letter keeps for this event; None when
+    it keeps none.
+
+    A list of what is ALLOWED, the event's own field set: a key that is
+    not in it -- `titel` is the letter under another name -- is dropped
+    like the letter. notification_request keeps its frame and envelope
+    (deploy/INTEGRATION.md section 7) without the withheld link; the
+    other events are the address book comms keeps anyway. An unknown or
+    absent event has no field set: nothing of its `data` is kept.
+    """
+    if event == EVENT_NOTIFICATION_REQUEST:
+        return NOTIFICATION_REQUEST_FRAME_FIELDS | (
+            NOTIFICATION_REQUEST_ENVELOPE_FIELDS - _DLQ_WITHHELD_ENVELOPE_FIELDS
+        )
+    if event is None:
+        return None
+    return EVENT_FIELDS.get(event)
+
+
+def dead_letter_fields(
+    fields: dict[Any, Any], *, reason: str, attempts: int, entry_id: str,
+) -> dict[str, str]:
+    """The dead letter of one stream entry (DEAD LETTERS, module header).
+
+    Values are written only where they are kept: `event` (when it is
+    UTF-8) and the allowed keys of `data` (when it is a UTF-8 JSON
+    object). Everything else is dropped by NAME -- a field of the entry
+    under its own name (entry_field_name: a byte that is not UTF-8 as a
+    backslash escape), a key of `data` as `data.<key>`, the whole of
+    `data` as `data` -- and the names are listed in _dlq_dropped, so the
+    reader sees what was there without seeing it. The fingerprint is of the
+    `data` bytes as the stream delivered them, the digest a refusal at
+    intake records (stream_fingerprint).
+    """
+    dead: dict[str, str] = {}
+    dropped: list[str] = []
+    event: str | None = None
+    raw_data: bytes | None = None
+    for key, value in fields.items():
+        name = entry_field_name(key)
+        raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
+        if name == ENVELOPE_EVENT_FIELD:
+            event = _utf8_or_none(raw)
+            if event is None:
+                dropped.append(name)
+        elif name == ENVELOPE_DATA_FIELD:
+            raw_data = raw
+        else:
+            dropped.append(name)
+    if event is not None:
+        dead[ENVELOPE_EVENT_FIELD] = event
+    if raw_data is not None:
+        dead["_dlq_data_fingerprint"] = stream_fingerprint(raw_data)
+        dead["_dlq_data_bytes"] = str(len(raw_data))
+        kept = dlq_kept_data_fields(event)
+        data = _json_object_or_none(raw_data)
+        if kept is None or data is None:
+            dropped.append(ENVELOPE_DATA_FIELD)
+        else:
+            # ensure_ascii: a lone surrogate (a JSON escape the producer
+            # may send) is not encodable as UTF-8 on the way to redis.
+            dead["_dlq_data"] = json.dumps(
+                {k: v for k, v in data.items() if k in kept}, sort_keys=True,
+            )
+            dropped += [
+                f"{ENVELOPE_DATA_FIELD}.{k}" for k in data if k not in kept
+            ]
+    dead["_dlq_dropped"] = json.dumps(sorted(dropped))
+    dead["_dlq_error"] = reason
+    dead["_dlq_attempts"] = str(attempts)
+    dead["_dlq_source_entry_id"] = entry_id
+    return dead
+
+
+def _utf8_or_none(raw: bytes) -> str | None:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _json_object_or_none(raw: bytes) -> dict[str, Any] | None:
+    text = _utf8_or_none(raw)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _id_str(entry_id: str | bytes) -> str:
     return (
         entry_id.decode("ascii")
         if isinstance(entry_id, bytes)
         else str(entry_id)
     )
-
-
-def _field_str(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    if isinstance(value, str):
-        return value
-    return json.dumps(value)
 
 
 async def run_consumer_loop() -> None:

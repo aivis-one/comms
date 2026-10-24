@@ -864,8 +864,11 @@ fields.
 - **conflict** -- the same key with other bytes: recorded under the key, the existing job untouched;
 - **rejected at intake** -- the key is readable but the request cannot be accepted (an undeclared type, a malformed address, an expiry already past, an unknown field): recorded under the key; the key is **not** taken, so a corrected request with the same key is accepted.
 
-A request whose key cannot be read at all goes to the dead-letter
-stream: there is nothing to record the rejection under.
+A request whose key cannot be read at all -- a field of the entry that
+is not UTF-8 included -- goes to the dead-letter stream: there is
+nothing to record the rejection under. The dead letter keeps its
+address, never its letter, and the fingerprint of its `data` -- find
+the request in your outbox by it (see "How long comms keeps things").
 
 ### The idempotency key names the request, not its subject
 
@@ -952,6 +955,15 @@ language, zone or address, a deactivation, a block. comms re-checks
 
 An event refused as stale is acknowledged and logged with its class;
 it has no key to be recorded under.
+
+**Forgetting does not reach a model's jobs.** A job of an llm type
+(section 11) has no addressee -- its delivery's `recipient_id` is
+`null` (section 8) -- so forgetting a person leaves it as it is, even
+when its letter carries that person's words. Its letter, and the link
+to its audio body, are deleted at the job's outcome; its answer lives
+the type's `answer_keep` (see "How long comms keeps things"). A
+person's words you may have to forget sooner than that belong in no
+letter.
 
 ### `group_changed` -- membership
 
@@ -1419,12 +1431,13 @@ The request (section 7) carries no address, no `title`, `body` or
 gateway's, the schema is `response_format`; such a request is rejected
 at intake. The letter is at most 200 000 characters of canonical JSON.
 comms checks the letter's FORM only; what it says is never read, logged
-or kept past the job's outcome -- its hash is.
+or kept past the job's outcome -- its hash is. The job has no addressee,
+so forgetting a person does not reach it (section 7, `user_deleted`).
 
 ### `llm_audio` -- an audio body by link
 
 A recording does not travel in the envelope: megabytes of a person's
-voice would sit in your outbox, in the stream and in a dead letter. Keep
+voice would sit in your outbox and in the stream. Keep
 the body in your own object store and put a SIGNED link to it in the
 envelope, beside the letter (never inside it -- comms does not read the
 letter):
@@ -1454,7 +1467,8 @@ attempt's memory -- never in its database, stream or dead letters. So:
 - **the link and the object must live at least as long as the job**
   (its `expiry_at`, or the type's `expires_after`, with its retries);
 - the link is kept on the job until its outcome and deleted then, with
-  the letter; it is in no answer, path, log line or error text;
+  the letter; it is in no answer, path, log line, error text or dead
+  letter;
 - deleting the recording after the outcome is yours.
 
 | the store answers | the delivery |
@@ -1818,7 +1832,8 @@ The questions every product asks once, answered here so the answer is
 not a trip through our source. The history and the threads are
 deploy-side settings with defaults; both are days-granular, and both
 treat zero as "never" (a negative value refuses the start, naming the
-variable). A model's answer is kept by its type.
+variable). The dead letters are capped by count, a deploy-side setting
+too. A model's answer is kept by its type.
 
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is
@@ -1836,9 +1851,34 @@ variable). A model's answer is kept by its type.
   comms deletes none -- and forgetting a person keeps them, as it keeps
   the bodies of their messages.
 
+- **Dead letters**: an entry comms cannot take -- a broken frame, an
+  unknown event, a request whose key cannot be read, an event that
+  failed past its retries -- lands in the dead-letter stream
+  `<COMMS_EVENTS_STREAM>:dlq` in comms' redis, for the investigation.
+  It keeps the entry's address and never its letter (the table below).
+  No expiry: the stream is capped at `DLQ_MAXLEN` entries, default
+  **10000**, the oldest trimmed first (approximately). Nothing is
+  replayed from it: once the cause is fixed, your outbox sends the
+  event again.
+
 A deploy that wants either behaviour off sets the value to 0. A
 product that needs history kept longer than comms keeps it should
 retain its own copy: comms is the delivery service, not the archive.
+
+**What a dead letter holds.** A value is kept only where the table
+says so; every other field of the entry, and every other key of its
+`data`, is dropped and only its NAME is listed.
+
+| field | what it holds |
+|---|---|
+| `event` | the entry's event name as sent; absent when the entry had none, or it was not UTF-8 |
+| `_dlq_data` | a JSON object of the keys of `data` the event's own field set names (section 7): for `notification_request` the frame and the envelope without `llm_audio` -- the signed link to a person's voice (section 11); for the other events their fields. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
+| `_dlq_data_fingerprint` | the SHA-256 of the `data` bytes as sent -- the digest a rejection at intake records; absent without `data` |
+| `_dlq_data_bytes` | the length of those bytes; absent without `data` |
+| `_dlq_dropped` | a JSON list of the names of everything not kept: a field of the entry by its name, a key of `data` as `data.<key>`, the whole of `data` as `data`; `[]` when nothing was |
+| `_dlq_error` | why: comms' own refusal (it names fields and the address, never the letter), or the class and the place of the failure -- never an exception's text |
+| `_dlq_attempts` | the attempts made; `0` -- refused as it was read |
+| `_dlq_source_entry_id` | the entry's id in the stream it came from |
 
 ## Compose project name
 

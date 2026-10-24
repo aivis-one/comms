@@ -39,8 +39,8 @@
 #   - "feedback": a generic English word with legitimate future uses.
 #
 # ROOTS -- app/ (AST), deploy/ (lines), and the FILES AT THE REPOSITORY
-# ROOT (lines, the deploy/ rules; D1 / R9): .env.example, Dockerfile,
-# pyproject.toml, alembic.ini ... are behavior of the service too. Not
+# ROOT (lines, the deploy/ rules; D1 / R9): Dockerfile, pyproject.toml,
+# alembic.ini ... are behavior of the service too. Not
 # recursive -- the directories at the root are other trees (.github/,
 # scripts/, migrations/, tests/), outside this fence. Full-line comments
 # stay free at the root exactly as in deploy/: the root's comments carry

@@ -98,13 +98,16 @@ _PROVIDER_MODULE_ROOTS = frozenset({"aiogram", "httpx", "httpcore"})
 
 
 def pipeline_error_of(exc: BaseException) -> str:
-    """The CLASS of an exception of comms' own and the PLACE in comms
-    where it was raised (module:line).
+    """The CLASS of an exception -- comms' own or a library's -- and the
+    PLACE in comms nearest to where it was raised: the deepest frame of
+    app/ on its traceback (module:line).
 
     NEVER the exception's text, sanitized or not. Sanitizing removes
     secrets, not content: a text raised from a template or a formatter
-    can carry the letter's variables, and a record of comms holds no
-    letter content (spec §6.4). The class and the place say where it
+    can carry the letter's variables, a database error's text is its
+    SQL and bound parameters, and a record of comms holds no letter
+    content (spec §6.4) -- nor does a dead letter
+    (app/transport/consumer.py). The class and the place say where it
     tore; the redacted traceback in the log says the rest.
     """
     name = f"{type(exc).__module__}.{type(exc).__qualname__}"

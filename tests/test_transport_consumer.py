@@ -442,8 +442,8 @@ class TestPoisonPill:
         type) is terminal too: no retry burn. Since F1.2 it is recorded
         under the request's key as rejected_at_intake instead of being
         dead-lettered -- one copy of the fact, where the product can
-        find it (the DLQ verbatim-envelope promise is pinned by the
-        unreadable-key cases above)."""
+        find it. (What a dead letter keeps, since G4 the address and
+        never the letter, is held in tests/test_dlq_no_letter.py.)"""
         data = _request_data(type="not_in_profile")
         await _xadd(redis, stream, "notification_request", data)
 
@@ -603,13 +603,25 @@ def _operational_error() -> OperationalError:
 
 # (id, the exception handle_event raises, the secret, what the DLQ
 # reason must still say, the log event that carries the text, its key).
+#
+# Until G4 the reason of the two unexpected cases and of the exhausted
+# retries said the exception's TEXT, redacted ("send failed", "connection
+# refused"), and these rows held the redaction there. G4 put the class
+# and the place in its stead (pipeline_error_of): an OperationalError's
+# text is its bound parameters -- the letter, on a job's insert -- and
+# redaction removes secrets, not the letter. The secret is still asserted
+# absent from every DLQ field and every log value; the redaction of the
+# TEXT is held where the text still goes -- the log lines (log_key) and
+# the ValidationError row below. The place is the deepest frame of app/:
+# here the consumer's call of handle_event, whose line moves with the
+# file, hence a prefix up to the colon.
 _CONSUMER_FAILURES = [
     (
         "unexpected_secret_only_in_cause",
         lambda: _chained(aiohttp.InvalidURL(_TG_URL),
                          RuntimeError("send failed")),
         _TG_SECRET,
-        "unexpected: RuntimeError: send failed",
+        "unexpected: builtins.RuntimeError at app/transport/consumer.py:",
         "event_unexpected_error", "exception",
     ),
     (
@@ -617,14 +629,15 @@ _CONSUMER_FAILURES = [
         lambda: _chained(aiohttp.InvalidURL(_TG_URL),
                          RuntimeError(f"send failed {_TG_URL}")),
         _TG_SECRET,
-        "unexpected: RuntimeError: send failed",
+        "unexpected: builtins.RuntimeError at app/transport/consumer.py:",
         "event_unexpected_error", "exception",
     ),
     (
         "operational_error_sql_and_params",
         _operational_error,
         _REDIS_PASS,
-        "retries exhausted: (builtins.Exception) connection refused",
+        "retries exhausted: sqlalchemy.exc.OperationalError at "
+        "app/transport/consumer.py:",
         "event_retries_exhausted", "error",
     ),
     (

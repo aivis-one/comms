@@ -770,11 +770,28 @@ class TestTheDeployForms:
         assert Settings(_env_file=None).templates_overlay_dir == "/profile-overlay"
 
     def test_the_templates_carry_the_variable_empty(self) -> None:
+        """Until G4 the root .env.example carried TEMPLATES_OVERLAY_DIR
+        empty, and this test held that. G4 left one template, the
+        deploy's (the root copy had drifted from it and is gone), where
+        the variable is not written at all: compose sets it for every
+        comms process from PROFILE_OVERLAY_DIR, and a value in .env would
+        be overridden. So the root's line is replaced by what decides the
+        value: the compose `environment:` of every comms-* service,
+        read as YAML."""
         deploy_env = (_DEPLOY / ".env.example").read_text()
         assert re.search(r"^PROFILE_OVERLAY_DIR=$", deploy_env, re.M)
         assert re.search(r"^PROFILE_DIR=\S+$", deploy_env, re.M)
-        root_env = (_REPO / ".env.example").read_text()
-        assert re.search(r"^TEMPLATES_OVERLAY_DIR=$", root_env, re.M)
+        assert not re.search(r"^#?TEMPLATES_OVERLAY_DIR=", deploy_env, re.M)
+        compose = yaml.safe_load((_DEPLOY / "docker-compose.yml").read_text())
+        processes = {
+            name: service for name, service in compose["services"].items()
+            if name in ("comms-app", "comms-worker", "comms-consumer")
+        }
+        assert len(processes) == 3
+        for service in processes.values():
+            assert service["environment"]["TEMPLATES_OVERLAY_DIR"] == (
+                "${PROFILE_OVERLAY_DIR:+/profile-overlay}"
+            )
         generated = _function("generate_env")
         assert re.search(r"^PROFILE_OVERLAY_DIR=$", generated, re.M)
         assert re.search(r"^PROFILE_DIR=\$PROFILE_DIR_DEFAULT$", generated, re.M)

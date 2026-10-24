@@ -178,7 +178,7 @@ jobs:
 
       # On the image's Python, Debian and installed packages. The checkout
       # is mounted over /app, read-only: the suite also reads files the
-      # image does not ship (deploy/, scripts/, .github/, .env.example) --
+      # image does not ship (deploy/, scripts/, .github/) --
       # the code is the same, the interpreter and the packages are the
       # image's (/opt/venv).
       - name: The suite inside the image

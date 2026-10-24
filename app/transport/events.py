@@ -27,11 +27,11 @@
 #
 # KNOWN CEILING -- a request whose key cannot be read is invisible to
 # the product.
-#   1. Mechanics: without a readable idempotency_key (data is not a
-#      JSON object, the key is absent, not a string, empty or longer
-#      than the column) there is no address to record the rejection
-#      under; the entry goes only to the DLQ, which the product does
-#      not read.
+#   1. Mechanics: without a readable idempotency_key (a field of the
+#      entry is not UTF-8, data is not a JSON object, the key is absent,
+#      not a string, empty or longer than the column) there is no
+#      address to record the rejection under; the entry goes only to
+#      the DLQ, which the product does not read.
 #   2. Status: acknowledged by design (spec §6.3 names this boundary).
 #   3. Backlog ref: none -- no key, no address; nothing to build.
 #   4. Promotion trigger (observable): an event_dead_lettered log line
@@ -583,20 +583,58 @@ def _validate_target(
 # ---------------------------------------------------------------------------
 
 
-def _decode(value: str | bytes) -> str:
-    return value.decode("utf-8") if isinstance(value, bytes) else value
+def entry_field_name(name: str | bytes) -> str:
+    """A stream entry's field name as text that can always be written
+    and printed: UTF-8 where it is UTF-8, a backslash escape for every
+    byte that is not. The one form a name takes in a refusal and in a
+    dead letter (app/transport/consumer.py)."""
+    if isinstance(name, bytes):
+        return name.decode("utf-8", errors="backslashreplace")
+    return name
+
+
+def _decode_entry(fields: dict[Any, Any]) -> dict[str, str]:
+    """Every field name and value of the entry as UTF-8 text.
+
+    The frame is UTF-8 (section 7); a byte that is not refuses the
+    ENTRY here, naming the field, so that it is dead-lettered like any
+    other broken frame. A decode error left to escape would end the
+    consumer's process -- and the restart would replay the same entry
+    from the pending list, forever (the poison-pill rule in
+    app/transport/consumer.py).
+    """
+    decoded: dict[str, str] = {}
+    for key, value in fields.items():
+        name = entry_field_name(key)
+        if not _is_utf8(key):
+            raise ValidationError(f"envelope: field name {name!r} is not UTF-8")
+        if not _is_utf8(value):
+            raise ValidationError(f"envelope: field {name!r} is not UTF-8")
+        decoded[name] = value.decode("utf-8") if isinstance(value, bytes) else value
+    return decoded
+
+
+def _is_utf8(value: str | bytes) -> bool:
+    if not isinstance(value, bytes):
+        return True
+    try:
+        value.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
 
 
 def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
     """Parse one stream entry's field map into a typed event.
 
     Raises ValidationError (terminal -> DLQ) on ANY malformation:
-    missing envelope fields, unknown event name, broken JSON, missing
-    or unsupported schema version, schema violations -- EXCEPT for a
-    notification_request whose key is readable, which comes back as a
+    a field name or value that is not UTF-8, missing envelope fields,
+    unknown event name, broken JSON, missing or unsupported schema
+    version, schema violations -- EXCEPT for a notification_request
+    whose key is readable, which comes back as a
     RejectedNotificationRequest (see _parse_notification_intake).
     """
-    decoded = {_decode(k): _decode(v) for k, v in fields.items()}
+    decoded = _decode_entry(fields)
 
     if ENVELOPE_EVENT_FIELD not in decoded:
         raise ValidationError(
@@ -630,7 +668,7 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
 def _raw_data(fields: dict[Any, Any]) -> bytes:
     """The `data` field's bytes exactly as the stream delivered them."""
     for key, value in fields.items():
-        if _decode(key) == ENVELOPE_DATA_FIELD:
+        if entry_field_name(key) == ENVELOPE_DATA_FIELD:
             return value if isinstance(value, bytes) else value.encode("utf-8")
     raise AssertionError("parse_event checked the data field first")
 
@@ -668,11 +706,14 @@ def _check_version(data: dict[str, Any], event: str) -> None:
         )
 
 
-# The closed field set of notification_request (F1.2): envelope,
-# letter and the protocol version. Anything else refuses the request.
-_NOTIFICATION_REQUEST_FIELDS = frozenset({
-    "v",
-    # envelope
+# The closed field set of notification_request (F1.2), split as
+# deploy/INTEGRATION.md section 7 splits it -- its "envelope / letter"
+# column, held to these three sets both ways by
+# tests/test_dlq_no_letter.py: the frame's version, the envelope comms
+# reads, the letter it carries and never interprets. Anything else
+# refuses the request.
+NOTIFICATION_REQUEST_FRAME_FIELDS = frozenset({"v"})
+NOTIFICATION_REQUEST_ENVELOPE_FIELDS = frozenset({
     "idempotency_key",
     "type",
     "target_type",
@@ -680,13 +721,21 @@ _NOTIFICATION_REQUEST_FIELDS = frozenset({
     "scheduled_at",
     "expiry_at",
     "correlation",
-    # letter
+    # The SIGNED link to the letter's audio body (section 11): it travels
+    # in the envelope, beside the letter and never inside it.
+    "llm_audio",
+})
+NOTIFICATION_REQUEST_LETTER_FIELDS = frozenset({
     "title",
     "body",
     "action_data",
     "llm",
-    "llm_audio",
 })
+_NOTIFICATION_REQUEST_FIELDS = (
+    NOTIFICATION_REQUEST_FRAME_FIELDS
+    | NOTIFICATION_REQUEST_ENVELOPE_FIELDS
+    | NOTIFICATION_REQUEST_LETTER_FIELDS
+)
 
 
 def _parse_notification_intake(
