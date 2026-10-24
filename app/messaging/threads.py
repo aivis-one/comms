@@ -35,9 +35,21 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import column, exists, select, table, tuple_
+from sqlalchemy import (
+    Uuid,
+    bindparam,
+    column,
+    exists,
+    func,
+    select,
+    table,
+    true,
+    tuple_,
+)
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.constants import PAGE_LIMIT_DEFAULT
 from app.core.exceptions import (
@@ -428,6 +440,13 @@ async def post_message(
 
 
 
+# A thread's messages, newest first: the feed's order, and so the one
+# definition of a thread's LAST message (last_messages) -- the first row
+# of the feed. created_at alone does not decide between two messages of
+# the same instant; id does, the same way in both.
+_NEWEST_FIRST = (Message.created_at.desc(), Message.id.desc())
+
+
 async def list_thread_messages(
     session: AsyncSession,
     *,
@@ -447,10 +466,7 @@ async def list_thread_messages(
     stmt = select(Message).where(Message.thread_id == thread_id)
     if cursor is not None:
         stmt = stmt.where(tuple_(Message.created_at, Message.id) < cursor)
-    stmt = (
-        stmt.order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(limit + 1)
-    )
+    stmt = stmt.order_by(*_NEWEST_FIRST).limit(limit + 1)
     rows = list(await session.scalars(stmt))
 
     has_more = len(rows) > limit
@@ -460,3 +476,36 @@ async def list_thread_messages(
         last = page[-1]
         next_cursor = (last.created_at, last.id)
     return page, next_cursor
+
+
+
+async def last_messages(
+    session: AsyncSession, thread_ids: Sequence[UUID],
+) -> dict[UUID, Message]:
+    """The last message of each thread of `thread_ids` -- the first row
+    its feed would give (_NEWEST_FIRST) -- in ONE statement for the
+    whole page (MSG-1): a LATERAL top-1 per thread on
+    ix_messages_thread_created. A thread with no message is absent from
+    the result; the caller says "none" for it."""
+    if not thread_ids:
+        return {}
+    # Driven by the page's ids themselves (unnest), not by a read of
+    # their thread rows: the rows are already in the caller's hands.
+    page = (
+        func.unnest(bindparam("thread_ids", list(thread_ids), ARRAY(Uuid)))
+        .table_valued("thread_id")
+        .render_derived(name="page")
+    )
+    newest = (
+        select(Message)
+        .where(Message.thread_id == page.c.thread_id)
+        .order_by(*_NEWEST_FIRST)
+        .limit(1)
+        .lateral("newest")
+    )
+    message = aliased(Message, newest)
+    rows = await session.scalars(
+        select(message).select_from(page).join(newest, true())
+    )
+    return {row.thread_id: row for row in rows}
+

@@ -16,7 +16,8 @@
 # CONTRACT (Phase 6 product proxy consumes as-is):
 #
 #   POST /api/v1/threads                      -> 200 <thread> + created
-#   GET  /api/v1/threads?operator=&is_supervisor=&limit=&cursor=
+#   GET  /api/v1/threads?operator=|client=&is_supervisor=&with_unread=
+#        &with_last_message=&locale=&limit=&cursor=
 #                                             -> 200 {items, next_cursor}
 #   POST /api/v1/threads/{tid}/messages       -> 200 <message>  (+ notify)
 #   GET  /api/v1/threads/{tid}/messages?limit=&cursor=&locale=
@@ -74,6 +75,9 @@
 #     race. ADDITIVE to the frozen 3b shape (seam T2 / ID-10, precedent
 #     reminder_cancel) -- every pre-existing field is unchanged, and no
 #     OTHER endpoint gained the key;
+#   - THE LIST (MSG-1): an operator's or a client's (exactly one), and
+#     with_last_message / locale add each row's last message and its
+#     variant -- deploy/INTEGRATION.md section 13;
 #   - A MESSAGE IN ANOTHER LANGUAGE (P5-4, app/variants.py): the two
 #     variant routes are insert-only records the product writes; with
 #     `locale` the feed adds `variant` and `variant_state` to every item,
@@ -142,6 +146,7 @@ from app.messaging.constants import (
     OperatorKind,
     ThreadKind,
     ThreadStatus,
+    VariantState,
 )
 from app.messaging.models import (
     Message,
@@ -158,6 +163,7 @@ from app.messaging.operators import (
     can_operate,
     can_post_message,
     claim_thread,
+    list_client_threads,
     list_visible_threads,
     retag_thread,
 )
@@ -171,6 +177,7 @@ from app.messaging.sections import get_or_create_section
 from app.messaging.status import set_status
 from app.messaging.threads import (
     create_or_get_thread_detailed,
+    last_messages,
     list_thread_messages,
     post_message,
 )
@@ -300,6 +307,34 @@ def _variant_out(row: MessageVariant) -> dict[str, Any]:
 def _feed_variant_out(row: MessageVariant) -> dict[str, Any]:
     full = _variant_out(row)
     return {name: full[name] for name in FEED_VARIANT_FIELDS}
+
+
+def _in_reader_language(
+    states: dict[UUID, tuple[VariantState, MessageVariant | None]],
+    message_id: UUID,
+) -> dict[str, Any]:
+    """`variant` and `variant_state` of one message for a reader -- the
+    two keys the feed's items and a list row's last_message carry, from
+    ONE reader_states (app/variants.py): one decision, two places."""
+    state, variant = states[message_id]
+    return {
+        "variant": _feed_variant_out(variant) if variant else None,
+        "variant_state": state.value,
+    }
+
+
+def _checked_locale(locale: str | None) -> str | None:
+    """A reader's language, of the variant form, or a 422."""
+    if locale is not None and not re.fullmatch(VARIANT_LOCALE_PATTERN, locale):
+        raise ValidationError(
+            f"locale must match {VARIANT_LOCALE_PATTERN}, got {locale!r}"
+        )
+    return locale
+
+
+# The fields of a list row's last_message (MSG-1): the message as the
+# feed gives it, but its thread -- the row IS the thread.
+LAST_MESSAGE_FIELDS = ("id", "sender", "body", "created_at")
 
 
 # ---------------------------------------------------------------------------
@@ -662,14 +697,35 @@ async def create_section(
 
 @router.get("")
 async def list_threads(
-    operator: UUID = Query(...),
+    operator: UUID | None = Query(default=None),
+    client: UUID | None = Query(default=None),
     is_supervisor: bool = Query(default=False),
     with_unread: bool = Query(default=False),
+    with_last_message: bool = Query(default=False),
+    locale: str | None = Query(default=None),
     limit: int = Query(default=PAGE_LIMIT_DEFAULT),
     cursor: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_reader),
 ) -> dict[str, Any]:
-    """The operator's visible threads, most-recently-active first.
+    """A reader's threads, most-recently-active first: the OPERATOR's
+    visible threads, or -- with `client` instead (MSG-1) -- the threads
+    in which that person is the client. Exactly one of the two.
+
+    THE CLIENT LIST (MSG-1): the same order, keyset and cursor as the
+    operator's (app/messaging/operators.py _activity_page); `unread` is
+    counted FOR THE CLIENT, through the same participation rule -- the
+    client takes part in every thread of their list, so every row
+    carries it. `is_supervisor` widens an operator's read and means
+    nothing for a client: with `client` it is a 422. The client is
+    TRUSTED exactly as `operator` is (below).
+
+    THE LAST MESSAGE (MSG-1), STRICTLY OPT-IN like `unread`: with
+    with_last_message every row gains "last_message" -- the first row
+    its feed would give (id, sender, body, created_at), or null for a
+    thread with no message -- read for the whole page in one statement.
+    With `locale` too, last_message carries `variant` and
+    `variant_state` from the SAME reader_states as the feed. `locale`
+    without with_last_message is a 422: it would apply to nothing.
 
     READ-SCOPING IS THE PROXY'S JOB (frozen trust model). `operator`
     and especially `is_supervisor` are TRUSTED query params: comms does
@@ -699,23 +755,72 @@ async def list_threads(
     "nothing unread here" and be indistinguishable from a thread the
     operator has fully read.
     """
-    threads, next_cursor = await list_visible_threads(
-        session,
-        operator=operator,
-        is_supervisor=is_supervisor,
-        limit=page_limit(limit),
-        cursor=decode_cursor(cursor),
-    )
+    if (operator is None) == (client is None):
+        raise ValidationError(
+            "exactly one of operator / client: the reader whose threads "
+            "are listed"
+        )
+    if client is not None and is_supervisor:
+        raise ValidationError(
+            "is_supervisor widens an operator's read; a client's list has "
+            "no such widening"
+        )
+    if locale is not None and not with_last_message:
+        raise ValidationError(
+            "locale applies to the last message: send with_last_message=true"
+        )
+    _checked_locale(locale)
+    if client is not None:
+        reader = client
+        threads, next_cursor = await list_client_threads(
+            session,
+            client=client,
+            limit=page_limit(limit),
+            cursor=decode_cursor(cursor),
+        )
+    else:
+        assert operator is not None  # exactly one of the two, above
+        reader = operator
+        threads, next_cursor = await list_visible_threads(
+            session,
+            operator=operator,
+            is_supervisor=is_supervisor,
+            limit=page_limit(limit),
+            cursor=decode_cursor(cursor),
+        )
     rows = [_thread_out(t) for t in threads]
     if with_unread:
         counts = await unread_counts_for_participant(
             session,
-            participant=operator,
+            participant=reader,
             thread_ids=[t.id for t in threads],
         )
         rows = [
             ({**row, "unread": counts[thread.id]} if thread.id in counts
              else row)
+            for row, thread in zip(rows, threads, strict=True)
+        ]
+    if with_last_message:
+        last = await last_messages(session, [t.id for t in threads])
+        states = (
+            await reader_states(
+                session, [message.id for message in last.values()], locale,
+            )
+            if locale is not None else {}
+        )
+
+        def _last(thread: Thread) -> dict[str, Any] | None:
+            message = last.get(thread.id)
+            if message is None:
+                return None
+            full = _message_out(message)
+            out = {name: full[name] for name in LAST_MESSAGE_FIELDS}
+            if locale is not None:
+                out.update(_in_reader_language(states, message.id))
+            return out
+
+        rows = [
+            {**row, "last_message": _last(thread)}
             for row, thread in zip(rows, threads, strict=True)
         ]
     # The one listing shape (app/api/paging.py): `items`, as everywhere.
@@ -849,10 +954,7 @@ async def get_thread_feed(
     -- every item also carries `variant` and `variant_state` (P5-4,
     app/variants.py); the page is selected exactly as without it.
     Without `locale` the response is what it always was."""
-    if locale is not None and not re.fullmatch(VARIANT_LOCALE_PATTERN, locale):
-        raise ValidationError(
-            f"locale must match {VARIANT_LOCALE_PATTERN}, got {locale!r}"
-        )
+    _checked_locale(locale)
     messages, next_cursor = await list_thread_messages(
         session, thread_id=thread_id, limit=page_limit(limit),
         cursor=decode_cursor(cursor),
@@ -862,11 +964,9 @@ async def get_thread_feed(
     states = await reader_states(session, [m.id for m in messages], locale)
 
     def _in_locale(message: Message) -> dict[str, Any]:
-        state, variant = states[message.id]
         return {
             **_message_out(message),
-            "variant": _feed_variant_out(variant) if variant else None,
-            "variant_state": state.value,
+            **_in_reader_language(states, message.id),
         }
 
     return page(messages, next_cursor, _in_locale)
