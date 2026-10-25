@@ -2,8 +2,8 @@
 # COMMS Service -- Messaging: Operators (Phase 4b, items 1-4)
 # =============================================================================
 #
-# Operator BEHAVIOR over the 4a data layer: resolve, claim, visibility,
-# retag. The operator target is the polymorphic pair from 4a
+# Operator BEHAVIOR over the 4a data layer: resolve, claim, assign /
+# release (TK-1), visibility, retag. The operator target is the polymorphic pair from 4a
 # (operator_kind, operator_value) -- see app/messaging/models.py.
 #
 # BL-1 DISCIPLINE: resolve_operator returns a DESCRIPTOR (OperatorScope),
@@ -37,10 +37,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import PAGE_LIMIT_DEFAULT
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import ClaimTakenError, NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind
 from app.messaging.membership import section_serves_clause, serves_section
 from app.messaging.models import Section, Thread
+from app.messaging.rows import take_thread
 from app.messaging.threads import is_dedup_violation, recipient_exists
 
 logger = structlog.get_logger()
@@ -161,8 +162,9 @@ async def can_claim(
 async def can_operate(
     session: AsyncSession, thread: Thread, actor: UUID
 ) -> bool:
-    """status / retag: the SERVING operator (assignee), or an operator
-    who SERVES the section (T-67, was: any operator at all).
+    """status / retag / assign / release: the SERVING operator
+    (assignee), or an operator who SERVES the section (T-67, was: any
+    operator at all).
 
     The assignee branch is unconditional and stays first: whoever took
     the conversation finishes it, even if their section membership is
@@ -224,13 +226,156 @@ async def claim_thread(
         )
         return True
 
-    # rowcount 0 -> already assigned, OR no such thread. Threads are
-    # immortal (never deleted), so this get is not racy; it only
-    # disambiguates the two failure modes.
+    # rowcount 0 -> already assigned, OR no such thread -- never was, or
+    # deleted by the product (TK-2), before this UPDATE or after it. The
+    # get tells the two apart; a deletion landing between the UPDATE
+    # and the get makes it a 404 rather than a 409, and both are true
+    # of some order of the two calls.
     thread = await session.get(Thread, thread_id)
     if thread is None:
         raise NotFoundError(f"thread {thread_id} does not exist")
     return False
+
+
+async def _fresh(session: AsyncSession, thread_id: UUID) -> Thread:
+    """The thread as it is now -- reloaded over the identity map -- or a
+    404, the same answer a verb gives a thread that is not there."""
+    thread = await session.get(Thread, thread_id, populate_existing=True)
+    if thread is None:
+        raise NotFoundError(f"thread {thread_id} does not exist")
+    return thread
+
+
+def _require_section_form(thread: Thread) -> None:
+    """A user thread's operator is fixed by the form (its master): it is
+    neither handed over nor released -- the same refusal as retag."""
+    if thread.operator_kind != OperatorKind.SECTION:
+        raise ValidationError(
+            "a user thread's operator is fixed by the form; only a "
+            "section thread is assigned or released"
+        )
+
+
+async def assign_thread(
+    session: AsyncSession,
+    *,
+    thread: Thread,
+    assignee: UUID,
+    when: datetime | None = None,
+) -> Thread:
+    """Hand a SECTION thread to `assignee`, an operator who serves its
+    section (TK-1) -- over whoever holds it, or out of the pool.
+
+    `thread` is the row the caller authorized against: WHO may hand over
+    (can_operate) was decided on its assignee and its section. The write
+    is pinned to exactly those values --
+
+        UPDATE threads SET assignee = :new, assigned_at = :now
+        WHERE id = :id AND operator_value = :seen_section
+          AND assignee IS NOT DISTINCT FROM :seen_assignee
+
+    -- so a claim, an assign, a release or a retag that landed in between
+    makes this one lose instead of writing over it (the claim_thread
+    discipline). The loser rereads: the thread already with `assignee`
+    is the same outcome (200); anything else is a 409 `conflict` -- read
+    the thread again and decide. No expected assignee is taken from the
+    caller: the product shows its admin who holds the thread itself.
+
+    IDEMPOTENT BY OUTCOME: a thread already with `assignee` is answered
+    as it is, nothing written, assigned_at kept.
+
+    Refused: a user thread (422); an assignee who is not a recipient
+    (404) or was deleted (409 recipient_deleted); an assignee who does
+    not serve the section (422) -- unreachable for a section with no
+    declared roster, which everybody serves (membership.py).
+
+    Pings nobody: the new assignee learns from the product, and the
+    next message pings them as the assignee (notifier.notify_new_message).
+    Callers commit.
+    """
+    _require_section_form(thread)
+    # The referent in code, as claim_thread does: the assignee FK
+    # (RESTRICT) would otherwise surface a raw IntegrityError -> 500.
+    if not await recipient_exists(session, assignee):
+        raise NotFoundError(f"assignee recipient {assignee} does not exist")
+    section = thread.operator_value
+    if not await serves_section(session, section, assignee):
+        raise ValidationError(
+            f"assignee {assignee} does not serve the thread's section"
+        )
+    if thread.assignee == assignee:
+        return thread
+
+    seen = thread.assignee
+    now = when if when is not None else datetime.now(UTC)
+    result = await session.execute(
+        update(Thread)
+        .where(
+            Thread.id == thread.id,
+            Thread.operator_value == section,
+            Thread.assignee.is_not_distinct_from(seen),
+        )
+        .values(assignee=assignee, assigned_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    rowcount: int = result.rowcount  # type: ignore[attr-defined]
+    current = await _fresh(session, thread.id)
+    if rowcount == 0 and current.assignee != assignee:
+        raise ClaimTakenError(
+            f"thread {thread.id} changed while it was being assigned; "
+            "read it again"
+        )
+    if rowcount == 1:
+        logger.info(
+            "thread_assigned",
+            thread_id=str(thread.id),
+            assignee=str(assignee),
+        )
+    return current
+
+
+async def release_thread(
+    session: AsyncSession,
+    *,
+    thread: Thread,
+) -> Thread:
+    """Return a SECTION thread to its section's pool (TK-1).
+
+    The write is pinned to the assignee the caller authorized against
+    (`assignee = :seen`), as in assign_thread: a claim or an assign that
+    landed in between makes this one lose -- 409 `conflict` -- rather
+    than throw their holder out. A thread already in the pool is the
+    same outcome (200, nothing written).
+
+    THE POOL IS NOT CALLED. The pool push (notifier.notify_new_message)
+    is a ping about a MESSAGE -- keyed by the message, titled "New
+    message", carrying its sender -- and a release has none; a ping of
+    its own would be a new notification type every product profile
+    must categorize. The thread reappears in the pool's list
+    (list_visible_threads); calling the roster, if wanted, is the
+    product's. The contract says so (deploy/INTEGRATION.md section 14).
+    Callers commit.
+    """
+    _require_section_form(thread)
+    seen = thread.assignee
+    if seen is None:
+        return thread
+    result = await session.execute(
+        update(Thread)
+        .where(Thread.id == thread.id, Thread.assignee == seen)
+        .values(assignee=None, assigned_at=None)
+        .execution_options(synchronize_session=False)
+    )
+    rowcount: int = result.rowcount  # type: ignore[attr-defined]
+    current = await _fresh(session, thread.id)
+    if rowcount == 0 and current.assignee is not None:
+        raise ClaimTakenError(
+            f"thread {thread.id} changed while it was being released; "
+            "read it again"
+        )
+    if rowcount == 1:
+        logger.info("thread_released", thread_id=str(thread.id))
+    return current
 
 
 def participation_clause(participant: UUID) -> ColumnElement[bool]:
@@ -415,7 +560,7 @@ async def retag_thread(
     Sets (operator_value=section, subject_ref), re-resolves the operator
     and RESETS assignee (the thread returns to the pool, must be
     re-claimed). The thread and its history are preserved: thread_id is
-    stable and the dedup key is NOT recomputed -- threads are NEVER
+    unchanged and the dedup key is NOT recomputed -- threads are NEVER
     merged. The partial unique indexes still guard, so a retag that
     would duplicate an existing (client, operator, subject) is REJECTED
     (one thread per entity), not merged.
@@ -436,13 +581,15 @@ async def retag_thread(
     #      section onto another/archive section, THEN delete it.
     #   6. Rejected: a hard FK on operator_value (would break the
     #      polymorphic pair -- a nullable two-FK design forces NULL into
-    #      the dedup key, and two NULLs never collide -> "one eternal
-    #      dm" quietly breaks); a silent orphan / cascade (would break
-    #      thread immortality by thread_id).
+    #      the dedup key, and two NULLs never collide -> "one dm per
+    #      pair" quietly breaks); a silent orphan / cascade (a section's
+    #      removal would delete conversations nobody asked to delete --
+    #      a thread goes only when the product deletes it, TK-2).
+
+    The row is TAKEN, FOR NO KEY UPDATE (TK-2): a thread deleted
+    meanwhile is a 404, not an UPDATE of zero rows (a 500).
     """
-    thread = await session.get(Thread, thread_id)
-    if thread is None:
-        raise NotFoundError(f"thread {thread_id} does not exist")
+    thread = await take_thread(session, thread_id)
     if thread.operator_kind != OperatorKind.SECTION:
         raise ValidationError(
             "user thread axes are frozen; retag is only allowed on "

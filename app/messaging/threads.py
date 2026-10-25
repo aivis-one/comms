@@ -6,7 +6,8 @@
 # key is applied ONLY at creation. Three cases (arch doc §2.4):
 #   - subject present  -> one thread per (client, operator, subject_ref)
 #                         (kind-agnostic: a subject is the identity);
-#   - subjectless dm   -> one eternal thread per (client, operator);
+#   - subjectless dm   -> one thread per (client, operator) while it
+#                         lives (a deleted one is followed by a new one);
 #   - subjectless ticket -> a fresh thread every time.
 # The first two are DB-enforced by partial unique indexes (migration
 # 0006); the third by the ABSENCE of a constraint. The race between two
@@ -39,6 +40,7 @@ from sqlalchemy import (
     Uuid,
     bindparam,
     column,
+    delete,
     exists,
     func,
     select,
@@ -60,6 +62,7 @@ from app.core.exceptions import (
 )
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Message, Section, Thread
+from app.messaging.rows import take_thread
 from app.messaging.status import apply_client_message_reopen
 
 logger = structlog.get_logger()
@@ -401,10 +404,14 @@ async def post_message(
     called by the POST handler in the SAME session, so the message and
     its ping commit together. `created_at` is accepted for
     deterministic ordering; it defaults to now (UTC).
+
+    THE THREAD IS TAKEN (TK-2), FOR NO KEY UPDATE -- this call writes
+    its row: a thread being deleted is waited for and then a 404, and a
+    deletion that comes second waits for this message and takes it
+    with the thread. Read without the lock, the insert met the deletion
+    at its foreign key, or the activity UPDATE at zero rows: a 500.
     """
-    thread = await session.get(Thread, thread_id)
-    if thread is None:
-        raise NotFoundError(f"thread {thread_id} does not exist")
+    thread = await take_thread(session, thread_id)
     # The sender must be a LIVE recipient (F1.4): a forgotten person
     # writes nothing -- RecipientDeletedError from the probe -- and an
     # unknown one is a clean 404 rather than a foreign-key 500.
@@ -442,6 +449,39 @@ async def post_message(
 
 
 
+async def delete_thread(session: AsyncSession, *, thread_id: UUID) -> None:
+    """Delete one thread with everything under it (TK-2): its messages,
+    their variants and variant requests, its read pointers.
+
+    ONE STATEMENT. `DELETE FROM threads WHERE id = :id` takes the row
+    (FOR UPDATE strength) and the foreign keys cascade to the children
+    in the same statement (messages and thread_read_states -> threads,
+    message_variants and message_variant_requests -> messages, all ON
+    DELETE CASCADE in the schema; the lookups ride on indexes that lead
+    with the parent's id -- tests/test_thread_delete.py measures them).
+    A writer under the thread takes the thread's row first
+    (app/messaging/rows.py), so it either finishes before this and goes
+    with the thread, or waits for it and finds no thread.
+
+    IDEMPOTENT: a thread that is not there -- never was, or already
+    deleted -- deletes nothing and is not an error. Who may delete, and
+    why, is the product's (spec §10.11): there is no actor here.
+
+    What does NOT go: the notifications the thread gave birth to (a
+    message ping, a close notice) are jobs of the engine, which never
+    reads a thread -- one already issued is delivered, its link leads to
+    a 404. A close notice not issued yet goes with the row that carried
+    its mark. Callers commit.
+    """
+    result = await session.execute(
+        delete(Thread)
+        .where(Thread.id == thread_id)
+        .execution_options(synchronize_session=False)
+    )
+    deleted: int = result.rowcount  # type: ignore[attr-defined]
+    logger.info("thread_deleted", thread_id=str(thread_id), deleted=deleted)
+
+
 # A thread's messages, newest first: the feed's order, and so the one
 # definition of a thread's LAST message (last_messages) -- the first row
 # of the feed. created_at alone does not decide between two messages of
@@ -461,7 +501,8 @@ async def list_thread_messages(
     visible-threads list. `limit` is bounded by the route (app/api/paging.py);
     `cursor` is the (created_at, id) of the last row already seen and
     the next page is WHERE (created_at, id) < cursor. An absent thread
-    yields an empty feed (the trust-model "empty is the honest answer").
+    yields an empty page here; the route answers it 404 before asking
+    (TK-2 -- a deleted thread reads as one that never existed).
     Returns (messages, next_cursor); next_cursor is None on the last
     page. The opaque wire cursor lives at the API edge.
     """

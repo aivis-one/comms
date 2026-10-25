@@ -19,7 +19,7 @@
 #   for the SECTION form -- both UUIDs, but two different tables, so a
 #   single column cannot carry a hard FK. It is kept NON-NULL so the
 #   dedup indexes stay clean (two NULLs never collide in Postgres, so a
-#   nullable operator would quietly break "one eternal dm"). Its
+#   nullable operator would quietly break "one dm per pair"). Its
 #   referent is verified in the service on creation, both forms
 #   (threads.create_or_get_thread) -- the compensation for the missing
 #   DB-level FK.
@@ -27,9 +27,12 @@
 # RECIPIENT REFERENCES: client / sender / participant are real FKs to
 # the audience-owned recipients table (referenced BY NAME -- messaging
 # does not import app.audience). ondelete is RESTRICT, not the repo's
-# usual CASCADE: a thread is immortal by thread_id, so a recipient that
-# a conversation references must not be shredded by a silent cascade
-# (see migration 0006 for the full rationale).
+# usual CASCADE: a conversation outlives the people in it -- a recipient
+# is never deleted, only made a tombstone (F1.4, app/forgetting.py) --
+# and a conversation goes only when the PRODUCT deletes the thread
+# (TK-2), never as a side effect of something else. RESTRICT keeps
+# that so. (Migration 0006 gives the rationale of its day: "a thread is
+# immortal by thread_id". TK-2 replaced the premise, not the choice.)
 # =============================================================================
 
 from datetime import datetime
@@ -350,9 +353,10 @@ class SectionMember(Base):
       - section CASCADE: a deleted section has no roster to keep;
       - operator CASCADE: a deleted recipient serves nothing.
     Both differ from the RESTRICT that guards thread references, and the
-    reason is that a thread is IMMORTAL and must never lose the identity
-    it names, whereas a membership row is a current fact with no
-    history to protect.
+    reason is that a thread must never lose the identity it names while
+    it lives -- it goes only when the product deletes it (TK-2) --
+    whereas a membership row is a current fact with no history to
+    protect.
 
     EMPTY IS NOT UNCONFIGURED. A section with no rows here is served by
     ANY operator -- that is the definition, not a migration window (see

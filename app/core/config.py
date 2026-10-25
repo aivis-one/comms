@@ -145,8 +145,16 @@ from app.core.lanes import Lane
 # is told by SQLSTATE and the driver's constraint name; a template
 # variable the job does not carry is never printed; the suite on the
 # image runs with pytest's cache.
+#
+# 3.11.0 is TK-1 and TK-2, a MINOR: a taken section thread is handed to
+# another serving operator (POST /threads/{id}/assign) or returned to its
+# pool (/release); an operator returns a resolved or closed thread to
+# open; status calls take the thread's row; a product deletes a thread
+# with DELETE /threads/{id} (204), its messages, variants and read
+# pointers going with it, and every route naming it answers 404 -- the
+# feed and unread-count of an absent thread too, instead of an empty page.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.11.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -653,10 +661,10 @@ class Settings(BaseSettings):
 
     # Phase 4b item 6: auto-close of idle THREADS. A thread that has
     # been silent for this many days is moved to `closed` (a status,
-    # NOT a delete -- a thread is immortal by thread_id, and a closed
-    # thread revives on the next client message). Silence is measured
-    # on COALESCE(last_message_at, created_at), so a thread that never
-    # got a message ages from creation.
+    # NOT a delete -- the thread stays, only the product deletes one
+    # (TK-2), and a closed thread revives on the next client message).
+    # Silence is measured on COALESCE(last_message_at, created_at), so
+    # a thread that never got a message ages from creation.
     # SEMANTICS (mirrors retention, fix I): 0 means auto-close is
     # DISABLED -- never a mass close. Disabling is loud (worker startup
     # log). Default 30.

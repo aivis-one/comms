@@ -51,6 +51,7 @@ from sqlalchemy.sql.selectable import LateralFromClause
 from app.core.exceptions import NotFoundError
 from app.messaging.models import Message, Thread, ThreadReadState
 from app.messaging.operators import participation_clause
+from app.messaging.rows import take_thread
 from app.messaging.threads import recipient_exists
 
 logger = structlog.get_logger()
@@ -79,10 +80,15 @@ async def mark_read(
     a read pointer for one of them is a plain request. So: a missing
     recipient is a clean 404, symmetric with how operators.claim
     validates the assignee referent and how create_or_get_thread
-    validates client / operator. The thread referent is checked by the
-    caller (app/api/messaging.py), with the same helper every other
-    thread write uses.
+    validates client / operator.
+
+    THE THREAD IS TAKEN, FOR KEY SHARE (TK-2): a pointer is a child of
+    the thread, so a deletion either waits for it and takes it along, or
+    goes first and this is a 404 -- never the foreign-key violation of
+    an insert under a thread deleted meanwhile. KEY SHARE, not more: a
+    read pointer queues nothing that writes the thread.
     """
+    await take_thread(session, thread_id, children_only=True)
     if not await recipient_exists(session, participant):
         raise NotFoundError(
             f"participant recipient {participant} does not exist"

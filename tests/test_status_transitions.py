@@ -1,8 +1,10 @@
 # =============================================================================
 # COMMS Service -- Status transition tests (Phase 4b, item 5)
 # =============================================================================
-# D5 matrix (manual): open->resolved, resolved->closed, open->closed;
-# X->X no-op; manual reopen / closed->resolved / backward rejected.
+# D5 matrix (manual): open->resolved, resolved->closed, open->closed,
+# and since TK-1 resolved->open, closed->open; X->X no-op;
+# closed->resolved rejected. Every cell, both forms, with the close
+# notice: tests/test_thread_handoff.py.
 # D6: reaching `closed` marks a SECTION thread notifiable (manual path
 # here); user/DM never. Auto-reopen: a CLIENT message revives a
 # resolved/closed thread and CLEARS the close-notify marker.
@@ -104,29 +106,45 @@ class TestManualMatrix:
         assert result.status == ThreadStatus.OPEN
         assert await _status_of(db_session, thread.id) == "open"
 
-    async def test_manual_reopen_rejected(
+    async def test_manual_reopen_from_resolved(
         self, db_session: AsyncSession
     ) -> None:
+        """resolved -> open by hand is a transition, on a DM as on a ticket.
+
+        Was test_manual_reopen_rejected, and it was right: until TK-1
+        only a client message reopened a thread. TK-1 put the reopen in
+        the manual matrix -- the ticket's lifecycle is the product's --
+        so the same call now returns the thread to `open`.
+        """
         thread, _ = await _dm_thread(db_session)
         await set_status(
             db_session, thread_id=thread.id, target=ThreadStatus.RESOLVED
         )
-        with pytest.raises(ValidationError):
-            await set_status(
-                db_session, thread_id=thread.id, target=ThreadStatus.OPEN
-            )
+        result = await set_status(
+            db_session, thread_id=thread.id, target=ThreadStatus.OPEN
+        )
+        assert result.status == ThreadStatus.OPEN
+        assert await _status_of(db_session, thread.id) == "open"
 
-    async def test_closed_to_open_rejected(
+    async def test_manual_reopen_from_closed(
         self, db_session: AsyncSession
     ) -> None:
+        """closed -> open by hand is a transition, on a DM as on a ticket.
+
+        Was test_closed_to_open_rejected, right until TK-1 for the same
+        reason as above; a DM carries no close notice, so the thread's
+        status is the whole effect here (the notice: test_thread_handoff).
+        """
         thread, _ = await _dm_thread(db_session)
         await set_status(
             db_session, thread_id=thread.id, target=ThreadStatus.CLOSED
         )
-        with pytest.raises(ValidationError):
-            await set_status(
-                db_session, thread_id=thread.id, target=ThreadStatus.OPEN
-            )
+        result = await set_status(
+            db_session, thread_id=thread.id, target=ThreadStatus.OPEN
+        )
+        assert result.status == ThreadStatus.OPEN
+        assert await _status_of(db_session, thread.id) == "open"
+        assert await _marker_of(db_session, thread.id) is None
 
     async def test_closed_to_resolved_rejected(
         self, db_session: AsyncSession

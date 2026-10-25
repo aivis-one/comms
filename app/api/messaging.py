@@ -5,8 +5,8 @@
 # Phase 4c item 3. The HTTP surface over the 4a/4b messaging domain:
 # create-or-get a thread, post a message, page a thread's feed, thread
 # read-state (position IN a thread -- NOT the delivery inbox "bell",
-# which is a different router), and the operator verbs claim / set-
-# status / retag plus the paginated visible-threads list.
+# which is a different router), and the operator verbs claim / assign /
+# release / set-status / retag plus the paginated visible-threads list.
 #
 # POSTing a message runs notify_new_message in the SAME transaction
 # (fork 3): the message row and the other side's notification rows
@@ -16,6 +16,7 @@
 # CONTRACT (Phase 6 product proxy consumes as-is):
 #
 #   POST /api/v1/threads                      -> 200 <thread> + created
+#   DELETE /api/v1/threads/{tid}              -> 204 (also when absent)
 #   GET  /api/v1/threads?operator=|client=&is_supervisor=&with_unread=
 #        &with_last_message=&locale=&limit=&cursor=
 #                                             -> 200 {items, next_cursor}
@@ -30,6 +31,8 @@
 #   GET  /api/v1/threads/{tid}/unread-count?participant=
 #                                             -> 200 {unread}
 #   POST /api/v1/threads/{tid}/claim          -> 200 {claimed, thread}
+#   POST /api/v1/threads/{tid}/assign         -> 200 <thread>
+#   POST /api/v1/threads/{tid}/release        -> 200 <thread>
 #   POST /api/v1/threads/{tid}/status         -> 200 <thread>
 #   POST /api/v1/threads/{tid}/retag          -> 200 <thread>
 #   POST /api/v1/threads/unread-counts        -> 200 {counts}
@@ -86,7 +89,14 @@
 #   - limit / cursor: the one paging scheme (app/api/paging.py) -- out
 #     of 1..100 or a malformed cursor -> 422 `validation`;
 #   - a bad status transition / half subject_ref -> 422; an absent
-#     thread on a verb that must exist (post/status/retag/claim) -> 404.
+#     thread -- never created, or deleted (TK-2) -- on every route that
+#     names one (the feed, unread-count, post, read, the variant routes
+#     and every operator verb) -> 404; the input's own 422 comes first.
+#     DELETE alone answers an absent thread as a present one: 204;
+#   - THE OPERATOR VERBS -- who may call, refusals, the status matrix
+#     and what a release does to the pool -- are the contract's section
+#     14 (deploy/INTEGRATION.md), held to this code by
+#     tests/test_thread_handoff.py.
 #
 # TRUST MODEL (frozen -- identical stance to the inbox contract): the
 # ACTOR identifiers in a request body / query (client, sender,
@@ -105,7 +115,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, Header, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -163,12 +173,14 @@ from app.messaging.operators import (
     KEEP,
     KeepSubject,
     SubjectRef,
+    assign_thread,
     can_claim,
     can_operate,
     can_post_message,
     claim_thread,
     list_client_threads,
     list_visible_threads,
+    release_thread,
     retag_thread,
 )
 from app.messaging.read_state import (
@@ -177,10 +189,12 @@ from app.messaging.read_state import (
     participant_unread_summary,
     unread_counts_for_participant,
 )
+from app.messaging.rows import take_thread
 from app.messaging.sections import get_or_create_section
 from app.messaging.status import set_status
 from app.messaging.threads import (
     create_or_get_thread_detailed,
+    delete_thread,
     last_messages,
     list_thread_messages,
     post_message,
@@ -511,6 +525,22 @@ class ClaimIn(BaseModel):
     operator: UUID
 
 
+class AssignIn(BaseModel):
+    """`operator` is the ACTOR, as on every operator verb; `assignee` is
+    the operator the thread is handed to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operator: UUID
+    assignee: UUID
+
+
+class ReleaseIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operator: UUID
+
+
 class StatusIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -609,6 +639,8 @@ async def _require_thread(session: AsyncSession, thread_id: UUID) -> Thread:
     if thread is None:
         raise NotFoundError(f"thread {thread_id} does not exist")
     return thread
+
+
 
 
 @router.post("")
@@ -907,6 +939,21 @@ async def unread_counts(
 # ---------------------------------------------------------------------------
 # Endpoints -- messages
 # ---------------------------------------------------------------------------
+@router.delete("/{thread_id}", status_code=204)
+async def delete_thread_route(
+    thread_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> Response:
+    """Delete a thread with its messages, their variants and requests,
+    and its read pointers (TK-2) -- the product's call, no actor.
+
+    204 whether the thread was there or not: a repeat after a lost
+    response, or a thread already gone, ends where the first call did.
+    deploy/INTEGRATION.md section 14, "Deleting a thread"."""
+    await delete_thread(session, thread_id=thread_id)
+    return Response(status_code=204)
+
+
 @router.post("/{thread_id}/messages")
 async def post_thread_message(
     request: Request,
@@ -925,7 +972,13 @@ async def post_thread_message(
     replayed = await _replay(session, Message, key, fingerprint)
     if replayed is not None:
         return _message_out(replayed)
-    thread = await _require_thread(session, thread_id)
+    # TAKEN, not read (TK-2): FOR NO KEY UPDATE -- the message writes the
+    # thread's row. A deletion running now is waited for and this is a
+    # 404; one that comes second waits for this message and takes it.
+    # The sender's role -- and the client's reopen -- are decided on the
+    # row as it is under the lock (closes TK-1's observation 2;
+    # tests/test_thread_delete.py TestRaces).
+    thread = await take_thread(session, thread_id)
     if not can_post_message(thread, payload.sender):
         raise AuthorizationError(
             "sender is neither a participant nor the serving operator "
@@ -965,11 +1018,16 @@ async def get_thread_feed(
     With `locale` -- the reader's language, a token of the variant form
     -- every item also carries `variant` and `variant_state` (P5-4,
     app/variants.py); the page is selected exactly as without it.
-    Without `locale` the response is what it always was."""
+    Without `locale` the response is what it always was.
+
+    An absent thread -- never created, or deleted (TK-2) -- is a 404,
+    after the input's own 422s: a deleted thread reads as one that
+    never existed, and neither is an empty page."""
     _checked_locale(locale)
+    size, position = page_limit(limit), decode_cursor(cursor)
+    await _require_thread(session, thread_id)
     messages, next_cursor = await list_thread_messages(
-        session, thread_id=thread_id, limit=page_limit(limit),
-        cursor=decode_cursor(cursor),
+        session, thread_id=thread_id, limit=size, cursor=position,
     )
     if locale is None:
         return page(messages, next_cursor, _message_out)
@@ -1084,7 +1142,9 @@ async def thread_unread_count(
     participant: UUID = Query(...),
     session: AsyncSession = Depends(get_db_reader),
 ) -> dict[str, int]:
-    """The participant's unread count for one thread."""
+    """The participant's unread count for one thread; an absent thread
+    -- never created, or deleted (TK-2) -- is a 404, not a zero."""
+    await _require_thread(session, thread_id)
     unread = await count_unread(
         session, thread_id=thread_id, participant=participant
     )
@@ -1118,6 +1178,40 @@ async def claim(
     return {"claimed": True, "thread": _thread_out(thread)}
 
 
+@router.post("/{thread_id}/assign")
+async def assign(
+    thread_id: UUID,
+    payload: AssignIn = Body(...),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Hand a section thread to an operator who serves its section."""
+    thread = await _require_thread(session, thread_id)
+    if not await can_operate(session, thread, payload.operator):
+        raise AuthorizationError(
+            "actor is not the serving operator of this thread"
+        )
+    thread = await assign_thread(
+        session, thread=thread, assignee=payload.assignee
+    )
+    return _thread_out(thread)
+
+
+@router.post("/{thread_id}/release")
+async def release(
+    thread_id: UUID,
+    payload: ReleaseIn = Body(...),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return a section thread to its section's pool."""
+    thread = await _require_thread(session, thread_id)
+    if not await can_operate(session, thread, payload.operator):
+        raise AuthorizationError(
+            "actor is not the serving operator of this thread"
+        )
+    thread = await release_thread(session, thread=thread)
+    return _thread_out(thread)
+
+
 @router.post("/{thread_id}/status")
 async def change_status(
     thread_id: UUID,
@@ -1125,7 +1219,10 @@ async def change_status(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Apply a manual status transition (D5 matrix)."""
-    thread = await _require_thread(session, thread_id)
+    # Taken, not read (TK-1): the role is decided on the row set_status
+    # will change, so a hand-over landing in between cannot leave the
+    # previous holder deciding on a thread that is no longer theirs.
+    thread = await take_thread(session, thread_id)
     if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
             "actor is not the serving operator of this thread"
@@ -1142,8 +1239,12 @@ async def retag(
     payload: RetagIn = Body(...),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Retag a section thread to a new section / subject_ref."""
-    thread = await _require_thread(session, thread_id)
+    """Retag a section thread to a new section / subject_ref.
+
+    The row is taken before WHO is decided (TK-2): a thread being
+    deleted is waited for, and the role is checked on the row retag
+    writes."""
+    thread = await take_thread(session, thread_id)
     if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
             "actor is not the serving operator of this thread"

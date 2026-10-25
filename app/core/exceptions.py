@@ -81,7 +81,9 @@ class IdempotencyConflictError(ConflictError):
 
 
 class ClaimTakenError(ConflictError):
-    """The thread is already assigned to another operator."""
+    """The thread's assignee is not what the call needed: held by
+    another operator (claim), or changed by another call between the
+    read and the write (assign / release, TK-1)."""
 
 
 class VariantExistsError(ConflictError):

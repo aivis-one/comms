@@ -44,11 +44,16 @@
 # _fold): those have no place in step 3.
 #
 # HOW LONG IT LIVES: as long as its message. Both tables go with the
-# message (ON DELETE CASCADE) -- and no path of comms deletes a message
-# or a thread today: forgetting keeps threads and messages (their
-# bodies are the product's decision, spec §10.6 -- and so are the
-# variants), retention deletes jobs, auto-close changes a status. A
-# request whose job retention deleted reads as IMPOSSIBLE.
+# message (ON DELETE CASCADE), and a message goes only with its thread,
+# when the product deletes the thread (TK-2, messaging/threads.py
+# delete_thread): forgetting keeps threads and messages (their bodies
+# are the product's decision, spec §10.6 -- and so are the variants),
+# retention deletes jobs, auto-close changes a status. A request whose
+# job retention deleted reads as IMPOSSIBLE. Both writes TAKE the
+# message's thread first (FOR KEY SHARE, messaging/rows.py), so a
+# deletion running at the same time is waited for -- a 404 -- or waits
+# for the write and takes the new row along: never the foreign-key
+# violation of an insert under a message deleted meanwhile.
 #
 # A NEUTRAL MODULE, like app/notifier.py: it reads messaging and the
 # engine's jobs; neither imports the other.
@@ -73,6 +78,7 @@ from app.engine.constants import NotificationStatus
 from app.engine.models import LLMAnswer, LLMCall, Notification
 from app.messaging.constants import VariantState
 from app.messaging.models import Message, MessageVariant, MessageVariantRequest
+from app.messaging.rows import take_thread
 
 # Step 3: a request's job status -> the reader's state. Only the
 # statuses an llm job can have (see the header); tests/
@@ -91,6 +97,8 @@ _BY_JOB_STATUS: dict[str, VariantState] = {
 async def _message_of_thread(
     session: AsyncSession, thread_id: UUID, message_id: UUID,
 ) -> Message:
+    """The message, under its thread taken FOR KEY SHARE -- or a 404."""
+    await take_thread(session, thread_id, children_only=True)
     message = await session.get(Message, message_id)
     if message is None or message.thread_id != thread_id:
         raise NotFoundError(

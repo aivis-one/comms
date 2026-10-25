@@ -20,7 +20,8 @@ import enum
 class ThreadKind(enum.StrEnum):
     """How a thread dedups on creation (arch doc §2.4).
 
-    DM     -- subjectless: one eternal thread per (client, operator).
+    DM     -- subjectless: one thread per (client, operator) at a time
+              (deleted by the product, it is followed by a new one).
     TICKET -- subjectless: a fresh thread every time.
 
     A thread carrying a subject_ref dedups on the subject regardless of
@@ -38,8 +39,9 @@ class ThreadStatus(enum.StrEnum):
 
     open     -- active, awaiting a reply (the creation default).
     resolved -- operator considers it handled, the window is still live.
-    closed   -- terminal (NOT a delete: a thread is immortal by
-                thread_id).
+    closed   -- terminal as a status, NOT a delete: the thread and its
+                messages stay; a thread goes only when the product
+                deletes it (DELETE /threads/{id}, TK-2).
 
     Phase 4a defines the values ONLY. The transitions -- manual
     resolved/closed, the client-message -> open auto-reopen, and the
