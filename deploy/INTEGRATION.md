@@ -562,6 +562,7 @@ construction, so it takes no key:
 | `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
 | `POST /threads/{id}/assign` | answers "whose is it now": a thread already with that assignee is returned as it is |
 | `POST /threads/{id}/release` | a thread already in the pool is returned as it is |
+| `DELETE /threads/{id}` | a thread that is not there -- never was, or already deleted -- is answered as one deleted: 204 |
 | `POST /threads/{id}/status` | sets a value; the same status is a no-op |
 | `POST /threads/{id}/retag` | sets values; a repeat finds the thread already moved and back in the pool |
 | `POST /threads/{id}/read` | the pointer only moves forward |
@@ -605,7 +606,8 @@ and closes their waiting deliveries as `recipient_inactive`. The row
 stays as a tombstone with the id alone, because the threads and messages
 they were part of stay: a conversation belongs to both sides, and what
 happens to message bodies -- and to their variants (section 12) -- is
-the product's decision. A deletion is
+the product's decision. That decision is a thread at a time: deleting a
+thread (section 14) removes every message in it, whoever wrote it. A deletion is
 final -- a person who returns gets a new id in the product. A
 recipient deactivated or deleted after a job was resolved is not sent
 to either: their delivery ends `recipient_inactive`, which is neither a
@@ -1646,8 +1648,9 @@ Without `locale` the feed is **exactly** what it was: no `variant`, no
 ### How long a variant lives
 
 As long as its message: a message's variants and requests go with it.
-comms deletes no message today: retention removes notifications,
-closing a thread is a status change. **Forgetting a person keeps the
+A message goes only with its thread, when you delete the thread
+(section 14): retention removes notifications, closing a thread is a
+status change. **Forgetting a person keeps the
 variants, as it keeps the bodies of their messages** (section 5) --
 what happens to a forgotten person's words in a shared conversation is
 your decision, for the variants as for the bodies.
@@ -1834,6 +1837,61 @@ closed again by the next auto-close pass -- a section thread with a new
 notice to its client. Keep `THREAD_AUTO_CLOSE_DAYS=0` if your operators
 reopen idle conversations, or write into the thread when reopening it.
 
+### Deleting a thread
+
+`DELETE /api/v1/threads/{id}` -- no body, no actor -- answers **204**,
+and nothing else for a thread that is not there: never created, or
+deleted already. A repeat after a lost response ends where the first
+call did. Who may delete, and why (spam, a retention rule of yours), is
+your decision: comms takes the service token and asks nothing more.
+
+**What goes**, in one transaction: the thread, every message in it --
+whoever wrote it -- the variants and variant requests of those
+messages (section 12), and the participants' read pointers in it.
+
+**What stays**: the people (their recipients); the notifications the
+thread has already given birth to; a model's job asked for one of its
+messages, and the job's answer, until notification retention (above).
+
+**After it, the thread is a thread that never existed.** Every route
+that names it answers 404 `not_found` -- the messages and the feed,
+`unread-count`, `read`, the variant routes, `claim`, `assign`,
+`release`, `status`, `retag`. The thread lists, `POST
+/threads/unread-counts` and the unread summary do not contain it.
+
+**The feed of a thread that does not exist is 404, not an empty page;
+its `unread-count` is 404, not 0.** This holds for a deleted thread and
+for an id that never was one alike. A malformed `cursor`, `limit` or
+`locale` is still 422 first.
+
+**A message ping or a close notice already issued is delivered.** It
+does not carry the conversation's text, and its link
+(`open_thread__<thread id>`) then leads your app to a thread that
+answers 404 -- show the person that the conversation is gone. A close
+notice not issued yet when the thread is deleted is never issued.
+
+**A new thread of the same subject is a new thread**, with a new id: a
+DM of the same pair, a ticket about the same entity. The same goes for a
+repeat of the old create request: its `Idempotency-Key` went with the
+thread, so `POST /threads` with it creates a new one -- as a job's key
+is free again after notification retention.
+
+**A model's job for a message of the deleted thread** runs to its
+outcome as any job; writing the variant from its answer is a 404.
+
+**Calls that cross a deletion.** A write on the thread that starts
+while it is being deleted either finishes first -- and what it wrote
+goes with the thread -- or waits for the deletion and answers 404. A
+read does not wait: it answers the thread as it was, or 404 -- and a
+feed page read in the very instant the deletion lands can come back
+empty. None of them fails otherwise.
+
+**Forgetting a person and deleting a thread, side by side.** Forgetting
+(section 5) keeps the threads and the bodies of the forgotten person's
+messages -- a conversation belongs to both sides. Deleting a thread
+removes the messages of both sides in it. The two do not conflict: the
+first is about a person, the second about a conversation.
+
 ## Operating the comms stack
 
 What an operator needs on the box, collected here because every item
@@ -1941,13 +1999,17 @@ too. A model's answer is kept by its type.
   **24h**, counted from the answer; the letter it answered, and the
   link to its audio body, are deleted at the job's outcome; the body
   itself is never kept. None outlives the notification history.
+- **A thread**: until you delete it -- `DELETE /threads/{id}`
+  (section 14) removes it with its messages, their variants and
+  variant requests, and the read pointers. comms deletes no thread by
+  itself, on no schedule.
 - **Threads closing themselves**: `THREAD_AUTO_CLOSE_DAYS`, default
   **30**. A thread with no activity for that long is closed by the
   same worker. Closing is a status change -- the thread, its messages
   and the participants' read pointers stay.
-- **A message's variants** (section 12): as long as the message --
-  comms deletes none -- and forgetting a person keeps them, as it keeps
-  the bodies of their messages.
+- **A message's variants** (section 12): as long as the message, which
+  goes with its thread when you delete the thread -- and forgetting a
+  person keeps them, as it keeps the bodies of their messages.
 
 - **Dead letters**: an entry comms cannot take -- a broken frame, an
   unknown event, a request whose key cannot be read, an event that

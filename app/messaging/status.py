@@ -29,23 +29,47 @@
 # consume_close_notifications). A reopen -- manual or by the client --
 # CLEARS the mark: the close was voided before 4c sent.
 #
-# THE ORDER OF ROW LOCKS (threads). Every writer of a threads row from a
-# request takes exactly ONE threads row: set_status here (FOR NO KEY
-# UPDATE -- it writes non-key columns only), the UPDATE of claim /
-# assign / release / retag, and post_message's activity bump
-# (app/messaging/operators.py, app/messaging/threads.py). Beside it a
-# writer takes KEY SHARE on recipients rows through the FKs of what it
-# writes (assignee, sender), before or after the thread row -- it does
-# not matter, because no path holds a recipients row and then asks for a
-# threads row: the recipient writers (app/audience/sync.py,
-# app/forgetting.py) take recipients FOR UPDATE and never write threads.
-# The two passes that take MANY threads rows take
-# disjoint sets -- auto-close below takes threads that are not closed,
-# the close-notice pass takes closed threads that carry the mark (the
-# mark is set only together with `closed` and cleared only together
-# with leaving it, in the same statement) -- and the
-# close-notice pass walks its set in (close_notify_pending_at, id)
-# order, so two of its passes queue on the first row they share.
+# THE ORDER OF ROW LOCKS (threads). THE THREAD'S ROW FIRST, THEN ITS
+# CHILDREN (messages, read pointers; a message's variants and variant
+# requests). Every path that writes a thread or anything under it
+# takes the thread's row before anything else of the thread
+# (app/messaging/rows.py take_thread), at the strength of what it
+# writes:
+#   - FOR NO KEY UPDATE -- the paths that write the thread row itself:
+#     set_status here, a message (post_message and its route -- the
+#     activity bump), retag; claim / assign / release write it by a
+#     conditional UPDATE, which takes the same lock as it writes (TK-1).
+#     Non-key columns only, hence not FOR UPDATE.
+#   - FOR KEY SHARE -- the paths that only insert children: a read
+#     pointer (read_state.mark_read), a variant request and a variant
+#     (app/variants.py). KEY SHARE conflicts with a deletion and with
+#     nothing that writes the thread's non-key columns: a read pointer
+#     or a variant never queues a status call, a claim or a message.
+#   - FOR UPDATE strength -- the deletion (threads.delete_thread, TK-2):
+#     one DELETE takes the thread's row, and its foreign keys cascade to
+#     the children in the same statement -- thread, then children, the
+#     order every writer above keeps. A writer that came first holds
+#     the thread row and the deletion waits for it; a deletion that came
+#     first holds it and the writer waits, then finds no thread (404).
+# Beside the thread a writer takes KEY SHARE on recipients rows through
+# the FKs of what it writes (assignee, sender), before or after the
+# thread row -- it does not matter, because no path holds a recipients
+# row and then asks for a threads row: the recipient writers
+# (app/audience/sync.py, app/forgetting.py) take recipients FOR UPDATE
+# and never write threads. Forgetting deletes a person's read pointers
+# across threads while a deletion deletes one thread's pointers across
+# people: the two sets share at most one row, (that thread, that
+# person), and a cycle needs two -- one waits for the other
+# (tests/test_thread_delete.py, both orders).
+# The two passes that take MANY threads rows take disjoint sets --
+# auto-close below takes threads that are not closed, the close-notice
+# pass takes closed threads that carry the mark (the mark is set only
+# together with `closed` and cleared only together with leaving it, in
+# the same statement) -- and take no children; the close-notice pass
+# walks its set in (close_notify_pending_at, id) order, so two of its
+# passes queue on the first row they share. A deletion against either
+# waits for the batch or is waited for: the pass's UPDATE then finds
+# the row gone and moves on to the next.
 #
 # AUTHZ: set_status validates the TRANSITION only, never WHO may make
 # it -- write-authz lives one layer up, in app/api/messaging.py (4c),
@@ -60,9 +84,10 @@ import structlog
 from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import ValidationError
 from app.messaging.constants import OperatorKind, ThreadStatus
 from app.messaging.models import Thread
+from app.messaging.rows import take_thread
 
 logger = structlog.get_logger()
 
@@ -160,14 +185,7 @@ async def set_status(
     #   The contract says the same to the product: deploy/INTEGRATION.md
     #   section 14.
     """
-    thread = await session.get(
-        Thread,
-        thread_id,
-        with_for_update={"key_share": True},
-        populate_existing=True,
-    )
-    if thread is None:
-        raise NotFoundError(f"thread {thread_id} does not exist")
+    thread = await take_thread(session, thread_id)
 
     current = ThreadStatus(thread.status)
     if target == current:

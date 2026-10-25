@@ -41,6 +41,7 @@ from app.core.exceptions import ClaimTakenError, NotFoundError, ValidationError
 from app.messaging.constants import OperatorKind
 from app.messaging.membership import section_serves_clause, serves_section
 from app.messaging.models import Section, Thread
+from app.messaging.rows import take_thread
 from app.messaging.threads import is_dedup_violation, recipient_exists
 
 logger = structlog.get_logger()
@@ -225,9 +226,11 @@ async def claim_thread(
         )
         return True
 
-    # rowcount 0 -> already assigned, OR no such thread. Threads are
-    # immortal (never deleted), so this get is not racy; it only
-    # disambiguates the two failure modes.
+    # rowcount 0 -> already assigned, OR no such thread -- never was, or
+    # deleted by the product (TK-2), before this UPDATE or after it. The
+    # get tells the two apart; a deletion landing between the UPDATE
+    # and the get makes it a 404 rather than a 409, and both are true
+    # of some order of the two calls.
     thread = await session.get(Thread, thread_id)
     if thread is None:
         raise NotFoundError(f"thread {thread_id} does not exist")
@@ -557,7 +560,7 @@ async def retag_thread(
     Sets (operator_value=section, subject_ref), re-resolves the operator
     and RESETS assignee (the thread returns to the pool, must be
     re-claimed). The thread and its history are preserved: thread_id is
-    stable and the dedup key is NOT recomputed -- threads are NEVER
+    unchanged and the dedup key is NOT recomputed -- threads are NEVER
     merged. The partial unique indexes still guard, so a retag that
     would duplicate an existing (client, operator, subject) is REJECTED
     (one thread per entity), not merged.
@@ -578,13 +581,15 @@ async def retag_thread(
     #      section onto another/archive section, THEN delete it.
     #   6. Rejected: a hard FK on operator_value (would break the
     #      polymorphic pair -- a nullable two-FK design forces NULL into
-    #      the dedup key, and two NULLs never collide -> "one eternal
-    #      dm" quietly breaks); a silent orphan / cascade (would break
-    #      thread immortality by thread_id).
+    #      the dedup key, and two NULLs never collide -> "one dm per
+    #      pair" quietly breaks); a silent orphan / cascade (a section's
+    #      removal would delete conversations nobody asked to delete --
+    #      a thread goes only when the product deletes it, TK-2).
+
+    The row is TAKEN, FOR NO KEY UPDATE (TK-2): a thread deleted
+    meanwhile is a 404, not an UPDATE of zero rows (a 500).
     """
-    thread = await session.get(Thread, thread_id)
-    if thread is None:
-        raise NotFoundError(f"thread {thread_id} does not exist")
+    thread = await take_thread(session, thread_id)
     if thread.operator_kind != OperatorKind.SECTION:
         raise ValidationError(
             "user thread axes are frozen; retag is only allowed on "

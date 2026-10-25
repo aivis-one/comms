@@ -29,7 +29,7 @@
 # A NAME IS NOT AN INVARIANT -- ITS DEFINITION IS. The existence list
 # pins each index's definition, not just its name, because the two come
 # apart: an index recreated under the same name WITHOUT `UNIQUE` passes
-# a by-name check, passes `alembic check`, and lets two eternal DMs
+# a by-name check, passes `alembic check`, and lets two live DMs
 # exist for one pair. That was measured, not imagined -- the invariant
 # was dead and both detectors were green. Two facts are pinned per
 # index: the catalog's `indisunique` flag, which is what died in that
@@ -113,7 +113,7 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "WHERE ((status)::text = 'sent'::text)"
         ),
     ),
-    # "One eternal DM per pair" -- partial unique index.
+    # "One DM per pair" (while it lives) -- partial unique index.
     "uq_threads_dedup_dm": IndexShape(
         unique=True,
         definition=(
