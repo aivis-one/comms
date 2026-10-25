@@ -5,8 +5,8 @@
 # Phase 4c item 3. The HTTP surface over the 4a/4b messaging domain:
 # create-or-get a thread, post a message, page a thread's feed, thread
 # read-state (position IN a thread -- NOT the delivery inbox "bell",
-# which is a different router), and the operator verbs claim / set-
-# status / retag plus the paginated visible-threads list.
+# which is a different router), and the operator verbs claim / assign /
+# release / set-status / retag plus the paginated visible-threads list.
 #
 # POSTing a message runs notify_new_message in the SAME transaction
 # (fork 3): the message row and the other side's notification rows
@@ -30,6 +30,8 @@
 #   GET  /api/v1/threads/{tid}/unread-count?participant=
 #                                             -> 200 {unread}
 #   POST /api/v1/threads/{tid}/claim          -> 200 {claimed, thread}
+#   POST /api/v1/threads/{tid}/assign         -> 200 <thread>
+#   POST /api/v1/threads/{tid}/release        -> 200 <thread>
 #   POST /api/v1/threads/{tid}/status         -> 200 <thread>
 #   POST /api/v1/threads/{tid}/retag          -> 200 <thread>
 #   POST /api/v1/threads/unread-counts        -> 200 {counts}
@@ -86,7 +88,12 @@
 #   - limit / cursor: the one paging scheme (app/api/paging.py) -- out
 #     of 1..100 or a malformed cursor -> 422 `validation`;
 #   - a bad status transition / half subject_ref -> 422; an absent
-#     thread on a verb that must exist (post/status/retag/claim) -> 404.
+#     thread on a verb that must exist (post/status/retag/claim/assign/
+#     release) -> 404;
+#   - THE OPERATOR VERBS -- who may call, refusals, the status matrix
+#     and what a release does to the pool -- are the contract's section
+#     14 (deploy/INTEGRATION.md), held to this code by
+#     tests/test_thread_handoff.py.
 #
 # TRUST MODEL (frozen -- identical stance to the inbox contract): the
 # ACTOR identifiers in a request body / query (client, sender,
@@ -163,12 +170,14 @@ from app.messaging.operators import (
     KEEP,
     KeepSubject,
     SubjectRef,
+    assign_thread,
     can_claim,
     can_operate,
     can_post_message,
     claim_thread,
     list_client_threads,
     list_visible_threads,
+    release_thread,
     retag_thread,
 )
 from app.messaging.read_state import (
@@ -511,6 +520,22 @@ class ClaimIn(BaseModel):
     operator: UUID
 
 
+class AssignIn(BaseModel):
+    """`operator` is the ACTOR, as on every operator verb; `assignee` is
+    the operator the thread is handed to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operator: UUID
+    assignee: UUID
+
+
+class ReleaseIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operator: UUID
+
+
 class StatusIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -606,6 +631,21 @@ async def _require_thread(session: AsyncSession, thread_id: UUID) -> Thread:
     """Load a thread for a write, or 404. Fetched before the authz check
     so a role decision is made against real thread state."""
     thread = await session.get(Thread, thread_id)
+    if thread is None:
+        raise NotFoundError(f"thread {thread_id} does not exist")
+    return thread
+
+
+async def _take_thread(session: AsyncSession, thread_id: UUID) -> Thread:
+    """Take a thread's row for a write (FOR NO KEY UPDATE, refreshed), or
+    404 -- for a verb that decides on the row under the lock it writes
+    with (status; app/messaging/status.py, THE ORDER OF ROW LOCKS)."""
+    thread = await session.get(
+        Thread,
+        thread_id,
+        with_for_update={"key_share": True},
+        populate_existing=True,
+    )
     if thread is None:
         raise NotFoundError(f"thread {thread_id} does not exist")
     return thread
@@ -1118,6 +1158,40 @@ async def claim(
     return {"claimed": True, "thread": _thread_out(thread)}
 
 
+@router.post("/{thread_id}/assign")
+async def assign(
+    thread_id: UUID,
+    payload: AssignIn = Body(...),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Hand a section thread to an operator who serves its section."""
+    thread = await _require_thread(session, thread_id)
+    if not await can_operate(session, thread, payload.operator):
+        raise AuthorizationError(
+            "actor is not the serving operator of this thread"
+        )
+    thread = await assign_thread(
+        session, thread=thread, assignee=payload.assignee
+    )
+    return _thread_out(thread)
+
+
+@router.post("/{thread_id}/release")
+async def release(
+    thread_id: UUID,
+    payload: ReleaseIn = Body(...),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return a section thread to its section's pool."""
+    thread = await _require_thread(session, thread_id)
+    if not await can_operate(session, thread, payload.operator):
+        raise AuthorizationError(
+            "actor is not the serving operator of this thread"
+        )
+    thread = await release_thread(session, thread=thread)
+    return _thread_out(thread)
+
+
 @router.post("/{thread_id}/status")
 async def change_status(
     thread_id: UUID,
@@ -1125,7 +1199,10 @@ async def change_status(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Apply a manual status transition (D5 matrix)."""
-    thread = await _require_thread(session, thread_id)
+    # Taken, not read (TK-1): the role is decided on the row set_status
+    # will change, so a hand-over landing in between cannot leave the
+    # previous holder deciding on a thread that is no longer theirs.
+    thread = await _take_thread(session, thread_id)
     if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
             "actor is not the serving operator of this thread"

@@ -15,7 +15,9 @@
 #     atomic with the message; delivery stays async on the worker tick).
 #   - consume_close_notifications -- item 2: the sibling of auto-close.
 #     Reads section threads flagged closed (close_notify_pending_at),
-#     emits the "conversation closed" notification and clears the flag.
+#     clears the flag it read -- and only if it is still that flag --
+#     and emits the "conversation closed" notification for what it
+#     cleared.
 #
 # TYPE / CATEGORY SOURCE (fork 2a): comms owns the ABSTRACT chat type
 # keys below; the product PROFILE gives each of them a preference
@@ -37,7 +39,7 @@ from datetime import datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
@@ -285,18 +287,17 @@ async def notify_new_message(
     return created
 
 
-async def _emit_close_notification(session: AsyncSession, thread: Thread) -> None:
+async def _emit_close_notification(
+    session: AsyncSession, thread: Thread, when: datetime
+) -> None:
     """Create the 'conversation closed' notice for one flagged thread.
 
-    Targets the client (participant side -> msg_participants). Deduped on
-    (thread, close-instant): a replayed pass over the same flag is the
-    DB's dedup arbiter, so a crash between emit and flag-clear cannot
-    double-notify. Only section threads are ever flagged (4b), so this
-    never reaches a user/DM thread.
+    `when` is the flag the pass cleared -- the close instant this notice
+    is about. Targets the client (participant side -> msg_participants).
+    Deduped on (thread, close-instant): a second pass over the same flag
+    is the DB's dedup arbiter. Only section threads are ever flagged
+    (4b), so this never reaches a user/DM thread.
     """
-    when = thread.close_notify_pending_at
-    if when is None:
-        return  # defensive: only flagged threads are passed here
     key = _close_idempotency_key(thread.id, when)
     fields = {
         "type": TYPE_THREAD_CLOSED,
@@ -337,19 +338,40 @@ async def consume_close_notifications(
     *,
     limit: int = _CLOSE_NOTIFY_BATCH_SIZE,
 ) -> int:
-    """Item 2: emit the close notice for flagged section threads, clear
-    the flag. Runs on EVERY pass of the worker's maintenance loop
-    (app/worker.py run_maintenance_pass) -- unlike the auto-close scan over
-    a growing table (its own slow gate), this hits a partial index over
+    """Item 2: clear the flag of flagged section threads and emit the
+    close notice for each flag cleared. Runs on EVERY pass of the
+    worker's maintenance loop (app/worker.py run_maintenance_pass) --
+    unlike the auto-close scan over a growing table (its own slow
+    gate), this hits a partial index over
     a NORMALLY-EMPTY set (the flag is transient: set on close, cleared
     here), so it is cheap and prompt.
 
-    Idempotent two ways: the flag is cleared on emit (a second pass does
-    not re-scan the thread), and the idempotency key (thread + close
-    instant) dedups a concurrent pass or a crash before the clear.
-    A client reopen in 4b already clears the flag, so a thread reopened
-    before this pass is never notified. user/DM threads are never
-    flagged -> never notified. Owns its own sessions; commits per batch.
+    THE FLAG IS TAKEN, NOT READ (TK-1). The batch is read without a
+    lock, so between that read and this pass's commit a thread can be
+    reopened (manually or by its client -- either voids the flag) or
+    closed again (a NEW flag). Each thread is therefore cleared first,
+    by a conditional UPDATE pinned to the flag that was read --
+
+        UPDATE threads SET close_notify_pending_at = NULL
+        WHERE id = :id AND close_notify_pending_at = :seen
+
+    -- and the notice is created only when that UPDATE took the row
+    (rowcount 1), in the same transaction. A reopen that landed first
+    leaves NULL: nothing is cleared, nobody is told "closed" about an
+    open conversation. A re-close that landed first leaves another
+    flag: it is not cleared here, and a later batch or pass notifies
+    it. A reopen that comes after the UPDATE queues on the row until
+    this pass commits: the notice describes a close that did happen.
+    Before, the notice was emitted and the flag cleared blindly, so
+    both landed -- the notice after a reopen, and a re-close's flag
+    wiped before it was sent.
+
+    Rows are walked in (close_notify_pending_at, id) order -- the order
+    of row locks for this pass (app/messaging/status.py): two passes
+    queue on the first row they share. Idempotent: the idempotency key
+    (thread + close instant) dedups the notice of a flag two passes
+    both cleared. user/DM threads are never flagged -> never notified.
+    Owns its own sessions; commits per batch.
 
     Returns the number of threads notified this pass.
     """
@@ -361,17 +383,28 @@ async def consume_close_notifications(
                 await session.scalars(
                     select(Thread)
                     .where(Thread.close_notify_pending_at.is_not(None))
-                    .order_by(Thread.close_notify_pending_at)
+                    .order_by(Thread.close_notify_pending_at, Thread.id)
                     .limit(limit)
                 )
             ).all()
             if not threads:
                 break
             for thread in threads:
-                await _emit_close_notification(session, thread)
-                thread.close_notify_pending_at = None
+                seen = thread.close_notify_pending_at
+                assert seen is not None  # the WHERE of the read above
+                cleared = await session.execute(
+                    update(Thread)
+                    .where(
+                        Thread.id == thread.id,
+                        Thread.close_notify_pending_at == seen,
+                    )
+                    .values(close_notify_pending_at=None)
+                    .execution_options(synchronize_session=False)
+                )
+                if cleared.rowcount == 1:  # type: ignore[attr-defined]
+                    await _emit_close_notification(session, thread, seen)
+                    total += 1
             await session.commit()
-            total += len(threads)
             if len(threads) < limit:
                 break
 

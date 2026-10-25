@@ -1008,7 +1008,9 @@ _POINTS: dict[tuple[str, str], str] = {
     ("app/engine/processor.py", "_attempt_job"): ("not a transition"),
     # Thread statuses (messaging), not jobs or deliveries.
     ("app/messaging/status.py", "set_status"): "thread",
-    ("app/messaging/status.py", "apply_client_message_reopen"): "thread",
+    # The reopen rule, shared by the manual and the client path (TK-1);
+    # apply_client_message_reopen writes nothing itself any more.
+    ("app/messaging/status.py", "reopen"): "thread",
     ("app/messaging/status.py", "auto_close_idle_threads_batch"): "thread",
 }
 

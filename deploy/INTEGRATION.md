@@ -523,7 +523,7 @@ body, with a class a program can branch on:
 | 403 | `forbidden` | the actor has no role in this thread |
 | 404 | `not_found` | the entity or the route does not exist |
 | 405 | `method_not_allowed` | the route exists, the method does not |
-| 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator |
+| 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator, or changed by another call while it was being assigned or released (section 14) |
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
@@ -560,6 +560,8 @@ construction, so it takes no key:
 | `PUT /recipients/{id}` | a versioned snapshot: the version is its key |
 | `DELETE /recipients/{id}` | forgetting twice is forgetting once |
 | `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
+| `POST /threads/{id}/assign` | answers "whose is it now": a thread already with that assignee is returned as it is |
+| `POST /threads/{id}/release` | a thread already in the pool is returned as it is |
 | `POST /threads/{id}/status` | sets a value; the same status is a no-op |
 | `POST /threads/{id}/retag` | sets values; a repeat finds the thread already moved and back in the pool |
 | `POST /threads/{id}/read` | the pointer only moves forward |
@@ -1742,6 +1744,95 @@ an answer in a language they do not read should be shown by this:
 | `preparing` | not `body`: a translation is on its way |
 | `impossible` | not `body` silently: there will be no translation -- your decision what to say |
 | `not_requested` | not `body`: **nothing has been translated yet -- do not show the original as if it were the reader's language**; decide whether to ask a model (section 12) |
+
+## 14. Thread verbs -- claim, assign, release, status, retag
+
+The operator side of a conversation. Every verb answers the thread in
+its current state; section 5 says why each one is safe to repeat.
+
+**Trust (spec §10.11): `operator` is the actor and is taken on faith.**
+comms checks the service token, not who is asking. Your proxy puts the
+operator from its own session and never forwards one the user sent.
+
+| call | body | who may call | answer |
+|---|---|---|---|
+| `POST /threads/{id}/claim` | `operator` | an operator who serves the thread's section | `{claimed, thread}`; 409 `conflict` when another operator holds it |
+| `POST /threads/{id}/assign` | `operator`, `assignee` | the thread's assignee, or an operator who serves its section | `<thread>`, its `assignee` the one named |
+| `POST /threads/{id}/release` | `operator` | the thread's assignee, or an operator who serves its section | `<thread>`, its `assignee` `null` |
+| `POST /threads/{id}/status` | `operator`, `status` | the thread's assignee; on a section thread also an operator who serves its section | `<thread>` |
+| `POST /threads/{id}/retag` | `operator`, `section`, `subject_type`, `subject_id` | as for `status` | `<thread>`, back in the new section's pool (section 5) |
+
+"Serves the section": a section with members declared
+(`section_membership_changed`, section 7) is served by its members; a
+section with none declared is served by every operator. The thread's
+assignee may act on it even after leaving the roster -- whoever took a
+conversation can finish it or hand it on.
+
+### Handing a ticket over -- `assign` and `release`
+
+Only a **section** thread changes hands. A DM's operator is its master,
+fixed by the form: `assign` and `release` refuse it.
+
+`assign` hands the thread to `assignee` -- over whoever holds it, or out
+of the pool. `assignee` must serve the thread's section. Once it is
+done the new assignee writes into the thread and the previous one no
+longer can (`POST /threads/{id}/messages` answers them 403). `release`
+returns the thread to its section's pool: no assignee, claimable again.
+
+**A release calls nobody.** No notification goes to the section's
+roster, and none to anybody on an `assign`. The released thread is in
+the pool's list again (`GET /threads?operator=`, section 13); the next
+message in it pings the roster as for any thread in the pool. If your
+operators must be told now, tell them yourself.
+
+**Two calls that cross.** comms pins each write to the thread as the
+call found it -- its assignee and its section. A claim, an assign, a
+release or a retag that landed in between makes the later call lose
+rather than write over it: 409 `conflict` -- read the thread and decide
+again. Of two crossing calls exactly one changes the thread. The same
+call twice is not a crossing: the second finds its own outcome and
+answers 200.
+
+| status | class | when |
+|---|---|---|
+| 404 | `not_found` | no such thread; no such `assignee` recipient |
+| 403 | `forbidden` | `operator` is neither the thread's assignee nor serves its section |
+| 422 | `validation` | the thread is a DM; `assignee` does not serve the section; a body field missing, `null` or unknown |
+| 409 | `recipient_deleted` | `assignee` was deleted |
+| 409 | `conflict` | the thread changed between your read and the write |
+
+### Status
+
+Three statuses: `open`, `resolved`, `closed`. A manual move, by row
+the current status, by column the one asked for:
+
+| from \ to | `open` | `resolved` | `closed` |
+|---|---|---|---|
+| `open` | no-op | yes | yes |
+| `resolved` | yes | no-op | yes |
+| `closed` | yes | 422 | no-op |
+
+The same matrix for a DM and for a section thread. "no-op" answers 200
+with the thread unchanged; 422 is `validation`. Besides the manual
+moves, a message from the client returns a `resolved` or `closed`
+thread to `open`, as it always did; a message from the operator side
+moves nothing. Two status calls that cross queue on the thread: the
+second is decided on the status the first left.
+
+**Closing a section thread tells the client** (`msg.thread_closed`):
+comms' maintenance pass issues the notice shortly after the close.
+**Returning the thread to `open` -- by hand or by the client's message
+-- before the notice is issued cancels it:** comms never issues it for
+a thread that is open again. A notice issued before the reopen is
+delivered like any other. A DM is never announced.
+
+**Returning a thread to `open` does not restart its idle clock.**
+Auto-close (`THREAD_AUTO_CLOSE_DAYS`) measures silence from the last
+message, and a manual reopen writes no message. With auto-close on, a
+thread that has been silent longer than that and is reopened by hand is
+closed again by the next auto-close pass -- a section thread with a new
+notice to its client. Keep `THREAD_AUTO_CLOSE_DAYS=0` if your operators
+reopen idle conversations, or write into the thread when reopening it.
 
 ## Operating the comms stack
 
