@@ -28,7 +28,13 @@ from tests.helpers import (
 )
 
 # The frozen 3b thread shape -- the fields the product proxy already
-# consumes. `created` is the ONLY addition this delivery makes.
+# consumes. `created` is the ONLY addition the seam-T2 delivery made to
+# this endpoint. The shape stays frozen: `revision` entered it by a
+# decision of its own in 3.12.0 (RV-1) -- a product asked for it, and
+# both products read the thread as a dict -- and the set below is still
+# exact: the next key is again a separate decision. Until 3.12.0 this
+# set did not hold `revision`, and was right; RV-1 added the key to
+# every answer carrying a thread.
 FROZEN_THREAD_KEYS = {
     "id",
     "client",
@@ -43,6 +49,7 @@ FROZEN_THREAD_KEYS = {
     "priority",
     "last_message_at",
     "created_at",
+    "revision",
 }
 
 
@@ -206,6 +213,7 @@ class TestResponseShape:
         assert payload["priority"] is None
         assert payload["last_message_at"] is None
         assert payload["created_at"]
+        assert payload["revision"] == 1  # a new thread
 
     async def test_no_other_endpoint_gained_the_key(
         self, client: AsyncClient

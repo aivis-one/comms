@@ -474,7 +474,13 @@ class TestWithUnreadIsStrictlyOptIn:
         self, client: AsyncClient
     ) -> None:
         """The 3b shape is frozen: the default response must be
-        unchanged, key for key, byte for byte."""
+        unchanged, key for key, byte for byte.
+
+        The set below is still exact. Until 3.12.0 it did not hold
+        `revision`, and was right; RV-1 entered that key into every
+        answer carrying a thread, by a decision of its own (a product
+        asked for it, both products read the thread as a dict). The
+        next key is again a separate decision."""
         factory = get_session_factory()
         async with factory() as s:
             customer = await _recipient(s)
@@ -511,6 +517,7 @@ class TestWithUnreadIsStrictlyOptIn:
             "priority",
             "last_message_at",
             "created_at",
+            "revision",
         }
 
     async def test_with_unread_adds_only_the_unread_key(

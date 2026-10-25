@@ -1718,7 +1718,8 @@ and the cursor walks it the same way for both readers.
 
 **A row** is the thread: `id`, `client`, `operator_kind`,
 `operator_value`, `assignee`, `kind`, `status`, `subject_type`,
-`subject_id`, `title`, `priority`, `last_message_at`, `created_at`.
+`subject_id`, `title`, `priority`, `last_message_at`, `created_at`,
+`revision` (section 14, "The thread's revision").
 Opt-in keys are added to it, never anything else:
 
 | key | when | value |
@@ -1836,6 +1837,31 @@ thread that has been silent longer than that and is reopened by hand is
 closed again by the next auto-close pass -- a section thread with a new
 notice to its client. Keep `THREAD_AUTO_CLOSE_DAYS=0` if your operators
 reopen idle conversations, or write into the thread when reopening it.
+
+### The thread's revision
+
+Every answer that carries a thread -- `POST /threads`, every row of
+`GET /threads`, `claim` (in its `thread`), `assign`, `release`,
+`status`, `retag` -- carries `revision`, an integer: the thread's state
+as of that answer, after the call's own write.
+
+**A thread starts at 1, and every write of it raises the number by
+one** -- whoever writes: your calls (`claim`, `assign`, `release`,
+`status`, `retag`), a message in the thread (it moves the thread's
+activity; a client's message also reopens it), and comms itself
+(auto-close; the bookkeeping of the close notice). So the number can
+grow while nothing you read changed, and it grows on writes that do not
+touch the assignee. A call that writes nothing -- a repeat that finds
+its outcome already there, a claim of a thread somebody holds, a
+status asked for that the thread already has -- leaves it as it was.
+
+**Keep your copy of a thread only if the answer's `revision` is greater
+than the one you keep.** Two answers about one thread can reach you in
+the other order -- two hand-overs, a hand-over and a status -- and the
+greater number is the later state. Compare numbers of ONE thread only:
+two threads' numbers mean nothing to each other, and a deleted thread
+ends its sequence (a new thread of the same subject starts at 1 under a
+new id).
 
 ### Deleting a thread
 

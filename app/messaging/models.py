@@ -38,7 +38,15 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    FetchedValue,
+    ForeignKey,
+    Integer,
+    String,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.constants import (
@@ -221,6 +229,33 @@ class Thread(UUIDMixin, TimestampMixin, Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+    # The row's REVISION (RV-1): 1 at birth, +1 on EVERY UPDATE of the
+    # row, whoever writes it -- a product's call or comms itself
+    # (auto-close, the close-notice bookkeeping, a message's activity).
+    # The DATABASE moves it: trigger threads_revision (migration 0035)
+    # sets NEW.revision := OLD.revision + 1 on every row an UPDATE
+    # touches, so no writer can forget it, set it, or skip it -- one copy
+    # of the rule, the raw-SQL path included. An UPDATE that matches no
+    # row fires nothing: a conditional write that lost moves nothing.
+    # Compared within ONE thread only; a deleted thread ends its
+    # sequence and a new thread starts at 1 under a new id.
+    #
+    # The ORM learns the value the database wrote: server_onupdate=
+    # FetchedValue() marks it as written by the server on UPDATE, and
+    # eager_defaults (below) fetches it in the same statement
+    # (RETURNING) -- so a thread just flushed answers its own revision,
+    # never the one it was read with. Core paths (claim / assign /
+    # release, app/messaging/operators.py) re-read the row after their
+    # UPDATE, in the transaction that holds its lock.
+    revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="1",
+        server_onupdate=FetchedValue(),
+    )
+
+    __mapper_args__ = {"eager_defaults": True}
 
     def __repr__(self) -> str:
         return (

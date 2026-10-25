@@ -302,6 +302,26 @@ def next_tk2_telegram_id() -> int:
     return tid
 
 
+RV1_TELEGRAM_ID_BAND_START = 93060
+RV1_TELEGRAM_ID_BAND_END = 93459
+
+_rv1_telegram_id_counter = itertools.count(RV1_TELEGRAM_ID_BAND_START)
+
+
+def next_rv1_telegram_id() -> int:
+    """Next telegram_id from the RV-1 band (a thread's revision).
+
+    93060-93459, one past the highest id held above (93059, TK-2); no
+    literal in tests/ or app/ sits in it.
+    """
+    tid = next(_rv1_telegram_id_counter)
+    if tid > RV1_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 93060-93459 exhausted"
+        )
+    return tid
+
+
 async def create_recipient(
     session: AsyncSession,
     *,
