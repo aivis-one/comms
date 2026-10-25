@@ -145,8 +145,16 @@ from app.core.lanes import Lane
 # is told by SQLSTATE and the driver's constraint name; a template
 # variable the job does not carry is never printed; the suite on the
 # image runs with pytest's cache.
+#
+# 3.11.0 is TK-1 and TK-2, a MINOR: a taken section thread is handed to
+# another serving operator (POST /threads/{id}/assign) or returned to its
+# pool (/release); an operator returns a resolved or closed thread to
+# open; status calls take the thread's row; a product deletes a thread
+# with DELETE /threads/{id} (204), its messages, variants and read
+# pointers going with it, and every route naming it answers 404 -- the
+# feed and unread-count of an absent thread too, instead of an empty page.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.11.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
