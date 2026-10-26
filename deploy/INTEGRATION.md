@@ -453,6 +453,25 @@ the channel list comes from the type's record in the profile
 (`channels`), taken when the request is accepted, and from nowhere
 else.
 
+**Your own email.** A request may carry the email ready-made -- the
+`email` block of `notification_request` (section 7): `subject`, `text`
+and, if you want one, `html`. Then the provider gets exactly these:
+the subject, the text and the HTML as you sent them, with the same
+sender, the same single recipient and tracking off as every other
+email. Nothing of the profile is used for that email -- neither the
+`subject` and `body` templates of the email channel nor the job's
+`title` and `body`, which stay the letter of the other channels. comms
+rewrites nothing: no variables are filled in, nothing is escaped, cut
+or cleaned, the HTML is not sanitized or checked, and a subject with a
+line break goes as it is -- if the provider refuses it, that is a
+refusal of that job like any other. Send the text always: it is the
+version of the message for a client that shows no HTML, and an HTML
+message without one is a common reason to be filed as spam. One block
+per job -- every recipient of a group job gets the same email; a
+person who muted the type's category gets none, as before. Without the
+block the email is composed from the profile as described above, byte
+for byte as before.
+
 **One delivery path.** There is no SMTP fallback, deliberately: a
 second path no deploy exercises rots from the first day. The
 consequence is worth stating -- while the provider is unreachable, mail
@@ -859,6 +878,7 @@ never interprets.
 | `body` | by type | letter | 1..5000; as `title` |
 | `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
+| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
 
 There is no channel and no priority on a request. The channel is the
@@ -867,6 +887,17 @@ carries is its type's: a type delivered to people takes the address and
 `title` and `body`; an llm type (section 11) takes `llm` and none of
 those -- either way the wrong set is rejected at intake, naming the
 fields.
+
+**`title` and `body` stay required with an `email` block.** They are the
+letter of the type's other channels (the inbox, `in_app`); the email
+does not use them.
+
+**A NUL character (`\u0000`) in any string of a request** -- a field, a
+value inside `action_data`, `llm` or `email`, a key of an object -- is
+rejected at intake, naming the field: Postgres stores no NUL. In the
+`idempotency_key` itself it makes the key unreadable: there is nothing
+to record the rejection under, and the request goes to the dead-letter
+stream.
 
 **What intake answers.** A request is decided the moment it is read:
 

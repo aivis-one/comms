@@ -444,6 +444,10 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # A thread's revision starts at 1 and only climbs (RV-1, migration
     # 0035): an insert that bypasses the default cannot start it lower.
     "ck_threads_revision_positive",
+    # The product's own email on a job (EM-1, migration 0036): SQL NULL
+    # or an object of subject, text and an optional html, none blank.
+    "ck_notifications_email_not_json_null",
+    "ck_notifications_email_form",
 })
 
 

@@ -55,7 +55,10 @@ from uuid import UUID
 from app.core.constants import (
     MAX_BODY_LEN,
     MAX_CORRELATION_LEN,
+    MAX_EMAIL_HTML_LEN,
     MAX_EMAIL_LEN,
+    MAX_EMAIL_SUBJECT_LEN,
+    MAX_EMAIL_TEXT_LEN,
     MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_LLM_AUDIO_URL_LEN,
@@ -140,6 +143,9 @@ class NotificationRequest:
     body: str | None
     action_data: dict[str, Any] | None
     llm: dict[str, Any] | None
+    # The product's own email (EM-1): {subject, text[, html]}, sent to
+    # the provider as it came; None -- the email is composed as before.
+    email: dict[str, str] | None
     # The link to the audio body of an llm letter (P5-2) -- a field of
     # the ENVELOPE, beside the letter, not inside it: comms reads the
     # envelope and never the letter.
@@ -344,6 +350,86 @@ def _datetime(value: Any, field: str, event: str) -> datetime:
 
 def _is_scalar(value: Any) -> bool:
     return isinstance(value, _SCALAR_TYPES)
+
+
+def _has_nul(value: Any) -> bool:
+    """Whether a NUL sits in a string of this JSON value -- a key of an
+    object included, at any depth."""
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(
+            _has_nul(key) or _has_nul(item) for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_has_nul(item) for item in value)
+    return False
+
+
+def _refuse_nul(data: dict[str, Any], event: str) -> None:
+    """Refuse a request with a NUL in any string it carries. The field
+    is named; a field NAME carrying a NUL is not repeated -- it is the
+    very string that cannot be stored."""
+    for name, value in data.items():
+        if _has_nul(name):
+            raise ValidationError(
+                f"{event}: a field name contains a NUL character"
+            )
+        if _has_nul(value):
+            raise ValidationError(
+                f"{event}: field {name!r} contains a NUL character"
+            )
+
+
+EMAIL_LETTER_LIMITS = {
+    "subject": MAX_EMAIL_SUBJECT_LEN,
+    "text": MAX_EMAIL_TEXT_LEN,
+    "html": MAX_EMAIL_HTML_LEN,
+}
+
+
+def validate_email_letter(
+    letter: Any, *, event: str = EVENT_NOTIFICATION_REQUEST,
+) -> dict[str, str]:
+    """The FORM of the product's own email (EM-1): `subject` and `text`
+    required, `html` optional; each a string with something besides
+    whitespace in it, within its limit in characters
+    (EMAIL_LETTER_LIMITS). Nothing is rewritten -- not a line break in
+    the subject, not a character of the HTML: the provider gets them as
+    they came. `html: null` is no HTML, and is not kept.
+
+    Every refusal names a field, never a value: the reason is recorded
+    under the product's key, and the letter must not land there.
+    """
+    if not isinstance(letter, dict):
+        raise ValidationError(f"{event}: email must be a JSON object")
+    unknown = sorted(str(k) for k in letter if k not in EMAIL_LETTER_LIMITS)
+    if unknown:
+        raise ValidationError(
+            f"{event}: email has unknown field(s) "
+            f"{', '.join(map(repr, unknown))}; allowed: "
+            f"{', '.join(sorted(EMAIL_LETTER_LIMITS))}"
+        )
+    kept: dict[str, str] = {}
+    for name, limit in EMAIL_LETTER_LIMITS.items():
+        value = letter.get(name)
+        if value is None:
+            if name == "html":
+                continue
+            raise ValidationError(
+                f"{event}: email needs the field {name!r}"
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise ValidationError(
+                f"{event}: email.{name} must be a string with more than "
+                f"whitespace in it"
+            )
+        if len(value) > limit:
+            raise ValidationError(
+                f"{event}: email.{name} exceeds {limit} characters"
+            )
+        kept[name] = value
+    return kept
 
 
 def validate_action_data(
@@ -730,6 +816,9 @@ NOTIFICATION_REQUEST_LETTER_FIELDS = frozenset({
     "body",
     "action_data",
     "llm",
+    # The product's own email (EM-1): part of the letter -- never in the
+    # dead letter, the journal, a log line or an error.
+    "email",
 })
 _NOTIFICATION_REQUEST_FIELDS = (
     NOTIFICATION_REQUEST_FRAME_FIELDS
@@ -753,6 +842,15 @@ def _parse_notification_intake(
         _require(data, "idempotency_key", event),
         "idempotency_key", event, max_len=MAX_IDEMPOTENCY_KEY_LEN,
     )
+    if "\x00" in idempotency_key:
+        # A key that cannot be stored cannot carry a refusal either:
+        # Postgres text holds no NUL, so this is the unreadable key's
+        # path -- the dead letter (spec §6.3), keeping the address and
+        # never the letter.
+        raise ValidationError(
+            f"{event}: field 'idempotency_key' contains a NUL character; "
+            f"a refusal cannot be recorded under it"
+        )
     fingerprint = stream_fingerprint(raw)
     try:
         _check_version(data, event)
@@ -769,6 +867,15 @@ def _parse_notification_request(
     data: dict[str, Any], idempotency_key: str, fingerprint: str,
 ) -> NotificationRequest:
     event = EVENT_NOTIFICATION_REQUEST
+
+    # NUL FIRST, before any rule that names a field: Postgres stores no
+    # NUL in text or jsonb, and every string of a request reaches one or
+    # the other -- the envelope's columns, title and body, the JSON of
+    # action_data, llm, llm_audio and email, and the refusal's own text,
+    # which quotes field names. Left to the INSERT, a NUL was a database
+    # error and the request a dead letter; here it is a refusal under
+    # the key, naming the field and never the value.
+    _refuse_nul(data, event)
 
     unknown = sorted(set(data) - _NOTIFICATION_REQUEST_FIELDS)
     if unknown:
@@ -812,6 +919,9 @@ def _parse_notification_request(
     llm: dict[str, Any] | None = None
     if "llm" in data:
         llm = validate_llm_letter(data["llm"])
+    email: dict[str, str] | None = None
+    if data.get("email") is not None:
+        email = validate_email_letter(data["email"])
     llm_audio: dict[str, Any] | None = None
     if "llm_audio" in data:
         llm_audio = validate_llm_audio(data["llm_audio"])
@@ -847,6 +957,7 @@ def _parse_notification_request(
         body=body,
         action_data=action_data,
         llm=llm,
+        email=email,
         llm_audio=llm_audio,
     )
 

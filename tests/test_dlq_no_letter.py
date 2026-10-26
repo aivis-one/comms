@@ -99,6 +99,10 @@ def _letter_request(**overrides: Any) -> dict[str, Any]:
         "body": f"body {_S}",
         "action_data": {"name": f"{_S}", "params": {"p": f"{_S}"}},
         "llm": {"messages": [{"role": "user", "content": f"{_S}"}]},
+        "email": {
+            "subject": f"subject {_S}", "text": f"text {_S}",
+            "html": f"<p>{_S}</p>",
+        },
         "llm_audio": {"url": f"http://rustfs:9000/a?sig={_S}", "format": "wav"},
         "titel": f"misspelled {_S}",
     }
@@ -175,8 +179,8 @@ _GRID: list[tuple[str, dict[bytes, bytes], str | None, list[str] | None, list[st
         "request_object_extra_field",
         _entry(b"notification_request", _REQUEST, note=_S.encode()),
         "notification_request", _KEPT_REQUEST,
-        ["data.action_data", "data.body", "data.llm", "data.llm_audio",
-         "data.title", "data.titel", "note"],
+        ["data.action_data", "data.body", "data.email", "data.llm",
+         "data.llm_audio", "data.title", "data.titel", "note"],
     ),
     (
         "request_without_key",
@@ -186,8 +190,8 @@ _GRID: list[tuple[str, dict[bytes, bytes], str | None, list[str] | None, list[st
         ).encode()),
         "notification_request",
         [k for k in _KEPT_REQUEST if k != "idempotency_key"],
-        ["data.action_data", "data.body", "data.llm", "data.llm_audio",
-         "data.title", "data.titel"],
+        ["data.action_data", "data.body", "data.email", "data.llm",
+         "data.llm_audio", "data.title", "data.titel"],
     ),
     (
         "address_book_event_unknown_key",
@@ -487,12 +491,22 @@ class TestEveryPath:
     async def test_the_unexpected_exception_from_the_database(
         self, redis: fakeaioredis.FakeRedis, stream: str, db_session: AsyncSession,
     ) -> None:
-        """No mock: a title Postgres refuses (a NUL character) reaches the
-        INSERT of the job, and the database error that comes back quotes
-        the bound parameters -- the letter."""
-        request = _letter_request(title=f"title {_S}\u0000")
-        for name in ("llm", "llm_audio", "titel"):
-            del request[name]  # a request comms ACCEPTS, up to the INSERT
+        """No mock: a title the database path refuses reaches the INSERT
+        of the job, and the error that comes back quotes what it was
+        given -- the letter.
+
+        Until EM-1 the title carried a NUL, which Postgres refuses at
+        the INSERT; that was right while the intake let a NUL through.
+        EM-1 refuses a NUL at the intake, under the key (a rejection,
+        not a dead letter), so the title carries a lone surrogate
+        instead: valid JSON, a Python string, and no UTF-8 for the
+        driver to send -- still past every rule of the intake, still
+        failing at the INSERT, still without a mock."""
+        request = _letter_request(title=f"title {_S}\ud800")
+        # A request comms ACCEPTS, up to the INSERT -- `email` out too:
+        # unit_event has no email channel, so the block would be refused.
+        for name in ("llm", "llm_audio", "titel", "email"):
+            del request[name]
         await redis.xadd(stream, {
             "event": "notification_request", "data": json.dumps(request),
         })
@@ -564,7 +578,10 @@ def _section(start: str) -> str:
 class TestTheContract:
     def test_the_split_of_a_request_is_section_7s(self) -> None:
         """The "envelope / letter" column of the notification_request
-        table against the code's three sets, both ways."""
+        table against the code's three sets, both ways.
+
+        The count was 13 until EM-1, and right; EM-1 added `email` to
+        the letter, so the request has 14 fields now."""
         start = _DOC.index("### `notification_request` -- a job")
         table = _DOC[start:_DOC.index("\n### ", start + 1)]
         column: dict[str, set[str]] = {}
@@ -581,7 +598,7 @@ class TestTheContract:
         # The pair: the table was read, every field of the request is in it.
         assert sum(map(len, column.values())) == len(
             EVENT_FIELDS["notification_request"]
-        ) == 13
+        ) == 14
 
     def test_the_fields_of_a_dead_letter_are_the_code_s(self) -> None:
         section = _section("## How long comms keeps things")

@@ -187,6 +187,7 @@ async def _handle_notification_request(
             target_value=event.target_value,
             action_data=event.action_data,
             llm=event.llm,
+            email=event.email,
             llm_audio=event.llm_audio,
             scheduled_at=event.scheduled_at,
             expiry_at=event.expiry_at,

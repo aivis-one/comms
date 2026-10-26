@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 import fakeredis.aioredis as fakeaioredis
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import JSON, select, text
+from sqlalchemy import JSON, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -54,6 +54,9 @@ _BEFORE = "0029_status_index_with_id"
 _SUBJECT = "0030_json_null_is_null"
 _DROPPED = (
     _REPO / "migrations" / "versions" / "2026_10_22_0032_drop_channel_options.py"
+)
+_ADDED = (
+    _REPO / "migrations" / "versions" / "2026_10_25_0036_notification_email.py"
 )
 
 
@@ -107,23 +110,32 @@ class TestTheWatchman:
             f"JSON_VALUE): {missing}"
         )
 
-    def test_it_sees_the_six(self) -> None:
+    def test_it_sees_the_seven(self) -> None:
         """The pair: the walk finds the columns -- the ones 0030 lists,
-        nullable as it says, less the ones a later migration dropped.
+        nullable as it says, less the ones a later migration dropped,
+        plus the ones a later migration added.
 
         It was "the seven, exactly 0030's list" until G1: 0032 dropped
         notification_deliveries.channel_options, and 0030, a migration
         in main, is not edited -- so the list is 0030's minus 0032's
-        DROPPED_JSONB_COLUMNS, and that set is not empty either."""
+        DROPPED_JSONB_COLUMNS. It was "the six" until EM-1: 0036 added
+        notifications.email, named in its ADDED_JSONB_COLUMNS. Neither
+        set is empty."""
         columns = _json_columns()
         dropped = set(_migration_module(_DROPPED).DROPPED_JSONB_COLUMNS)
+        added = {
+            (table, column): nullable
+            for table, column, nullable
+            in _migration_module(_ADDED).ADDED_JSONB_COLUMNS
+        }
         listed = {
             (table, column): nullable
             for table, column, nullable in _migration_module().JSONB_COLUMNS
             if (table, column) not in dropped
-        }
+        } | added
         assert dropped == {("notification_deliveries", "channel_options")}
-        assert len(columns) == 6
+        assert added == {("notifications", "email"): True}
+        assert len(columns) == 7
         assert {k: c.nullable for k, c in columns.items()} == listed
 
     async def test_each_has_its_check_in_the_database(self) -> None:
@@ -258,6 +270,7 @@ class TestTheDatabaseRefusesJsonNull:
         return {
             ("notifications", "channels"): ("id", job.id),
             ("notifications", "action_data"): ("id", job.id),
+            ("notifications", "email"): ("id", job.id),
             ("recipients", "allowed_windows"): ("id", recipient.id),
             ("llm_calls", "sets"): ("notification_id", call.notification_id),
             ("llm_calls", "letter"): ("notification_id", call.notification_id),
@@ -314,15 +327,50 @@ async def at_head_afterwards() -> AsyncGenerator[None, None]:
     await _migrate("upgrade", "head")
 
 
+async def _job_before(session: AsyncSession, **fields: Any) -> Any:
+    """A job written with the columns it names and their defaults only,
+    so a row is insertable into the schema BEFORE a later migration
+    added a column of its own.
+
+    Until EM-1 _seed_before wrote its jobs through the ORM; that was
+    right while every column of the model existed at 0029. 0036 added
+    notifications.email, which an ORM insert names and 0029 lacks."""
+    base: dict[str, Any] = {
+        "type": "unit_event_in_app", "title": "T", "body": "B",
+        "target_type": "all", "target_value": "*",
+        **notification_row_fields(),
+    }
+    base.update(fields)
+    return (await session.execute(
+        insert(Notification.__table__).values(**base)
+        .returning(Notification.__table__.c.id)
+    )).scalar_one()
+
+
 async def _seed_before(session: AsyncSession) -> dict[str, Any]:
     """Rows as the code before 0030 left them: a JSON `null` beside a
     nested null and an ordinary value, in every nullable column."""
     cleared = await create_recipient(session)
     windows = await create_recipient(session)
-    job_null = await _job(session)
-    job_nested = await _job(session, action_data={"a": None})
-    delivery = await _delivery(session)
-    call = await _llm_call(session)
+    job_null = await _job_before(session)
+    job_nested = await _job_before(session, action_data={"a": None})
+    delivery = NotificationDelivery(
+        notification_id=await _job_before(session),
+        recipient_id=(await create_recipient(session)).id, channel="in_app",
+    )
+    session.add(delivery)
+    await session.flush()
+    call = LLMCall(
+        notification_id=await _job_before(
+            session, type="ask.model", title=None, body=None,
+            target_type=None, target_value=None,
+            **notification_row_fields(channels=["llm"]),
+        ),
+        sets=["llm.gw"], letter={"messages": []}, letter_hash="a" * 64,
+        answer_keep_seconds=60,
+    )
+    session.add(call)
+    await session.flush()
     await session.commit()
     for statement, params in (
         ("UPDATE recipients SET allowed_windows = 'null'::jsonb WHERE id = :v",
@@ -331,7 +379,7 @@ async def _seed_before(session: AsyncSession) -> dict[str, Any]:
          "'[{\"day\": 1, \"from\": 0, \"to\": 60}]'::jsonb WHERE id = :v",
          {"v": windows.id}),
         ("UPDATE notifications SET action_data = 'null'::jsonb WHERE id = :v",
-         {"v": job_null.id}),
+         {"v": job_null}),
         ("UPDATE notification_deliveries SET channel_options = 'null'::jsonb "
          "WHERE id = :v", {"v": delivery.id}),
         # P5-1's cleared letter; its audio was SQL NULL from 0028 on.
@@ -341,8 +389,8 @@ async def _seed_before(session: AsyncSession) -> dict[str, Any]:
         await session.execute(text(statement), params)
     await session.commit()
     return {
-        "cleared": cleared.id, "windows": windows.id, "job_null": job_null.id,
-        "job_nested": job_nested.id, "delivery": delivery.id,
+        "cleared": cleared.id, "windows": windows.id, "job_null": job_null,
+        "job_nested": job_nested, "delivery": delivery.id,
         "call": call.notification_id,
     }
 
@@ -373,6 +421,11 @@ async def test_migration_0030(
 
     # Item 2: the person whose schedule was cleared BEFORE the migration
     # -- the row that held a JSON null -- is forgotten now (by the API).
+    # Today's code runs at HEAD, not at 0030: until EM-1 this step ran it
+    # at 0030, which held while no later migration gave notifications a
+    # column of its own; 0036 did (notifications.email), and the code
+    # reads it.
+    await _migrate("upgrade", "head")
     answer = await bare_client.request(
         "DELETE", f"/api/v1/recipients/{ids['cleared']}", json={"version": 2},
     )
@@ -401,11 +454,15 @@ async def test_the_migration_seeds_the_stream_case(
 ) -> None:
     """Item 2 by the STREAM: a cleared schedule seeded as JSON null
     before 0030; after it, user_deleted forgets the person and the
-    dead-letter stream stays empty."""
+    dead-letter stream stays empty.
+
+    The consumer -- today's code -- runs at HEAD, which includes 0030:
+    until EM-1 it ran at 0030 itself, which held while no later
+    migration gave notifications a column of its own (0036 did)."""
     await _migrate("downgrade", _BEFORE)
     async with get_session_factory()() as session:
         ids = await _seed_before(session)
-    await _migrate("upgrade", _SUBJECT)
+    await _migrate("upgrade", "head")
     dlq = await _consume_user_deleted(monkeypatch, ids["cleared"])
     assert dlq == 0
     assert (await _sql(

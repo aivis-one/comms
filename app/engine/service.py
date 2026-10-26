@@ -681,6 +681,7 @@ async def create_notification(
     fingerprint: str,
     action_data: dict[str, Any] | None = None,
     llm: dict[str, Any] | None = None,
+    email: dict[str, str] | None = None,
     llm_audio: dict[str, Any] | None = None,
     scheduled_at: datetime | None = None,
     expiry_at: datetime | None = None,
@@ -714,6 +715,11 @@ async def create_notification(
         llm: The model's letter -- required for a type of the llm kind
             and refused for any other (P5-1). Kept in llm_calls until the
             job's outcome, with its hash and the type's key sets.
+        email: The product's own email (EM-1), its form checked at the
+            stream boundary. Only for a type with email among its
+            channels: a block that could never leave is refused. title
+            and body stay required for a type delivered to people --
+            they are the letter of the other channels, not of this one.
         llm_audio: The link to the letter's audio body (P5-2) -- an llm
             type only; its host must be in LLM_BODY_HOSTS. Kept with the
             letter, cleared with it.
@@ -749,6 +755,17 @@ async def create_notification(
     )
     if llm_audio is not None:
         _check_body_host(llm_audio["url"])
+    if email is not None and DeliveryChannel.EMAIL not in record.value(
+        "channels"
+    ):
+        # A block that would never be sent is the product's mistake, said
+        # at once -- an llm type included (its channels are [llm]). A
+        # recipient who muted the type's category, or has no address, is
+        # not this: the block is simply not sent to that one.
+        raise ValidationError(
+            f"type {type} has no email channel: the request may not "
+            f"carry 'email'"
+        )
 
     # -- The size limit (H1, spec §5.9): its LENGTH, never its content.
     # Refused here, not at delivery: comms does not accept a job it
@@ -820,6 +837,7 @@ async def create_notification(
         target_type=target_type,
         target_value=target_value,
         action_data=action_data,
+        email=email,
         channels=channels,
         category=category,
         push_on=push_on,
