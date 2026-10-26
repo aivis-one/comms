@@ -892,12 +892,18 @@ fields.
 letter of the type's other channels (the inbox, `in_app`); the email
 does not use them.
 
-**A NUL character (`\u0000`) in any string of a request** -- a field, a
-value inside `action_data`, `llm` or `email`, a key of an object -- is
-rejected at intake, naming the field: Postgres stores no NUL. In the
-`idempotency_key` itself it makes the key unreadable: there is nothing
-to record the rejection under, and the request goes to the dead-letter
-stream.
+**A string the database cannot store -- a NUL character (`\u0000`) or
+a lone surrogate (`\ud800` and its kin, which have no UTF-8) -- in any
+event is rejected at intake**, wherever it sits: a field, a value
+inside `action_data`, `llm` or `email`, an item of a list, a key of an
+object, a field's name. A `notification_request` is rejected under its
+key, naming the field and never the value. In the `idempotency_key`
+itself it makes the key unreadable: there is nothing to record the
+rejection under, and the request goes to the dead-letter stream. Every
+other event (`user_upserted`, `user_deleted`, `group_changed`,
+`section_membership_changed`, `reminder_cancel`) goes to the
+dead-letter stream at once, naming the field -- the event is malformed,
+not failing.
 
 **What intake answers.** A request is decided the moment it is read:
 

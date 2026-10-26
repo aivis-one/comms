@@ -491,18 +491,23 @@ class TestEveryPath:
     async def test_the_unexpected_exception_from_the_database(
         self, redis: fakeaioredis.FakeRedis, stream: str, db_session: AsyncSession,
     ) -> None:
-        """No mock: a title the database path refuses reaches the INSERT
-        of the job, and the error that comes back quotes what it was
-        given -- the letter.
+        """No mock: a value the database refuses reaches the INSERT of
+        the job, and the error that comes back quotes what it was given
+        -- the letter.
 
-        Until EM-1 the title carried a NUL, which Postgres refuses at
-        the INSERT; that was right while the intake let a NUL through.
-        EM-1 refuses a NUL at the intake, under the key (a rejection,
-        not a dead letter), so the title carries a lone surrogate
-        instead: valid JSON, a Python string, and no UTF-8 for the
-        driver to send -- still past every rule of the intake, still
-        failing at the INSERT, still without a mock."""
-        request = _letter_request(title=f"title {_S}\ud800")
+        The input moved twice. Until EM-1 the title carried a NUL, which
+        Postgres refuses at the INSERT. EM-1 refused a NUL at the intake,
+        so the title carried a lone surrogate, which the driver cannot
+        encode. The EM-1 FIX refuses that too, at the intake of every
+        event (app/transport/events.py refuse_unstorable): no STRING
+        reaches the INSERT that the database will not take. A NUMBER
+        still does: JSON's NaN, which Python's json reads and jsonb
+        refuses -- the intake checks that a value of action_data is a
+        scalar, not that the database can hold it. So the letter's
+        action_data carries a NaN beside the sentinel."""
+        request = _letter_request(action_data={
+            "name": f"{_S}", "params": {"p": f"{_S}"}, "n": float("nan"),
+        })
         # A request comms ACCEPTS, up to the INSERT -- `email` out too:
         # unit_event has no email channel, so the block would be refused.
         for name in ("llm", "llm_audio", "titel", "email"):
@@ -517,6 +522,62 @@ class TestEveryPath:
         _assert_no_sentinel_logged(logs)
         assert dead["_dlq_error"].startswith("unexpected: ")
         assert " at app/" in dead["_dlq_error"]
+
+
+class TestUnstorable:
+    """A string the database will not take -- a NUL, a lone surrogate --
+    in an event other than the request (EM-1 FIX): a malformation of the
+    event, dead-lettered at once by the parse -- no attempt at the
+    database, no retries -- the reason naming the field and carrying
+    neither kind (a dead letter is written down too). Until the FIX such
+    an event reached its write and failed there: a database error, the
+    retries, "unexpected"."""
+
+    @pytest.mark.parametrize("bad", ["\x00", "\ud800"], ids=["nul", "surrogate"])
+    @pytest.mark.parametrize(("event", "data", "field"), [
+        ("user_upserted", {
+            "v": 1, "recipient_id": str(uuid4()), "version": 1,
+            "telegram_id": None, "email": None, "locale": "en{bad}",
+            "timezone": None, "active": True,
+        }, "locale"),
+        ("user_deleted", {
+            "v": 1, "recipient_id": "{bad}", "version": 2,
+        }, "recipient_id"),
+        ("group_changed", {
+            "v": 1, "group_key": "g{bad}", "recipient_id": str(uuid4()),
+            "member": True,
+        }, "group_key"),
+        ("section_membership_changed", {
+            "v": 1, "section_key": "support", "section_label": "S{bad}",
+            "operator_id": str(uuid4()), "member": True,
+        }, "section_label"),
+        ("reminder_cancel", {
+            "v": 1, "types": ["unit_rem_1h"], "correlation": "c{bad}",
+        }, "correlation"),
+    ])
+    async def test_dead_lettered_at_once(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        bad: str,
+        event: str,
+        data: dict[str, Any],
+        field: str,
+    ) -> None:
+        payload = {
+            key: value.replace("{bad}", bad) if isinstance(value, str) else value
+            for key, value in data.items()
+        }
+        await redis.xadd(stream, {"event": event, "data": json.dumps(payload)})
+        (dead,) = await _consume(redis, stream, 1)
+        assert dead["_dlq_attempts"] == "0"
+        assert dead["event"] == event
+        assert f"field {field!r} is a string the database cannot store" in (
+            dead["_dlq_error"]
+        )
+        assert "\x00" not in dead["_dlq_error"]
+        dead["_dlq_error"].encode("utf-8")
 
 
 class TestNotUtf8:

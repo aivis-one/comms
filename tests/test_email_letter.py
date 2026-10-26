@@ -9,8 +9,10 @@
 #     value; the limits at the border; the block refused on a type
 #     without email among its channels; the same key with the same block
 #     a duplicate, with another a conflict; the pair: no block, as before;
-#   2 a NUL in ANY string of a request -- refused under the key, the
-#     field named; a NUL in the key itself -- the unreadable key's path;
+#   2 a string the database will not take (a NUL, a lone surrogate) in
+#     ANY string of ANY event -- a request refused under the key, the
+#     field named; in the key itself, the unreadable key's path; every
+#     other event a malformation, the dead letter at once (EM-1 FIX);
 #   3 the delivery on the real path of the engine with the provider's
 #     transport faked: the provider gets subject / text / html byte for
 #     byte, nothing of the template or of title / body, no html key when
@@ -33,7 +35,10 @@
 #   M7  create_notification not keeping the block -> TestTheDelivery
 #   M8  a limit in the contract other than the constant -> TestTheContract
 #   M9  a refusal quoting the value -> TestTheIntake (the reasons)
-#   M10 the NUL rule taken out -> TestNul (the request a dead letter)
+#   M10 the rule of the string the database will not take (EM-1 FIX):
+#       without the surrogate -> the surrogate rows of TestUnstorable;
+#       taken out of the other events -> their rows; taken out of the
+#       request -> its rows (the request a database error, a dead letter)
 # =============================================================================
 
 import json
@@ -254,64 +259,153 @@ async def _count(session: AsyncSession, key: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 2 -- a NUL, in any string of a request
+# 2 -- a string the database will not take, in any event (EM-1 FIX)
 # ---------------------------------------------------------------------------
 
+# The two kinds of the class: a NUL, and a lone surrogate (valid JSON,
+# a Python string, no UTF-8 for it).
+_BAD = {"nul": "\x00", "surrogate": "\ud800"}
+_UNSTORABLE_SAID = "is a string the database cannot store"
 
-class TestNul:
+
+def _clean(reason: str) -> None:
+    """The reason is itself written down -- a refusal under the key, a
+    dead letter -- so it carries neither kind."""
+    assert "\x00" not in reason
+    reason.encode("utf-8")
+
+
+@pytest.mark.parametrize("bad", sorted(_BAD))
+class TestUnstorable:
     @pytest.mark.parametrize(("field", "overrides"), [
-        ("email", {"email": _block(subject="a\x00b")}),
-        ("email", {"email": _block(text="a\x00b")}),
-        ("email", {"email": _block(html="<p>\x00</p>")}),
-        ("title", {"title": "T\x00"}),
-        ("body", {"body": "B\x00"}),
-        ("action_data", {"action_data": {"params": {"p": "x\x00"}}}),
-        ("action_data", {"action_data": {"var\x00": "x"}}),
-        ("correlation", {"correlation": "c\x00"}),
-        ("type", {"type": "unit\x00event"}),
+        ("email", lambda b: {"email": _block(subject=f"a{b}b")}),
+        ("email", lambda b: {"email": _block(text=f"a{b}b")}),
+        ("email", lambda b: {"email": _block(html=f"<p>{b}</p>")}),
+        ("title", lambda b: {"title": f"T{b}"}),
+        ("body", lambda b: {"body": f"B{b}"}),
+        ("action_data", lambda b: {"action_data": {"params": {"p": f"x{b}"}}}),
+        ("action_data", lambda b: {"action_data": {f"var{b}": "x"}}),
+        ("correlation", lambda b: {"correlation": f"c{b}"}),
+        ("type", lambda b: {"type": f"unit{b}event"}),
+        ("target_value", lambda b: {"target_value": f"*{b}"}),
+        ("scheduled_at", lambda b: {"scheduled_at": f"2030{b}"}),
     ])
-    async def test_refused_under_the_key(
-        self, db_session: AsyncSession, field: str, overrides: dict[str, Any]
+    async def test_a_request_refused_under_the_key(
+        self, db_session: AsyncSession, bad: str, field: str, overrides: Any,
     ) -> None:
-        data = _request(**overrides)
+        data = _request(**overrides(_BAD[bad]))
         assert await _handle(db_session, data) is HandleResult.REJECTED
         reason = await _reason(db_session, data["idempotency_key"])
-        assert f"field {field!r} contains a NUL character" in reason
-        assert "\x00" not in reason
+        assert f"field {field!r} {_UNSTORABLE_SAID}" in reason
+        _clean(reason)
 
     @pytest.mark.usefixtures("provider")
-    async def test_in_an_llm_letter(self, db_session: AsyncSession) -> None:
+    async def test_in_an_llm_letter(self, db_session: AsyncSession, bad: str) -> None:
         data = {
             "v": 1, "idempotency_key": f"em1-{uuid4().hex}",
             "type": "ask.model",
-            "llm": {"messages": [{"role": "user", "content": "q\x00"}]},
+            "llm": {"messages": [{"role": "user", "content": f"q{_BAD[bad]}"}]},
         }
         assert await _handle(db_session, data) is HandleResult.REJECTED
-        assert "field 'llm' contains a NUL" in await _reason(
-            db_session, data["idempotency_key"]
-        )
+        reason = await _reason(db_session, data["idempotency_key"])
+        assert f"field 'llm' {_UNSTORABLE_SAID}" in reason
+        _clean(reason)
 
-    async def test_in_a_field_name(self, db_session: AsyncSession) -> None:
+    async def test_in_a_field_name(self, db_session: AsyncSession, bad: str) -> None:
         data = _request()
-        data["tit\x00le"] = "x"
+        data[f"tit{_BAD[bad]}le"] = "x"
         assert await _handle(db_session, data) is HandleResult.REJECTED
         reason = await _reason(db_session, data["idempotency_key"])
-        assert "a field name contains a NUL character" in reason
-        assert "\x00" not in reason
+        assert f"a field name {_UNSTORABLE_SAID}" in reason
+        _clean(reason)
 
-    async def test_the_pair_without_nul(self, db_session: AsyncSession) -> None:
+    def test_in_the_key_the_key_is_unreadable(self, bad: str) -> None:
+        """Nothing to record a refusal under: parse_event raises -- the
+        dead letter's path (spec §6.3, tests/test_dlq_no_letter.py)."""
+        data = _request(idempotency_key=f"key{_BAD[bad]}")
+        with pytest.raises(ValidationError, match="idempotency_key") as raised:
+            parse_event({"event": "notification_request",
+                         "data": json.dumps(data)})
+        _clean(str(raised.value))
+
+    @pytest.mark.parametrize(("event", "field"), [
+        ("user_upserted", "locale"),
+        ("user_upserted", "email"),
+        ("user_deleted", "recipient_id"),
+        ("group_changed", "group_key"),
+        ("section_membership_changed", "section_label"),
+        ("reminder_cancel", "correlation"),
+        ("reminder_cancel", "types"),
+    ])
+    def test_every_other_event(self, bad: str, event: str, field: str) -> None:
+        """A malformation of the event: parse_event raises -- the dead
+        letter at once (tests/test_dlq_no_letter.py TestUnstorable) --
+        naming the field. Never a database error and its retries."""
+        data = _other_event(event)
+        value = data[field]
+        data[field] = (
+            [f"{value[0]}{_BAD[bad]}"] if isinstance(value, list)
+            else f"{value}{_BAD[bad]}"
+        )
+        with pytest.raises(ValidationError) as raised:
+            parse_event({"event": event, "data": json.dumps(data)})
+        assert f"field {field!r} {_UNSTORABLE_SAID}" in str(raised.value)
+        _clean(str(raised.value))
+
+    @pytest.mark.parametrize("event", sorted(
+        ["user_upserted", "user_deleted", "group_changed",
+         "section_membership_changed", "reminder_cancel"],
+    ))
+    def test_a_field_name_of_every_other_event(
+        self, bad: str, event: str
+    ) -> None:
+        data = _other_event(event)
+        data[f"no{_BAD[bad]}te"] = "x"
+        with pytest.raises(ValidationError) as raised:
+            parse_event({"event": event, "data": json.dumps(data)})
+        assert f"a field name {_UNSTORABLE_SAID}" in str(raised.value)
+        _clean(str(raised.value))
+
+
+class TestStorable:
+    """The pair: the same fields without either kind are accepted."""
+
+    async def test_a_request(self, db_session: AsyncSession) -> None:
         data = _request(
-            action_data={"params": {"p": "x"}, "var": "y"}, correlation="c",
+            action_data={"params": {"p": "x"}, "var": "y"},
+            correlation="c", email=_block(subject="a b"),
         )
         assert await _handle(db_session, data) is HandleResult.PROCESSED
 
-    def test_in_the_key_the_key_is_unreadable(self) -> None:
-        """Nothing to record a refusal under: parse_event raises -- the
-        dead letter's path (spec §6.3, tests/test_dlq_no_letter.py)."""
-        data = _request(idempotency_key="key\x00")
-        with pytest.raises(ValidationError, match="idempotency_key"):
-            parse_event({"event": "notification_request",
-                         "data": json.dumps(data)})
+    @pytest.mark.parametrize("event", sorted(
+        ["user_upserted", "user_deleted", "group_changed",
+         "section_membership_changed", "reminder_cancel"],
+    ))
+    def test_every_other_event(self, event: str) -> None:
+        parse_event({"event": event, "data": json.dumps(_other_event(event))})
+
+
+def _other_event(event: str) -> dict[str, Any]:
+    """A well-formed payload of each event other than the request."""
+    rid = str(uuid4())
+    return {
+        "user_upserted": {
+            "v": 1, "recipient_id": rid, "version": 1, "telegram_id": None,
+            "email": "one@example.test", "locale": "en",
+            "timezone": "Europe/Berlin", "active": True,
+        },
+        "user_deleted": {"v": 1, "recipient_id": rid, "version": 2},
+        "group_changed": {
+            "v": 1, "group_key": "g1", "recipient_id": rid, "member": True,
+        },
+        "section_membership_changed": {
+            "v": 1, "section_key": "support", "section_label": "Support",
+            "operator_id": rid, "member": True,
+        },
+        "reminder_cancel": {
+            "v": 1, "types": ["unit_rem_1h"], "correlation": "c-1",
+        },
+    }[event]
 
 
 # ---------------------------------------------------------------------------
@@ -484,13 +578,22 @@ class TestTheContract:
         assert documented == dict(EMAIL_LETTER_LIMITS) == _LIMITS
         assert "`null` is no block" in row
 
-    def test_title_and_body_and_nul(self) -> None:
+    def test_title_and_body_and_the_unstorable_string(self) -> None:
         start = _DOC.index("### `notification_request` -- a job")
         part = _DOC[start:_DOC.index("\n### ", start + 1)]
         assert "**`title` and `body` stay required with an `email` " \
                "block.**" in part
         assert "the email\ndoes not use them" in part
-        assert "**A NUL character" in part
+        nul = part.split("**A string the database cannot store", 1)[1]
+        nul = nul.split("\n\n", 1)[0]
+        for said in ("a NUL character", "a lone surrogate",
+                     "in any\nevent is rejected at intake",
+                     "rejected under its\nkey",
+                     "makes the key unreadable", "dead-letter stream at once"):
+            assert said in nul, said
+        for event in ("user_upserted", "user_deleted", "group_changed",
+                      "section_membership_changed", "reminder_cancel"):
+            assert f"`{event}`" in nul, event
 
     def test_your_own_email(self) -> None:
         part = _DOC.split("**Your own email.**", 1)[1].split("\n\n", 1)[0]

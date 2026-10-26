@@ -352,33 +352,56 @@ def _is_scalar(value: Any) -> bool:
     return isinstance(value, _SCALAR_TYPES)
 
 
-def _has_nul(value: Any) -> bool:
-    """Whether a NUL sits in a string of this JSON value -- a key of an
-    object included, at any depth."""
+# A STRING THE DATABASE WILL NOT TAKE -- ONE RULE, EVERY EVENT (EM-1
+# FIX). Postgres stores no NUL in text or jsonb, and the driver sends
+# UTF-8: a string with a lone surrogate (valid JSON, "\ud800", and a
+# Python string) cannot be encoded at all. Every string of an event
+# reaches the database one way or another -- a column, a JSON value, the
+# text of a refusal that names a field -- so either kind used to surface
+# as a database or driver error at the write, retried and dead-lettered
+# as "unexpected", the reason saying nothing useful. parse_event refuses
+# them first, before any rule that would quote a name or a value.
+_UNSTORABLE = "a string the database cannot store (a NUL character or a lone surrogate)"
+
+
+def _storable(text: str) -> bool:
+    """Whether Postgres can hold this string: no NUL, and UTF-8 for it
+    exists (no lone surrogate)."""
+    if "\x00" in text:
+        return False
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _has_unstorable(value: Any) -> bool:
+    """Whether a string of this JSON value -- a key of an object
+    included, at any depth -- is one the database cannot store."""
     if isinstance(value, str):
-        return "\x00" in value
+        return not _storable(value)
     if isinstance(value, dict):
         return any(
-            _has_nul(key) or _has_nul(item) for key, item in value.items()
+            _has_unstorable(key) or _has_unstorable(item)
+            for key, item in value.items()
         )
     if isinstance(value, list):
-        return any(_has_nul(item) for item in value)
+        return any(_has_unstorable(item) for item in value)
     return False
 
 
-def _refuse_nul(data: dict[str, Any], event: str) -> None:
-    """Refuse a request with a NUL in any string it carries. The field
-    is named; a field NAME carrying a NUL is not repeated -- it is the
-    very string that cannot be stored."""
+def refuse_unstorable(data: dict[str, Any], event: str) -> None:
+    """Refuse an event's data with a string the database cannot store,
+    anywhere in it. The field is named; a field NAME that is such a
+    string is not repeated -- it is the very string that cannot be
+    stored, and the reason itself is written down (a refusal under the
+    key, a dead letter)."""
     for name, value in data.items():
-        if _has_nul(name):
-            raise ValidationError(
-                f"{event}: a field name contains a NUL character"
-            )
-        if _has_nul(value):
-            raise ValidationError(
-                f"{event}: field {name!r} contains a NUL character"
-            )
+        if _has_unstorable(name):
+            raise ValidationError(f"{event}: a field name is {_UNSTORABLE}")
+        if _has_unstorable(value):
+            raise ValidationError(f"{event}: field {name!r} is {_UNSTORABLE}")
 
 
 EMAIL_LETTER_LIMITS = {
@@ -737,7 +760,12 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
 
     data = _json_object(decoded[ENVELOPE_DATA_FIELD], event)
     if event == EVENT_NOTIFICATION_REQUEST:
+        # The key first, then refuse_unstorable under it -- see there.
         return _parse_notification_intake(data, _raw_data(fields))
+    # Every other event: a string the database cannot store is a
+    # malformation of the event, refused first -- the dead letter at
+    # once, naming the field, never a database error and its retries.
+    refuse_unstorable(data, event)
     _check_version(data, event)
 
     if event == EVENT_USER_UPSERTED:
@@ -842,14 +870,13 @@ def _parse_notification_intake(
         _require(data, "idempotency_key", event),
         "idempotency_key", event, max_len=MAX_IDEMPOTENCY_KEY_LEN,
     )
-    if "\x00" in idempotency_key:
+    if not _storable(idempotency_key):
         # A key that cannot be stored cannot carry a refusal either:
-        # Postgres text holds no NUL, so this is the unreadable key's
-        # path -- the dead letter (spec §6.3), keeping the address and
-        # never the letter.
+        # this is the unreadable key's path -- the dead letter (spec
+        # §6.3), keeping the address and never the letter.
         raise ValidationError(
-            f"{event}: field 'idempotency_key' contains a NUL character; "
-            f"a refusal cannot be recorded under it"
+            f"{event}: field 'idempotency_key' is {_UNSTORABLE}; a refusal "
+            f"cannot be recorded under it"
         )
     fingerprint = stream_fingerprint(raw)
     try:
@@ -868,14 +895,11 @@ def _parse_notification_request(
 ) -> NotificationRequest:
     event = EVENT_NOTIFICATION_REQUEST
 
-    # NUL FIRST, before any rule that names a field: Postgres stores no
-    # NUL in text or jsonb, and every string of a request reaches one or
-    # the other -- the envelope's columns, title and body, the JSON of
-    # action_data, llm, llm_audio and email, and the refusal's own text,
-    # which quotes field names. Left to the INSERT, a NUL was a database
-    # error and the request a dead letter; here it is a refusal under
-    # the key, naming the field and never the value.
-    _refuse_nul(data, event)
+    # A STRING THE DATABASE WILL NOT TAKE, FIRST (refuse_unstorable):
+    # here, past the readable key, it is a refusal under the key --
+    # naming the field, never the value -- and not a database error at
+    # the INSERT and a dead letter.
+    refuse_unstorable(data, event)
 
     unknown = sorted(set(data) - _NOTIFICATION_REQUEST_FIELDS)
     if unknown:
