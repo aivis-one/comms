@@ -157,7 +157,11 @@ from app.core.lanes import Lane
 # 3.12.0 is RV-1, a MINOR: every answer that carries a thread carries
 # revision -- 1 at birth, +1 on every write of its row (trigger
 # threads_revision, migration 0035), so a product keeps its copy only if
-# the answer's revision is greater than the one it keeps.
+# the answer's revision is greater than the one it keeps. And EM-1: a
+# notification_request may carry the product's own email -- email:
+# {subject, text, html?} -- sent to the provider exactly as it came; a
+# string the database cannot store (NUL, a lone surrogate) is refused at
+# intake, under the key for a request, to the DLQ for any other event.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
 APP_VERSION = "3.12.0"
 
