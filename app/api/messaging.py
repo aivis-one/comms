@@ -270,6 +270,10 @@ def _thread_out(thread: Thread) -> dict[str, Any]:
         "priority": thread.priority,
         "last_message_at": _iso(thread.last_message_at),
         "created_at": _iso(thread.created_at),
+        # RV-1 (3.12.0): the row's revision AFTER this call's write --
+        # the ORM fetches it on flush (Thread.revision), the Core verbs
+        # re-read the row before answering.
+        "revision": thread.revision,
     }
 
 
@@ -661,8 +665,11 @@ async def create_thread(
     without comms pushing anything back.
 
     The key is attached HERE, not inside _thread_out: that serializer
-    is shared with the list / claim / status / retag responses, whose
-    shapes are frozen (3b) and must stay byte-for-byte.
+    is shared with the list / claim / assign / release / status / retag
+    responses, whose shape is FROZEN (3b) -- a key enters it only by a
+    decision of its own. One has: `revision`, in 3.12.0 (RV-1), asked
+    for by a product to order two answers about one thread; the next
+    key is again a separate decision, not a freedom to add fields.
     """
     key = require_key(idempotency_key)
     fingerprint = await request_fingerprint(request)

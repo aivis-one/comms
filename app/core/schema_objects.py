@@ -441,7 +441,47 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_message_variants_job_key",
     "ck_message_variants_body",
     "ck_message_variants_form",
+    # A thread's revision starts at 1 and only climbs (RV-1, migration
+    # 0035): an insert that bypasses the default cannot start it lower.
+    "ck_threads_revision_positive",
+    # The product's own email on a job (EM-1, migration 0036): SQL NULL
+    # or an object of subject, text and an optional html, none blank.
+    "ck_notifications_email_not_json_null",
+    "ck_notifications_email_form",
 })
+
+
+@dataclass(frozen=True)
+class TriggerShape:
+    """What a trigger must BE: its definition as the catalog prints it
+    (pg_get_triggerdef) and the source of the function it runs (prosrc,
+    whitespace-trimmed). The function is pinned with the trigger because
+    a trigger that fires a function which no longer does the job is a
+    trigger in name only."""
+
+    definition: str
+    function: str
+    source: str
+
+
+# THE TRIGGERS THE MIGRATIONS OWN. A third list, because neither the
+# comparison nor the two lists above see a trigger or a function:
+# `alembic check` never reflects them, so nothing but the suite asking
+# the catalogs directly (tests/test_schema_objects.py) notices one gone
+# or changed. RV-1 brought the first.
+MIGRATION_OWNED_TRIGGERS: dict[str, TriggerShape] = {
+    # Every UPDATE of a threads row raises its revision by one, whoever
+    # writes it (app/messaging/models.py Thread.revision, migration
+    # 0035).
+    "threads_revision": TriggerShape(
+        definition=(
+            "CREATE TRIGGER threads_revision BEFORE UPDATE ON public.threads "
+            "FOR EACH ROW EXECUTE FUNCTION threads_revision_next()"
+        ),
+        function="threads_revision_next",
+        source="BEGIN NEW.revision := OLD.revision + 1; RETURN NEW; END",
+    ),
+}
 
 # Everything the schema must carry although the metadata never mentions
 # it. The suite walks this set against the live catalogs.

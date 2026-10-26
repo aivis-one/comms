@@ -453,6 +453,25 @@ the channel list comes from the type's record in the profile
 (`channels`), taken when the request is accepted, and from nowhere
 else.
 
+**Your own email.** A request may carry the email ready-made -- the
+`email` block of `notification_request` (section 7): `subject`, `text`
+and, if you want one, `html`. Then the provider gets exactly these:
+the subject, the text and the HTML as you sent them, with the same
+sender, the same single recipient and tracking off as every other
+email. Nothing of the profile is used for that email -- neither the
+`subject` and `body` templates of the email channel nor the job's
+`title` and `body`, which stay the letter of the other channels. comms
+rewrites nothing: no variables are filled in, nothing is escaped, cut
+or cleaned, the HTML is not sanitized or checked, and a subject with a
+line break goes as it is -- if the provider refuses it, that is a
+refusal of that job like any other. Send the text always: it is the
+version of the message for a client that shows no HTML, and an HTML
+message without one is a common reason to be filed as spam. One block
+per job -- every recipient of a group job gets the same email; a
+person who muted the type's category gets none, as before. Without the
+block the email is composed from the profile as described above, byte
+for byte as before.
+
 **One delivery path.** There is no SMTP fallback, deliberately: a
 second path no deploy exercises rots from the first day. The
 consequence is worth stating -- while the provider is unreachable, mail
@@ -859,6 +878,7 @@ never interprets.
 | `body` | by type | letter | 1..5000; as `title` |
 | `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
+| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
 
 There is no channel and no priority on a request. The channel is the
@@ -867,6 +887,23 @@ carries is its type's: a type delivered to people takes the address and
 `title` and `body`; an llm type (section 11) takes `llm` and none of
 those -- either way the wrong set is rejected at intake, naming the
 fields.
+
+**`title` and `body` stay required with an `email` block.** They are the
+letter of the type's other channels (the inbox, `in_app`); the email
+does not use them.
+
+**A string the database cannot store -- a NUL character (`\u0000`) or
+a lone surrogate (`\ud800` and its kin, which have no UTF-8) -- in any
+event is rejected at intake**, wherever it sits: a field, a value
+inside `action_data`, `llm` or `email`, an item of a list, a key of an
+object, a field's name. A `notification_request` is rejected under its
+key, naming the field and never the value. In the `idempotency_key`
+itself it makes the key unreadable: there is nothing to record the
+rejection under, and the request goes to the dead-letter stream. Every
+other event (`user_upserted`, `user_deleted`, `group_changed`,
+`section_membership_changed`, `reminder_cancel`) goes to the
+dead-letter stream at once, naming the field -- the event is malformed,
+not failing.
 
 **What intake answers.** A request is decided the moment it is read:
 
@@ -1718,7 +1755,8 @@ and the cursor walks it the same way for both readers.
 
 **A row** is the thread: `id`, `client`, `operator_kind`,
 `operator_value`, `assignee`, `kind`, `status`, `subject_type`,
-`subject_id`, `title`, `priority`, `last_message_at`, `created_at`.
+`subject_id`, `title`, `priority`, `last_message_at`, `created_at`,
+`revision` (section 14, "The thread's revision").
 Opt-in keys are added to it, never anything else:
 
 | key | when | value |
@@ -1836,6 +1874,31 @@ thread that has been silent longer than that and is reopened by hand is
 closed again by the next auto-close pass -- a section thread with a new
 notice to its client. Keep `THREAD_AUTO_CLOSE_DAYS=0` if your operators
 reopen idle conversations, or write into the thread when reopening it.
+
+### The thread's revision
+
+Every answer that carries a thread -- `POST /threads`, every row of
+`GET /threads`, `claim` (in its `thread`), `assign`, `release`,
+`status`, `retag` -- carries `revision`, an integer: the thread's state
+as of that answer, after the call's own write.
+
+**A thread starts at 1, and every write of it raises the number by
+one** -- whoever writes: your calls (`claim`, `assign`, `release`,
+`status`, `retag`), a message in the thread (it moves the thread's
+activity; a client's message also reopens it), and comms itself
+(auto-close; the bookkeeping of the close notice). So the number can
+grow while nothing you read changed, and it grows on writes that do not
+touch the assignee. A call that writes nothing -- a repeat that finds
+its outcome already there, a claim of a thread somebody holds, a
+status asked for that the thread already has -- leaves it as it was.
+
+**Keep your copy of a thread only if the answer's `revision` is greater
+than the one you keep.** Two answers about one thread can reach you in
+the other order -- two hand-overs, a hand-over and a status -- and the
+greater number is the later state. Compare numbers of ONE thread only:
+two threads' numbers mean nothing to each other, and a deleted thread
+ends its sequence (a new thread of the same subject starts at 1 under a
+new id).
 
 ### Deleting a thread
 

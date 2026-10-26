@@ -646,19 +646,25 @@ _NO_TRACKING: dict[str, str] = {
 
 
 class EmailFormatter:
-    """Deliver notifications as plain-text email through the provider.
+    """Deliver notifications as email through the provider.
 
     ONE PATH, on purpose: an SMTP fallback would be code no deploy
     executes and only a mock ever exercises. Delivery is retried, and
     the products that send codes re-send them on request.
 
-    TEXT ONLY: an HTML body carrying a link, with no text alternative,
-    is a classic reason to be filed as spam -- and deliverability is the
-    single reason this provider is used at all.
-
-    SUBJECT AND BODY come from the profile like every other channel:
-    {type: {channel: {field}}}, so email reads its OWN `subject` and
-    `body` fields. Nothing new enters the profile contract.
+    TWO SOURCES OF THE MESSAGE, decided per job:
+      - THE PRODUCT'S OWN EMAIL (EM-1, notification.email): the
+        provider gets its `subject`, `text` and -- when the product sent
+        one -- `html`, exactly as they came. No template, no title or
+        body, no cleaning of the subject, no touching of the HTML: the
+        product wrote the message, comms delivers it. The text is
+        always there (the intake requires it), so an HTML message never
+        goes without its text alternative -- the classic reason to be
+        filed as spam does not arise.
+      - OTHERWISE, as before, byte for byte: subject and body from the
+        profile like every other channel -- {type: {channel: {field}}},
+        email reads its OWN `subject` and `body` fields -- with the
+        fallbacks of _compose, and TEXT ONLY: comms composes no HTML.
     """
 
     def __init__(
@@ -702,7 +708,14 @@ class EmailFormatter:
                 f"({_address_defect(recipient.email)})"
             )
 
-        subject, body = self._compose(notification, recipient)
+        content: dict[str, str]
+        if notification.email is not None:
+            # The product's own email: its fields, as they came -- html
+            # only when it sent one.
+            content = dict(notification.email)
+        else:
+            subject, body = self._compose(notification, recipient)
+            content = {"subject": subject, "text": body}
 
         try:
             response = await self._client.post(
@@ -711,8 +724,7 @@ class EmailFormatter:
                 data={
                     "from": self._from_address,
                     "to": [address],
-                    "subject": subject,
-                    "text": body,
+                    **content,
                     **_NO_TRACKING,
                 },
             )

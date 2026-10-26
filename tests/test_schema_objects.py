@@ -33,6 +33,7 @@ from app.core.schema_objects import (
     MIGRATION_OWNED_CHECKS,
     MIGRATION_OWNED_INDEXES,
     MIGRATION_OWNED_INVARIANTS,
+    MIGRATION_OWNED_TRIGGERS,
     include_object,
 )
 
@@ -143,6 +144,41 @@ class TestMigrationOwnedInvariantsExist:
                 {"name": name},
             )
         assert found == name
+
+
+class TestMigrationOwnedTriggersExist:
+    """Every trigger the migrations own is in the database, enabled, as
+    pinned, running the function as pinned (RV-1). `alembic check`
+    reflects neither triggers nor functions: without this, a migration
+    that dropped threads_revision -- or rewrote its function into one
+    that moves nothing -- would pass every comparison."""
+
+    @pytest.mark.parametrize("name", sorted(MIGRATION_OWNED_TRIGGERS))
+    async def test_the_trigger_is_in_the_schema_as_declared(
+        self, name: str
+    ) -> None:
+        expected = MIGRATION_OWNED_TRIGGERS[name]
+        async with get_engine().connect() as connection:
+            row = (await connection.execute(
+                text(
+                    "SELECT pg_get_triggerdef(t.oid), t.tgenabled::text, "
+                    "p.proname, btrim(p.prosrc) "
+                    "FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
+                    "WHERE t.tgname = :name AND NOT t.tgisinternal"
+                ),
+                {"name": name},
+            )).one_or_none()
+        assert row is not None, f"trigger {name} is not in the schema"
+        definition, enabled, function, source = row
+        assert definition == expected.definition
+        assert enabled == "O"  # fires in the normal origin mode
+        assert function == expected.function
+        assert source == expected.source
+
+    def test_the_list_is_not_empty(self) -> None:
+        """The pair of the parametrized test above: an empty list would
+        make it vanish rather than fail."""
+        assert "threads_revision" in MIGRATION_OWNED_TRIGGERS
 
 
 class TestTheListsDescribeReality:

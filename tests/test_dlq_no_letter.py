@@ -99,6 +99,10 @@ def _letter_request(**overrides: Any) -> dict[str, Any]:
         "body": f"body {_S}",
         "action_data": {"name": f"{_S}", "params": {"p": f"{_S}"}},
         "llm": {"messages": [{"role": "user", "content": f"{_S}"}]},
+        "email": {
+            "subject": f"subject {_S}", "text": f"text {_S}",
+            "html": f"<p>{_S}</p>",
+        },
         "llm_audio": {"url": f"http://rustfs:9000/a?sig={_S}", "format": "wav"},
         "titel": f"misspelled {_S}",
     }
@@ -175,8 +179,8 @@ _GRID: list[tuple[str, dict[bytes, bytes], str | None, list[str] | None, list[st
         "request_object_extra_field",
         _entry(b"notification_request", _REQUEST, note=_S.encode()),
         "notification_request", _KEPT_REQUEST,
-        ["data.action_data", "data.body", "data.llm", "data.llm_audio",
-         "data.title", "data.titel", "note"],
+        ["data.action_data", "data.body", "data.email", "data.llm",
+         "data.llm_audio", "data.title", "data.titel", "note"],
     ),
     (
         "request_without_key",
@@ -186,8 +190,8 @@ _GRID: list[tuple[str, dict[bytes, bytes], str | None, list[str] | None, list[st
         ).encode()),
         "notification_request",
         [k for k in _KEPT_REQUEST if k != "idempotency_key"],
-        ["data.action_data", "data.body", "data.llm", "data.llm_audio",
-         "data.title", "data.titel"],
+        ["data.action_data", "data.body", "data.email", "data.llm",
+         "data.llm_audio", "data.title", "data.titel"],
     ),
     (
         "address_book_event_unknown_key",
@@ -487,12 +491,27 @@ class TestEveryPath:
     async def test_the_unexpected_exception_from_the_database(
         self, redis: fakeaioredis.FakeRedis, stream: str, db_session: AsyncSession,
     ) -> None:
-        """No mock: a title Postgres refuses (a NUL character) reaches the
-        INSERT of the job, and the database error that comes back quotes
-        the bound parameters -- the letter."""
-        request = _letter_request(title=f"title {_S}\u0000")
-        for name in ("llm", "llm_audio", "titel"):
-            del request[name]  # a request comms ACCEPTS, up to the INSERT
+        """No mock: a value the database refuses reaches the INSERT of
+        the job, and the error that comes back quotes what it was given
+        -- the letter.
+
+        The input moved twice. Until EM-1 the title carried a NUL, which
+        Postgres refuses at the INSERT. EM-1 refused a NUL at the intake,
+        so the title carried a lone surrogate, which the driver cannot
+        encode. The EM-1 FIX refuses that too, at the intake of every
+        event (app/transport/events.py refuse_unstorable): no STRING
+        reaches the INSERT that the database will not take. A NUMBER
+        still does: JSON's NaN, which Python's json reads and jsonb
+        refuses -- the intake checks that a value of action_data is a
+        scalar, not that the database can hold it. So the letter's
+        action_data carries a NaN beside the sentinel."""
+        request = _letter_request(action_data={
+            "name": f"{_S}", "params": {"p": f"{_S}"}, "n": float("nan"),
+        })
+        # A request comms ACCEPTS, up to the INSERT -- `email` out too:
+        # unit_event has no email channel, so the block would be refused.
+        for name in ("llm", "llm_audio", "titel", "email"):
+            del request[name]
         await redis.xadd(stream, {
             "event": "notification_request", "data": json.dumps(request),
         })
@@ -503,6 +522,62 @@ class TestEveryPath:
         _assert_no_sentinel_logged(logs)
         assert dead["_dlq_error"].startswith("unexpected: ")
         assert " at app/" in dead["_dlq_error"]
+
+
+class TestUnstorable:
+    """A string the database will not take -- a NUL, a lone surrogate --
+    in an event other than the request (EM-1 FIX): a malformation of the
+    event, dead-lettered at once by the parse -- no attempt at the
+    database, no retries -- the reason naming the field and carrying
+    neither kind (a dead letter is written down too). Until the FIX such
+    an event reached its write and failed there: a database error, the
+    retries, "unexpected"."""
+
+    @pytest.mark.parametrize("bad", ["\x00", "\ud800"], ids=["nul", "surrogate"])
+    @pytest.mark.parametrize(("event", "data", "field"), [
+        ("user_upserted", {
+            "v": 1, "recipient_id": str(uuid4()), "version": 1,
+            "telegram_id": None, "email": None, "locale": "en{bad}",
+            "timezone": None, "active": True,
+        }, "locale"),
+        ("user_deleted", {
+            "v": 1, "recipient_id": "{bad}", "version": 2,
+        }, "recipient_id"),
+        ("group_changed", {
+            "v": 1, "group_key": "g{bad}", "recipient_id": str(uuid4()),
+            "member": True,
+        }, "group_key"),
+        ("section_membership_changed", {
+            "v": 1, "section_key": "support", "section_label": "S{bad}",
+            "operator_id": str(uuid4()), "member": True,
+        }, "section_label"),
+        ("reminder_cancel", {
+            "v": 1, "types": ["unit_rem_1h"], "correlation": "c{bad}",
+        }, "correlation"),
+    ])
+    async def test_dead_lettered_at_once(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        bad: str,
+        event: str,
+        data: dict[str, Any],
+        field: str,
+    ) -> None:
+        payload = {
+            key: value.replace("{bad}", bad) if isinstance(value, str) else value
+            for key, value in data.items()
+        }
+        await redis.xadd(stream, {"event": event, "data": json.dumps(payload)})
+        (dead,) = await _consume(redis, stream, 1)
+        assert dead["_dlq_attempts"] == "0"
+        assert dead["event"] == event
+        assert f"field {field!r} is a string the database cannot store" in (
+            dead["_dlq_error"]
+        )
+        assert "\x00" not in dead["_dlq_error"]
+        dead["_dlq_error"].encode("utf-8")
 
 
 class TestNotUtf8:
@@ -564,7 +639,10 @@ def _section(start: str) -> str:
 class TestTheContract:
     def test_the_split_of_a_request_is_section_7s(self) -> None:
         """The "envelope / letter" column of the notification_request
-        table against the code's three sets, both ways."""
+        table against the code's three sets, both ways.
+
+        The count was 13 until EM-1, and right; EM-1 added `email` to
+        the letter, so the request has 14 fields now."""
         start = _DOC.index("### `notification_request` -- a job")
         table = _DOC[start:_DOC.index("\n### ", start + 1)]
         column: dict[str, set[str]] = {}
@@ -581,7 +659,7 @@ class TestTheContract:
         # The pair: the table was read, every field of the request is in it.
         assert sum(map(len, column.values())) == len(
             EVENT_FIELDS["notification_request"]
-        ) == 13
+        ) == 14
 
     def test_the_fields_of_a_dead_letter_are_the_code_s(self) -> None:
         section = _section("## How long comms keeps things")

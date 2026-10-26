@@ -77,6 +77,16 @@ MAX_BODY_LEN = 5000
 # ceiling is ours, the product's own limit is the model's context.
 MAX_LLM_LETTER_CHARS = 200_000
 
+# The product's own email (EM-1): the `email` block of a
+# notification_request -- subject, text and html, each in characters,
+# sent to the provider as they came. The subject is as long as a title;
+# the text and the HTML sit far under the provider's message size and
+# keep a stream entry and a job's row within the llm letter's order of
+# size (MAX_LLM_LETTER_CHARS).
+MAX_EMAIL_SUBJECT_LEN = 500
+MAX_EMAIL_TEXT_LEN = 64_000
+MAX_EMAIL_HTML_LEN = 256_000
+
 # The ceiling of a type's max_audio_bytes (P5-2): an audio body is held
 # in the attempt's memory whole, and once more as base64 in the request
 # -- 20 MiB is about 50 MiB of one attempt's memory.

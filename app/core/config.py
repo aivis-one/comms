@@ -153,8 +153,17 @@ from app.core.lanes import Lane
 # with DELETE /threads/{id} (204), its messages, variants and read
 # pointers going with it, and every route naming it answers 404 -- the
 # feed and unread-count of an absent thread too, instead of an empty page.
+#
+# 3.12.0 is RV-1, a MINOR: every answer that carries a thread carries
+# revision -- 1 at birth, +1 on every write of its row (trigger
+# threads_revision, migration 0035), so a product keeps its copy only if
+# the answer's revision is greater than the one it keeps. And EM-1: a
+# notification_request may carry the product's own email -- email:
+# {subject, text, html?} -- sent to the provider exactly as it came; a
+# string the database cannot store (NUL, a lone surrogate) is refused at
+# intake, under the key for a request, to the DLQ for any other event.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.11.0"
+APP_VERSION = "3.12.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

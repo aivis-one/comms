@@ -255,6 +255,18 @@ class Notification(UUIDMixin, Base):
         nullable=True,
     )
 
+    # The product's own email (EM-1): {subject, text[, html]} -- part of
+    # the letter, sent to the provider as it came (EmailFormatter);
+    # NULL -- the email is composed from the profile and title/body.
+    # Its form is held by ck_notifications_email_form and its SQL-NULL
+    # by ck_notifications_email_not_json_null (migration 0036); its
+    # lengths by the intake (app/transport/events.py
+    # validate_email_letter). Lives with the row, like title and body.
+    email: Mapped[dict[str, str] | None] = mapped_column(
+        JSON_VALUE,
+        nullable=True,
+    )
+
     scheduled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
