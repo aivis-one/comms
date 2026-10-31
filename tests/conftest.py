@@ -190,6 +190,39 @@ _FIXTURE_PROFILE = load_profile(FileProfileSource(FIXTURE_PROFILE_DIR))
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# localhost as on the stand (TX-1 FIX): two addresses, ::1 then 127.0.0.1
+# ---------------------------------------------------------------------------
+
+LOCALHOST_TWO_ADDRESSES_ENV = "COMMS_TEST_LOCALHOST_TWO_ADDRESSES"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def localhost_as_on_the_stand() -> Generator[None, None, None]:
+    """With COMMS_TEST_LOCALHOST_TWO_ADDRESSES=1, `localhost` resolves to
+    ::1 and then 127.0.0.1 in this process, as on the stand -- where a
+    refused connection comes as asyncio's combined OSError, which a
+    sandbox resolving it to 127.0.0.1 alone never sees (TX-1 FIX). The
+    suite runs both ways: unset (the sandbox's resolver) and set."""
+    if os.environ.get(LOCALHOST_TWO_ADDRESSES_ENV) != "1":
+        yield
+        return
+    import socket
+
+    original = socket.getaddrinfo
+
+    def two_addresses(host: Any, *args: Any, **kwargs: Any) -> Any:
+        if host == "localhost":
+            return original("::1", *args, **kwargs) + original(
+                "127.0.0.1", *args, **kwargs,
+            )
+        return original(host, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(socket, "getaddrinfo", two_addresses)
+        yield
+
+
 @pytest.fixture(scope="session", autouse=True)
 def apply_migrations() -> None:
     """Bring the schema up via the alembic CLI -- same path as the VPS."""

@@ -19,6 +19,8 @@
 #   get_db_session() commits automatically after yield.
 # =============================================================================
 
+import errno
+import socket
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -304,6 +306,63 @@ _TRANSIENT_SQLSTATES = frozenset({
 })
 
 
+# The errno of a NETWORK failure on the way to the database (TX-1 FIX):
+# what an OSError of the socket says when the connection could not be
+# made or was lost. Each one is a state of the network or of the
+# server's listener, gone on a repeat; none is a file, a right or an
+# argument of ours:
+#   ECONNREFUSED  -- nothing listens yet (the server restarting);
+#   ECONNRESET    -- the server or a middlebox dropped the connection;
+#   ECONNABORTED  -- the connection aborted on our side of the network;
+#   EHOSTUNREACH  -- no route to the host now (a container not up yet);
+#   EHOSTDOWN     -- the host reported down (the same, said otherwise);
+#   ENETUNREACH   -- no route to the network now;
+#   ENETDOWN      -- the interface down (a network being re-created);
+#   ETIMEDOUT     -- the kernel's own connect timeout;
+#   EADDRNOTAVAIL -- no local address or port to connect from right
+#                    now (ephemeral ports exhausted, an interface
+#                    still coming up).
+# The first three and ETIMEDOUT usually come as ConnectionError and
+# TimeoutError subclasses already -- Python maps them -- and are listed
+# so a plain OSError carrying them is not missed.
+_NETWORK_ERRNOS = frozenset({
+    errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED,
+    errno.EHOSTUNREACH, errno.EHOSTDOWN, errno.ENETUNREACH, errno.ENETDOWN,
+    errno.ETIMEDOUT, errno.EADDRNOTAVAIL,
+})
+
+
+def _network_failure(exc: BaseException) -> bool:
+    """Whether an OS-level error is a failure of the network on the way
+    to the database -- by its class and its errno, never its text:
+      - ConnectionError (refused, reset, aborted, a broken pipe) and
+        TimeoutError (the connect timed out);
+      - socket.gaierror -- the database's name did not resolve;
+      - an OSError whose errno is in _NETWORK_ERRNOS;
+      - THE COMBINED FAILURE OF SEVERAL ADDRESSES: asyncio's
+        BaseEventLoop.create_connection (Python 3.12), when every
+        address of a name refused and their texts differ, raises a new
+        `OSError('Multiple exceptions: ...')` -- exactly OSError, no
+        errno, the per-address errors dropped. The type is checked by
+        EQUALITY, not isinstance: every subclass of OSError that means
+        something else (FileNotFoundError, PermissionError, ...) is
+        then outside it, and so is any OSError carrying an errno -- a
+        bare OSError with no errno is what asyncio builds, and nothing
+        on a route's or handle_event's path raises one otherwise. On the
+        stand `localhost` resolves to ::1 and 127.0.0.1, and a refused
+        connection came as this one, which the rule missed.
+    NOT a network failure: any other OSError -- a file not found, a
+    right refused, a directory, a would-block, an errno outside the set.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if type(exc) is OSError and exc.errno is None:
+        return True
+    return exc.errno in _NETWORK_ERRNOS
+
+
 def _sqlstate(exc: BaseException) -> str | None:
     """The SQLSTATE of a database error: the code SQLAlchemy's asyncpg
     adapter copies onto `orig` (pgcode), or the driver's own."""
@@ -332,10 +391,11 @@ def is_transient_db_error(exc: BaseException) -> bool:
       - OperationalError: PEP 249's "not necessarily under the control of
         the programmer". asyncpg's adapter never raises one (its
         translation table has none); it stays by its definition;
-      - the connection never opened: a bare ConnectionError
-        (ConnectionRefusedError, ...) or TimeoutError -- SQLAlchemy does
-        not wrap the driver's connect errors -- and the pool's own
-        timeout (sqlalchemy.exc.TimeoutError), an overload that passes.
+      - the connection never opened or the network failed on the way:
+        an OS-level error SQLAlchemy does not wrap, read by its class
+        and errno (_network_failure -- the combined failure of several
+        addresses included) -- and the pool's own timeout
+        (sqlalchemy.exc.TimeoutError), an overload that passes.
     NOT TRANSIENT: everything else -- a constraint (class 23), bad data
     (22), a statement or a right (42), a cancelled statement (57014).
     NOT IN THE RULE: 55P03 lock_not_available. Nothing in comms can
@@ -352,7 +412,7 @@ def is_transient_db_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, (InterfaceError, OperationalError, PoolTimeoutError)):
         return True
-    if isinstance(exc, (ConnectionError, TimeoutError)):
+    if _network_failure(exc):
         return True
     code = _sqlstate(exc)
     if code is None:

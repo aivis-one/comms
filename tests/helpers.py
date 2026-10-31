@@ -552,6 +552,50 @@ async def real_connection_refused() -> Exception:
     raise AssertionError("port 1 answered")
 
 
+async def real_combined_connect_failure() -> Exception:
+    """THE COMBINED FAILURE OF SEVERAL ADDRESSES (TX-1 FIX), raised by
+    asyncio itself: the database's name resolves to two addresses (a
+    patched getaddrinfo -- 127.0.0.1 and 127.0.0.2, both loopback), both
+    refuse on port 1 with texts that differ, and BaseEventLoop.
+    create_connection raises a new bare OSError('Multiple exceptions:
+    ...') with no errno. Through the app's real driver path: SQLAlchemy,
+    asyncpg, the loop. On the stand `localhost` resolves to ::1 and
+    127.0.0.1 and a refused connection comes as this."""
+    import asyncio
+    import socket as socket_module
+
+    from sqlalchemy import text
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    loop = asyncio.get_running_loop()
+    name = "comms-two-addresses.invalid"
+
+    async def two_addresses(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+        if host != name:
+            return await original(host, port, *args, **kwargs)
+        return [
+            (socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "",
+             (address, int(port)))
+            for address in ("127.0.0.1", "127.0.0.2")
+        ]
+
+    original = loop.getaddrinfo
+    loop.getaddrinfo = two_addresses  # type: ignore[method-assign]
+    engine = create_async_engine(
+        make_url(settings.database_url).set(host=name, port=1),
+    )
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        return exc
+    finally:
+        del loop.getaddrinfo
+        await engine.dispose()
+    raise AssertionError("two refusing addresses answered")
+
+
 async def real_constraint_violations() -> dict[str, Exception]:
     """Not transient, by Postgres: a unique violation (23505), a CHECK
     (23514), a foreign key (23503)."""

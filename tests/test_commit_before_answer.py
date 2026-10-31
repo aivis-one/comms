@@ -33,11 +33,19 @@
 #   M6  class 08 and the driver's InterfaceError out -> TestTheRule
 #       (the own backend terminated)
 #   M7  the 503 row out of the contract -> TestTheContract
+#   TX-1 FIX:
+#   M8  the rule = the whole of OSError -> test_twins_of_the_wrong_form
+#   M9  the `errno is None` check off the combined form -> the twins of
+#       a plain OSError with an errno (EIO, EINVAL)
+#   M10 the combined form out of the rule -> the combined rows (rule,
+#       route, consumer)
 # =============================================================================
 
 import ast
+import errno
 import json
 import re
+import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +87,7 @@ from tests.helpers import (
     create_section,
     intake_fields,
     next_tx1_telegram_id,
+    real_combined_connect_failure,
     real_connection_refused,
     real_constraint_violations,
     real_deadlock,
@@ -135,9 +144,55 @@ class TestTheRule:
         assert is_transient_db_error(failure)
 
     async def test_a_connection_refused(self) -> None:
+        """Whatever form the environment gives a refused connection, it is
+        transient. Until the TX-1 FIX this asserted ConnectionRefusedError
+        -- the sandbox's form, `localhost` resolving to 127.0.0.1 alone. On
+        the stand it resolves to ::1 and 127.0.0.1, both refuse, and
+        asyncio combines them into a bare OSError without errno; the
+        assertion failed there, and so did the rule. The combined form is
+        built on purpose below (test_the_combined_failure_of_two_addresses)."""
         failure = await real_connection_refused()
-        assert isinstance(failure, ConnectionRefusedError)  # bare, unwrapped
+        assert isinstance(failure, OSError)  # unwrapped by SQLAlchemy
+        assert type(failure) in (ConnectionRefusedError, OSError)
         assert is_transient_db_error(failure)
+
+    async def test_the_combined_failure_of_two_addresses(self) -> None:
+        """asyncio's own combined OSError, through SQLAlchemy and asyncpg:
+        exactly OSError, no errno -- the stand's form."""
+        failure = await real_combined_connect_failure()
+        assert type(failure) is OSError
+        assert failure.errno is None
+        assert is_transient_db_error(failure)
+
+    @pytest.mark.parametrize("code", [
+        errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED,
+        errno.EHOSTUNREACH, errno.EHOSTDOWN, errno.ENETUNREACH, errno.ENETDOWN,
+        errno.ETIMEDOUT, errno.EADDRNOTAVAIL,
+    ], ids=errno.errorcode.get)
+    def test_a_network_errno(self, code: int) -> None:
+        """By class and errno: a network that cannot be broken here on
+        purpose without taking it from every other test."""
+        assert is_transient_db_error(OSError(code, "network"))
+
+    def test_a_name_that_did_not_resolve(self) -> None:
+        assert is_transient_db_error(socket.gaierror(socket.EAI_AGAIN, "dns"))
+
+    @pytest.mark.parametrize("failure", [
+        FileNotFoundError(errno.ENOENT, "no file"),
+        PermissionError(errno.EACCES, "no right"),
+        IsADirectoryError(errno.EISDIR, "a directory"),
+        BlockingIOError(errno.EAGAIN, "would block"),
+        OSError(errno.ENOENT, "mapped to FileNotFoundError"),
+        OSError(errno.EACCES, "mapped to PermissionError"),
+        OSError(errno.EIO, "plain OSError, an errno outside the set"),
+        OSError(errno.EINVAL, "plain OSError, an errno outside the set"),
+    ], ids=lambda e: f"{type(e).__name__}-{errno.errorcode.get(e.errno, e.errno)}")
+    def test_twins_of_the_wrong_form(self, failure: OSError) -> None:
+        """An OSError that is no network failure is not transient: a file,
+        a right, a directory, a would-block, a plain OSError with an
+        errno outside the network set. The rule takes the network's
+        features, never the whole of OSError."""
+        assert not is_transient_db_error(failure)
 
     async def test_the_pools_timeout(self) -> None:
         assert is_transient_db_error(await real_pool_timeout())
@@ -635,10 +690,16 @@ class TestUnhandled:
         assert line["error"].startswith("builtins.RuntimeError at app/")
         assert _S not in json.dumps(logs, default=str)
 
+    @pytest.mark.parametrize("make", [real_connection_refused,
+                                      real_combined_connect_failure],
+                             ids=["refused", "combined"])
     async def test_a_refused_connection_is_unavailable(
         self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+        make: Callable[[], Awaitable[Exception]],
     ) -> None:
-        refused = await real_connection_refused()
+        """Both forms of a refused connection -- the environment's, and
+        asyncio's combined one of the stand -- are a 503."""
+        refused = await make()
 
         async def broken(*_args: Any, **_kwargs: Any) -> Any:
             raise refused
@@ -707,6 +768,36 @@ class TestTheConsumer:
         assert await fake_redis.xlen(settings.dlq_stream) == 0
         assert calls == 2
         assert [e["event"] for e in logs].count("event_retry_scheduled") == 1
+
+    async def test_a_combined_connect_failure_once_then_applied(
+        self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
+        db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The stand's form of a refused connection: retried, not
+        dead-lettered (TX-1 FIX)."""
+        failure = await real_combined_connect_failure()
+        real = consumer_module.handle_event
+        calls = 0
+
+        async def once(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise failure
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(consumer_module, "handle_event", once)
+        person = uuid4()
+        await _xadd(fake_redis, a_stream, "user_upserted",
+                    _user_upserted_data(person))
+
+        async def applied() -> bool:
+            found = await _scalar(select(Recipient.id).where(Recipient.id == person))
+            return found is not None and await _no_pending(fake_redis, a_stream)
+
+        await _consume_until(fake_redis, a_stream, applied)
+        assert await fake_redis.xlen(settings.dlq_stream) == 0
+        assert calls == 2
 
     @pytest.mark.parametrize("make", [real_serialization_failure,
                                       real_misuse_of_a_connection],
