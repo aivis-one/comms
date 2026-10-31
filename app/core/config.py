@@ -162,8 +162,18 @@ from app.core.lanes import Lane
 # {subject, text, html?} -- sent to the provider exactly as it came; a
 # string the database cannot store (NUL, a lone surrogate) is refused at
 # intake, under the key for a request, to the DLQ for any other event.
+#
+# 3.13.0 is TX-1 and the fix of EM-1, a MINOR: a route that writes answers
+# only after its commit; a transient failure of the database is a 503
+# unavailable with an unknown outcome on a route and a retry in the
+# consumer, never a dead letter at once; anything no handler takes is a
+# 500 in the one error form. The data of every event is read by one
+# reader and checked once: NaN, Infinity, numbers past range, dates
+# outside a timestamp and nesting past 64 levels are refused at intake,
+# and any failure of the parse dead-letters the entry instead of stopping
+# the consumer; the subject of a ready email refuses a line break.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.12.0"
+APP_VERSION = "3.13.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
