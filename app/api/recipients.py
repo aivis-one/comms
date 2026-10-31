@@ -56,7 +56,7 @@ from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
+from app.api.deps import DbSession, require_service_auth
 from app.api.paging import PAGE_LIMIT_DEFAULT, decode_cursor, page, page_limit
 from app.audience import sync
 from app.audience.book import list_book
@@ -69,7 +69,7 @@ from app.core.constants import (
     MAX_TIMEZONE_LEN,
     MIN_TELEGRAM_ID,
 )
-from app.core.database import get_db_reader, get_db_session
+from app.core.database import get_db_reader
 from app.forgetting import forget_recipient
 
 router = APIRouter(
@@ -152,9 +152,9 @@ async def list_recipients(
 
 @router.put("/{recipient_id}")
 async def upsert_recipient(
+    session: DbSession,
     recipient_id: UUID,
     snapshot: RecipientSnapshot = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Create or update one recipient, synchronously, by version.
 
@@ -185,9 +185,9 @@ async def upsert_recipient(
 
 @router.delete("/{recipient_id}")
 async def delete_recipient(
+    session: DbSession,
     recipient_id: UUID,
     deletion: RecipientDeletion = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Forget one recipient (app/forgetting.py). A repeat is not an
     error; an id comms never heard of becomes a tombstone too, so a

@@ -20,6 +20,13 @@
 #                                                | recipient_deleted
 #   CursorExpiredError                   -> 410  cursor_expired
 #   DBAPIError                           -> 500  internal
+#   a TRANSIENT failure of the database  -> 503  unavailable
+#     (is_transient_db_error: a deadlock, a lost or refused connection,
+#     a restart, an overload), Retry-After: 1 -- and on a write the
+#     outcome is unknown: the commit may have landed (TX-1)
+#   anything else no handler takes       -> 500  internal
+#     (UnhandledErrorMiddleware: the class and the place to the log,
+#     nothing of the exception to the caller)
 #
 # Starlette's own HTTPException (401 from the token dependency, the
 # router's 404 / 405) is mapped here too, so no response leaves the
@@ -46,7 +53,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.core.database import is_transient_db_error
 from app.core.exceptions import (
     AuthorizationError,
     ConflictError,
@@ -56,6 +65,7 @@ from app.core.exceptions import (
     conflict_class,
 )
 from app.core.sanitize import sanitized_traceback
+from app.engine.journal import pipeline_error_of
 
 logger = structlog.get_logger()
 
@@ -85,6 +95,28 @@ class ErrorClass(StrEnum):
     # A changes cursor older than the retention period (P2-3).
     CURSOR_EXPIRED = "cursor_expired"
     INTERNAL = "internal"
+    # A transient failure of the database (TX-1): repeat the request.
+    UNAVAILABLE = "unavailable"
+
+
+# What the caller is told on a TRANSIENT database failure (TX-1). Fixed
+# text, like the internal one. On a write the outcome is UNKNOWN: a
+# connection lost on the COMMIT itself may have taken the commit with it
+# or not -- so the answer says to repeat with the same key, which every
+# write is safe to repeat by (deploy/INTEGRATION.md section 5).
+_UNAVAILABLE_DETAIL = (
+    "The service could not complete the request now; its outcome is "
+    "unknown. Repeat the same request -- with the same key, where the "
+    "call takes one."
+)
+_RETRY_AFTER = {"Retry-After": "1"}
+
+
+def unavailable_response() -> JSONResponse:
+    """THE answer to a transient failure: 503, `unavailable`."""
+    return error_response(
+        503, ErrorClass.UNAVAILABLE, _UNAVAILABLE_DETAIL, headers=_RETRY_AFTER,
+    )
 
 
 _HTTP_CLASSES = {
@@ -174,6 +206,11 @@ def register_error_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         """A database error that reached the edge: 500, and loud.
 
+        A TRANSIENT ONE IS A 503 (TX-1): the same request may succeed
+        when repeated (is_transient_db_error) -- and on a write its
+        outcome is unknown. Logged with its class and SQLSTATE, a warning:
+        it is the database's moment, not our defect.
+
         A SAFETY NET, NOT A SUBSTITUTE FOR BOUNDS. Every input this
         release could name is bounded in its model, where an oversized
         value is a 422 the caller can act on. Whatever still arrives
@@ -191,6 +228,15 @@ def register_error_handlers(app: FastAPI) -> None:
         (sanitized_traceback): a driver error can print the connection
         URL, password included.
         """
+        if is_transient_db_error(exc):
+            logger.warning(
+                "database_unavailable_at_api_edge",
+                path=request.url.path,
+                method=request.method,
+                error=pipeline_error_of(exc),
+                sqlstate=getattr(exc.orig, "pgcode", None),
+            )
+            return unavailable_response()
         logger.error(
             "database_error_at_api_edge",
             path=request.url.path,
@@ -199,3 +245,56 @@ def register_error_handlers(app: FastAPI) -> None:
             exception=sanitized_traceback(exc),
         )
         return error_response(500, ErrorClass.INTERNAL, _DB_FAILURE_DETAIL)
+
+
+    app.add_middleware(UnhandledErrorMiddleware)
+
+
+class UnhandledErrorMiddleware:
+    """Whatever no handler above takes still answers in the ONE form
+    (TX-1). Before, a RuntimeError of a route -- or a connection refused
+    when the session opened (a bare ConnectionRefusedError, which
+    SQLAlchemy does not wrap) -- left the app and Starlette answered a
+    plain-text 500 outside this body.
+
+    A transient failure (is_transient_db_error: the connection refused or
+    timed out, the pool's timeout) is a 503 `unavailable`; anything else
+    a 500 `internal`. The log gets the class and the place
+    (pipeline_error_of), never the exception's text -- it may quote what
+    the route was given; the caller gets neither. An exception after the
+    response has started cannot be answered any more, and is raised on.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked)
+        except Exception as exc:
+            if started:
+                raise
+            transient = is_transient_db_error(exc)
+            logger.error(
+                "unhandled_error_at_api_edge",
+                path=scope.get("path"),
+                method=scope.get("method"),
+                error=pipeline_error_of(exc),
+                transient=transient,
+            )
+            response = (
+                unavailable_response() if transient
+                else error_response(500, ErrorClass.INTERNAL, _DB_FAILURE_DETAIL)
+            )
+            await response(scope, receive, send)

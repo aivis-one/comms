@@ -651,6 +651,10 @@ _SQL_WORDS = re.compile(
 # Substring tests of SQL-looking text that are NOT a search for a
 # statement -- (file, function) -> what the text is.
 NOT_A_STATEMENT_SEARCH: dict[tuple[str, str], str] = {
+    ("tests/test_transport_consumer.py",
+     "test_a_real_transient_error_retried_and_redacted"):
+        "a redacted retry log line still naming the failed statement of a "
+        "REAL 40001 (TX-1) -- the pair of the OperationalError row",
     ("tests/helpers.py", "sql_shape"):
         "the helper itself, over the clauses it has already split",
     ("tests/test_drain_source.py",

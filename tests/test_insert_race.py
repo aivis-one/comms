@@ -200,8 +200,12 @@ class TestTheCategoryMuteRace:
         )
         with capture_logs() as logs:
             form_b = await _race(
-                lambda s: patch_preferences_form(rid, a, s),
-                lambda s: patch_preferences_form(rid, b, s),
+                lambda s: patch_preferences_form(
+                    recipient_id=rid, patch=a, session=s,
+                ),
+                lambda s: patch_preferences_form(
+                    recipient_id=rid, patch=b, session=s,
+                ),
             )
         # B answered with the form (a 200), not an exception (a 500) ...
         assert form_b["categories"]["unit_updates"] is False

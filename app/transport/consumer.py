@@ -24,8 +24,15 @@
 #              the event can never succeed; the stream MUST keep
 #              moving.
 #   retryable  (NotFoundError: group_changed before its user_upserted;
-#              OperationalError: transient DB hiccup) -> bounded
-#              inline backoff, then DLQ + XACK.
+#              a TRANSIENT failure of the database by the one rule,
+#              app/core/database.py is_transient_db_error -- a deadlock,
+#              a serialization failure, a lost or refused connection, a
+#              restart, an overload) -> bounded inline backoff, then
+#              DLQ + XACK, "retries exhausted". Until TX-1 only an
+#              OperationalError was retried here -- which asyncpg's
+#              adapter never raises: a deadlock or a dropped connection
+#              reached the DLQ on the first try, and the event (a
+#              user_deleted among them) was lost.
 #   duplicate  (same key, same bytes) -> XACK only: a replay is the
 #              at-least-once contract working, not an error.
 #   rejected / conflict (a notification request not accepted, F1.2)
@@ -81,10 +88,9 @@ import structlog
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 from redis.typing import EncodableT, FieldT
-from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
-from app.core.database import get_session_factory
+from app.core.database import get_session_factory, is_transient_db_error
 from app.core.exceptions import (
     ConflictError,
     NotFoundError,
@@ -327,10 +333,30 @@ class StreamConsumer:
                 )
                 await self._ack(entry_id)
                 return
-            except (NotFoundError, OperationalError) as exc:
-                # Retryable: sync ordering lag / transient DB failure.
-                # See the KNOWN CEILING (BL-4) in the module header:
-                # this inline sleep blocks the whole stream.
+            except Exception as exc:
+                if not _retryable(exc):
+                    # Unknown bug in ONE event must not wedge the stream
+                    # (poison-pill rule): preserve the evidence, move on.
+                    # Not logger.exception(): the renderer would print
+                    # the chain raw -- a database error's text is its SQL
+                    # and bound parameters. Same event, level and
+                    # `exception` key, redacted (app/core/sanitize.py).
+                    logger.error(
+                        "event_unexpected_error",
+                        entry_id=_id_str(entry_id),
+                        exception=sanitized_traceback(exc),
+                    )
+                    await self._to_dlq(
+                        entry_id, fields,
+                        reason=f"unexpected: {pipeline_error_of(exc)}",
+                        attempts=attempt,
+                    )
+                    await self._ack(entry_id)
+                    return
+                # Retryable: sync ordering lag, or a transient failure of
+                # the database (_retryable). See the KNOWN CEILING (BL-4)
+                # in the module header: this inline sleep blocks the
+                # whole stream.
                 if attempt > len(_BACKOFF_DELAYS):
                     logger.warning(
                         "event_retries_exhausted",
@@ -338,10 +364,10 @@ class StreamConsumer:
                         attempts=attempt,
                         error=sanitize_text(str(exc)),
                     )
-                    # The class and the place, never the text: an
-                    # OperationalError's text is its SQL and bound
-                    # parameters -- the letter, on a job's insert. The
-                    # text stays in the log line above (redacted).
+                    # The class and the place, never the text: a database
+                    # error's text is its SQL and bound parameters -- the
+                    # letter, on a job's insert. The text stays in the
+                    # log line above (redacted).
                     await self._to_dlq(
                         entry_id, fields,
                         reason=f"retries exhausted: {pipeline_error_of(exc)}",
@@ -358,25 +384,6 @@ class StreamConsumer:
                     error=sanitize_text(str(exc)),
                 )
                 await asyncio.sleep(delay)
-            except Exception as exc:
-                # Unknown bug in ONE event must not wedge the stream
-                # (poison-pill rule): preserve the evidence, move on.
-                # Not logger.exception(): the renderer would print the
-                # chain raw -- an OperationalError's text is its SQL and
-                # bound parameters. Same event, level and `exception`
-                # key, redacted (app/core/sanitize.py).
-                logger.error(
-                    "event_unexpected_error",
-                    entry_id=_id_str(entry_id),
-                    exception=sanitized_traceback(exc),
-                )
-                await self._to_dlq(
-                    entry_id, fields,
-                    reason=f"unexpected: {pipeline_error_of(exc)}",
-                    attempts=attempt,
-                )
-                await self._ack(entry_id)
-                return
 
     # -- plumbing ------------------------------------------------------------
 
@@ -422,6 +429,13 @@ class StreamConsumer:
             reason=reason,
             attempts=attempts,
         )
+
+
+def _retryable(exc: BaseException) -> bool:
+    """Whether the consumer tries an event again: an ordering lag (a
+    NotFoundError -- the address book has not caught up) or a transient
+    failure of the database, by the one rule (TX-1)."""
+    return isinstance(exc, NotFoundError) or is_transient_db_error(exc)
 
 
 def dlq_kept_data_fields(event: str | None) -> frozenset[str] | None:

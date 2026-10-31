@@ -1766,12 +1766,12 @@ def _answer_row(call: LLMCall, reply: LLMReply) -> LLMAnswer:
 # UPDATE; Postgres sorts before it locks (LockRows over Sort), so the
 # rows are taken in that order. Two such paths over overlapping sets
 # then queue on the first row they share and never hold each other's
-# next one: no 40P01. It matters because a deadlock is not retried:
-# asyncpg's DeadlockDetectedError reaches SQLAlchemy as a bare
-# DBAPIError, not an OperationalError, so the consumer -- where
-# cancellation and forgetting arrive -- dead-letters the event at once
-# (app/transport/consumer.py), and the reminders stay or the person is
-# not forgotten. The paths: close_notifications (expiry, cancellation)
+# next one: no 40P01. A deadlock is retried by the consumer since TX-1
+# (app/core/database.py is_transient_db_error; asyncpg's
+# DeadlockDetectedError reaches SQLAlchemy as a bare DBAPIError with
+# SQLSTATE 40P01, which the rule reads), but a retry costs the stream
+# its inline backoff, and a path the order keeps free of deadlocks does
+# not pay it. The paths: close_notifications (expiry, cancellation)
 # and withdraw_recipient (forgetting), which locks EVERY job it will
 # write, finished ones included, before its mass updates. The batch
 # deletes of retention and of the expiry cleanup take their jobs in the

@@ -74,7 +74,11 @@ from app.transport.events import (
     NOTIFICATION_REQUEST_FRAME_FIELDS,
     NOTIFICATION_REQUEST_LETTER_FIELDS,
 )
-from tests.helpers import next_phase3c_telegram_id, next_snapshot_version
+from tests.helpers import (
+    next_phase3c_telegram_id,
+    next_snapshot_version,
+    real_serialization_failure,
+)
 
 _REPO = Path(__file__).resolve().parents[1]
 _DOC = (_REPO / "deploy" / "INTEGRATION.md").read_text(encoding="utf-8")
@@ -464,6 +468,38 @@ class TestEveryPath:
         )
         assert int(dead["_dlq_attempts"]) == 3
         assert "idempotency_key" in json.loads(dead["_dlq_data"])
+
+    async def test_the_exhausted_retries_on_a_real_transient_error(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The pair of test_the_exhausted_retries on a REAL failure (TX-1):
+        its OperationalError is built by hand and asyncpg never raises
+        one. A 40001 from Postgres, whose bound parameter carries the
+        letter: retried, then dead-lettered -- the class and the place,
+        never the letter."""
+        real = await real_serialization_failure(label=f"title {_S}")
+        assert _S in str(real)
+
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise real
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await redis.xadd(stream, {
+            "event": "notification_request",
+            "data": json.dumps(_letter_request()),
+        })
+        with capture_logs() as logs:
+            (dead,) = await _consume(redis, stream, 1)
+        _assert_no_sentinel(dead)
+        _assert_the_pair(dead)
+        _assert_no_sentinel_logged(logs)
+        assert dead["_dlq_error"].startswith(
+            "retries exhausted: sqlalchemy.exc.DBAPIError at app/"
+        )
 
     async def test_the_unexpected_exception_mocked(
         self,

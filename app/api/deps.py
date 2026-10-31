@@ -42,11 +42,14 @@
 
 import secrets
 from collections import Counter
+from typing import Annotated
 
 import structlog
-from fastapi import Header, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import get_db_session
 from app.core.exceptions import ValidationError
 
 logger = structlog.get_logger()
@@ -99,3 +102,13 @@ async def refuse_repeated_query(request: Request) -> None:
             f"query parameter given more than once: {', '.join(repeated)}; "
             f"each is read once -- send it once"
         )
+
+
+# THE WRITE SESSION OF A ROUTE (TX-1) -- the one place the transaction's
+# boundary is set. scope="function": the session's commit (get_db_session,
+# after its yield) runs before the response is sent, so a product never
+# holds a success whose row was not committed, and a commit that fails is
+# the answer (app/api/errors.py). Every route that writes takes its
+# session as `session: DbSession`; a guard holds it so
+# (tests/test_commit_before_answer.py).
+DbSession = Annotated[AsyncSession, Depends(get_db_session, scope="function")]

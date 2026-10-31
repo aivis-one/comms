@@ -550,8 +550,25 @@ body, with a class a program can branch on:
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 422 | `validation` | the input is wrong; `fields` names each input |
 | 500 | `internal` | our defect; the text carries nothing from it |
+| 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
 The message is for a human; the class is the contract.
+
+**A write is answered after its commit.** Every route that writes
+answers only once what it wrote is committed: a 2xx means the row is
+there. A commit that fails is the answer -- a 503 or a 500 -- never a
+success with nothing behind it.
+
+**503 `unavailable`: the outcome is unknown -- repeat the same
+request.** A connection lost on the commit itself may have taken the
+commit with it or not; comms cannot tell, and neither can you. So
+repeat the request as it was -- with the same `Idempotency-Key` where
+the call takes one (`POST /threads`, `POST /threads/{id}/messages`, the
+variant routes); every other write is safe to repeat by construction
+(the table below). A repeat after a write that did land answers as the
+first would have. A 503 that comes back every time is a defect of ours,
+not a moment of the database: a misuse of a connection looks to comms
+like a lost one, and is retried the same way until it is not.
 
 **One way to page.** Every listing -- the inbox, the visible threads, a
 thread's messages, a job's deliveries and its path, the address book,

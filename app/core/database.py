@@ -26,7 +26,13 @@ from enum import StrEnum
 import structlog
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import (
+    DBAPIError,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+)
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -176,7 +182,23 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Transactional read-write session (auto-commit on success)."""
+    """Transactional read-write session: committed on success, rolled
+    back on failure.
+
+    A ROUTE TAKES IT ONLY AS `DbSession` (app/api/deps.py), never as a bare
+    Depends(get_db_session). The commit is this function's code after
+    `yield`, and WHEN it runs is the dependency's scope: FastAPI gives a
+    yield-dependency without one the scope "request", whose exit stack
+    closes after the response has been sent (fastapi/routing.py:
+    `await response(...)` inside the request stack, the function stack
+    already closed) -- so the product got its 200 before the commit, and
+    a commit that failed was a success with no row behind it (TX-1).
+    scope="function" closes the stack before the response is sent: the
+    commit happens first, and a commit that fails raises into the error
+    handlers (app/api/errors.py) and becomes the answer. The response
+    body is serialized inside the endpoint's call, before that exit, so
+    nothing in it waits on the commit (expire_on_commit=False besides).
+    """
     factory = get_session_factory()
     session = factory()
     try:
@@ -261,6 +283,81 @@ async def once_more_on_insert_race[T](
 
 # SQLSTATE of a unique violation -- the insert race's one signature.
 UNIQUE_VIOLATION = "23505"
+
+
+# -----------------------------------------------------------------------------
+# A transient database failure (TX-1) -- one rule, by code and class
+# -----------------------------------------------------------------------------
+
+# The measure: the SAME request, repeated unchanged, may succeed. By the
+# SQLSTATE the driver reports and by the class of the exception -- never
+# by a message's text.
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({
+    "40",  # transaction rollback: 40001 serialization, 40P01 deadlock
+    "08",  # connection exception: 08003 the connection died mid-query
+})
+_TRANSIENT_SQLSTATES = frozenset({
+    "57P01",  # admin_shutdown -- a restart, or pg_terminate_backend
+    "57P02",  # crash_shutdown
+    "57P03",  # cannot_connect_now -- the server is starting
+    "53300",  # too_many_connections -- an overload, and it passes
+})
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    """The SQLSTATE of a database error: the code SQLAlchemy's asyncpg
+    adapter copies onto `orig` (pgcode), or the driver's own."""
+    if isinstance(exc, DBAPIError):
+        code = getattr(exc.orig, "pgcode", None)
+    else:
+        code = getattr(exc, "sqlstate", None)
+    return code if isinstance(code, str) else None
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """Whether a failure is one the same request, repeated unchanged, may
+    get past: the database or the way to it, not the request. ONE RULE
+    (TX-1) -- the consumer retries by it (app/transport/consumer.py) and
+    a route answers 503 by it (app/api/errors.py).
+
+    TRANSIENT:
+      - SQLSTATE of class 40 (a serialization failure, a deadlock) or
+        class 08 (the connection gone in the middle of a statement);
+      - 57P01 / 57P02 / 57P03 (the server shut down, crashed, or is
+        starting -- a restart, measured as 57P0x, not as class 08) and
+        53300 (too many connections);
+      - the connection already gone when a statement is sent: SQLAlchemy's
+        InterfaceError -- the driver's own InterfaceError, which carries
+        no SQLSTATE (measured: a backend terminated while idle);
+      - OperationalError: PEP 249's "not necessarily under the control of
+        the programmer". asyncpg's adapter never raises one (its
+        translation table has none); it stays by its definition;
+      - the connection never opened: a bare ConnectionError
+        (ConnectionRefusedError, ...) or TimeoutError -- SQLAlchemy does
+        not wrap the driver's connect errors -- and the pool's own
+        timeout (sqlalchemy.exc.TimeoutError), an overload that passes.
+    NOT TRANSIENT: everything else -- a constraint (class 23), bad data
+    (22), a statement or a right (42), a cancelled statement (57014).
+    NOT IN THE RULE: 55P03 lock_not_available. Nothing in comms can
+    reach it -- no NOWAIT and no lock_timeout anywhere; SKIP LOCKED skips
+    rather than fails (the TX-1 report).
+
+    A FALSE TRANSIENT IS A BUG OF OURS, BOUNDED. The driver's
+    InterfaceError is also what it raises when code misuses a
+    connection ("another operation is in progress"). Retrying that
+    cannot help, and does not hide it: the consumer retries it a bounded
+    number of times and then dead-letters it, "retries exhausted" with
+    its class and place, and a route answers 503 -- repeated, it fails
+    the same way. Telling the two apart would mean reading the message.
+    """
+    if isinstance(exc, (InterfaceError, OperationalError, PoolTimeoutError)):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    code = _sqlstate(exc)
+    if code is None:
+        return False
+    return code[:2] in _TRANSIENT_SQLSTATE_CLASSES or code in _TRANSIENT_SQLSTATES
 
 
 def is_unique_violation(exc: IntegrityError) -> bool:

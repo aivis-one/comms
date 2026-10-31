@@ -48,7 +48,7 @@ from sqlalchemy import and_, select, text
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session_factory
+from app.core.database import get_session_factory, is_transient_db_error
 from app.engine.constants import DeliveryStatus, NotificationStatus, TargetType
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import cleanup_expired_notifications
@@ -227,12 +227,17 @@ def _no_deadlock(results: list[int | BaseException]) -> list[int]:
     return [result for result in results if isinstance(result, int)]
 
 
-class TestTheDeadlockIsNotRetried:
-    """Why the order is needed, measured on the real stack: a 40P01 from
-    asyncpg reaches the code as a bare DBAPIError, not an
-    OperationalError -- the consumer retries the latter and dead-letters
-    everything else (app/transport/consumer.py). Built with an explicit
-    crossing of two raw sessions; the pair -- it IS 40P01."""
+class TestTheDeadlockIsADbapiError:
+    """A 40P01 from asyncpg reaches the code as a bare DBAPIError, not an
+    OperationalError -- measured on the real stack, two raw sessions
+    crossing; the pair -- it IS 40P01.
+
+    Was TestTheDeadlockIsNotRetried, and it was right: until TX-1 the
+    consumer retried an OperationalError only, so a deadlock was
+    dead-lettered at once -- why the order of row locks was needed. TX-1
+    retries it by its SQLSTATE (app/core/database.py
+    is_transient_db_error), asserted here too; the order still spares
+    the stream the retry."""
 
     async def test_a_deadlock_is_a_dbapi_error_not_operational(self) -> None:
         mine, theirs = await _recipients()
@@ -271,6 +276,7 @@ class TestTheDeadlockIsNotRetried:
         assert isinstance(failure, DBAPIError)
         assert not isinstance(failure, OperationalError)
         assert getattr(failure.orig, "sqlstate", None) == "40P01"
+        assert is_transient_db_error(failure)  # retried since TX-1
 
 
 @pytest.mark.usefixtures("pristine_tables")

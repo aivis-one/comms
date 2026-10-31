@@ -42,6 +42,7 @@ from tests.helpers import (
     create_recipient,
     next_phase3c_telegram_id,
     next_snapshot_version,
+    real_serialization_failure,
 )
 
 _WAIT_TIMEOUT = 5.0
@@ -593,7 +594,14 @@ def _chained(cause: BaseException, outer: BaseException) -> BaseException:
 
 def _operational_error() -> OperationalError:
     """SQLAlchemy's text is the failed SQL plus its bound parameters; a
-    parameter here carries the secret."""
+    parameter here carries the secret.
+
+    BUILT BY HAND, and asyncpg never raises it: its adapter's
+    translation table has no OperationalError (TX-1), so this mock drove
+    a branch the real driver does not reach. It stays -- the rule keeps
+    OperationalError transient by PEP 249's definition -- and each test
+    on it has its pair on a REAL transient error (a 40001 from Postgres,
+    tests/helpers.py real_serialization_failure)."""
     return OperationalError(
         "INSERT INTO recipients (locale, note) VALUES ($1, $2)",
         ("en", f"redis://:{_REDIS_PASS}@comms-redis:6379/0"),
@@ -725,6 +733,50 @@ class TestConsumerRedactsItsFailures:
         assert "InvalidURL" in entry["exception"]
         assert "The above exception was the direct cause" in entry["exception"]
         assert "api.telegram.org/[redacted]/sendMessage" in entry["exception"]
+
+    async def test_a_real_transient_error_retried_and_redacted(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        fast_backoff: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The pair of the OperationalError rows, on a REAL failure: a
+        40001 from Postgres whose bound parameter carries the secret.
+        Retried (TX-1), each retry line redacted and naming the failure;
+        then the dead letter, "retries exhausted", class and place."""
+        real = await real_serialization_failure(
+            label=f"redis://:{_REDIS_PASS}@comms-redis:6379/0",
+        )
+        assert _REDIS_PASS in str(real)  # the secret IS in its text
+
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise real
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
+
+        async def dead_lettered() -> bool:
+            length: int = await redis.xlen(settings.dlq_stream)
+            return length == 1
+
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), dead_lettered)
+
+        retries = [e for e in logs if e["event"] == "event_retry_scheduled"]
+        assert len(retries) == 4
+        for entry in retries:
+            assert _REDIS_PASS not in entry["error"]
+            assert "UPDATE sections" in entry["error"]
+        entries = await redis.xrange(settings.dlq_stream)
+        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
+        assert fields["_dlq_error"].startswith(
+            "retries exhausted: sqlalchemy.exc.DBAPIError at "
+            "app/transport/consumer.py:"
+        )
+        for value in fields.values():
+            assert _REDIS_PASS not in value
 
     async def test_every_retry_log_is_redacted(
         self,

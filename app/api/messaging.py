@@ -121,7 +121,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
+from app.api.deps import DbSession, require_service_auth
 from app.api.idempotency import (
     IDEMPOTENCY_HEADER,
     request_fingerprint,
@@ -137,7 +137,6 @@ from app.api.paging import (
 from app.core.constants import MAX_IDEMPOTENCY_KEY_LEN, PAGE_LIMIT_MAX
 from app.core.database import (
     get_db_reader,
-    get_db_session,
     is_unique_violation_of,
 )
 from app.core.exceptions import (
@@ -649,10 +648,10 @@ async def _require_thread(session: AsyncSession, thread_id: UUID) -> Thread:
 
 @router.post("")
 async def create_thread(
+    session: DbSession,
     request: Request,
     payload: ThreadCreateIn = Body(...),
     idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Create a thread, or return the existing one per the dedup key.
 
@@ -706,8 +705,8 @@ async def create_thread(
 
 @sections_router.post("")
 async def create_section(
+    session: DbSession,
     payload: SectionIn = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Create a section for this key, or return the existing one.
 
@@ -948,8 +947,8 @@ async def unread_counts(
 # ---------------------------------------------------------------------------
 @router.delete("/{thread_id}", status_code=204)
 async def delete_thread_route(
+    session: DbSession,
     thread_id: UUID,
-    session: AsyncSession = Depends(get_db_session),
 ) -> Response:
     """Delete a thread with its messages, their variants and requests,
     and its read pointers (TK-2) -- the product's call, no actor.
@@ -963,11 +962,11 @@ async def delete_thread_route(
 
 @router.post("/{thread_id}/messages")
 async def post_thread_message(
+    session: DbSession,
     request: Request,
     thread_id: UUID,
     payload: MessageIn = Body(...),
     idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Append a message AND ping the other side in one transaction.
 
@@ -1051,12 +1050,12 @@ async def get_thread_feed(
 
 @router.post("/{thread_id}/messages/{message_id}/variant-requests")
 async def post_variant_request(
+    session: DbSession,
     request: Request,
     thread_id: UUID,
     message_id: UUID,
     payload: VariantRequestIn = Body(...),
     idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Record that a variant of the message in `locale` was asked for,
     by the llm job `job_key` (P5-4). Insert only, idempotent under its
@@ -1075,12 +1074,12 @@ async def post_variant_request(
 
 @router.post("/{thread_id}/messages/{message_id}/variants")
 async def post_variant(
+    session: DbSession,
     request: Request,
     thread_id: UUID,
     message_id: UUID,
     payload: VariantIn = Body(...),
     idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Write the variant of the message in `locale` (P5-4): one per
     language, never replaced; the original is not touched. Idempotent
@@ -1105,9 +1104,9 @@ async def post_variant(
 # ---------------------------------------------------------------------------
 @router.post("/{thread_id}/read")
 async def mark_thread_read(
+    session: DbSession,
     thread_id: UUID,
     payload: ReadIn = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
     """Advance the participant's read pointer; return the fresh unread
     count computed in the SAME transaction (race-safe badge).
@@ -1163,9 +1162,9 @@ async def thread_unread_count(
 # ---------------------------------------------------------------------------
 @router.post("/{thread_id}/claim")
 async def claim(
+    session: DbSession,
     thread_id: UUID,
     payload: ClaimIn = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Claim an unassigned thread; report whether THIS call won it."""
     thread = await _require_thread(session, thread_id)
@@ -1187,9 +1186,9 @@ async def claim(
 
 @router.post("/{thread_id}/assign")
 async def assign(
+    session: DbSession,
     thread_id: UUID,
     payload: AssignIn = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Hand a section thread to an operator who serves its section."""
     thread = await _require_thread(session, thread_id)
@@ -1205,9 +1204,9 @@ async def assign(
 
 @router.post("/{thread_id}/release")
 async def release(
+    session: DbSession,
     thread_id: UUID,
     payload: ReleaseIn = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Return a section thread to its section's pool."""
     thread = await _require_thread(session, thread_id)
@@ -1221,9 +1220,9 @@ async def release(
 
 @router.post("/{thread_id}/status")
 async def change_status(
+    session: DbSession,
     thread_id: UUID,
     payload: StatusIn = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Apply a manual status transition (D5 matrix)."""
     # Taken, not read (TK-1): the role is decided on the row set_status
@@ -1242,9 +1241,9 @@ async def change_status(
 
 @router.post("/{thread_id}/retag")
 async def retag(
+    session: DbSession,
     thread_id: UUID,
     payload: RetagIn = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Retag a section thread to a new section / subject_ref.
 
