@@ -93,7 +93,19 @@ def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
 
 async def run_async_migrations() -> None:
     """Create async engine and run migrations."""
-    connectable = create_async_engine(settings.database_url)
+    # A MIGRATION WAITS FOR A LOCK AT MOST 10 s (TX-4). Its DDL takes an
+    # ACCESS EXCLUSIVE lock on a live table; queued behind a long
+    # transaction, it would hold every query of that table queued behind
+    # ITSELF, without a bound. With lock_timeout it fails instead (55P03),
+    # its transaction rolls back whole, comms-app does not start --
+    # `comms-deploy.sh update` says so, with the dump it made first --
+    # and the container's restart policy tries the migration again.
+    # Set on the migration's own connection (server_settings at
+    # connect), not in a transaction it could leave with.
+    connectable = create_async_engine(
+        settings.database_url,
+        connect_args={"server_settings": {"lock_timeout": "10s"}},
+    )
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

@@ -1,0 +1,24 @@
+# =============================================================================
+# The build context (TX-4): only what the Dockerfile COPYs --
+# pyproject.toml, requirements.lock, app/, alembic.ini, migrations/.
+# Everything else stays out: it is not needed, and a context that ships
+# .git, the tests or a stray .env into the builder is how secrets and
+# weight end up in an image. tests/test_deploy_hardening.py holds both
+# lists against each other.
+# =============================================================================
+.git
+.github
+.dockerignore
+.env
+.env.*
+**/.env
+tests/
+deploy/
+scripts/
+docs/
+**/__pycache__
+**/*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.md

@@ -295,20 +295,117 @@ handover_token() {
 # Poll the comms-app container health until healthy or timeout. The
 # API is INTERNAL (no host port), so the probe reads docker's own
 # health state instead of curling from the host.
-wait_for_app() {
-    local attempts=60 status
-    echo "Waiting for comms-app to become healthy (migration runs first)..."
-    for i in $(seq 1 "$attempts"); do
-        status=$(docker inspect --format '{{.State.Health.Status}}' comms-app 2>/dev/null)
-        if [ "$status" = "healthy" ]; then
-            echo -e "${GREEN}✓ comms-app is healthy (after ${i} checks)${NC}"
+# How long a start may take to become healthy, in seconds (TX-4): ONE
+# limit for the application and the datastores. 120 by default -- the
+# 60 checks x 2 s it always was; a box whose migration takes longer sets
+# COMMS_HEALTH_WAIT_SECONDS in /opt/comms/.env.
+health_wait_seconds() {
+    local limit="${COMMS_HEALTH_WAIT_SECONDS:-120}"
+    case "$limit" in
+        ''|*[!0-9]*) limit=120 ;;
+    esac
+    echo "$limit"
+}
+
+# Wait until every named container reports healthy, up to the limit.
+wait_healthy() {
+    local limit checks i name status pending
+    limit=$(health_wait_seconds)
+    checks=$(( (limit + 1) / 2 ))
+    for i in $(seq 1 "$checks"); do
+        pending=""
+        for name in "$@"; do
+            status=$(docker inspect --format '{{.State.Health.Status}}' "$name" 2>/dev/null)
+            [ "$status" = "healthy" ] || pending="$pending $name"
+        done
+        if [ -z "$pending" ]; then
+            echo -e "${GREEN}✓ healthy:$(printf ' %s' "$@") (after ${i} checks)${NC}"
             return 0
         fi
         sleep 2
     done
-    echo -e "${RED}✗ comms-app did not become healthy${NC}"
+    echo -e "${RED}✗ not healthy within ${limit}s:${pending}${NC}"
+    return 1
+}
+
+wait_for_app() {
+    echo "Waiting for comms-app to become healthy (migration runs first)..."
+    if wait_healthy comms-app; then
+        return 0
+    fi
+    echo "  comms-app may still be migrating -- '$0 logs comms-app' shows where it is."
     show_app_log_tail
     return 1
+}
+
+# The datastores, converged and healthy BEFORE anything touches their
+# data (TX-4): `up -d` recreates postgres or redis only when its own
+# definition changed -- compose's default for a service named here --
+# and a definition change reaches them exactly this way. Never with
+# --force-recreate: they hold the data.
+converge_datastores() {
+    echo "Converging comms-postgres and comms-redis..."
+    if ! $COMPOSE_CMD up -d comms-postgres comms-redis; then
+        echo -e "${RED}✗ compose up of the datastores failed${NC}"
+        return 1
+    fi
+    wait_healthy comms-postgres comms-redis
+}
+
+# THE dump of the comms database -- ONE copy, for db dump, update,
+# install and drain (TX-4). The file is created under umask 077 -- 600
+# from its first byte, never readable in between -- in a directory
+# kept at 700, and every older dump there is brought to 600 too: a dump
+# holds letters, addresses and tokens. Success means pg_dump said so
+# AND the file is not empty; anything else removes the file and fails.
+dump_db() {
+    local out="$1"
+    if ! (umask 077 && mkdir -p "$BACKUP_DIR") || ! chmod 700 "$BACKUP_DIR"; then
+        echo -e "${RED}✗ cannot prepare $BACKUP_DIR${NC}"
+        return 1
+    fi
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.sql' -exec chmod 600 {} + 2>/dev/null
+    if ! (umask 077 && $COMPOSE_CMD exec -T comms-postgres \
+            pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$out"); then
+        rm -f "$out"
+        echo -e "${RED}✗ pg_dump failed${NC}"
+        return 1
+    fi
+    if [ ! -s "$out" ]; then
+        rm -f "$out"
+        echo -e "${RED}✗ pg_dump wrote nothing${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✓ Dumped to $out${NC}"
+    return 0
+}
+
+# Whether the comms database already holds a schema: an alembic_version
+# table (the same test as the drain driver's). "yes", "no", or a failure.
+schema_exists() {
+    local answer
+    if ! answer=$($COMPOSE_CMD exec -T comms-postgres psql -X -U "$POSTGRES_USER" \
+            -d "$POSTGRES_DB" -tAc "SELECT to_regclass('public.alembic_version') IS NOT NULL"); then
+        return 2
+    fi
+    answer=$(printf '%s' "$answer" | tr -d '[:space:]')
+    if [ "$answer" = "t" ]; then
+        echo yes
+    elif [ "$answer" = "f" ]; then
+        echo no
+    else
+        return 2
+    fi
+}
+
+# Recreate the three application containers, never the datastores
+# (--no-deps) -- ONE copy, for restart, update and restore. Among the
+# three, compose keeps their own depends_on (comms-worker and
+# comms-consumer wait for comms-app healthy, that is migrated): its
+# service selection drops only the dependencies OUTSIDE the selection
+# (compose-go types/project.go WithSelectedServices).
+recreate_app() {
+    $COMPOSE_CMD up -d --force-recreate --no-deps comms-app comms-worker comms-consumer
 }
 
 # Print the last lines of comms-app and where the full log is.
@@ -361,8 +458,30 @@ cmd_install() {
     seed_profile
     handover_token
     check_overlay_dir
-    echo "Building and starting the comms stack..."
-    if ! $COMPOSE_CMD up -d --build; then
+    echo "Building the comms images..."
+    if ! $COMPOSE_CMD build; then
+        echo -e "${RED}✗ image build failed${NC}"
+        exit 1
+    fi
+    # A box where comms already lives keeps its data: comms-app migrates
+    # it on start, so it is dumped FIRST, as update does (TX-4). A new
+    # box has no schema and nothing to dump.
+    if ! converge_datastores; then
+        exit 1
+    fi
+    local existing
+    if ! existing=$(schema_exists); then
+        echo -e "${RED}✗ could not tell whether comms-postgres holds a schema -- nothing started${NC}"
+        exit 1
+    fi
+    if [ "$existing" = "yes" ]; then
+        if ! dump_db "$BACKUP_DIR/comms-preinstall-$(date -u +%Y%m%d-%H%M%S).sql"; then
+            echo -e "${RED}✗ no dump -- the existing database is not migrated, comms-app not started${NC}"
+            exit 1
+        fi
+    fi
+    echo "Starting the comms stack..."
+    if ! $COMPOSE_CMD up -d; then
         echo -e "${RED}✗ compose up failed${NC}"
         show_app_log_tail
         exit 1
@@ -387,31 +506,45 @@ cmd_update() {
     fi
     cd_compose
     ensure_env_link
+    load_env
     if ! $COMPOSE_CMD build; then
         echo -e "${RED}✗ image build failed -- containers left as they were${NC}"
         exit 1
     fi
     check_overlay_dir
-    # Recreated comms-app re-runs `alembic upgrade head` in its
-    # command before serving -- the migration IS the restart path.
+    # THE ORDER (TX-4): the datastores converge first -- recreated only
+    # when their own definition changed, never forced -- then the
+    # database is dumped, and only then is comms-app recreated, which
+    # re-runs `alembic upgrade head` in its command before serving: the
+    # migration IS the restart path, so no dump means no migration.
+    if ! converge_datastores; then
+        echo -e "${RED}✗ update aborted -- application containers left as they were${NC}"
+        exit 1
+    fi
+    local dump
+    dump="$BACKUP_DIR/comms-preupdate-$(date -u +%Y%m%d-%H%M%S).sql"
+    if ! dump_db "$dump"; then
+        echo -e "${RED}✗ no dump -- no migration; application containers left as they were${NC}"
+        exit 1
+    fi
     # The three app containers are recreated ALWAYS, by name. Whether
     # plain `up -d` notices an edited .env depends on how the installed
     # compose version hashes a service, and this path must not depend
     # on it: an undetected environment change costs an hour, a
     # recreate costs seconds (cmd_restart says why a signal is not
-    # enough either).
-    # postgres and redis are NOT named, so compose applies its default
-    # to them -- recreated only when their own definition changed --
-    # which is what `up -d` did before.
-    if ! $COMPOSE_CMD up -d --force-recreate comms-app comms-worker comms-consumer; then
+    # enough either). --no-deps (recreate_app): the datastores were
+    # converged above, on their own.
+    if ! recreate_app; then
         echo -e "${RED}✗ compose up failed${NC}"
         show_app_log_tail
+        echo "  The database was dumped before the migration: $0 db restore $dump"
         exit 1
     fi
     if ! wait_for_app; then
+        echo "  The database was dumped before the migration: $0 db restore $dump"
         exit 1
     fi
-    echo -e "${GREEN}✓ comms updated (pulled, rebuilt, migrated)${NC}"
+    echo -e "${GREEN}✓ comms updated (pulled, rebuilt, dumped, migrated)${NC}"
 }
 
 # Recreate the three application containers -- API, worker, consumer --
@@ -440,7 +573,7 @@ cmd_restart() {
     echo -e "${CYAN}== comms restart ==${NC}"
     cd_compose
     check_overlay_dir
-    if ! $COMPOSE_CMD up -d --force-recreate --no-deps comms-app comms-worker comms-consumer; then
+    if ! recreate_app; then
         echo -e "${RED}✗ restart failed${NC}"
         show_app_log_tail
         exit 1
@@ -527,14 +660,7 @@ cmd_db() {
     local action="${1:-}"
     case "$action" in
         dump)
-            mkdir -p "$BACKUP_DIR"
-            local out
-            out="$BACKUP_DIR/comms-$(date -u +%Y%m%d-%H%M%S).sql"
-            if $COMPOSE_CMD exec -T comms-postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$out"; then
-                echo -e "${GREEN}✓ Dumped to $out${NC}"
-            else
-                rm -f "$out"
-                echo -e "${RED}✗ pg_dump failed${NC}"
+            if ! dump_db "$BACKUP_DIR/comms-$(date -u +%Y%m%d-%H%M%S).sql"; then
                 exit 1
             fi
             ;;
@@ -550,10 +676,38 @@ cmd_db() {
                 echo "Aborted."
                 exit 1
             fi
-            if $COMPOSE_CMD exec -T comms-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$src"; then
+            # HONEST (TX-4): the three application containers stop
+            # first -- a DROP SCHEMA would wait on their connections,
+            # and afterwards they would hold statements prepared on
+            # the old schema. The dump goes into an EMPTY schema in ONE
+            # transaction under ON_ERROR_STOP: any error rolls it all
+            # back and the database is as it was. Then the containers
+            # come back by the restart path -- after a failure too, on
+            # the untouched database.
+            local restored=0 started=0
+            echo "Stopping comms-app, comms-worker, comms-consumer..."
+            if ! $COMPOSE_CMD stop comms-app comms-worker comms-consumer; then
+                echo -e "${RED}✗ could not stop the application containers -- nothing restored${NC}"
+                exit 1
+            fi
+            echo "Restoring from $src (one transaction, into an empty schema)..."
+            if { printf 'DROP SCHEMA public CASCADE;\nCREATE SCHEMA public;\n'; cat "$src"; } \
+                | $COMPOSE_CMD exec -T comms-postgres psql -X -q -v ON_ERROR_STOP=1 \
+                    --single-transaction -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null; then
+                restored=1
+                echo -e "${GREEN}✓ database restored from $src${NC}"
+            else
+                echo -e "${RED}✗ restore failed -- rolled back, the database is as it was${NC}"
+            fi
+            echo "Starting comms-app, comms-worker, comms-consumer..."
+            if recreate_app && wait_for_app; then
+                started=1
+            else
+                echo -e "${RED}✗ the application containers did not come back${NC}"
+            fi
+            if [ "$restored" = 1 ] && [ "$started" = 1 ]; then
                 echo -e "${GREEN}✓ Restored from $src${NC}"
             else
-                echo -e "${RED}✗ restore failed${NC}"
                 exit 1
             fi
             ;;
@@ -654,17 +808,13 @@ cmd_drain() {
     fi
     echo -e "${CYAN}comms-app stopped.${NC}"
 
-    mkdir -p "$BACKUP_DIR"
     local dump
     dump="$BACKUP_DIR/comms-predrain-$(date -u +%Y%m%d-%H%M%S).sql"
-    if ! $COMPOSE_CMD exec -T comms-postgres \
-            pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$dump"; then
-        rm -f "$dump"
-        echo -e "${RED}✗ pg_dump failed -- nothing deleted (comms-app stays stopped)${NC}"
+    if ! dump_db "$dump"; then
+        echo -e "${RED}✗ nothing deleted (comms-app stays stopped)${NC}"
         echo "  Next: $0 start (back in service), or free space in $BACKUP_DIR and $0 drain --apply"
         exit 2
     fi
-    echo -e "${GREEN}✓ Dumped to $dump${NC}"
     rotate_predrain_dumps "$BACKUP_DIR" 3
 
     rc=0

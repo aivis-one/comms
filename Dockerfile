@@ -58,8 +58,11 @@ COPY pyproject.toml requirements.lock ./
 # transitive package, and nothing recorded which. requirements.lock is
 # the resolution itself, regenerated deliberately (see its header) in
 # the same commit as any dependency change.
+#
+# NO `pip install --upgrade pip` (TX-4): it fetched whatever pip was
+# newest on the day of the build -- the one unpinned download of the
+# image. The venv's pip is the base image's, pinned by its digest above.
 RUN python -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip && \
     /opt/venv/bin/pip install --no-cache-dir -r requirements.lock
 
 # ---------------------------------------------------------------------------
@@ -77,7 +80,12 @@ COPY --from=builder /opt/venv /opt/venv
 
 # Copy everything the service needs.
 COPY app/ ./app/
-COPY tests/ ./tests/
+# NO tests/ (TX-4): nothing in the image runs them from here. Both who
+# run the suite on this image -- `comms-deploy.sh test` and CI's `image`
+# job -- mount the checkout over /app, so the tests come from the
+# checkout; the image gives the interpreter and the packages, pytest,
+# ruff and mypy included (/opt/venv) -- they stay. .dockerignore keeps
+# tests/ and the rest out of the build context too.
 COPY pyproject.toml ./
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
