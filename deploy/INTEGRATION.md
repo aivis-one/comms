@@ -462,12 +462,14 @@ email. Nothing of the profile is used for that email -- neither the
 `subject` and `body` templates of the email channel nor the job's
 `title` and `body`, which stay the letter of the other channels. comms
 rewrites nothing: no variables are filled in, nothing is escaped, cut
-or cleaned, the HTML is not sanitized or checked, and a subject with a
-line break goes as it is -- if the provider refuses it, that is a
-refusal of that job like any other. Send the text always: it is the
-version of the message for a client that shows no HTML, and an HTML
-message without one is a common reason to be filed as spam. One block
-per job -- every recipient of a group job gets the same email; a
+or cleaned, the HTML is not sanitized or checked. The subject is one
+line: a subject with a line break (`\r` or `\n`) is rejected at intake
+-- comms refuses it rather than clean it, for the email is yours; a tab
+or two spaces in a row go as they are. The sender and the single
+recipient are comms', whatever the block holds. Send the text always:
+it is the version of the message for a client that shows no HTML, and
+an HTML message without one is a common reason to be filed as spam. One
+block per job -- every recipient of a group job gets the same email; a
 person who muted the type's category gets none, as before. Without the
 block the email is composed from the profile as described above, byte
 for byte as before.
@@ -878,7 +880,7 @@ never interprets.
 | `body` | by type | letter | 1..5000; as `title` |
 | `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
-| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
+| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500, one line: no `\r` or `\n`), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
 
 There is no channel and no priority on a request. The channel is the
@@ -904,6 +906,19 @@ other event (`user_upserted`, `user_deleted`, `group_changed`,
 `section_membership_changed`, `reminder_cancel`) goes to the
 dead-letter stream at once, naming the field -- the event is malformed,
 not failing.
+
+**The same holds for every value of that class -- one comms cannot
+store -- and for data nested too deep.** A number that is no JSON
+number comms can store -- `NaN`, `Infinity`, `-Infinity` (some JSON
+writers emit them), a literal past the float range (`1e309`), an
+integer of more than 4300 digits -- is rejected naming the field; so
+is `data` nested deeper than 64 levels (the `data` object itself the
+first), and a `scheduled_at` or `expiry_at` that lies, in UTC, before
+the year 1 or after 9999 (the year 1 at `+01:00`, say). A request is
+rejected under its key whenever the key can be read. Data that cannot
+be read at all -- broken JSON, a nesting past what the reader can
+follow -- leaves no key, and the request goes to the dead-letter
+stream.
 
 **What intake answers.** A request is decided the moment it is read:
 

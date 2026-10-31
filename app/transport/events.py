@@ -45,9 +45,10 @@
 # =============================================================================
 
 import json
+import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -61,6 +62,7 @@ from app.core.constants import (
     MAX_EMAIL_TEXT_LEN,
     MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_JSON_DEPTH,
     MAX_LLM_AUDIO_URL_LEN,
     MAX_LOCALE_LEN,
     MAX_SNAPSHOT_VERSION,
@@ -345,6 +347,18 @@ def _datetime(value: Any, field: str, event: str) -> datetime:
             f"{event}: field {field!r} must carry a timezone offset "
             f"(naive timestamps are ambiguous on the wire)"
         )
+    try:
+        parsed.astimezone(UTC)
+    except OverflowError as exc:
+        # A value of the class check_event_data refuses (EM-1 FIX-2):
+        # the year 1 at +01:00 is a datetime Python holds and a
+        # timestamptz nobody can send -- in UTC it lies before the year
+        # 1 (or, at 9999 and a negative offset, after 9999). The driver
+        # refused it at the INSERT; here it is a refusal under the key.
+        raise ValidationError(
+            f"{event}: field {field!r} lies outside the range of a "
+            f"timestamp (in UTC before the year 1 or after 9999)"
+        ) from exc
     return parsed
 
 
@@ -352,16 +366,80 @@ def _is_scalar(value: Any) -> bool:
     return isinstance(value, _SCALAR_TYPES)
 
 
-# A STRING THE DATABASE WILL NOT TAKE -- ONE RULE, EVERY EVENT (EM-1
-# FIX). Postgres stores no NUL in text or jsonb, and the driver sends
-# UTF-8: a string with a lone surrogate (valid JSON, "\ud800", and a
-# Python string) cannot be encoded at all. Every string of an event
-# reaches the database one way or another -- a column, a JSON value, the
-# text of a refusal that names a field -- so either kind used to surface
-# as a database or driver error at the write, retried and dead-lettered
-# as "unexpected", the reason saying nothing useful. parse_event refuses
-# them first, before any rule that would quote a name or a value.
+# THE DATA OF AN EVENT: ONE READER, ONE CHECK (EM-1 FIX, FIX-2).
+#
+# load_event_data is the only json.loads of an event's `data`: parse_event
+# reads through it, and so does the dead letter (event_data_or_none, for
+# app/transport/consumer.py). check_event_data is the only walk over what
+# it read -- iterative, so no depth of the data costs a frame -- and
+# parse_event runs it first, before any rule that names a field or walks
+# a value. One class is refused there: JSON the intake would let through
+# and the parse, the database or the driver would then fail on --
+#   - a STRING the database cannot store: Postgres keeps no NUL in text
+#     or jsonb, and the driver sends UTF-8, which a lone surrogate
+#     ("\ud800", valid JSON, a Python string) does not have;
+#   - a NUMBER that is no JSON number comms can store: NaN, Infinity and
+#     -Infinity (Python's json reads them), a literal past the float
+#     range (1e309 -- read as infinity), an integer past Python's digit
+#     limit (a ValueError of the decoder, not a JSONDecodeError);
+#   - data nested deeper than MAX_JSON_DEPTH.
+# The reader MARKS the numbers (_NOT_STORABLE) rather than raising, so a
+# request's key stays readable and the refusal goes under it -- the line's
+# principle: a refusal under the product's key wherever the key can be
+# read. What cannot be read at all -- a nesting past the decoder's own
+# recursion, broken JSON -- leaves no key: the dead letter. (A date is a
+# value of the same class; it is a field's own rule, _datetime.)
 _UNSTORABLE = "a string the database cannot store (a NUL character or a lone surrogate)"
+_NO_NUMBER = (
+    "a number comms cannot store (NaN, Infinity, past the float range or "
+    "past the digit limit)"
+)
+
+
+class _NotStorable:
+    """What the reader puts where the JSON held a number comms cannot
+    store. check_event_data refuses it; nothing writes it anywhere."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<not a storable number>"
+
+
+_NOT_STORABLE = _NotStorable()
+
+
+def _float_or_mark(text: str) -> float | _NotStorable:
+    value = float(text)
+    return value if math.isfinite(value) else _NOT_STORABLE
+
+
+def _int_or_mark(text: str) -> int | _NotStorable:
+    try:
+        return int(text)
+    except ValueError:  # past sys.get_int_max_str_digits()
+        return _NOT_STORABLE
+
+
+def load_event_data(text: str, event: str) -> dict[str, Any]:
+    """An event's `data` as a JSON object, or a ValidationError: the ONE
+    reader of event data (see above)."""
+    try:
+        data = json.loads(
+            text,
+            parse_constant=lambda _name: _NOT_STORABLE,
+            parse_float=_float_or_mark,
+            parse_int=_int_or_mark,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"{event}: data is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise ValidationError(
+            f"{event}: data is nested deeper than {MAX_JSON_DEPTH} levels"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValidationError(f"{event}: data must be a JSON object")
+    return data
 
 
 def _storable(text: str) -> bool:
@@ -376,32 +454,68 @@ def _storable(text: str) -> bool:
     return True
 
 
-def _has_unstorable(value: Any) -> bool:
-    """Whether a string of this JSON value -- a key of an object
-    included, at any depth -- is one the database cannot store."""
-    if isinstance(value, str):
-        return not _storable(value)
-    if isinstance(value, dict):
-        return any(
-            _has_unstorable(key) or _has_unstorable(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, list):
-        return any(_has_unstorable(item) for item in value)
-    return False
-
-
-def refuse_unstorable(data: dict[str, Any], event: str) -> None:
-    """Refuse an event's data with a string the database cannot store,
-    anywhere in it. The field is named; a field NAME that is such a
-    string is not repeated -- it is the very string that cannot be
-    stored, and the reason itself is written down (a refusal under the
-    key, a dead letter)."""
+def _first_defect(data: dict[str, Any]) -> tuple[str, str] | None:
+    """The first thing in the data that comms cannot take, as (kind, the
+    top-level field) -- kind "name", "string", "number" or "depth" -- or
+    None. Iterative: a stack, never a recursion."""
     for name, value in data.items():
-        if _has_unstorable(name):
-            raise ValidationError(f"{event}: a field name is {_UNSTORABLE}")
-        if _has_unstorable(value):
-            raise ValidationError(f"{event}: field {name!r} is {_UNSTORABLE}")
+        if not _storable(name):
+            return "name", name
+        stack: list[tuple[Any, int]] = [(value, 2)]
+        while stack:
+            item, depth = stack.pop()
+            if item is _NOT_STORABLE:
+                return "number", name
+            if isinstance(item, str):
+                if not _storable(item):
+                    return "string", name
+            elif isinstance(item, dict | list):
+                if depth > MAX_JSON_DEPTH:
+                    return "depth", name
+                if isinstance(item, dict):
+                    for key, child in item.items():
+                        if not _storable(key):
+                            return "string", name
+                        stack.append((child, depth + 1))
+                else:
+                    stack.extend((child, depth + 1) for child in item)
+    return None
+
+
+def check_event_data(data: dict[str, Any], event: str) -> None:
+    """Refuse the first defect of the data (see above), naming the
+    top-level field, never the value. A field NAME that is itself a
+    string the database cannot store is not repeated: the reason is
+    written down too (a refusal under the key, a dead letter)."""
+    defect = _first_defect(data)
+    if defect is None:
+        return
+    kind, name = defect
+    if kind == "name":
+        raise ValidationError(f"{event}: a field name is {_UNSTORABLE}")
+    if kind == "string":
+        raise ValidationError(f"{event}: field {name!r} is {_UNSTORABLE}")
+    if kind == "number":
+        raise ValidationError(f"{event}: field {name!r} holds {_NO_NUMBER}")
+    raise ValidationError(
+        f"{event}: field {name!r} is nested deeper than {MAX_JSON_DEPTH} levels"
+    )
+
+
+def event_data_or_none(raw: bytes) -> dict[str, Any] | None:
+    """A stream entry's `data` as a dead letter may write it back: a
+    UTF-8 JSON object, read by the one reader, holding no number comms
+    cannot write and no depth a writer would recurse into -- or None,
+    and the dead letter keeps none of it. A string the database cannot
+    store is fine here: the dead letter writes JSON with ensure_ascii."""
+    try:
+        data = load_event_data(raw.decode("utf-8"), "dead letter")
+    except (UnicodeDecodeError, ValidationError):
+        return None
+    defect = _first_defect(data)
+    if defect is not None and defect[0] in ("number", "depth"):
+        return None
+    return data
 
 
 EMAIL_LETTER_LIMITS = {
@@ -417,9 +531,13 @@ def validate_email_letter(
     """The FORM of the product's own email (EM-1): `subject` and `text`
     required, `html` optional; each a string with something besides
     whitespace in it, within its limit in characters
-    (EMAIL_LETTER_LIMITS). Nothing is rewritten -- not a line break in
-    the subject, not a character of the HTML: the provider gets them as
-    they came. `html: null` is no HTML, and is not kept.
+    (EMAIL_LETTER_LIMITS); the subject on one line. Nothing is
+    rewritten -- not a character of the subject, the text or the HTML:
+    the provider gets them as they came. A subject with a line break is
+    REFUSED rather than cleaned (FIX-2): the composed email cleans its
+    own (formatters._clean_subject), the ready one is the product's, and
+    a refusal under its key tells the product. `html: null` is no HTML,
+    and is not kept.
 
     Every refusal names a field, never a value: the reason is recorded
     under the product's key, and the letter must not land there.
@@ -450,6 +568,10 @@ def validate_email_letter(
         if len(value) > limit:
             raise ValidationError(
                 f"{event}: email.{name} exceeds {limit} characters"
+            )
+        if name == "subject" and ("\r" in value or "\n" in value):
+            raise ValidationError(
+                f"{event}: email.subject must hold no line break"
             )
         kept[name] = value
     return kept
@@ -758,14 +880,14 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
     if event not in KNOWN_EVENTS:
         raise ValidationError(f"envelope: unknown event {event!r}")
 
-    data = _json_object(decoded[ENVELOPE_DATA_FIELD], event)
+    data = load_event_data(decoded[ENVELOPE_DATA_FIELD], event)
     if event == EVENT_NOTIFICATION_REQUEST:
-        # The key first, then refuse_unstorable under it -- see there.
+        # The key first, then check_event_data under it -- see there.
         return _parse_notification_intake(data, _raw_data(fields))
-    # Every other event: a string the database cannot store is a
-    # malformation of the event, refused first -- the dead letter at
-    # once, naming the field, never a database error and its retries.
-    refuse_unstorable(data, event)
+    # Every other event: what comms cannot take is a malformation of the
+    # event, refused first -- the dead letter at once, naming the field,
+    # never a database error and its retries.
+    check_event_data(data, event)
     _check_version(data, event)
 
     if event == EVENT_USER_UPSERTED:
@@ -785,18 +907,6 @@ def _raw_data(fields: dict[Any, Any]) -> bytes:
         if entry_field_name(key) == ENVELOPE_DATA_FIELD:
             return value if isinstance(value, bytes) else value.encode("utf-8")
     raise AssertionError("parse_event checked the data field first")
-
-
-def _json_object(text: str, event: str) -> dict[str, Any]:
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValidationError(
-            f"{event}: data is not valid JSON: {exc}"
-        ) from exc
-    if not isinstance(data, dict):
-        raise ValidationError(f"{event}: data must be a JSON object")
-    return data
 
 
 def _check_version(data: dict[str, Any], event: str) -> None:
@@ -895,11 +1005,11 @@ def _parse_notification_request(
 ) -> NotificationRequest:
     event = EVENT_NOTIFICATION_REQUEST
 
-    # A STRING THE DATABASE WILL NOT TAKE, FIRST (refuse_unstorable):
-    # here, past the readable key, it is a refusal under the key --
-    # naming the field, never the value -- and not a database error at
-    # the INSERT and a dead letter.
-    refuse_unstorable(data, event)
+    # WHAT COMMS CANNOT TAKE, FIRST (check_event_data): past the readable
+    # key it is a refusal under the key -- naming the field, never the
+    # value -- not a database error at the INSERT, nor a walk out of
+    # stack.
+    check_event_data(data, event)
 
     unknown = sorted(set(data) - _NOTIFICATION_REQUEST_FIELDS)
     if unknown:

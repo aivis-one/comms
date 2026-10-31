@@ -180,6 +180,39 @@ class TestMigrationOwnedTriggersExist:
         make it vanish rather than fail."""
         assert "threads_revision" in MIGRATION_OWNED_TRIGGERS
 
+    async def test_every_trigger_of_the_schema_is_listed(self) -> None:
+        """The other way round (EM-1 FIX-2): every trigger of the schema
+        -- the internal ones of foreign keys aside -- is in the list. A
+        trigger added without its entry is a mechanism nothing pins."""
+        assert set(await _schema_triggers()) == set(MIGRATION_OWNED_TRIGGERS)
+
+    async def test_a_stray_trigger_is_seen(self) -> None:
+        """The pair: a trigger created for the length of this test is
+        found by the same query -- the comparison above is not blind."""
+        async with get_engine().connect() as connection:
+            await connection.execute(text(
+                "CREATE TRIGGER stray_for_the_test BEFORE UPDATE ON threads "
+                "FOR EACH ROW EXECUTE FUNCTION threads_revision_next()"
+            ))
+            found = await _schema_triggers(connection)
+            await connection.rollback()
+        assert "stray_for_the_test" in found
+        assert set(found) != set(MIGRATION_OWNED_TRIGGERS)
+
+
+async def _schema_triggers(connection: Any = None) -> list[str]:
+    """The triggers of the comms schema, the internal ones excluded."""
+    query = text(
+        "SELECT t.tgname FROM pg_trigger t "
+        "JOIN pg_class c ON c.oid = t.tgrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE NOT t.tgisinternal AND n.nspname = current_schema()"
+    )
+    if connection is not None:
+        return list((await connection.execute(query)).scalars())
+    async with get_engine().connect() as own:
+        return list((await own.execute(query)).scalars())
+
 
 class TestTheListsDescribeReality:
     """The lists are claims about the schema, and claims rot."""

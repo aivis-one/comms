@@ -29,12 +29,20 @@
 #   M2  deliver ignores the block -> TestTheDelivery
 #   M3  html sent as "" when there is none -> TestTheDelivery
 #   M4  the block's subject through _clean_subject -> TestTheDelivery
-#       (two spaces and a line break)
+#       (two spaces and a tab; a line break is refused at the intake
+#       since FIX-2)
 #   M5  the "email among the channels" rule taken out -> TestTheIntake
 #   M6  a limit off by one -> TestTheIntake (the borders)
 #   M7  create_notification not keeping the block -> TestTheDelivery
 #   M8  a limit in the contract other than the constant -> TestTheContract
 #   M9  a refusal quoting the value -> TestTheIntake (the reasons)
+#   F1  the parse's catch-all off -> tests/test_dlq_no_letter.py
+#       TestPoisonPill (the consumer goes down)
+#   F2  the depth limit off -> TestDepth, TestPoisonPill
+#   F3  the date range check off -> TestDates
+#   F4  parse_constant / parse_float / parse_int off -> TestNumbers
+#   F5  comms' fields before the block -> TestCommsOwnFields
+#   F6  the subject's line-break rule off -> TestTheIntake
 #   M10 the rule of the string the database will not take (EM-1 FIX):
 #       without the surrogate -> the surrogate rows of TestUnstorable;
 #       taken out of the other events -> their rows; taken out of the
@@ -54,19 +62,24 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from app.audience.models import CategoryMute
+from app.audience.models import CategoryMute, Recipient
 from app.core.constants import (
     MAX_EMAIL_HTML_LEN,
     MAX_EMAIL_SUBJECT_LEN,
     MAX_EMAIL_TEXT_LEN,
+    MAX_JSON_DEPTH,
 )
 from app.core.database import get_session_factory
 from app.core.exceptions import ValidationError
 from app.engine.constants import DeliveryStatus
-from app.engine.models import Notification
+from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import process_pending_notifications
 from app.engine.service import intake_outcomes_for
-from app.transport.events import EMAIL_LETTER_LIMITS, parse_event
+from app.transport.events import (
+    EMAIL_LETTER_LIMITS,
+    check_event_data,
+    parse_event,
+)
 from app.transport.handlers import HandleResult, handle_event
 from tests.helpers import create_recipient, next_em1_telegram_id
 from tests.test_email_channel import _deliveries, _formatter, _Provider
@@ -241,10 +254,31 @@ class TestTheIntake:
             data["email"]
         )
 
-    async def test_a_line_break_in_the_subject_is_kept(
+    @pytest.mark.parametrize("subject", [
+        "\rsubject", "sub\rject", "subject\r",
+        "\nsubject", "sub\nject", "subject\n",
+        "\r\nsubject", "sub\r\nject", "subject\r\n",
+    ])
+    async def test_a_line_break_in_the_subject_is_refused(
+        self, db_session: AsyncSession, subject: str
+    ) -> None:
+        """Was test_a_line_break_in_the_subject_is_kept, and it was right:
+        EM-1 sent the ready subject as it came, a line break and all.
+        FIX-2 refuses a line break at the intake instead -- refused, not
+        cleaned, for the email is the product's."""
+        data = _request(email=_block(subject=f"{subject} {_S}"))
+        assert await _handle(db_session, data) is HandleResult.REJECTED
+        reason = await _reason(db_session, data["idempotency_key"])
+        assert "email.subject must hold no line break" in reason
+        assert _S not in reason
+        assert await _count(db_session, data["idempotency_key"]) == 0
+
+    async def test_a_tab_and_two_spaces_are_kept(
         self, db_session: AsyncSession
     ) -> None:
-        subject = "two  spaces\r\nand a break"
+        """The pair: whitespace that is no line break is the product's,
+        and is not touched."""
+        subject = "two  spaces\tand a tab"
         data = _request(email=_block(subject=subject))
         assert await _handle(db_session, data) is HandleResult.PROCESSED
         job = await _job(db_session, data["idempotency_key"])
@@ -385,6 +419,194 @@ class TestStorable:
         parse_event({"event": event, "data": json.dumps(_other_event(event))})
 
 
+# ---------------------------------------------------------------------------
+# 2b -- the rest of the class: numbers, depth, dates (FIX-2)
+# ---------------------------------------------------------------------------
+
+_NAN, _INF = float("nan"), float("inf")
+
+
+def _nested(depth: int) -> Any:
+    """A list nested `depth` levels deep, built without recursion."""
+    value: Any = []
+    for _ in range(depth - 1):
+        value = [value]
+    return value
+
+
+def _with(data: dict[str, Any], field: str, literal: str) -> str:
+    """The request's JSON with `field` set to a raw JSON literal."""
+    data = dict(data)
+    data[field] = 0
+    text = json.dumps(data)
+    return text.replace(f'"{field}": 0', f'"{field}": {literal}', 1)
+
+
+async def _handle_text(session: AsyncSession, text: str) -> HandleResult:
+    entry = {"event": "notification_request", "data": text}
+    return await handle_event(session, parse_event(entry))
+
+
+class TestNumbers:
+    @pytest.mark.parametrize(("field", "value"), [
+        ("action_data", {"n": _NAN}),
+        ("action_data", {"n": _INF}),
+        ("action_data", {"n": -_INF}),
+        ("action_data", {"params": {"p": _NAN}}),
+    ])
+    async def test_a_request_refused_under_the_key(
+        self, db_session: AsyncSession, field: str, value: Any,
+    ) -> None:
+        data = _request(**{field: value})
+        assert await _handle(db_session, data) is HandleResult.REJECTED
+        reason = await _reason(db_session, data["idempotency_key"])
+        assert f"field {field!r} holds a number comms cannot store" in reason
+
+    @pytest.mark.parametrize("literal", ["1e309", "-1e309", "9" * 5000])
+    async def test_past_the_float_range_and_the_digit_limit(
+        self, db_session: AsyncSession, literal: str
+    ) -> None:
+        """1e309 the decoder reads as infinity; 5000 digits it cannot
+        read at all (a ValueError) -- both marked, the key read, the
+        refusal under it."""
+        data = _request()
+        text = _with(data, "correlation", literal)
+        assert await _handle_text(db_session, text) is HandleResult.REJECTED
+        reason = await _reason(db_session, data["idempotency_key"])
+        assert "field 'correlation' holds a number comms cannot store" in reason
+
+    @pytest.mark.usefixtures("provider")
+    async def test_in_an_llm_letter(self, db_session: AsyncSession) -> None:
+        data = {
+            "v": 1, "idempotency_key": f"em1-{uuid4().hex}", "type": "ask.model",
+            "llm": {"messages": [{"role": "user", "content": "q"}],
+                    "params": {"temperature": _NAN}},
+        }
+        assert await _handle(db_session, data) is HandleResult.REJECTED
+        assert "field 'llm' holds a number" in await _reason(
+            db_session, data["idempotency_key"]
+        )
+
+    @pytest.mark.parametrize(("event", "field"), [
+        ("user_upserted", "version"),
+        ("user_upserted", "telegram_id"),
+        ("user_deleted", "version"),
+    ])
+    def test_every_other_event(self, event: str, field: str) -> None:
+        data = _other_event(event)
+        data[field] = _INF
+        with pytest.raises(ValidationError) as raised:
+            parse_event({"event": event, "data": json.dumps(data)})
+        assert f"field {field!r} holds a number comms cannot store" in str(
+            raised.value
+        )
+
+    def test_in_the_key_the_key_is_unreadable(self) -> None:
+        text = _with(_request(), "idempotency_key", "NaN")
+        with pytest.raises(ValidationError, match="idempotency_key"):
+            parse_event({"event": "notification_request", "data": text})
+
+    async def test_the_pair(self, db_session: AsyncSession) -> None:
+        """The largest finite double and a negative zero are numbers
+        jsonb takes."""
+        data = _request(action_data={"big": 1e308, "zero": -0.0})
+        assert await _handle(db_session, data) is HandleResult.PROCESSED
+        job = await _job(db_session, data["idempotency_key"])
+        assert job.action_data is not None
+        # jsonb keeps the number, not Python's type: 1e308 comes back as
+        # the exact integer 10**308 (an observation of the FIX-2 report).
+        assert float(job.action_data["big"]) == 1e308
+        assert job.action_data["zero"] == 0
+
+
+class TestDepth:
+    def test_the_border(self) -> None:
+        """MAX_JSON_DEPTH counts the data object as the first level."""
+        check_event_data({"f": _nested(MAX_JSON_DEPTH - 1)}, "e")
+        with pytest.raises(ValidationError, match=(
+            f"field 'f' is nested deeper than {MAX_JSON_DEPTH} levels"
+        )):
+            check_event_data({"f": _nested(MAX_JSON_DEPTH)}, "e")
+
+    @pytest.mark.parametrize("depth", [MAX_JSON_DEPTH, 500])
+    async def test_a_request_with_a_readable_key(
+        self, db_session: AsyncSession, depth: int
+    ) -> None:
+        data = _request(action_data={"params": _nested(depth)})
+        assert await _handle(db_session, data) is HandleResult.REJECTED
+        reason = await _reason(db_session, data["idempotency_key"])
+        assert f"field 'action_data' is nested deeper than {MAX_JSON_DEPTH}" in (
+            reason
+        )
+
+    def test_a_nesting_the_reader_cannot_follow(self) -> None:
+        """Past the decoder's own recursion the key is never read: the
+        dead letter (tests/test_dlq_no_letter.py TestPoisonPill)."""
+        text = _with(_request(), "correlation", "[" * 200_000 + "]" * 200_000)
+        with pytest.raises(ValidationError, match="nested deeper than"):
+            parse_event({"event": "notification_request", "data": text})
+
+    @pytest.mark.parametrize("depth", [MAX_JSON_DEPTH, 500])
+    def test_another_event(self, depth: int) -> None:
+        data = _other_event("user_deleted")
+        data["recipient_id"] = _nested(depth)
+        with pytest.raises(ValidationError, match="nested deeper than"):
+            parse_event({"event": "user_deleted", "data": json.dumps(data)})
+
+
+class TestDates:
+    @pytest.mark.parametrize("field", ["scheduled_at", "expiry_at"])
+    @pytest.mark.parametrize("value", [
+        "0001-01-01T00:59:59+01:00",   # in UTC: the year 0
+        "9999-12-31T23:00:00-01:00",   # in UTC: the year 10000
+    ])
+    async def test_outside_a_timestamp(
+        self, db_session: AsyncSession, field: str, value: str
+    ) -> None:
+        data = _request(**{field: value})
+        assert await _handle(db_session, data) is HandleResult.REJECTED
+        reason = await _reason(db_session, data["idempotency_key"])
+        assert f"field {field!r} lies outside the range of a timestamp" in reason
+
+    @pytest.mark.parametrize(("field", "value"), [
+        ("scheduled_at", "0001-01-01T01:00:00+01:00"),  # UTC 0001-01-01
+        ("scheduled_at", "9999-12-31T22:59:59-01:00"),  # UTC 9999-12-31
+        ("expiry_at", "9999-12-31T22:59:59-01:00"),
+        ("scheduled_at", "2030-06-01T12:00:00+02:00"),
+    ])
+    async def test_the_pair_at_the_borders(
+        self, db_session: AsyncSession, field: str, value: str
+    ) -> None:
+        data = _request(**{field: value})
+        assert await _handle(db_session, data) is HandleResult.PROCESSED
+
+
+# ---------------------------------------------------------------------------
+# 3b -- comms' own fields come after a block (FIX-2)
+# ---------------------------------------------------------------------------
+
+
+class TestCommsOwnFields:
+    async def test_from_and_to_are_comms(self) -> None:
+        """A block carrying `from` and `to` -- built past the intake and
+        its CHECK, an object in memory -- does not take over the sender or
+        the single recipient: comms' fields come after it."""
+        mailgun = _Provider()
+        formatter = _formatter(mailgun)
+        notification = Notification(
+            type="unit_event_email", title="T", body="B",
+            email={"subject": "s", "text": "t",
+                   "from": "evil@example.test", "to": "many@example.test"},
+        )
+        recipient = Recipient(id=uuid4(), email="one@example.test")
+        await formatter.deliver(notification, NotificationDelivery(), recipient)
+        (pairs,) = _pairs(mailgun)
+        fields = dict(pairs)
+        assert fields["from"] == formatter._from_address
+        assert fields["to"] == "one@example.test"
+        assert [name for name, _ in pairs].count("from") == 1
+
+
 def _other_event(event: str) -> dict[str, Any]:
     """A well-formed payload of each event other than the request."""
     rid = str(uuid4())
@@ -452,7 +674,9 @@ _TRACKING = [
 class TestTheDelivery:
     async def test_the_block_as_it_came(self, db_session: AsyncSession) -> None:
         await _person(db_session, "one@example.test")
-        subject = f"two  spaces\nand a break {_S}"
+        # Two spaces and a tab: what _clean_subject would collapse (M4).
+        # A line break is refused at the intake since FIX-2.
+        subject = f"two  spaces\tand a tab {_S}"
         data = _request(
             title=f"T-{_S}-title", body=f"B-{_S}-body",
             email=_block(subject=subject),
@@ -598,6 +822,9 @@ class TestTheContract:
     def test_your_own_email(self) -> None:
         part = _DOC.split("**Your own email.**", 1)[1].split("\n\n", 1)[0]
         for said in ("exactly these", "the HTML is not sanitized",
-                     "a subject with a\nline break goes as it is",
-                     "One block\nper job", "byte\nfor byte as before"):
+                     "a subject with a line break (`\\r` or `\\n`) is "
+                     "rejected at intake",
+                     "a tab\nor two spaces in a row go as they are",
+                     "The sender and the single\nrecipient are comms'",
+                     "One\nblock per job", "byte\nfor byte as before"):
             assert said in part, said

@@ -53,13 +53,14 @@ from uuid import uuid4
 
 import pytest
 from fakeredis import aioredis as fakeaioredis
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DataError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 import app.transport.consumer as consumer_module
 from app.audience.models import Recipient
 from app.core.config import Settings, settings
+from app.engine.models import Notification
 from app.engine.service import stream_fingerprint
 from app.transport.consumer import (
     _DLQ_WITHHELD_ENVELOPE_FIELDS,
@@ -489,25 +490,41 @@ class TestEveryPath:
         )
 
     async def test_the_unexpected_exception_from_the_database(
-        self, redis: fakeaioredis.FakeRedis, stream: str, db_session: AsyncSession,
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """No mock: a value the database refuses reaches the INSERT of
-        the job, and the error that comes back quotes what it was given
-        -- the letter.
+        """A database error at the INSERT of the job, whose text quotes
+        the bound parameters -- the letter. MOCKED, and that is the
+        honest way now.
 
-        The input moved twice. Until EM-1 the title carried a NUL, which
-        Postgres refuses at the INSERT. EM-1 refused a NUL at the intake,
-        so the title carried a lone surrogate, which the driver cannot
-        encode. The EM-1 FIX refuses that too, at the intake of every
-        event (app/transport/events.py refuse_unstorable): no STRING
-        reaches the INSERT that the database will not take. A NUMBER
-        still does: JSON's NaN, which Python's json reads and jsonb
-        refuses -- the intake checks that a value of action_data is a
-        scalar, not that the database can hold it. So the letter's
-        action_data carries a NaN beside the sentinel."""
-        request = _letter_request(action_data={
-            "name": f"{_S}", "params": {"p": f"{_S}"}, "n": float("nan"),
-        })
+        It ran without a mock while comms let through a value the
+        database or the driver would not take: a NUL in the title (until
+        EM-1), a lone surrogate (until the EM-1 FIX), then a NaN and a
+        date outside a timestamp's range (until FIX-2, which refuses
+        every value of that class at the intake, under the key). No input
+        reaches the INSERT and fails there any more -- that is the gain,
+        and the path a database error takes is the same whatever raised
+        it: the flush raises a DataError carrying the letter, as the
+        driver's own did."""
+        request = _letter_request()
+        real_flush = AsyncSession.flush
+
+        async def failing_flush(
+            self: AsyncSession, *args: Any, **kw: Any,
+        ) -> None:
+            if any(isinstance(o, Notification) for o in self.new):
+                raise DataError(
+                    "INSERT INTO notifications (title, action_data) "
+                    "VALUES ($1, $2)",
+                    (f"title {_S}", f"{{\"p\": \"{_S}\"}}"),
+                    Exception(f"invalid input for query argument {_S}"),
+                )
+            await real_flush(self, *args, **kw)
+
+        monkeypatch.setattr(AsyncSession, "flush", failing_flush)
         # A request comms ACCEPTS, up to the INSERT -- `email` out too:
         # unit_event has no email channel, so the block would be refused.
         for name in ("llm", "llm_audio", "titel", "email"):
@@ -520,7 +537,9 @@ class TestEveryPath:
         _assert_no_sentinel(dead)
         _assert_the_pair(dead)
         _assert_no_sentinel_logged(logs)
-        assert dead["_dlq_error"].startswith("unexpected: ")
+        # The mocked error, not some other one: the same outcome a real
+        # DataError of the driver had.
+        assert dead["_dlq_error"].startswith("unexpected: sqlalchemy.exc.DataError")
         assert " at app/" in dead["_dlq_error"]
 
 
@@ -578,6 +597,114 @@ class TestUnstorable:
         )
         assert "\x00" not in dead["_dlq_error"]
         dead["_dlq_error"].encode("utf-8")
+
+
+class TestPoisonPill:
+    """A bad entry costs a dead letter, never the consumer (EM-1 FIX-2):
+    the next entry is processed by the same process, nothing stays
+    pending. Before, a nested bomb raised a RecursionError out of the
+    parse -- only a ValidationError was caught there -- and the consumer
+    went down, and down again on the same pending entry after a restart
+    (reproduced on a real Redis: the FIX-2 report)."""
+
+    _NEXT = {
+        "event": "reminder_cancel",
+        "data": json.dumps({
+            "v": 1, "types": ["unit_rem_1h"], "correlation": "next-entry",
+        }),
+    }
+
+    async def _then_the_next(
+        self, redis: fakeaioredis.FakeRedis, stream: str, entry: dict[str, str],
+    ) -> tuple[dict[str, str], list[dict[str, Any]]]:
+        await redis.xadd(stream, entry)
+        await redis.xadd(stream, self._NEXT)
+        with capture_logs() as logs:
+            (dead,) = await _consume(redis, stream, 1)
+        processed = [
+            e for e in logs
+            if e["event"] == "event_processed"
+            and e.get("event_type") == "ReminderCancel"
+        ]
+        assert len(processed) == 1  # the next entry, the same process
+        assert await _no_pending(redis, stream)
+        return dead, logs
+
+    @pytest.mark.parametrize("depth", [500, 200_000])
+    async def test_a_nested_bomb(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        depth: int,
+    ) -> None:
+        data = (
+            '{"v": 1, "recipient_id": ' + "[" * depth + "]" * depth
+            + ', "version": 2}'
+        )
+        dead, _ = await self._then_the_next(
+            redis, stream, {"event": "user_deleted", "data": data},
+        )
+        assert dead["_dlq_attempts"] == "0"
+        assert "nested deeper than" in dead["_dlq_error"]
+        # Not written back: a writer would recurse into it.
+        assert "data" in json.loads(dead["_dlq_dropped"])
+
+    async def test_any_exception_of_the_parse(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Whatever the parse raises -- a RecursionError nothing saw
+        coming, here -- the entry goes to the dead letter with the class
+        and the place, is acknowledged, and the log line carries no
+        traceback and no text of it."""
+        real = consumer_module.parse_event
+        calls = 0
+
+        def parse(fields: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RecursionError(f"bomb {_S}")
+            return real(fields)
+
+        monkeypatch.setattr(consumer_module, "parse_event", parse)
+        dead, logs = await self._then_the_next(redis, stream, {
+            "event": "user_deleted",
+            "data": json.dumps({"v": 1, "recipient_id": str(uuid4()),
+                                "version": 2}),
+        })
+        assert dead["_dlq_attempts"] == "0"
+        assert dead["_dlq_error"].startswith("unexpected: builtins.RecursionError")
+        assert _S not in json.dumps(dead)
+        assert _S not in json.dumps(logs, default=str)
+        (line,) = [e for e in logs if e["event"] == "event_unexpected_error"]
+        assert line["stage"] == "parse"
+        assert "exception" not in line  # class and place, no traceback
+
+    async def test_no_storable_number(
+        self,
+        redis: fakeaioredis.FakeRedis,
+        stream: str,
+        db_session: AsyncSession,
+    ) -> None:
+        """Infinity in an address-book event: the dead letter at once,
+        naming the field, the data not written back -- a dead letter
+        holds JSON."""
+        data = json.dumps({
+            "v": 1, "recipient_id": str(uuid4()), "version": float("inf"),
+        })
+        dead, _ = await self._then_the_next(
+            redis, stream, {"event": "user_deleted", "data": data},
+        )
+        assert dead["_dlq_attempts"] == "0"
+        assert "field 'version' holds a number comms cannot store" in (
+            dead["_dlq_error"]
+        )
+        assert "data" in json.loads(dead["_dlq_dropped"])
 
 
 class TestNotUtf8:

@@ -103,6 +103,7 @@ from app.transport.events import (
     NOTIFICATION_REQUEST_ENVELOPE_FIELDS,
     NOTIFICATION_REQUEST_FRAME_FIELDS,
     entry_field_name,
+    event_data_or_none,
     parse_event,
 )
 from app.transport.handlers import HandleResult, handle_event
@@ -250,6 +251,28 @@ class StreamConsumer:
             event = parse_event(fields)
         except ValidationError as exc:
             await self._to_dlq(entry_id, fields, reason=str(exc), attempts=0)
+            await self._ack(entry_id)
+            return
+        except Exception as exc:
+            # ANY failure of the parse is the entry's, never the
+            # process's (poison-pill rule, EM-1 FIX-2). Only a
+            # ValidationError was caught here before: a RecursionError
+            # from a nested bomb left the loop, the consumer went down,
+            # and down again on the same pending entry after a restart.
+            # The class and the place -- in the dead letter and in the
+            # log alike, no traceback: what the parse raises may quote the
+            # data it was reading, and a request's data is the letter.
+            logger.error(
+                "event_unexpected_error",
+                entry_id=_id_str(entry_id),
+                stage="parse",
+                error=pipeline_error_of(exc),
+            )
+            await self._to_dlq(
+                entry_id, fields,
+                reason=f"unexpected: {pipeline_error_of(exc)}",
+                attempts=0,
+            )
             await self._ack(entry_id)
             return
 
@@ -457,7 +480,9 @@ def dead_letter_fields(
         dead["_dlq_data_fingerprint"] = stream_fingerprint(raw_data)
         dead["_dlq_data_bytes"] = str(len(raw_data))
         kept = dlq_kept_data_fields(event)
-        data = _json_object_or_none(raw_data)
+        # Read by the one reader of event data (app/transport/events.py):
+        # a bomb is not recursed into here, a NaN is not written back.
+        data = event_data_or_none(raw_data)
         if kept is None or data is None:
             dropped.append(ENVELOPE_DATA_FIELD)
         else:
@@ -481,17 +506,6 @@ def _utf8_or_none(raw: bytes) -> str | None:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
-
-
-def _json_object_or_none(raw: bytes) -> dict[str, Any] | None:
-    text = _utf8_or_none(raw)
-    if text is None:
-        return None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _id_str(entry_id: str | bytes) -> str:

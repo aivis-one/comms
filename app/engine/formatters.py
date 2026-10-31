@@ -708,25 +708,36 @@ class EmailFormatter:
                 f"({_address_defect(recipient.email)})"
             )
 
-        content: dict[str, str]
+        data: dict[str, Any]
         if notification.email is not None:
-            # The product's own email: its fields, as they came -- html
-            # only when it sent one.
-            content = dict(notification.email)
+            # The product's own email: its fields as they came -- html
+            # only when it sent one -- and comms' own AFTER them: the
+            # sender and the single recipient are comms', not the
+            # product's. A block carrying `from` or `to` (built past the
+            # intake and its CHECK) cannot take them over (FIX-2).
+            data = {
+                **notification.email,
+                "from": self._from_address,
+                "to": [address],
+                **_NO_TRACKING,
+            }
         else:
+            # Composed from the profile, the request byte for byte as
+            # before EM-1 -- the same fields in the same order.
             subject, body = self._compose(notification, recipient)
-            content = {"subject": subject, "text": body}
+            data = {
+                "from": self._from_address,
+                "to": [address],
+                "subject": subject,
+                "text": body,
+                **_NO_TRACKING,
+            }
 
         try:
             response = await self._client.post(
                 self._url,
                 auth=("api", self._api_key),
-                data={
-                    "from": self._from_address,
-                    "to": [address],
-                    **content,
-                    **_NO_TRACKING,
-                },
+                data=data,
             )
         except Exception as exc:
             # Transient by construction: connect failures and read
@@ -1446,6 +1457,12 @@ def _clean_subject(value: str) -> str:
     the telegram side. A line break in a subject is a header-injection
     shape wherever headers are built from it, and a folded subject is
     wrong even where they are not.
+
+    THE OTHER PATH: the product's own email (notification.email, EM-1) is
+    never cleaned here -- it goes as it came. Its subject holds no line
+    break because the intake refuses one (app/transport/events.py
+    validate_email_letter): a refusal rather than a cleaning, for that
+    email is the product's.
     """
     return " ".join(value.split())
 

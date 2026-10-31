@@ -77,6 +77,16 @@ MAX_BODY_LEN = 5000
 # ceiling is ours, the product's own limit is the model's context.
 MAX_LLM_LETTER_CHARS = 200_000
 
+# How deep the `data` of an event may nest (EM-1 FIX-2); the data object
+# itself is the first level. The deepest data a product sends is an llm
+# letter's response_format: data -> llm -> response_format -> json_schema
+# -> schema, then two levels for every object nested in the schema
+# (properties -> the field's schema). 64 holds a schema nested some 29
+# objects deep -- far past any real one -- and stays far under Python's
+# recursion limit (1000) less the frames the consumer already stands on.
+# Deeper is refused at the parse, before any code walks it.
+MAX_JSON_DEPTH = 64
+
 # The product's own email (EM-1): the `email` block of a
 # notification_request -- subject, text and html, each in characters,
 # sent to the provider as they came. The subject is as long as a title;
