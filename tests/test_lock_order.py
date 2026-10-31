@@ -62,6 +62,7 @@ from tests.helpers import (
     create_recipient,
     intake_fields,
     notification_row_fields,
+    row_waiters,
 )
 
 _BOUND = 10.0
@@ -407,15 +408,13 @@ class TestWithdrawAgainstCleanup:
             cleanup = asyncio.ensure_future(cleanup_expired_notifications())
             relation = None
             for _ in range(int(_BOUND / _POLL)):
-                async with factory() as observer:
-                    relation = (await observer.execute(text(
-                        "SELECT l.relation::regclass::text FROM pg_locks l "
-                        "JOIN pg_stat_activity a ON a.pid = l.pid "
-                        "WHERE a.wait_event_type = 'Lock' "
-                        "AND a.datname = current_database() "
-                        "AND a.query ILIKE 'DELETE FROM notifications%' "
-                        "AND l.locktype = 'tuple' AND l.granted"
-                    ))).scalar_one_or_none()
+                # The cleanup's DELETE waiting on the job row -- by its
+                # locks, not its text (tests/helpers.py row_waiters).
+                deleters = [
+                    w for _, w in await row_waiters("notifications")
+                    if w.is_delete
+                ]
+                relation = deleters[0].relation if deleters else None
                 if relation is not None or cleanup.done():
                     break
                 await asyncio.sleep(_POLL)

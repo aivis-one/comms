@@ -273,7 +273,17 @@ async def auto_close_idle_threads_batch(
     )
     result = await session.execute(
         update(Thread)
-        .where(Thread.id.in_(batch_ids))
+        # THE IDLE CONDITION AGAIN, on the row itself (TX-3): a thread
+        # the batch picked and a client's message reached meanwhile was
+        # closed anyway -- the UPDATE waited for the message's row, and
+        # on that newer row Postgres rechecks the UPDATE's own WHERE, not
+        # the subquery's (measured in TK-1). Here the recheck sees the new
+        # activity and the open status, and leaves the thread alone.
+        .where(
+            Thread.id.in_(batch_ids),
+            Thread.status != ThreadStatus.CLOSED,
+            activity < cutoff,
+        )
         .values(
             status=ThreadStatus.CLOSED,
             # D6: mark section threads notifiable at the close instant;

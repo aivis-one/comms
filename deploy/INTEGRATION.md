@@ -1199,10 +1199,18 @@ job's outcome, within `keep_until`.
 
 | field | value |
 |---|---|
-| `attempts` | failed pipeline attempts; 0 when none |
-| `step` | the step that tore last: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
-| `error` | the class and the place of the failure, or `null` |
-| `retry_at` | when the job is tried again, or `null` |
+| `attempts` | failed pipeline attempts; 0 when none. A transient failure of comms' own database (a deadlock, a lost connection, a restart) is not counted |
+| `step` | the step of the last counted failure: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null`. A transient failure of comms' database is not one |
+| `error` | the class and the place of the last counted failure, or `null` |
+| `retry_at` | when the job is tried again, or `null`. With `attempts` 0 it is a wait on a transient failure of comms' database; that wait is recorded in the job's path, one row per wait |
+
+**A job STUCK at the ceiling.** A job whose `attempts` equal comms' ceiling
+(`NOTIFICATION_MAX_PIPELINE_ATTEMPTS`) while its `status` is not an
+outcome is stuck: comms failed at the ceiling to close it. That is a
+defect of comms, not of your request -- its `error` names the class and
+the place, and comms says it once in its log. No worker takes it again;
+raising the ceiling in comms' settings makes it selectable once more, on
+purpose.
 
 ### `delivery_count`
 
@@ -1246,6 +1254,17 @@ One row per transition, in order.
 | `category` | the category a mute gate decided by, or `null` |
 | `error` | an exception of comms' own: class and place, never its text; or `null` |
 | `provider_text` | the provider's answer, sanitized; `null` when it said nothing or its recipient was forgotten |
+
+**A wait on a transient failure of comms' database is one row, not one
+per retry.** Such a failure does not spend an attempt; the job waits
+behind its retry gate (`wait_reason: pipeline_retry`) and is tried again.
+Its row in the path -- the step, the failure's class and place,
+`wait_until` -- is written when the wait begins, and again only when the
+step or the failure's class changes within it. The job's `pipeline`
+(`attempts`, `step`, `error`) keeps the counted failures only; a wait
+leaves them as they were. A step that succeeds ends the wait,
+and so does an ordinary failure: the next transient failure begins a new
+wait, with a row of its own.
 
 ## 9. What changed since a cursor
 

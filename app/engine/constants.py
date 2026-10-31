@@ -80,6 +80,16 @@ class NotificationStatus(enum.StrEnum):
     NO_RECIPIENTS = "no_recipients"
 
 
+# The statuses of a job not closed yet -- ONE copy (TX-3): the code reads
+# it (app/engine/service.py), and migration 0037 builds its CHECK
+# ck_notifications_transient_wait_open from it; tests/test_worker_keeps_its_work.py
+# holds the database's CHECK to this set.
+ACTIVE_STATUSES: tuple[NotificationStatus, ...] = (
+    NotificationStatus.PENDING,
+    NotificationStatus.PROCESSING,
+)
+
+
 class DeliveryStatus(enum.StrEnum):
     """Per-recipient, per-channel delivery status.
 

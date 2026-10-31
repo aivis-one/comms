@@ -60,7 +60,7 @@ from app.engine.formatters import RateLimitedError
 from app.engine.models import NotificationDelivery, NotificationTransition
 from app.engine.service import create_notification, withdraw_recipient
 from app.forgetting import forget_recipient
-from tests.helpers import create_recipient, intake_fields, sql_shape
+from tests.helpers import RowWait, create_recipient, intake_fields, row_wait
 
 _BOUND = 10.0
 # The provider's words, quoting the address being forgotten. A sentinel:
@@ -124,20 +124,15 @@ async def _forget(recipient_id: UUID, pid: list[int] | None = None) -> bool:
         return forgotten
 
 
-async def _waiting_statement(pid: list[int]) -> str | None:
-    """The statement the forgetting session waits in on a lock, or None."""
+async def _waiting_statement(pid: list[int]) -> RowWait | None:
+    """The row-lock wait of the forgetting session, or None -- by its
+    LOCKS (tests/helpers.py row_wait), never by its text."""
     if not pid:
         return None
-    async with get_session_factory()() as session:
-        query: str | None = (await session.execute(text(
-            "SELECT query FROM pg_stat_activity "
-            "WHERE pid = :pid AND wait_event_type = 'Lock' "
-            "AND datname = current_database()"
-        ), {"pid": pid[0]})).scalar_one_or_none()
-        return query
+    return await row_wait(pid[0])
 
 
-async def _until_waiting(pid: list[int]) -> str:
+async def _until_waiting(pid: list[int]) -> RowWait:
     """The statement the forgetting session waits in -- that session's,
     by its pid."""
     for _ in range(int(_BOUND / 0.02)):
@@ -202,9 +197,13 @@ class TestTheFirstAttempt:
         pid: list[int] = []
         forgetting = asyncio.create_task(_forget(recipient_id, pid))
         waiting = await _until_waiting(pid)
-        # The tombstone's own read of the recipient row, FOR UPDATE.
-        shape = sql_shape(waiting)
-        assert (shape.table, shape.lock) == ("recipients", "FOR UPDATE")
+        # The tombstone's own read of the recipient row, FOR UPDATE --
+        # read off the locks. Until TX-3 off pg_stat_activity.query's
+        # text, which was right while the statement fit
+        # track_activity_query_size; TX-3 grew the job row's SELECT past
+        # it, and the text lost its lock clause.
+        assert (waiting.relation, waiting.row_lock) == ("recipients", "FOR UPDATE")
+        assert not waiting.is_delete
         assert not forgetting.done()
 
         fake.release.set()
@@ -307,9 +306,13 @@ class TestALaterAttempt:
         pid: list[int] = []
         forgetting = asyncio.create_task(_forget(recipient_id, pid))
         waiting = await _until_waiting(pid)
-        # withdraw_recipient's lock of the job rows.
-        shape = sql_shape(waiting)
-        assert (shape.table, shape.lock) == ("notifications", "FOR UPDATE")
+        # withdraw_recipient's lock of the job rows -- read off the locks
+        # (see the test above): the job row's SELECT outgrew
+        # track_activity_query_size in TX-3.
+        assert (waiting.relation, waiting.row_lock) == (
+            "notifications", "FOR UPDATE",
+        )
+        assert not waiting.is_delete
         assert not forgetting.done()
 
         fake.release.set()

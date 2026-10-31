@@ -894,3 +894,87 @@ def sql_shape(statement: Any) -> SqlShape:
         lock=lock,
         sources=frozenset(_SOURCES.findall(text)),
     )
+
+
+# -----------------------------------------------------------------------------
+# A row-lock wait, identified by the LOCKS, never by the statement's text
+# -----------------------------------------------------------------------------
+#
+# pg_stat_activity.query is cut at track_activity_query_size (1024 bytes
+# by default): a SELECT of a whole job row grew past it in TX-3 (three
+# columns) and lost its FOR UPDATE from the text a test parsed. What a
+# backend waits FOR is in pg_locks: a backend waiting on a row holds the
+# row's TUPLE lock (granted) and waits on the holder's transaction; the
+# tuple lock's mode is the row lock asked for, and the relation lock the
+# statement took says what kind of statement it is.
+
+TUPLE_LOCK = {
+    "AccessShareLock": "FOR KEY SHARE",
+    "RowShareLock": "FOR SHARE",
+    "ExclusiveLock": "FOR NO KEY UPDATE",
+    # FOR UPDATE, and a DELETE (or a key-changing UPDATE) alike: the
+    # relation lock tells them apart (RowShareLock / RowExclusiveLock).
+    "AccessExclusiveLock": "FOR UPDATE",
+}
+
+
+@dataclass(frozen=True)
+class RowWait:
+    """What a backend waiting on a row lock waits with."""
+
+    relation: str
+    row_lock: str                  # TUPLE_LOCK of its tuple lock's mode
+    relation_modes: frozenset[str]  # the locks its transaction holds there
+
+    @property
+    def is_delete(self) -> bool:
+        return self.row_lock == "FOR UPDATE" and (
+            "RowExclusiveLock" in self.relation_modes
+        )
+
+
+async def row_wait(pid: int) -> RowWait | None:
+    """The row-lock wait of backend `pid` in this database, or None."""
+    from sqlalchemy import text as sql_text
+
+    from app.core.database import get_session_factory
+
+    async with get_session_factory()() as observer:
+        rows = (await observer.execute(sql_text(
+            "SELECT c.relname, t.mode, "
+            "array(SELECT r.mode FROM pg_locks r WHERE r.pid = a.pid "
+            "      AND r.locktype = 'relation' AND r.relation = t.relation) "
+            "FROM pg_stat_activity a "
+            "JOIN pg_locks t ON t.pid = a.pid AND t.locktype = 'tuple' "
+            "     AND t.granted "
+            "JOIN pg_class c ON c.oid = t.relation "
+            "WHERE a.pid = :pid AND a.wait_event_type = 'Lock' "
+            "AND a.datname = current_database()"
+        ), {"pid": pid})).all()
+    if not rows:
+        return None
+    (relation, mode, modes), = rows
+    return RowWait(relation, TUPLE_LOCK[mode], frozenset(modes))
+
+
+async def row_waiters(relation: str) -> list[tuple[int, RowWait]]:
+    """Every backend of this database waiting on a row of `relation`."""
+    from sqlalchemy import text as sql_text
+
+    from app.core.database import get_session_factory
+
+    async with get_session_factory()() as observer:
+        pids = (await observer.execute(sql_text(
+            "SELECT a.pid FROM pg_stat_activity a "
+            "JOIN pg_locks t ON t.pid = a.pid AND t.locktype = 'tuple' "
+            "     AND t.granted "
+            "WHERE a.wait_event_type = 'Lock' "
+            "AND a.datname = current_database() "
+            "AND t.relation = CAST(:rel AS regclass)"
+        ), {"rel": relation})).scalars().all()
+    found = []
+    for pid in pids:
+        wait = await row_wait(pid)
+        if wait is not None:
+            found.append((pid, wait))
+    return found
