@@ -31,7 +31,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder -- install all dependencies
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS builder
+FROM python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159 AS builder
 
 WORKDIR /build
 
@@ -68,7 +68,7 @@ RUN python -m venv /opt/venv && \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS runtime
+FROM python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159 AS runtime
 
 WORKDIR /app
 
