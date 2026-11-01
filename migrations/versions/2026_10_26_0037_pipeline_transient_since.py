@@ -42,6 +42,27 @@ fails until a migration follows it.
 
 DOWN removes everything up created and restores ck_notifications_pipeline_gate
 as 0015 defined it.
+
+NO PASS OVER THE TABLE UNDER ACCESS EXCLUSIVE (FIX TX-3). Each CHECK is
+added NOT VALID -- the catalog only, under ACCESS EXCLUSIVE for
+milliseconds -- and VALIDATEd afterwards, each in a transaction of its
+own (autocommit_block), under SHARE UPDATE EXCLUSIVE, which lets reads
+and writes go on: an `ADD CONSTRAINT ... CHECK` checked every row of a
+table that may hold hundreds of megabytes of heap for a few thousand
+live rows (velo-test: 588 MB, 11 138 rows), and stopped every query of
+it meanwhile. Between the ADD and the VALIDATE a new or updated row is
+checked at once; the old ones satisfy the CHECKs by construction (new
+columns NULL, the new gate wider than 0015's) -- VALIDATE confirms it.
+
+IDEMPOTENT UP TO THE BLOCK: autocommit_block commits what came before
+it, and alembic_version moves to 0037 only after upgrade() returns. A
+VALIDATE that fails (its lock_timeout, a lost connection) leaves the
+columns and the NOT VALID constraints committed at 0036; the next run
+of upgrade() -- comms-app's restart runs it -- goes through again
+(IF NOT EXISTS / DROP IF EXISTS) and validates. VALIDATE of a valid
+constraint is a no-op. DOWN is one transaction, its gate added with a
+full pass (downgrade() says why). The rules for every later migration:
+migrations/env.py's header, held by tests/test_migration_safety.py.
 """
 
 from collections.abc import Sequence
@@ -66,56 +87,86 @@ _GATE_0037 = (
 )
 
 
-def upgrade() -> None:
-    op.execute(
-        "ALTER TABLE notifications "
-        "ADD COLUMN pipeline_transient_since timestamptz, "
-        "ADD COLUMN pipeline_transient_step varchar(10), "
-        "ADD COLUMN pipeline_transient_error varchar(300)"
-    )
-    op.execute(
-        "ALTER TABLE notifications ADD CONSTRAINT "
-        "ck_notifications_transient_wait_whole CHECK ("
+_CHECKS = {
+    "ck_notifications_transient_wait_whole": (
         "(pipeline_transient_since IS NULL AND pipeline_transient_step IS NULL "
         "AND pipeline_transient_error IS NULL) OR ("
         "pipeline_transient_since IS NOT NULL "
         f"AND pipeline_transient_step IN ({_STEPS_SQL}) "
         "AND pipeline_transient_error IS NOT NULL "
-        "AND pipeline_transient_error <> ''))"
-    )
+        "AND pipeline_transient_error <> '')"
+    ),
+    "ck_notifications_transient_wait_gated": (
+        "pipeline_transient_since IS NULL OR pipeline_retry_at IS NOT NULL"
+    ),
+    "ck_notifications_transient_wait_open": (
+        f"pipeline_transient_since IS NULL OR status IN ({_ACTIVE_SQL})"
+    ),
+    "ck_notifications_pipeline_gate": _GATE_0037,
+}
+
+
+def _add_not_valid(name: str, definition: str) -> None:
+    """The catalog only: drop the constraint if a half-applied run left
+    it, add it NOT VALID -- no row is read."""
+    op.execute(f"ALTER TABLE notifications DROP CONSTRAINT IF EXISTS {name}")
     op.execute(
-        "ALTER TABLE notifications ADD CONSTRAINT "
-        "ck_notifications_transient_wait_gated CHECK ("
-        "pipeline_transient_since IS NULL OR pipeline_retry_at IS NOT NULL)"
+        f"ALTER TABLE notifications ADD CONSTRAINT {name} "
+        f"CHECK ({definition}) NOT VALID"
     )
+
+
+def _validate(*names: str) -> None:
+    """Each VALIDATE in a transaction of its own, under SHARE UPDATE
+    EXCLUSIVE -- reads and writes of notifications go on meanwhile."""
+    with op.get_context().autocommit_block():
+        for name in names:
+            op.execute(f"ALTER TABLE notifications VALIDATE CONSTRAINT {name}")
+
+
+def upgrade() -> None:
     op.execute(
-        "ALTER TABLE notifications ADD CONSTRAINT "
-        "ck_notifications_transient_wait_open CHECK ("
-        f"pipeline_transient_since IS NULL OR status IN ({_ACTIVE_SQL}))"
+        "ALTER TABLE notifications "
+        "ADD COLUMN IF NOT EXISTS pipeline_transient_since timestamptz, "
+        "ADD COLUMN IF NOT EXISTS pipeline_transient_step varchar(10), "
+        "ADD COLUMN IF NOT EXISTS pipeline_transient_error varchar(300)"
     )
-    op.execute(
-        "ALTER TABLE notifications DROP CONSTRAINT ck_notifications_pipeline_gate"
-    )
-    op.execute(
-        "ALTER TABLE notifications ADD CONSTRAINT "
-        f"ck_notifications_pipeline_gate CHECK ({_GATE_0037})"
-    )
+    for name, definition in _CHECKS.items():
+        _add_not_valid(name, definition)
+    _validate(*_CHECKS)
 
 
 def downgrade() -> None:
+    """ONE TRANSACTION, the stamp included (FIX TX-3) -- no
+    autocommit_block here: alembic moves alembic_version only after
+    downgrade() returns, so a block would commit the schema's undoing
+    while a later step of the same run could still roll the stamp back
+    -- the stamp AHEAD of the schema, which neither a second downgrade
+    (its columns gone) nor an upgrade (a no-op at "head") gets out of.
+    0015's gate therefore comes back with a plain ADD CONSTRAINT and its
+    full pass under ACCESS EXCLUSIVE: a downgrade on a box is a rare
+    manual act, where being right weighs more than being available."""
+    # A wait at zero attempts holds a gate 0015's CHECK refuses: the
+    # wait goes with its columns below, and its gate with it -- first,
+    # and in ONE statement with the wait's own fields, or 0037's CHECKs,
+    # still standing, would refuse a wait without its gate.
     op.execute(
-        "ALTER TABLE notifications DROP CONSTRAINT ck_notifications_pipeline_gate"
-    )
-    op.execute(
-        "ALTER TABLE notifications ADD CONSTRAINT "
-        f"ck_notifications_pipeline_gate CHECK ({_GATE_0015})"
+        "UPDATE notifications SET pipeline_retry_at = NULL, "
+        "pipeline_transient_since = NULL, pipeline_transient_step = NULL, "
+        "pipeline_transient_error = NULL "
+        "WHERE pipeline_attempts = 0 AND pipeline_transient_since IS NOT NULL"
     )
     for name in (
         "ck_notifications_transient_wait_open",
         "ck_notifications_transient_wait_gated",
         "ck_notifications_transient_wait_whole",
+        "ck_notifications_pipeline_gate",
     ):
         op.execute(f"ALTER TABLE notifications DROP CONSTRAINT {name}")
+    op.execute(
+        "ALTER TABLE notifications ADD CONSTRAINT "
+        f"ck_notifications_pipeline_gate CHECK ({_GATE_0015})"
+    )
     op.execute(
         "ALTER TABLE notifications "
         "DROP COLUMN pipeline_transient_error, "

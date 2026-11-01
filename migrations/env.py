@@ -7,6 +7,19 @@
 # autogenerate.
 #
 # RULE: add imports as modules are created.
+# RULES (FIX TX-3), held by tests/test_migration_safety.py for every
+# migration after 0036 -- different for the two directions, because
+# alembic moves alembic_version only after the step returns:
+#   upgrade():   no check of existing rows under a lock that stops writes --
+#     a CHECK or FOREIGN KEY on an existing table is added NOT VALID and
+#     VALIDATEd in an autocommit_block; SET NOT NULL only after such a
+#     validated CHECK (col IS NOT NULL). What precedes the block is
+#     committed before the stamp, so it is IDEMPOTENT (IF NOT EXISTS,
+#     DROP ... IF EXISTS first): a failure later leaves the stamp BEHIND the
+#     schema, and running upgrade again goes through.
+#   downgrade(): NO autocommit_block -- one transaction with the stamp. A
+#     partial commit there leaves the stamp AHEAD of the schema, and nothing
+#     gets out of that; a rare manual downgrade may take its full pass.
 # =============================================================================
 
 import asyncio
