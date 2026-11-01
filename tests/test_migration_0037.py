@@ -218,7 +218,13 @@ async def _bloat(rows: int) -> int:
             "'respect', 'normal' FROM generate_series(1, :rows) g"
         ), {"rows": rows, "every": _LIVE_EVERY})
         await auto.execute(text("DELETE FROM notifications WHERE status = 'sent'"))
-        await auto.execute(text("VACUUM notifications"))
+        # PARALLEL 0: notifications has six indexes, and a parallel
+        # VACUUM keeps its dead-row list in dynamic shared memory, sized
+        # by maintenance_work_mem (64 MB) -- in /dev/shm, which a Docker
+        # container (CI's postgres service) has at 64 MB: the segment did
+        # not fit (DiskFullError). Without workers the list lives in this
+        # backend's own memory; the heap is cleaned the same.
+        await auto.execute(text("VACUUM (PARALLEL 0) notifications"))
         await auto.execute(text("ALTER TABLE notifications RESET (autovacuum_enabled)"))
         pages = await auto.scalar(text(
             "SELECT pg_relation_size('notifications') / 8192"))
