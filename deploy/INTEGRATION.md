@@ -1075,6 +1075,13 @@ comms has not been told about yet is retried, the same lag
 
 ### Ordering the producer relies on
 
+**comms' own database down does not lose your event.** When it does not
+answer at all, comms waits -- without a limit, the delay growing to 30 s
+-- and processes the event once it is back. When it does answer and one
+event keeps meeting a transient failure, that event goes to the
+dead-letter stream after a short bounded series of retries, so the
+events behind it are not held.
+
 - `user_upserted` for a new user precedes `group_changed` for them; a
   momentary inversion is retried by comms with a bounded backoff, a
   persistent one ends in the dead-letter stream.

@@ -404,6 +404,21 @@ schema_exists() {
 # comms-consumer wait for comms-app healthy, that is migrated): its
 # service selection drops only the dependencies OUTSIDE the selection
 # (compose-go types/project.go WithSelectedServices).
+# Stop the three application containers, the reader of new work first
+# (FIX review 3.13.0) -- before anything touches the datastores. Absent
+# containers (a new box) are nothing to stop.
+stop_app() {
+    echo "Stopping comms-consumer, comms-worker, comms-app..."
+    $COMPOSE_CMD stop comms-consumer comms-worker comms-app || true
+}
+
+# Bring the stopped containers back as they were, after a failure that
+# came before their recreate -- the old code on the untouched data.
+start_old_app() {
+    echo "Starting the previous comms-app, comms-worker, comms-consumer again..."
+    $COMPOSE_CMD start comms-app comms-worker comms-consumer || true
+}
+
 recreate_app() {
     $COMPOSE_CMD up -d --force-recreate --no-deps comms-app comms-worker comms-consumer
 }
@@ -466,17 +481,25 @@ cmd_install() {
     # A box where comms already lives keeps its data: comms-app migrates
     # it on start, so it is dumped FIRST, as update does (TX-4). A new
     # box has no schema and nothing to dump.
+    # On a box where comms already runs, the same order as update
+    # (FIX review 3.13.0): the application stops before the datastores
+    # converge, and comes back as it was on a failure. On a new box
+    # there is nothing to stop and nothing to bring back.
+    stop_app
     if ! converge_datastores; then
+        start_old_app
         exit 1
     fi
     local existing
     if ! existing=$(schema_exists); then
         echo -e "${RED}✗ could not tell whether comms-postgres holds a schema -- nothing started${NC}"
+        start_old_app
         exit 1
     fi
     if [ "$existing" = "yes" ]; then
         if ! dump_db "$BACKUP_DIR/comms-preinstall-$(date -u +%Y%m%d-%H%M%S).sql"; then
-            echo -e "${RED}✗ no dump -- the existing database is not migrated, comms-app not started${NC}"
+            echo -e "${RED}✗ no dump -- the existing database is not migrated${NC}"
+            start_old_app
             exit 1
         fi
     fi
@@ -512,19 +535,28 @@ cmd_update() {
         exit 1
     fi
     check_overlay_dir
-    # THE ORDER (TX-4): the datastores converge first -- recreated only
-    # when their own definition changed, never forced -- then the
+    # THE ORDER (TX-4, FIX review 3.13.0): the three application
+    # containers STOP first -- the consumer, then the worker, then the
+    # app -- so nothing of comms runs while the datastores converge
+    # (recreated only when their own definition changed, never forced):
+    # events wait in the Redis stream, jobs in the database. Then the
     # database is dumped, and only then is comms-app recreated, which
     # re-runs `alembic upgrade head` in its command before serving: the
-    # migration IS the restart path, so no dump means no migration.
+    # migration IS the restart path, so no dump means no migration. A
+    # failure before the recreate brings the old containers back.
+    # comms' API is down from the stop to comms-app healthy: the
+    # convergence, the dump and the migration.
+    stop_app
     if ! converge_datastores; then
-        echo -e "${RED}✗ update aborted -- application containers left as they were${NC}"
+        echo -e "${RED}✗ update aborted${NC}"
+        start_old_app
         exit 1
     fi
     local dump
     dump="$BACKUP_DIR/comms-preupdate-$(date -u +%Y%m%d-%H%M%S).sql"
     if ! dump_db "$dump"; then
-        echo -e "${RED}✗ no dump -- no migration; application containers left as they were${NC}"
+        echo -e "${RED}✗ no dump -- no migration${NC}"
+        start_old_app
         exit 1
     fi
     # The three app containers are recreated ALWAYS, by name. Whether

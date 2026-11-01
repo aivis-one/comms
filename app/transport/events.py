@@ -47,6 +47,7 @@
 import json
 import math
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -454,32 +455,40 @@ def _storable(text: str) -> bool:
     return True
 
 
-def _first_defect(data: dict[str, Any]) -> tuple[str, str] | None:
-    """The first thing in the data that comms cannot take, as (kind, the
-    top-level field) -- kind "name", "string", "number" or "depth" -- or
-    None. Iterative: a stack, never a recursion."""
+def _defects(data: dict[str, Any]) -> Iterator[tuple[str, str]]:
+    """Every thing in the data that comms cannot take, as (kind, the
+    top-level field) -- kind "name", "string", "number" or "depth" -- in
+    order. Iterative: a stack, never a recursion. ONE walk, for the
+    parse (the first defect, _first_defect) and the dead letter (every
+    defect, event_data_or_none)."""
     for name, value in data.items():
         if not _storable(name):
-            return "name", name
+            yield "name", name
+            continue
         stack: list[tuple[Any, int]] = [(value, 2)]
         while stack:
             item, depth = stack.pop()
             if item is _NOT_STORABLE:
-                return "number", name
-            if isinstance(item, str):
+                yield "number", name
+            elif isinstance(item, str):
                 if not _storable(item):
-                    return "string", name
+                    yield "string", name
             elif isinstance(item, dict | list):
                 if depth > MAX_JSON_DEPTH:
-                    return "depth", name
+                    yield "depth", name
+                    continue
                 if isinstance(item, dict):
                     for key, child in item.items():
                         if not _storable(key):
-                            return "string", name
+                            yield "string", name
                         stack.append((child, depth + 1))
                 else:
                     stack.extend((child, depth + 1) for child in item)
-    return None
+
+
+def _first_defect(data: dict[str, Any]) -> tuple[str, str] | None:
+    """The first defect of the data (_defects), or None."""
+    return next(_defects(data), None)
 
 
 def check_event_data(data: dict[str, Any], event: str) -> None:
@@ -512,8 +521,11 @@ def event_data_or_none(raw: bytes) -> dict[str, Any] | None:
         data = load_event_data(raw.decode("utf-8"), "dead letter")
     except (UnicodeDecodeError, ValidationError):
         return None
-    defect = _first_defect(data)
-    if defect is not None and defect[0] in ("number", "depth"):
+    # EVERY defect, not the first (FIX review 3.13.0): a key with a NUL
+    # came first in the review's entry, and the NaN mark behind it went
+    # on into json.dumps -- a TypeError out of the dead letter's own
+    # writing, and the consumer down.
+    if any(kind in ("number", "depth") for kind, _ in _defects(data)):
         return None
     return data
 

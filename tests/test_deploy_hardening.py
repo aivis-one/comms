@@ -107,6 +107,7 @@ sleep() { :; }
 _FUNCTIONS = (
     "health_wait_seconds", "wait_healthy", "wait_for_app",
     "converge_datastores", "dump_db", "schema_exists", "recreate_app",
+    "stop_app", "start_old_app",
     "cmd_update", "cmd_install", "cmd_db", "cmd_restart",
 )
 
