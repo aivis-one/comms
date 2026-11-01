@@ -180,6 +180,10 @@ from app.core.lanes import Lane
 # ceiling is left stuck, visible and no longer taken. And TX-4: update and
 # install dump a live database before migrating; db restore is honest;
 # dumps are 600; comms-postgres leaves the shared network; CI is pinned.
+# And the review's fixes: the consumer never goes down on a dead letter
+# (the entry stays pending), waits for its database while it does not
+# answer, and dead-letters an event only when the database answers;
+# update stops comms before the datastores; a hanging test is red.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
 APP_VERSION = "3.13.0"
 
