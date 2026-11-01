@@ -684,7 +684,12 @@ class TestAHangIsRed:
         test.write_text(body)
         started = time.monotonic()
         done = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            # No flag on the cache plugin (G3 forbids switching it off,
+            # FIX review 3.13.0, the third): the subprocess's rootdir is
+            # tmp_path -- the checkout's pyproject.toml is no ancestor of
+            # it -- so its cache lands in tmp_path/.pytest_cache, asserted
+            # below, and nothing is written into the checkout.
+            [sys.executable, "-m", "pytest", "-q",
              "-o", "asyncio_mode=auto", "--timeout=2",
              "-o", "timeout_method=signal", str(test)],
             cwd=tmp_path, capture_output=True, text=True, timeout=120,
@@ -693,5 +698,7 @@ class TestAHangIsRed:
         if red:
             assert done.returncode != 0
             assert "Timeout" in done.stdout
+            # the subprocess's cache: in the test's own temporary directory
+            assert (tmp_path / ".pytest_cache" / "v" / "cache" / "lastfailed").is_file()
         else:
             assert done.returncode == 0, done.stdout
