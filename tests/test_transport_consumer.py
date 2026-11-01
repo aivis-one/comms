@@ -16,8 +16,12 @@
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -467,14 +471,28 @@ class TestPoisonPill:
 
 
 class TestEntrypoint:
-    def test_consumer_refuses_to_start_without_redis_url(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        import app.consumer as entrypoint
+    def test_consumer_refuses_to_start_without_redis_url(self) -> None:
+        """python -m app.consumer without REDIS_URL refuses to start --
+        in a process of its own.
 
-        monkeypatch.setattr(settings, "redis_url", "")
-        with pytest.raises(RuntimeError, match="REDIS_URL"):
-            entrypoint.main()
+        Was entrypoint.main() in this process, with settings.redis_url
+        emptied: right as a check, and safe only because main() refuses
+        BEFORE its asyncio.run -- which would take the session's event
+        loop of the suite with it (FIX ST-1 #0) -- while its
+        setup_logging() and set_process_role() reconfigured the suite's
+        own process. tests/test_event_loop_guard.py now refuses any test
+        that calls an entry point with asyncio.run in this process."""
+        done = subprocess.run(
+            [sys.executable, "-m", "app.consumer"],
+            cwd=Path(__file__).resolve().parents[1],
+            env=dict(os.environ, REDIS_URL=""),
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        output = done.stdout + done.stderr
+        assert done.returncode != 0
+        # Through the process's own excepthook (app/core/logging.py).
+        assert "RuntimeError: REDIS_URL is required to run the consumer" in output
+        assert '"event": "unhandled_exception"' in output
 
 
 class TestReminderCancel:
