@@ -93,7 +93,7 @@ from app.core.channels import (
     evaluate_channels,
 )
 from app.core.config import Settings, settings
-from app.core.sanitize import sanitize_error, sanitize_text, sanitized_traceback
+from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine.constants import DeliveryChannel
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.template_engine import render, resolve_flag
@@ -575,13 +575,13 @@ class TelegramFormatter:
             # disguised as weather.
             if isinstance(exc, TelegramUnauthorizedError):
                 raise ConfigurationError(
-                    f"Telegram rejected the bot token: {exc}"
+                    f"Telegram rejected the bot token: {exception_text(exc)}"
                 ) from exc
             error_msg = str(exc).lower()
             for perm_error in _PERMANENT_ERRORS:
                 if perm_error in error_msg:
                     raise MessageRejectedError(
-                        f"Telegram permanent failure: {exc}"
+                        f"Telegram permanent failure: {exception_text(exc)}"
                     ) from exc
             # Transient error -- service layer retries.
             raise
@@ -750,7 +750,7 @@ class EmailFormatter:
                 delivery_id=str(delivery.id),
                 recipient_id=str(delivery.recipient_id),
                 sent_unknown=_request_may_have_arrived(exc),
-                error=sanitize_error(exc),
+                error=exception_text(exc),
             )
             raise
 
@@ -1339,12 +1339,13 @@ class LLMFormatter:
             logger.warning(
                 "llm_body_download_failed",
                 outcome="refused",
-                detail=str(exc),
+                detail=exception_text(exc),
             )
             raise
         except LLMTransientError as exc:
             logger.warning(
-                "llm_body_download_failed", outcome="transient", detail=str(exc),
+                "llm_body_download_failed", outcome="transient",
+                detail=exception_text(exc),
             )
             raise
         except Exception as exc:

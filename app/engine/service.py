@@ -79,7 +79,7 @@ from app.core.constants import MAX_LLM_LETTER_CHARS
 from app.core.database import is_unique_violation_of
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.lanes import Lane
-from app.core.sanitize import sanitize_text, sanitized_traceback
+from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
     ACTIVE_STATUSES,
@@ -974,11 +974,18 @@ async def resolve_notification(
     # A job for people has its address (ck_notifications_letter_by_kind).
     assert notification.target_type is not None
     assert notification.target_value is not None
-    recipient_ids = await resolve_targets(
-        session,
-        notification.target_type,
-        notification.target_value,
-    )
+    # The job's id and its key go with every line the resolver writes
+    # (DB-1): the target's value never does, and by these two the product
+    # finds the job on its side.
+    with structlog.contextvars.bound_contextvars(
+        notification_id=str(notification.id),
+        idempotency_key=notification.idempotency_key,
+    ):
+        recipient_ids = await resolve_targets(
+            session,
+            notification.target_type,
+            notification.target_value,
+        )
 
     if not recipient_ids:
         # Nobody to deliver to: the product's sync, not comms, is what
@@ -1662,7 +1669,7 @@ async def _deliver_single(
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
                 failure_class=failure_class.value,
-                error=sanitize_text(str(exc))[:200],
+                error=exception_text(exc)[:200],
             )
             answer = journal.answer_of(exc, failure_class)
             outcome = _DeliveryOutcome(

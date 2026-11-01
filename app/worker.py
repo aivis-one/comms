@@ -74,9 +74,8 @@ from app.core.config import settings
 from app.core.database import ProcessRole, dispose_engine, set_process_role
 from app.core.lanes import Lane
 from app.core.logging import setup_logging
-from app.core.sanitize import sanitized_traceback
+from app.core.sanitize import pipeline_error_of, sanitized_traceback
 from app.engine.formatters import close_formatters, init_formatters
-from app.engine.journal import pipeline_error_of
 from app.engine.processor import (
     LaneJobs,
     cleanup_terminal_notifications,

@@ -75,6 +75,25 @@ def sanitize_event(
     return event_dict
 
 
+def format_exc_info_by_the_rule(
+    _logger: Any, _method: str, event_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """structlog's format_exc_info, with the traceback rendered by
+    sanitized_traceback (DB-1): exc_info=True, an exception or a tuple."""
+    exc_info = event_dict.pop("exc_info", None)
+    if not exc_info:
+        return event_dict
+    if isinstance(exc_info, BaseException):
+        exc: BaseException | None = exc_info
+    elif isinstance(exc_info, tuple):
+        exc = exc_info[1]
+    else:
+        exc = sys.exc_info()[1]
+    if exc is not None:
+        event_dict["exception"] = sanitized_traceback(exc)
+    return event_dict
+
+
 def processors(renderer: Any) -> list[Any]:
     """The structlog chain: the traceback rendered, then every string
     sanitized, then the line rendered."""
@@ -83,7 +102,9 @@ def processors(renderer: Any) -> list[Any]:
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
+        # DB-1: an exc_info from ANY logger renders by the one rule
+        # (sanitized_traceback) -- never format_exc_info's raw chain.
+        format_exc_info_by_the_rule,
         sanitize_event,
         renderer,
     ]
@@ -100,6 +121,11 @@ class SanitizingFormatter(logging.Formatter):
         self.inner = inner or logging.Formatter("%(message)s")
 
     def format(self, record: logging.LogRecord) -> str:
+        # DB-1: a library's traceback (uvicorn, SQLAlchemy's pool) renders
+        # by the one rule -- a database error's text replaced by its
+        # summary -- before the line is sanitized.
+        if record.exc_info and record.exc_info[1] is not None:
+            record.exc_text = sanitized_traceback(record.exc_info[1])
         return sanitize_text(self.inner.format(record))
 
 

@@ -153,6 +153,8 @@ def get_engine() -> AsyncEngine:
         pool = POOLS[_role]
         _engine = create_async_engine(
             settings.database_url,
+            # DB-1: no bound value in an error's text ([parameters]).
+            hide_parameters=True,
             echo=False,
             pool_size=pool.size,
             max_overflow=pool.overflow,

@@ -12,6 +12,8 @@
 
 import re
 import traceback
+from pathlib import Path
+from typing import Any
 
 # Secret-redaction patterns (review 1.1, widened in F0-comms item 2).
 #
@@ -107,28 +109,153 @@ def sanitize_text(text: str) -> str:
     return _KEYVAL_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
 
 
-def sanitize_error(exc: Exception) -> str:
-    """An exception's text with secrets removed, cut to the record size."""
+_APP_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = _APP_ROOT.parent
+# notifications.pipeline_error and notification_transitions.error are
+# varchar(300) (migrations 0015, 0017).
+_PIPELINE_ERROR_MAX = 300
+
+
+def pipeline_error_of(exc: BaseException) -> str:
+    """The CLASS of an exception -- comms' own or a library's -- and the
+    PLACE in comms nearest to where it was raised: the deepest frame of
+    app/ on its traceback (module:line).
+
+    NEVER the exception's text, sanitized or not. Sanitizing removes
+    secrets, not content: a text raised from a template or a formatter
+    can carry the letter's variables, a database error's text is its
+    SQL and bound parameters, and a record of comms holds no letter
+    content (spec §6.4) -- nor does a dead letter
+    (app/transport/consumer.py). The class and the place say where it
+    tore; the redacted traceback in the log says the rest. Lives here,
+    in app/core, since DB-1: the rule for a database error's text in a
+    log (db_error_summary) is built on it, and core imports no engine.
+    """
+    name = f"{type(exc).__module__}.{type(exc).__qualname__}"
+    frames = traceback.extract_tb(exc.__traceback__)
+    place = "no traceback"
+    for frame in reversed(frames):
+        path = Path(frame.filename).resolve()
+        if path.is_relative_to(_APP_ROOT):
+            place = f"{path.relative_to(_REPO_ROOT).as_posix()}:{frame.lineno}"
+            break
+    else:
+        if frames:
+            place = f"{Path(frames[-1].filename).name}:{frames[-1].lineno}"
+    return f"{name} at {place}"[:_PIPELINE_ERROR_MAX]
+
+
+
+
+# =============================================================================
+# A DATABASE ERROR'S TEXT NEVER REACHES A LOG (DB-1)
+# =============================================================================
+# The owner's decision of 1 November 2026 (spec §16.3): a database error
+# in a log is its CLASS, its PLACE, its SQLSTATE and the NAME of the
+# constraint -- never its text. Measured on real errors: the text of every
+# link of the chain -- SQLAlchemy's error, the driver adapter's, asyncpg's
+# own -- carries the server's DETAIL ("Key (id)=(...) already exists",
+# "Failing row contains (...)": a whole row, a letter in it), and an error
+# like 22P02 carries the value in its message itself; hide_parameters on
+# the engine removes SQLAlchemy's [parameters] alone. So the text goes,
+# link by link; the frames stay. ONE recognition (_is_database_error), for
+# the traceback (sanitized_traceback), the one line (exception_text) and
+# the logging pipeline (app/core/logging.py).
+
+
+def _database_classes() -> tuple[type[BaseException], ...]:
+    """The classes whose text is the database's or the driver's: SQLAlchemy's
+    StatementError (DBAPIError's base; it carries [SQL] and [parameters]
+    without a driver too), the asyncpg adapter's errors, asyncpg's own --
+    the server's (PostgresError) and the client's (InterfaceError, its
+    DataError for a parameter of the wrong type quoting the value)."""
+    from asyncpg.exceptions import InterfaceError, PostgresError
+    from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
+    from sqlalchemy.exc import StatementError
+
+    return (StatementError, AsyncAdapt_asyncpg_dbapi.Error, PostgresError,
+            InterfaceError)
+
+
+def _is_database_error(exc: BaseException) -> bool:
+    return isinstance(exc, _database_classes())
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """exc and what it wraps: SQLAlchemy's .orig, then __cause__ /
+    __context__, without loops."""
+    seen: list[BaseException] = []
+    link: BaseException | None = exc
+    while link is not None and all(link is not s for s in seen):
+        seen.append(link)
+        orig = getattr(link, "orig", None)
+        link = orig if isinstance(orig, BaseException) else (
+            link.__cause__ or link.__context__)
+    return seen
+
+
+def db_error_summary(exc: BaseException) -> str | None:
+    """A database error as a log may hold it: "<class> at <place>",
+    SQLSTATE and the constraint's name when the chain has them -- or None
+    for an exception that is not the database's."""
+    if not _is_database_error(exc):
+        return None
+    sqlstate = constraint = None
+    for link in _chain(exc):
+        sqlstate = sqlstate or getattr(link, "sqlstate", None) or getattr(
+            link, "pgcode", None)
+        constraint = constraint or getattr(link, "constraint_name", None)
+    summary = pipeline_error_of(exc)
+    if sqlstate:
+        summary += f", SQLSTATE {sqlstate}"
+    if constraint:
+        summary += f", constraint {constraint}"
+    return summary
+
+
+def exception_text(exc: BaseException) -> str:
+    """ONE line for an exception in a log or a record: a database error's
+    summary (db_error_summary), any other exception's text, sanitized --
+    comms' own words (a ValidationError, a provider's answer) stay."""
+    summary = db_error_summary(exc)
+    if summary is not None:
+        return summary
     return sanitize_text(str(exc))[:2000]
 
 
 def sanitized_traceback(exc: BaseException) -> str:
-    """The traceback structlog's format_exc_info would render, redacted.
+    """The traceback structlog's format_exc_info would render: the frames
+    whole, the text of every link that is a database error replaced by its
+    summary (DB-1), the rest redacted as ONE text.
 
-    For a log line that must keep the stack but cannot let the renderer
-    print it raw: log it as `exception=sanitized_traceback(exc)` instead
-    of logger.exception(). The key and the text are what format_exc_info
-    produces, so the record keeps its shape.
-
-    Redacted as ONE text, never cut: traceback.format_exception prints
-    str() of every exception in the chain (__cause__, __context__), the
-    notes and the members of an exception group, and a secret can sit in
-    any of them -- the aiogram network error carries the bot's URL both
-    in its own text and in its __cause__. Frame locals are not printed
-    by this formatter, so they are not a path. What the patterns cannot
-    recognise is the KNOWN CEILING on _LONG_HEX_RE; this is another
-    caller of sanitize_text, not another sanitizer.
-    """
-    rendered = "".join(traceback.format_exception(exc))
-    # format_exc_info drops the one trailing newline; so does this.
+    Every place that logs an exception logs it as
+    `exception=sanitized_traceback(exc)` -- never logger.exception() or
+    exc_info, which would print the chain raw -- and the logging pipeline
+    renders an exc_info it meets the same way (app/core/logging.py)."""
+    rendered_exc = traceback.TracebackException.from_exception(exc)
+    _replace_database_texts(rendered_exc, exc, set())
+    rendered = "".join(rendered_exc.format())
     return sanitize_text(rendered.removesuffix("\n"))
+
+
+def _replace_database_texts(
+    rendered: Any, exc: BaseException | None, seen: set[int],
+) -> None:
+    """Walk the rendering and the exception chain together; a database
+    link's printed text becomes its summary."""
+    while rendered is not None and exc is not None and id(rendered) not in seen:
+        seen.add(id(rendered))
+        summary = db_error_summary(exc)
+        if summary is not None:
+            rendered._str = summary
+        for inner, inner_exc in zip(
+            getattr(rendered, "exceptions", None) or [],
+            getattr(exc, "exceptions", None) or [], strict=False,
+        ):
+            _replace_database_texts(inner, inner_exc, seen)
+        if rendered.__cause__ is not None:
+            rendered, exc = rendered.__cause__, exc.__cause__
+        elif rendered.__context__ is not None:
+            rendered, exc = rendered.__context__, exc.__context__
+        else:
+            rendered = None

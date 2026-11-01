@@ -39,7 +39,7 @@ from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import Settings
-from app.core.sanitize import sanitize_error, sanitize_text, sanitized_traceback
+from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine.constants import DeliveryChannel, FailureClass
 from app.engine.formatters import (
     ChannelRegistry,
@@ -558,26 +558,26 @@ class TestSanitizeError:
     """Review 1.1: sanitizer covers DSNs, key=value and bearer shapes."""
 
     def test_dsn_userinfo_redacted(self) -> None:
-        msg = sanitize_error(
+        msg = exception_text(
             Exception("connect postgresql+asyncpg://comms:s3cret@db/comms")
         )
         assert "s3cret" not in msg
         assert "://comms:[redacted]@db/comms" in msg
 
     def test_key_value_redacted(self) -> None:
-        msg = sanitize_error(Exception("failed: token=abc123 rest"))
+        msg = exception_text(Exception("failed: token=abc123 rest"))
         assert "abc123" not in msg
         assert "token=[redacted]" in msg
 
     def test_bearer_before_keyword_redacted(self) -> None:
         """Secret precedes the keyword -- the Phase 1 gap (review §4)."""
-        msg = sanitize_error(
+        msg = exception_text(
             Exception("invalid Authorization: Bearer eyJhbGci.payload x")
         )
         assert "eyJhbGci" not in msg
 
     def test_plain_message_untouched(self) -> None:
-        assert sanitize_error(Exception("plain failure")) == "plain failure"
+        assert exception_text(Exception("plain failure")) == "plain failure"
 
 
 
@@ -750,11 +750,12 @@ class TestSanitizeForms:
         assert sanitize_text("") == ""
 
     def test_the_record_cut_never_splits_a_secret(self) -> None:
-        """sanitize_error cuts at 2000 AFTER redacting: a secret that
+        """exception_text (sanitize_error until DB-1, which folded it into the
+        one rule for an exception's text) cuts at 2000 AFTER redacting: a secret that
         straddles the cut would otherwise leave its prefix behind,
         which no pattern recognises once the @ is gone."""
         text = "x" * 1985 + f" redis://:{_REDIS_PASS}@comms-redis:6379/0"
-        cleaned = sanitize_error(Exception(text))
+        cleaned = exception_text(Exception(text))
         assert len(cleaned) == 2000
         assert _REDIS_PASS[:8] not in cleaned
 

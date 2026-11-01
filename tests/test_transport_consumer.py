@@ -744,12 +744,20 @@ class TestConsumerRedactsItsFailures:
     ) -> None:
         """The pair of the OperationalError rows, on a REAL failure: a
         40001 from Postgres whose bound parameter carries the secret.
-        Retried (TX-1), each retry line redacted and naming the failure;
-        then the dead letter, "retries exhausted", class and place."""
+        Retried (TX-1), each retry line naming the failure without it;
+        then the dead letter, "retries exhausted", class and place.
+
+        Until DB-1 the secret stood in the error's text ([parameters]) and
+        the retry line carried that text redacted -- the SQL in it named the
+        failure, and this asserted both. DB-1 hides the parameters on the
+        engine and writes a database error into a log as its summary: the
+        line names the failure by class, place and SQLSTATE, and holds
+        neither the secret nor the SQL."""
         real = await real_serialization_failure(
             label=f"redis://:{_REDIS_PASS}@comms-redis:6379/0",
         )
-        assert _REDIS_PASS in str(real)  # the secret IS in its text
+        assert _REDIS_PASS not in str(real)  # hidden on the engine (DB-1)
+        assert "[SQL parameters hidden" in str(real)
 
         async def failing(*_args: Any, **_kwargs: Any) -> Any:
             raise real
@@ -768,7 +776,9 @@ class TestConsumerRedactsItsFailures:
         assert len(retries) == 4
         for entry in retries:
             assert _REDIS_PASS not in entry["error"]
-            assert "UPDATE sections" in entry["error"]
+            assert "UPDATE sections" not in entry["error"]
+            assert entry["error"].startswith("sqlalchemy.exc.DBAPIError at ")
+            assert "SQLSTATE 40001" in entry["error"]
         entries = await redis.xrange(settings.dlq_stream)
         fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
         assert fields["_dlq_error"].startswith(
@@ -787,7 +797,9 @@ class TestConsumerRedactsItsFailures:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The same secret on every attempt: each of the four retry
-        lines is redacted, and each still names the failure."""
+        lines is without it, and each still names the failure -- by its
+        summary since DB-1 (until then by its redacted text, the SQL
+        included)."""
         async def failing(*_args: Any, **_kwargs: Any) -> Any:
             raise _operational_error()
 
@@ -805,5 +817,6 @@ class TestConsumerRedactsItsFailures:
         assert len(retries) == 4
         for entry in retries:
             assert _REDIS_PASS not in entry["error"]
-            assert "INSERT INTO recipients" in entry["error"]
+            assert "INSERT INTO recipients" not in entry["error"]
+            assert entry["error"].startswith("sqlalchemy.exc.OperationalError at ")
 

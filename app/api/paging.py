@@ -43,6 +43,7 @@ from uuid import UUID
 
 from app.core.constants import PAGE_LIMIT_DEFAULT, PAGE_LIMIT_MAX
 from app.core.exceptions import ValidationError
+from app.core.sanitize import exception_text
 
 __all__ = [
     "PAGE_LIMIT_DEFAULT",
@@ -88,7 +89,7 @@ def decode_cursor(value: str | None) -> tuple[datetime, UUID] | None:
             raise ValueError("missing separator")
         return datetime.fromisoformat(when_text), UUID(id_text)
     except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed cursor: {exc}") from exc
+        raise ValidationError(f"Malformed cursor: {exception_text(exc)}") from exc
 
 
 def page[T](
@@ -122,7 +123,7 @@ def decode_seq_cursor(value: str | None) -> int | None:
             raise ValueError("not a non-negative integer")
         return int(digits)
     except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed cursor: {exc}") from exc
+        raise ValidationError(f"Malformed cursor: {exception_text(exc)}") from exc
 
 
 def page_by_seq[T](
@@ -183,4 +184,4 @@ def decode_changes_cursor(value: str | None) -> ChangesCursor | None:
             raise ValueError("the read time carries no zone")
         return ChangesCursor(int(xact_text), int(ident_text), read_at)
     except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed cursor: {exc}") from exc
+        raise ValidationError(f"Malformed cursor: {exception_text(exc)}") from exc

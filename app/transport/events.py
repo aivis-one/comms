@@ -74,6 +74,7 @@ from app.core.constants import (
     MIN_TELEGRAM_ID,
 )
 from app.core.exceptions import ValidationError
+from app.core.sanitize import exception_text
 from app.engine.constants import TargetType
 from app.engine.service import stream_fingerprint
 from app.messaging.constants import MAX_SECTION_KEY_LEN, MAX_SECTION_LABEL_LEN
@@ -433,7 +434,9 @@ def load_event_data(text: str, event: str) -> dict[str, Any]:
             parse_int=_int_or_mark,
         )
     except json.JSONDecodeError as exc:
-        raise ValidationError(f"{event}: data is not valid JSON: {exc}") from exc
+        raise ValidationError(
+            f"{event}: data is not valid JSON: {exception_text(exc)}"
+        ) from exc
     except RecursionError as exc:
         raise ValidationError(
             f"{event}: data is nested deeper than {MAX_JSON_DEPTH} levels"
@@ -1008,7 +1011,7 @@ def _parse_notification_intake(
         return RejectedNotificationRequest(
             idempotency_key=idempotency_key,
             fingerprint=fingerprint,
-            reason=str(exc),
+            reason=exception_text(exc),
         )
 
 

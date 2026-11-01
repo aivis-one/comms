@@ -186,8 +186,15 @@ _REFUSALS = {
 # caught exception, its status, its reason), counts and limits, and the
 # deploy's own facts. A name of the letter -- an action, its parameters,
 # the startapp built from them, a variable -- is none of these.
-_ALLOWED_NAMES = {"exc", "status", "reason", "retry_after", "_STARTAPP_MAX_LEN"}
-_ALLOWED_CALLS = {"len", "_reason_tail", "_clean_reason", "_address_defect", "float"}
+# A caught exception enters a refusal only through the one rule for an
+# exception's text, exception_text (DB-1) -- no longer as a bare `exc`:
+# that was right while every exception there was a provider's; the rule
+# now holds whatever it is.
+_ALLOWED_NAMES = {"status", "reason", "retry_after", "_STARTAPP_MAX_LEN"}
+_ALLOWED_CALLS = {
+    "len", "_reason_tail", "_clean_reason", "_address_defect", "float",
+    "exception_text",
+}
 _ALLOWED_ATTRIBUTES = {"self._channel", "self._reason"}
 
 

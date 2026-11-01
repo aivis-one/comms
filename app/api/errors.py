@@ -64,8 +64,7 @@ from app.core.exceptions import (
     ValidationError,
     conflict_class,
 )
-from app.core.sanitize import sanitized_traceback
-from app.engine.journal import pipeline_error_of
+from app.core.sanitize import pipeline_error_of, sanitized_traceback
 
 logger = structlog.get_logger()
 

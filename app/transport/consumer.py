@@ -105,8 +105,12 @@ from app.core.exceptions import (
     ValidationError,
     conflict_class,
 )
-from app.core.sanitize import sanitize_text, sanitized_traceback
-from app.engine.journal import pipeline_error_of
+from app.core.sanitize import (
+    exception_text,
+    pipeline_error_of,
+    sanitize_text,
+    sanitized_traceback,
+)
 from app.engine.service import stream_fingerprint
 from app.transport.connection import redis_client
 from app.transport.events import (
@@ -337,7 +341,7 @@ class StreamConsumer:
             event = parse_event(fields)
         except ValidationError as exc:
             await self._dead_letter_or_hold(
-                entry_id, fields, reason=str(exc), attempts=0,
+                entry_id, fields, reason=exception_text(exc), attempts=0,
             )
             return
         except Exception as exc:
@@ -373,13 +377,13 @@ class StreamConsumer:
                     entry_id=_id_str(entry_id),
                     event_type=type(event).__name__,
                     refusal_class=conflict_class(exc),
-                    reason=sanitize_text(str(exc)),
+                    reason=exception_text(exc),
                 )
                 await self._ack_or_hold(entry_id)
                 return
             except ValidationError as exc:
                 await self._dead_letter_or_hold(
-                    entry_id, fields, reason=str(exc), attempts=attempt,
+                    entry_id, fields, reason=exception_text(exc), attempts=attempt,
                 )
                 return
             except Exception as exc:
@@ -420,7 +424,7 @@ class StreamConsumer:
                         "event_retries_exhausted",
                         entry_id=_id_str(entry_id),
                         attempts=attempt,
-                        error=sanitize_text(str(exc)),
+                        error=exception_text(exc),
                     )
                     # The class and the place, never the text: a database
                     # error's text is its SQL and bound parameters -- the
@@ -438,7 +442,7 @@ class StreamConsumer:
                     entry_id=_id_str(entry_id),
                     attempt=attempt,
                     delay=delay,
-                    error=sanitize_text(str(exc)),
+                    error=exception_text(exc),
                 )
                 await asyncio.sleep(delay)
                 continue

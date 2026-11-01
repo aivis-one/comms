@@ -482,7 +482,12 @@ class TestEveryPath:
         letter: retried, then dead-lettered -- the class and the place,
         never the letter."""
         real = await real_serialization_failure(label=f"title {_S}")
-        assert _S in str(real)
+        # Until DB-1 the letter stood in the error's text ([parameters]) and
+        # this instrument asserted it there; the engine now hides bound
+        # parameters, and what remains to hold is that nothing of it
+        # reaches the dead letter or the log either way.
+        assert _S not in str(real)
+        assert "[SQL parameters hidden" in str(real)
 
         async def failing(*_args: Any, **_kwargs: Any) -> Any:
             raise real

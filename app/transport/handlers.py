@@ -56,6 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience import sync
 from app.core.exceptions import ValidationError
+from app.core.sanitize import exception_text
 from app.engine.constants import IntakeOutcomeClass
 from app.engine.reminders import cancel_reminders
 from app.engine.service import (
@@ -197,7 +198,7 @@ async def _handle_notification_request(
         # The request cannot be accepted (undeclared type, an expiry
         # already passed, ...): the product's responsibility, recorded.
         return await _reject(
-            session, event.idempotency_key, event.fingerprint, str(exc),
+            session, event.idempotency_key, event.fingerprint, exception_text(exc),
         )
 
     notification = acceptance.notification

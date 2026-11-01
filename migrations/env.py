@@ -117,6 +117,8 @@ async def run_async_migrations() -> None:
     # connect), not in a transaction it could leave with.
     connectable = create_async_engine(
         settings.database_url,
+        # DB-1: no bound value in an error's text ([parameters]).
+        hide_parameters=True,
         connect_args={"server_settings": {"lock_timeout": "10s"}},
     )
 

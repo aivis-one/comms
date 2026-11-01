@@ -42,7 +42,6 @@
 # job's outcome that follows is its own row.
 # =============================================================================
 
-import traceback
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,7 +54,7 @@ from sqlalchemy import func, inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory
-from app.core.sanitize import sanitize_error, sanitized_traceback
+from app.core.sanitize import exception_text, pipeline_error_of, sanitized_traceback
 from app.engine.constants import (
     ChannelAnswer,
     DeliveryStatus,
@@ -97,37 +96,12 @@ _PIPELINE_ERROR_MAX = 300
 _PROVIDER_MODULE_ROOTS = frozenset({"aiogram", "httpx", "httpcore"})
 
 
-def pipeline_error_of(exc: BaseException) -> str:
-    """The CLASS of an exception -- comms' own or a library's -- and the
-    PLACE in comms nearest to where it was raised: the deepest frame of
-    app/ on its traceback (module:line).
-
-    NEVER the exception's text, sanitized or not. Sanitizing removes
-    secrets, not content: a text raised from a template or a formatter
-    can carry the letter's variables, a database error's text is its
-    SQL and bound parameters, and a record of comms holds no letter
-    content (spec §6.4) -- nor does a dead letter
-    (app/transport/consumer.py). The class and the place say where it
-    tore; the redacted traceback in the log says the rest.
-    """
-    name = f"{type(exc).__module__}.{type(exc).__qualname__}"
-    frames = traceback.extract_tb(exc.__traceback__)
-    place = "no traceback"
-    for frame in reversed(frames):
-        path = Path(frame.filename).resolve()
-        if path.is_relative_to(_APP_ROOT):
-            place = f"{path.relative_to(_REPO_ROOT).as_posix()}:{frame.lineno}"
-            break
-    else:
-        if frames:
-            place = f"{Path(frames[-1].filename).name}:{frames[-1].lineno}"
-    return f"{name} at {place}"[:_PIPELINE_ERROR_MAX]
-
-
 def _provider_text(exc: Exception) -> str | None:
     """The provider's answer, sanitized BEFORE it is cut; None, never a
     blank string, when it says nothing."""
-    return sanitize_error(exc) or None
+    # exception_text (DB-1): a database error's summary, a provider's
+    # answer sanitized -- the one rule for an exception's text.
+    return exception_text(exc) or None
 
 
 # -----------------------------------------------------------------------------

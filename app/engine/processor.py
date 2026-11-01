@@ -111,7 +111,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_session_factory, is_transient_db_error
 from app.core.lanes import Lane
-from app.core.sanitize import sanitized_traceback
+from app.core.sanitize import pipeline_error_of, sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
     DeliveryStatus,
@@ -120,7 +120,6 @@ from app.engine.constants import (
     NotificationStatus,
     PipelineStep,
 )
-from app.engine.journal import pipeline_error_of
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.service import (
     LANE_CONCURRENCY,

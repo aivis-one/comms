@@ -47,7 +47,7 @@ _APP = _REPO / "app"
 _PASSWORD = "pw" + "SENTINEL" + "zq7"
 _DSN = f"postgresql+asyncpg://comms:{_PASSWORD}@db:5432/comms"
 _HEX = "ab" * 32  # 64 hex characters: a digest, a key, or a secret
-_FUNCTIONS = ("sanitize_text", "sanitize_error", "sanitized_traceback")
+_FUNCTIONS = ("sanitize_text", "exception_text", "sanitized_traceback")
 
 
 def _child(body: str) -> str:
@@ -238,7 +238,7 @@ class TestOneSanitizer:
                     importers[name] = node.module or ""
         assert sorted(definers) == [
             "app/core/sanitize.py:_LONG_HEX_RE",
-            "app/core/sanitize.py:sanitize_error",
+            "app/core/sanitize.py:exception_text",
             "app/core/sanitize.py:sanitize_text",
             "app/core/sanitize.py:sanitized_traceback",
         ]

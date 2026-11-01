@@ -206,6 +206,7 @@ from app.core.constants import (
 )
 from app.core.exceptions import ProfileError
 from app.core.lanes import Lane
+from app.core.sanitize import exception_text
 from app.profile.registry import (
     Decided,
     Layer,
@@ -468,9 +469,11 @@ class FileProfileSource:
                 finally:
                     loader.dispose()
         except yaml.YAMLError as exc:
-            raise ProfileError(f"Invalid YAML in {path}: {exc}") from exc
+            raise ProfileError(
+            f"Invalid YAML in {path}: {exception_text(exc)}"
+        ) from exc
         except OSError as exc:
-            raise ProfileError(f"Cannot read {path}: {exc}") from exc
+            raise ProfileError(f"Cannot read {path}: {exception_text(exc)}") from exc
         for key, line, first in loader.duplicates:
             violations.append(Violation(
                 where, "", f"line {line:06d}",
@@ -1399,13 +1402,15 @@ def _leaf_complaint(fname: str, template: Any) -> str | None:
         template.format_map(_ProbeDict())
     except AttributeError as exc:
         return (
-            f"uses attribute access on a template variable ({exc}). "
+            f"uses attribute access on a template variable "
+            f"({exception_text(exc)}). "
             f"Variables are JSON values, so `{{user.name}}` fails at "
             f"runtime -- use item access (`{{user[name]}}`)."
         )
     except (ValueError, TypeError, IndexError, KeyError) as exc:
         return (
-            f"has a broken format spec or field path: {exc}. Template "
+            f"has a broken format spec or field path: "
+            f"{exception_text(exc)}. Template "
             f"language is str.format_map -- check braces and format specs."
         )
     return None
