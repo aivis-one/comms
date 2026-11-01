@@ -472,7 +472,13 @@ an HTML message without one is a common reason to be filed as spam. One
 block per job -- every recipient of a group job gets the same email; a
 person who muted the type's category gets none, as before. Without the
 block the email is composed from the profile as described above, byte
-for byte as before.
+for byte as before. **The block lives until the job's outcome:** comms
+deletes it when the job reaches its outcome -- whichever outcome -- as it
+deletes a model's letter (section 11); until then every attempt of the
+email channel reads it, retries included. No answer of comms carries it
+(section 8). The job's `title`, `body` and `action_data` stay until the
+notification history goes (see "How long comms keeps things"): the
+`in_app` inbox reads them.
 
 **One delivery path.** There is no SMTP fallback, deliberately: a
 second path no deploy exercises rots from the first day. The
@@ -897,7 +903,7 @@ never interprets.
 | `body` | by type | letter | 1..5000; as `title` |
 | `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
-| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500, one line: no `\r` or `\n`), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
+| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500, one line: no `\r` or `\n`), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email. Kept until the job's outcome (section 3a) |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
 
 There is no channel and no priority on a request. The channel is the
@@ -2115,7 +2121,11 @@ too. A model's answer is kept by its type.
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is
   removed by the worker's retention pass after that many days. Nothing
-  is removed while a delivery is still pending.
+  is removed while a delivery is still pending. A job's `title`, `body`
+  and `action_data` live as long: the `in_app` inbox reads them.
+- **Your own email** (the `email` block, section 3a): until the job's
+  outcome, whichever it is -- the email channel reads it at its
+  attempts and nothing else does.
 - **A model's answer** (section 11): the type's `answer_keep`, default
   **24h**, counted from the answer; the letter it answered, and the
   link to its audio body, are deleted at the job's outcome; the body
@@ -2136,11 +2146,26 @@ too. A model's answer is kept by its type.
   unknown event, a request whose key cannot be read, an event that
   failed past its retries -- lands in the dead-letter stream
   `<COMMS_EVENTS_STREAM>:dlq` in comms' redis, for the investigation.
-  It keeps the entry's address and never its letter (the table below).
+  It keeps the entry's address and never its letter (the table below);
+  of an address-book event, who it is about and never the person's
+  contacts -- forgetting a person (`user_deleted`, section 7) does not
+  reach this stream, so it never holds them. Find the event at home by
+  the fingerprint of its `data`.
   No expiry: the stream is capped at `DLQ_MAXLEN` entries, default
   **10000**, the oldest trimmed first (approximately). Nothing is
   replayed from it: once the cause is fixed, your outbox sends the
   event again.
+- **Dead letters written by an older comms** keep that comms' rule until
+  they are trimmed: an address-book event's contacts, or -- older
+  still -- a whole entry with an exception's text. `comms-deploy.sh
+  dlq-scrub` counts them by form and changes nothing; `dlq-scrub --apply`
+  asks you to type `yes` and brings each to today's rule in place -- the
+  same ids, in the same order, as many entries. An older entry's reason
+  is not kept: it reads `written by an older comms: its reason was an exception's text and is not kept`.
+  A stream with a consumer group is refused and left as it is. Exit
+  **0** = done or nothing to do; **1** = refused; **2** = cannot (redis
+  down, the stream kept changing); **3** = the check found entries to
+  bring to the rule.
 
 A deploy that wants either behaviour off sets the value to 0. A
 product that needs history kept longer than comms keeps it should
@@ -2153,7 +2178,7 @@ says so; every other field of the entry, and every other key of its
 | field | what it holds |
 |---|---|
 | `event` | the entry's event name as sent; absent when the entry had none, or it was not UTF-8 |
-| `_dlq_data` | a JSON object of the keys of `data` the event's own field set names (section 7): for `notification_request` the frame and the envelope without `llm_audio` -- the signed link to a person's voice (section 11); for the other events their fields. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
+| `_dlq_data` | a JSON object of the keys of `data` the event keeps, of those its own field set names (section 7): `notification_request` -- the frame and the envelope without `llm_audio`, the signed link to a person's voice (section 11); `user_upserted`, `user_deleted` -- `v`, `recipient_id`, `version`; `group_changed` -- `v`, `recipient_id`; `section_membership_changed` -- `v`, `operator_id`; `reminder_cancel` -- its fields, the envelope of the jobs it cancels. Contacts, `active`, a group or section key and a section label are not kept: with the person's id they say something about the person, and that would outlive the forgetting. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
 | `_dlq_data_fingerprint` | the SHA-256 of the `data` bytes as sent -- the digest a rejection at intake records; absent without `data` |
 | `_dlq_data_bytes` | the length of those bytes; absent without `data` |
 | `_dlq_dropped` | a JSON list of the names of everything not kept: a field of the entry by its name, a key of `data` as `data.<key>`, the whole of `data` as `data`; `[]` when nothing was |

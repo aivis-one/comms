@@ -199,9 +199,16 @@ _GRID: list[tuple[str, dict[bytes, bytes], str | None, list[str] | None, list[st
          "data.llm_audio", "data.title", "data.titel"],
     ),
     (
+        # Was: the event's whole field set kept, and only `data.title`
+        # dropped -- right while an address-book event kept the book
+        # comms holds anyway. ST-1 keeps who the event is about and
+        # never the person's contacts (DLQ_KEPT_DATA_FIELDS; every
+        # address-book event: tests/test_dlq_identity.py).
         "address_book_event_unknown_key",
         _entry(b"user_upserted", _UPSERT),
-        "user_upserted", sorted(EVENT_FIELDS["user_upserted"]), ["data.title"],
+        "user_upserted", ["recipient_id", "v", "version"],
+        ["data.active", "data.email", "data.locale", "data.telegram_id",
+         "data.timezone", "data.title"],
     ),
     (
         "unknown_event_object",

@@ -152,7 +152,11 @@ def _verbs(script: str) -> set[str]:
     return labels
 
 
-def test_the_verbs_are_the_old_ones_plus_drain() -> None:
+def test_the_verbs_are_the_old_ones_plus_drain_and_dlq_scrub() -> None:
+    """Was test_the_verbs_are_the_old_ones_plus_drain, and it was right
+    until ST-1 added `dlq-scrub` -- a verb the products see in their
+    list (their svc_verbs reads this case) and run only by hand. The
+    set stays exact: a verb no one meant to add still fails here."""
     before = {
         "install",
         "update",
@@ -164,7 +168,9 @@ def test_the_verbs_are_the_old_ones_plus_drain() -> None:
         "test",
         "status",
     }
-    assert _verbs(SCRIPT.read_text(encoding="utf-8")) == before | {"drain"}
+    assert _verbs(SCRIPT.read_text(encoding="utf-8")) == (
+        before | {"drain", "dlq-scrub"}
+    )
 
 
 def test_the_dispatcher_is_the_only_case_at_column_zero() -> None:

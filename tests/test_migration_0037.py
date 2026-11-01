@@ -321,7 +321,9 @@ async def _state() -> tuple[str, bool, bool]:
     return str(version), bool(wait), bool(email)
 
 
-_HEAD = ("0037_pipeline_transient_since", True, True)
+# The state at 0037 -- the revision this file's downgrade test starts
+# from (it was "head" until 0038 came after it).
+_AT_0037 = ("0037_pipeline_transient_since", True, True)
 
 
 async def test_a_downgrade_that_fails_later_keeps_stamp_and_schema_together(
@@ -331,14 +333,21 @@ async def test_a_downgrade_that_fails_later_keeps_stamp_and_schema_together(
     depends on the column it drops): 0037's step must roll back with it,
     so the stamp and the schema stay at head together. With an
     autocommit_block in 0037's downgrade, its undoing was committed while
-    the stamp rolled back to 0037 -- the stamp ahead of the schema."""
+    the stamp rolled back to 0037 -- the stamp ahead of the schema.
+
+    It started from head and named head 0037, and was right until 0038
+    (ST-1) came after it: a downgrade from head then also undoes 0038,
+    and the steps below took head for 0037. It starts at 0037 now, so
+    what it measures stays 0037's whatever comes later."""
+    await _migrate("downgrade", "0037_pipeline_transient_since")
+    assert await _state() == _AT_0037
     await _execute("CREATE VIEW zz_holds_email AS SELECT email FROM notifications")
     try:
         await dispose_engine()
         failed = _alembic("downgrade", _0035)
         await dispose_engine()
         assert failed.returncode != 0
-        assert await _state() == _HEAD
+        assert await _state() == _AT_0037
     finally:
         await _execute("DROP VIEW IF EXISTS zz_holds_email")
     # every step, one at a time, down and back up
@@ -350,7 +359,7 @@ async def test_a_downgrade_that_fails_later_keeps_stamp_and_schema_together(
         assert await _state() == expected
     for target, expected in (
         ("+1", ("0036_notification_email", False, True)),
-        ("+1", _HEAD),
+        ("+1", _AT_0037),
     ):
         await _migrate("upgrade", target)
         assert await _state() == expected
