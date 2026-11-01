@@ -29,6 +29,9 @@ permissions: {}
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A HANG IS RED (FIX review 3.13.0, the second): the last green run's
+    # suite took 931 s (~16 min with its setup) -- 40 gives ~2.5x.
+    timeout-minutes: 40
     permissions:
       contents: read
 
@@ -106,6 +109,8 @@ jobs:
 
   image:
     runs-on: ubuntu-latest
+    # The image's build plus the same suite inside it.
+    timeout-minutes: 45
     permissions:
       contents: read
 

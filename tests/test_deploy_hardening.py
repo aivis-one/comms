@@ -410,6 +410,14 @@ def _uses_lines(text_: str) -> list[str]:
             if re.match(r"\s*(-\s+)?uses:", line)]
 
 
+def _jobs_without_a_limit(data: dict[str, Any]) -> list[str]:
+    return [
+        name for name, job in data["jobs"].items()
+        if not (isinstance(job.get("timeout-minutes"), int)
+                and job["timeout-minutes"] > 0)
+    ]
+
+
 class TestCi:
     @pytest.mark.parametrize("workflow", _WORKFLOWS, ids=lambda p: p.name)
     def test_every_job_has_its_permissions(self, workflow: Path) -> None:
@@ -424,6 +432,18 @@ class TestCi:
         assert lines
         for line in lines:
             assert re.search(r"@[0-9a-f]{40}\s+#\s*v\d", line), line
+
+    @pytest.mark.parametrize("workflow", _WORKFLOWS, ids=lambda p: p.name)
+    def test_every_job_has_a_time_limit(self, workflow: Path) -> None:
+        """A hang is red (FIX review 3.13.0, the second): without a limit
+        a job that hangs waits GitHub's six hours."""
+        data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        assert _jobs_without_a_limit(data) == []
+
+    def test_the_guard_sees_a_job_without_a_limit(self) -> None:
+        data = {"jobs": {"a": {"timeout-minutes": 40}, "b": {}, "c": {
+            "timeout-minutes": 0}}}
+        assert _jobs_without_a_limit(data) == ["b", "c"]
 
     def test_the_guard_sees_a_tag(self) -> None:
         line = _uses_lines("      - uses: actions/checkout@v7\n")[0]
@@ -634,3 +654,44 @@ class TestTheLockSatisfies:
     def test_the_guard_sees_a_drift(self) -> None:
         drifted = [Requirement("fastapi>=999.0")]
         assert _unsatisfied(drifted, _locked()) == ["fastapi>=999.0"]
+
+
+# ---------------------------------------------------------------------------
+# a hung test is red (FIX review 3.13.0, the second)
+# ---------------------------------------------------------------------------
+
+
+class TestAHangIsRed:
+    def test_the_image_gets_the_timeout_from_the_lock(self) -> None:
+        """The suite on a box (comms-deploy.sh test) and CI's image job run
+        on the image's venv: pytest-timeout reaches it through the lock."""
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        assert re.search(r"pip install [^\n]*-r requirements\.lock", dockerfile)
+        assert re.search(r"^pytest-timeout==", _LOCK, re.M)
+        options = _PYPROJECT["tool"]["pytest"]["ini_options"]
+        assert options["timeout"] == 300
+        assert options["timeout_method"] == "signal"
+
+    @pytest.mark.parametrize("body, red", [
+        ("import asyncio\n\nasync def test_x():\n    await asyncio.Event().wait()\n",
+         True),
+        ("async def test_x():\n    pass\n", False),
+    ], ids=["hangs", "returns"])
+    def test_a_hanging_test_is_red_not_a_hang(
+        self, tmp_path: Path, body: str, red: bool,
+    ) -> None:
+        test = tmp_path / "test_probe.py"
+        test.write_text(body)
+        started = time.monotonic()
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+             "-o", "asyncio_mode=auto", "--timeout=2",
+             "-o", "timeout_method=signal", str(test)],
+            cwd=tmp_path, capture_output=True, text=True, timeout=120,
+        )
+        assert time.monotonic() - started < 60
+        if red:
+            assert done.returncode != 0
+            assert "Timeout" in done.stdout
+        else:
+            assert done.returncode == 0, done.stdout

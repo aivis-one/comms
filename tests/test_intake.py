@@ -31,6 +31,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.core.config import settings
 from app.core.constants import MAX_CORRELATION_LEN
@@ -534,6 +535,17 @@ class TestDurableIntake:
     async def test_crash_between_commit_and_ack(
         self, monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession,
     ) -> None:
+        """The XACK fails after the commit: the job is created ONCE, the
+        entry stays pending, the process lives; a restart replays the
+        entry, the key collapses it (a duplicate), the pending list empties
+        and the job is still one.
+
+        Until FIX review 3.13.0 a failed XACK left run() and took the
+        process down -- the old assertion (`run()` raises) was right then.
+        That fix acknowledges outside the handling, and an ack that fails
+        leaves the entry pending with the process alive (_ack_or_hold):
+        the property is the same -- nothing lost, nothing twice -- and
+        every wait here has a deadline, never a bare `await run()`."""
         redis = fakeaioredis.FakeRedis()
         stream = f"comms:test:{uuid4().hex[:8]}"
         monkeypatch.setattr(settings, "comms_events_stream", stream)
@@ -541,34 +553,45 @@ class TestDurableIntake:
         data = _data()
         await redis.xadd(stream, _entry(data))
 
+        async def pending() -> list[Any]:
+            return list(await redis.xpending_range(
+                stream, settings.comms_consumer_group, min="-", max="+", count=10,
+            ))
+
         crashing = StreamConsumer(redis)
 
         async def crash(entry_id: Any) -> None:
             raise RuntimeError("crash between commit and XACK")
 
         monkeypatch.setattr(crashing, "_ack", crash)
-        with pytest.raises(RuntimeError, match="between commit and XACK"):
-            await crashing.run()
+        with capture_logs() as logs:
+            task = asyncio.ensure_future(crashing.run())
+            try:
+                deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT
+                while "event_ack_failed" not in [e["event"] for e in logs]:
+                    assert asyncio.get_event_loop().time() < deadline
+                    assert not task.done(), "the consumer went down"
+                    await asyncio.sleep(0.02)
+                assert not task.done()  # alive, past the failed ack
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         db_session.expire_all()
         assert len(await _jobs(db_session, data["idempotency_key"])) == 1
-        pending = await redis.xpending_range(
-            stream, settings.comms_consumer_group, min="-", max="+", count=10,
-        )
-        assert len(pending) == 1
+        assert len(await pending()) == 1
 
         restarted = StreamConsumer(redis)
-        task = asyncio.ensure_future(restarted.run())
-        try:
-            deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT
-            while await redis.xpending_range(
-                stream, settings.comms_consumer_group, min="-", max="+",
-                count=10,
-            ):
-                assert asyncio.get_event_loop().time() < deadline
-                await asyncio.sleep(0.02)
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        with capture_logs() as logs:
+            task = asyncio.ensure_future(restarted.run())
+            try:
+                deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT
+                while await pending():
+                    assert asyncio.get_event_loop().time() < deadline
+                    await asyncio.sleep(0.02)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        assert "event_duplicate_acked" in [e["event"] for e in logs]
         db_session.expire_all()
         assert len(await _jobs(db_session, data["idempotency_key"])) == 1
         assert await intake_outcomes_for(db_session, data["idempotency_key"]) == []
@@ -597,8 +620,11 @@ class TestDurableIntake:
             await real_commit(self)
 
         monkeypatch.setattr(_Session, "commit", failing_commit)
+        # A cancellation is a BaseException: neither the entry's handling
+        # nor its last line catches it, and run() ends -- under a
+        # deadline, so a run() that would live on is red, not a hang.
         with pytest.raises(asyncio.CancelledError):
-            await StreamConsumer(redis).run()
+            await asyncio.wait_for(StreamConsumer(redis).run(), _WAIT_TIMEOUT)
         db_session.expire_all()
         monkeypatch.setattr(_Session, "commit", real_commit)
         assert await _jobs(db_session, data["idempotency_key"]) == []
