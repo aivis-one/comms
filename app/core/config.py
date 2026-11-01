@@ -171,7 +171,15 @@ from app.core.lanes import Lane
 # reader and checked once: NaN, Infinity, numbers past range, dates
 # outside a timestamp and nesting past 64 levels are refused at intake,
 # and any failure of the parse dead-letters the entry instead of stopping
-# the consumer; the subject of a ready email refuses a line break.
+# the consumer; the subject of a ready email refuses a line break. And
+# TX-3: a transient failure of the database no longer spends a job's
+# pipeline attempts -- the job waits in its own fields (migration 0037,
+# its CHECKs added NOT VALID and validated outside the table lock); a dead
+# connection no longer takes the worker down; each maintenance pass fails
+# alone; auto-close rechecks idleness; a job comms cannot close at the
+# ceiling is left stuck, visible and no longer taken. And TX-4: update and
+# install dump a live database before migrating; db restore is honest;
+# dumps are 600; comms-postgres leaves the shared network; CI is pinned.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
 APP_VERSION = "3.13.0"
 
