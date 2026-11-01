@@ -460,6 +460,99 @@ class TestImage:
 
 
 # ---------------------------------------------------------------------------
+# every run of the image reads only what the image has, or a mount
+# (TX-4 FIX)
+# ---------------------------------------------------------------------------
+
+
+def _image_paths() -> set[str]:
+    """What the image carries: the TARGETS of the runtime stage's COPY
+    lines (a white list), resolved against its WORKDIR -- the Dockerfile
+    parsed, one copy. .dockerignore is a black list of the build
+    context and says nothing of what the image holds."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    runtime = dockerfile.rsplit("\nFROM ", 1)[1]
+    workdir = "/"
+    found = set()
+    for line in runtime.splitlines():
+        line = line.strip()
+        if line.startswith("WORKDIR "):
+            # the directory exists, empty: a path IN it is the COPYs'
+            workdir = line.split(None, 1)[1]
+        elif line.startswith("COPY "):
+            parts = [p for p in line.split()[1:] if not p.startswith("--")]
+            *sources, target = parts
+            base = target if target.startswith("/") else f"{workdir}/{target}"
+            base = re.sub(r"/\./|/\.$", "/", base).replace("//", "/")
+            for source in sources:
+                if base.endswith("/") and not source.endswith("/"):
+                    found.add(base + source.rsplit("/", 1)[-1])
+                else:
+                    found.add(base.rstrip("/"))
+    return found
+
+
+def _image_runs(text_: str) -> list[str]:
+    """Every `docker run` of comms' image in a workflow, one string each,
+    from `docker run` to the image name and the rest of its line."""
+    runs = []
+    for step in re.findall(r"run: \|\n((?:\s{10,}.*\n)+)", text_):
+        joined = re.sub(r"\\\n\s*", " ", step)
+        runs += [m.group(0) for m in
+                 re.finditer(r"docker run [^\n]*?comms:ci[^\n]*", joined)]
+    return runs
+
+
+def _unreachable(run: str, image: set[str]) -> list[str]:
+    """The /app paths `run` reads that are neither in the image nor under
+    a directory mounted in the same run."""
+    mounts = [m.split(":")[1] for m in
+              re.findall(r'-v\s+"?([^"\s]+)"?', run)]
+    without_mounts = re.sub(r'-v\s+"?[^"\s]+"?', " ", run)
+    missing = []
+    for path in re.findall(r"/app(?:/[\w./-]*)?", without_mounts):
+        path = path.rstrip("/.") or "/app"
+        covered = [m for m in mounts if path == m or path.startswith(m + "/")]
+        held = [p for p in image if path == p or path.startswith(p + "/")]
+        if path == "/app":
+            held = ["/app"]  # the WORKDIR itself
+        if not covered and not held:
+            missing.append(path)
+    return missing
+
+
+_CI = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+
+class TestImageRuns:
+    def test_every_path_is_in_the_image_or_mounted(self) -> None:
+        image = _image_paths()
+        assert {"/app/app", "/app/migrations", "/app/alembic.ini"} <= image
+        assert not any(p.startswith("/app/tests") for p in image)
+        runs = _image_runs(_CI)
+        assert len(runs) == 2  # the start, and the suite
+        for run in runs:
+            assert _unreachable(run, image) == [], run
+
+    def test_the_guard_sees_a_path_the_image_lacks(self) -> None:
+        run = ("docker run -d --name x -e TEMPLATES_DIR=/app/tests/fixtures/"
+               "profile comms:ci")
+        assert _unreachable(run, _image_paths()) == ["/app/tests/fixtures/profile"]
+        mounted = ('docker run -v "$PWD:/app:ro" -e TEMPLATES_DIR=/app/tests/x '
+                   "comms:ci")
+        assert _unreachable(mounted, _image_paths()) == []
+
+    def test_the_start_reads_the_profile_where_a_box_does(self) -> None:
+        (start,) = [r for r in _image_runs(_CI) if "TEMPLATES_DIR" in r]
+        ci_dir = re.search(r"-e TEMPLATES_DIR=(\S+)", start)
+        assert ci_dir is not None
+        services = _compose()["services"]
+        box = {services[n]["environment"]["TEMPLATES_DIR"]
+               for n in ("comms-app", "comms-worker", "comms-consumer")}
+        assert box == {ci_dir.group(1)}
+
+
+# ---------------------------------------------------------------------------
 # a migration waits for a lock 10 s at most
 # ---------------------------------------------------------------------------
 

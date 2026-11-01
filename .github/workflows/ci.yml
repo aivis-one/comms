@@ -161,6 +161,12 @@ jobs:
       # channel with no keys -- so the channels get keys of the right
       # shape that reach nothing (the token assembled here: a literal of
       # a real token's shape would trip secret scanning).
+      # THE PROFILE IS MOUNTED, AS ON A BOX (TX-4 FIX): the image carries
+      # app/ and migrations/, not tests/ -- so the test profile is mounted
+      # read-only on /profile and TEMPLATES_DIR names it, the same path
+      # deploy/docker-compose.yml gives comms-app (tests/test_deploy_hardening.py
+      # holds both: every /app path of this step is in the image or
+      # mounted, and TEMPLATES_DIR is the compose file's).
       - name: The image starts (GET /ready)
         run: |
           token="123456789:$(printf 'A%.0s' $(seq 35))"
@@ -168,7 +174,8 @@ jobs:
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
-            -e TEMPLATES_DIR=/app/tests/fixtures/profile \
+            -v "$PWD/tests/fixtures/profile:/profile:ro" \
+            -e TEMPLATES_DIR=/profile \
             -e TELEGRAM_BOT_TOKEN="$token" \
             -e TELEGRAM_BOT_URL=https://t.me/comms_ci_bot \
             -e EMAIL_MAILGUN_API_KEY=ci-not-a-provider-key \
