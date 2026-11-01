@@ -21,9 +21,19 @@ on:
   push:
   pull_request:
 
+# THE TOKEN GETS NOTHING BY DEFAULT (TX-4): each job says what it needs,
+# and both only read the repository. tests/test_deploy_hardening.py holds
+# every job to a `permissions` of its own.
+permissions: {}
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A HANG IS RED (FIX review 3.13.0, the second): the last green run's
+    # suite took 931 s (~16 min with its setup) -- 40 gives ~2.5x.
+    timeout-minutes: 40
+    permissions:
+      contents: read
 
     env:
       APP_ENV: ci
@@ -35,10 +45,10 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
@@ -99,14 +109,18 @@ jobs:
 
   image:
     runs-on: ubuntu-latest
+    # The image's build plus the same suite inside it.
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # Only to read the compose file (PyYAML at the lock's version).
       - name: Set up Python 3.12
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
@@ -152,6 +166,12 @@ jobs:
       # channel with no keys -- so the channels get keys of the right
       # shape that reach nothing (the token assembled here: a literal of
       # a real token's shape would trip secret scanning).
+      # THE PROFILE IS MOUNTED, AS ON A BOX (TX-4 FIX): the image carries
+      # app/ and migrations/, not tests/ -- so the test profile is mounted
+      # read-only on /profile and TEMPLATES_DIR names it, the same path
+      # deploy/docker-compose.yml gives comms-app (tests/test_deploy_hardening.py
+      # holds both: every /app path of this step is in the image or
+      # mounted, and TEMPLATES_DIR is the compose file's).
       - name: The image starts (GET /ready)
         run: |
           token="123456789:$(printf 'A%.0s' $(seq 35))"
@@ -159,7 +179,8 @@ jobs:
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
-            -e TEMPLATES_DIR=/app/tests/fixtures/profile \
+            -v "$PWD/tests/fixtures/profile:/profile:ro" \
+            -e TEMPLATES_DIR=/profile \
             -e TELEGRAM_BOT_TOKEN="$token" \
             -e TELEGRAM_BOT_URL=https://t.me/comms_ci_bot \
             -e EMAIL_MAILGUN_API_KEY=ci-not-a-provider-key \

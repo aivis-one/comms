@@ -82,6 +82,7 @@ from app.core.lanes import Lane
 from app.core.sanitize import sanitize_text, sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
+    ACTIVE_STATUSES,
     ChannelAnswer,
     DeliveryChannel,
     DeliveryStatus,
@@ -983,6 +984,7 @@ async def resolve_notification(
         # Nobody to deliver to: the product's sync, not comms, is what
         # to look at -- and not the recipients' choice either.
         notification.status = NotificationStatus.NO_RECIPIENTS
+        end_transient_wait(notification)
         journal.record_job(session, notification, JournalStep.RESOLVE)
         logger.warning(
             "notification_no_targets",
@@ -1020,6 +1022,7 @@ async def resolve_notification(
         if not recipient_ids:
             # Every recipient muted it: their decision, not a failure.
             notification.status = NotificationStatus.SUPPRESSED
+            end_transient_wait(notification)
             journal.record_job(session, notification, JournalStep.RESOLVE)
             logger.info(
                 "notification_all_muted",
@@ -1343,7 +1346,27 @@ async def deliver_notification(
         )
 
     if tasks:
-        results = await asyncio.gather(*tasks)
+        # EVERY DELIVERY TO ITS END BEFORE THE ATTEMPT DECIDES (TX-3).
+        # Plain gather raised the first exception at once while the
+        # others ran on -- calling the provider, journaling its answer --
+        # after the attempt had rolled back. Cancelling them instead
+        # could cut one after the provider accepted and before its
+        # journal row: out, not journaled, sent again by the next
+        # attempt. So each runs to its end and journals its answer
+        # first, the next attempt reads it (journal.accepted_answers) and
+        # does not send twice; then the first exception is raised -- a
+        # cancellation (a BaseException) before any other, so a stop of
+        # the worker is never swallowed.
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [r for r in gathered if isinstance(r, BaseException)]
+        stops = [f for f in failures if not isinstance(f, Exception)]
+        if stops:
+            raise stops[0]
+        if failures:
+            raise failures[0]
+        results = [
+            r for r in gathered if not isinstance(r, BaseException)
+        ]
 
         # Apply results to delivery objects (sequential, session-safe).
         for delivery, outcome in results:
@@ -1766,12 +1789,12 @@ def _answer_row(call: LLMCall, reply: LLMReply) -> LLMAnswer:
 # UPDATE; Postgres sorts before it locks (LockRows over Sort), so the
 # rows are taken in that order. Two such paths over overlapping sets
 # then queue on the first row they share and never hold each other's
-# next one: no 40P01. It matters because a deadlock is not retried:
-# asyncpg's DeadlockDetectedError reaches SQLAlchemy as a bare
-# DBAPIError, not an OperationalError, so the consumer -- where
-# cancellation and forgetting arrive -- dead-letters the event at once
-# (app/transport/consumer.py), and the reminders stay or the person is
-# not forgotten. The paths: close_notifications (expiry, cancellation)
+# next one: no 40P01. A deadlock is retried by the consumer since TX-1
+# (app/core/database.py is_transient_db_error; asyncpg's
+# DeadlockDetectedError reaches SQLAlchemy as a bare DBAPIError with
+# SQLSTATE 40P01, which the rule reads), but a retry costs the stream
+# its inline backoff, and a path the order keeps free of deadlocks does
+# not pay it. The paths: close_notifications (expiry, cancellation)
 # and withdraw_recipient (forgetting), which locks EVERY job it will
 # write, finished ones included, before its mass updates. The batch
 # deletes of retention and of the expiry cleanup take their jobs in the
@@ -1861,6 +1884,22 @@ def first_waiting_delivery(
     )
 
 
+def end_transient_wait(notification: Notification) -> None:
+    """End the job's open wait on a transient failure of the database
+    (TX-3): a step that succeeded, an ordinary failure, or the job's
+    close. Every such place calls this -- the field never outlives
+    them (ck_notifications_transient_wait_open holds it in the database).
+    The wait's own three fields, and -- with no attempt counted -- the
+    gate too: such a gate had no other ground than the wait
+    (ck_notifications_pipeline_gate). The counted failures' trace
+    (pipeline_attempts / _step / _error) and their gate stay."""
+    notification.pipeline_transient_since = None
+    notification.pipeline_transient_step = None
+    notification.pipeline_transient_error = None
+    if not notification.pipeline_attempts:
+        notification.pipeline_retry_at = None
+
+
 async def rollup_notification(
     session: AsyncSession,
     notification: Notification,
@@ -1904,6 +1943,7 @@ async def rollup_notification(
     if verdict is None:
         return
     notification.status = verdict
+    end_transient_wait(notification)
     journal.record_job(session, notification, step)
     await forget_llm_letter(session, notification)
     await session.flush()
@@ -1989,7 +2029,7 @@ _CLOSING_STEP = {
     NotificationStatus.CANCELLED: JournalStep.CANCEL,
 }
 
-_ACTIVE_STATUSES = (NotificationStatus.PENDING, NotificationStatus.PROCESSING)
+_ACTIVE_STATUSES = ACTIVE_STATUSES
 
 
 async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
@@ -2110,6 +2150,7 @@ async def close_notifications(
         if notification.status == NotificationStatus.PENDING:
             # Not resolved: no deliveries exist to carry the outcome.
             notification.status = outcome
+            end_transient_wait(notification)
             journal.record_job(session, notification, step)
             await forget_llm_letter(session, notification)
             continue

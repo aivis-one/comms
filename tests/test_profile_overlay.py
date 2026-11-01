@@ -868,6 +868,19 @@ class TestTheDeployGuard:
         "verb", ["cmd_install", "cmd_update", "cmd_restart", "cmd_start"],
     )
     def test_every_verb_that_starts_checks_first(self, verb: str) -> None:
+        """The check comes before the first start, in any of its forms:
+        a literal `$COMPOSE_CMD up`, or since TX-4 the two helpers that
+        start -- converge_datastores (the datastores, before update's and
+        install's dump) and recreate_app (the three application
+        containers, one copy for restart, update and restore). Until
+        TX-4 the literal was the only form, and the assertion read it
+        alone; the helpers made it miss starts it now must see."""
         body = _function(verb)
+        starts = [
+            body.index(form)
+            for form in ("$COMPOSE_CMD up", "converge_datastores", "recreate_app")
+            if form in body
+        ]
+        assert starts, f"{verb} starts nothing?"
         assert "check_overlay_dir" in body
-        assert body.index("check_overlay_dir") < body.index("$COMPOSE_CMD up")
+        assert body.index("check_overlay_dir") < min(starts)

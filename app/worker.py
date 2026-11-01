@@ -76,6 +76,7 @@ from app.core.lanes import Lane
 from app.core.logging import setup_logging
 from app.core.sanitize import sanitized_traceback
 from app.engine.formatters import close_formatters, init_formatters
+from app.engine.journal import pipeline_error_of
 from app.engine.processor import (
     LaneJobs,
     cleanup_terminal_notifications,
@@ -140,45 +141,84 @@ async def run_maintenance_pass() -> int:
     """
     global _last_retention_at, _last_auto_close_at
 
-    done = await run_engine_maintenance()
+    # EACH PASS ON ITS OWN (TX-3): a pass that fails is logged with its
+    # class and place and the others still run in this cycle -- before,
+    # a failed engine maintenance raised out of the cycle and took the
+    # close notices, retention and auto-close with it. A slow pass's
+    # cadence mark moves only after it SUCCEEDED, so a failed one runs
+    # again next cycle instead of a whole interval later.
+    done = 0
+    engine_done = await _isolated("engine_maintenance", run_engine_maintenance)
+    done += engine_done or 0
 
     # Close-notify consumer (Phase 4c item 2): EVERY pass -- a partial
     # index over a normally-empty flag set makes it cheap and prompt,
     # unlike the two growing-table maintenance scans below (own gates).
-    done += await consume_close_notifications()
+    notified = await _isolated("close_notifications", consume_close_notifications)
+    done += notified or 0
 
     if settings.notification_retention_days > 0:
         now = time.monotonic()
         interval = settings.notification_retention_interval_seconds
-        if (
+        due = (
             _last_retention_at is None
             or now - _last_retention_at >= interval
-        ):
+        )
+        if due and await _isolated(
+            "retention", cleanup_terminal_notifications,
+        ) is not None:
             _last_retention_at = now
-            await cleanup_terminal_notifications()
 
     if settings.thread_auto_close_days > 0:
         now = time.monotonic()
         interval = settings.thread_auto_close_interval_seconds
-        if (
+        due = (
             _last_auto_close_at is None
             or now - _last_auto_close_at >= interval
-        ):
+        )
+        if due and await _auto_close_pass() is not None:
             _last_auto_close_at = now
-            try:
-                await auto_close_idle_threads()
-            except AutoClosePassError as exc:
-                # Logged here, not in the pass: messaging cannot import
-                # the redactor (app/messaging/processor.py,
-                # AutoClosePassError). A failed pass does not stop the
-                # loop -- it never did.
-                logger.error(
-                    "thread_auto_close_pass_error",
-                    closed=exc.closed,
-                    exception=sanitized_traceback(exc),
-                )
 
     return done
+
+
+async def _auto_close_pass() -> int | None:
+    """The auto-close pass on its own: its count, or None when it failed.
+    Its failure keeps the log line it always had -- logged here, not in
+    the pass: messaging cannot import the redactor
+    (app/messaging/processor.py, AutoClosePassError)."""
+    try:
+        return await auto_close_idle_threads()
+    except AutoClosePassError as exc:
+        logger.error(
+            "thread_auto_close_pass_error",
+            closed=exc.closed,
+            exception=sanitized_traceback(exc),
+        )
+        return None
+    except Exception as exc:
+        logger.error(
+            "maintenance_pass_error",
+            maintenance_pass="auto_close",
+            error=pipeline_error_of(exc),
+        )
+        return None
+
+
+async def _isolated(
+    name: str, run: Callable[[], Awaitable[int]],
+) -> int | None:
+    """Run one maintenance pass on its own: its result, or None when it
+    raised -- logged here with its class and place (TX-3)."""
+    try:
+        return await run()
+    except Exception as exc:
+        logger.error(
+            "maintenance_pass_error",
+            maintenance_pass=name,
+            error=pipeline_error_of(exc),
+        )
+        return None
 
 
 async def _poll_loop(
@@ -240,8 +280,10 @@ async def _lane_loop(lane: Lane, wake: asyncio.Event) -> None:
     the attempts they start run in -- with the lane's places and slots
     (engine.processor.LaneJobs), one set for the process's life.
     Cancelling the loop cancels its attempts and waits for their
-    rollback; an attempt that raises past its own handling (only a
-    BaseException does) ends the loop."""
+    rollback. An attempt raises nothing else into the group: its last
+    line (engine.processor._attempt) catches every Exception -- a
+    rollback on a dead connection included, which until TX-3 escaped
+    and ended the loop and the process."""
     async with asyncio.TaskGroup() as attempts:
         await _poll_loop(
             _lane_pass(lane, wake, LaneJobs(lane, attempts)),

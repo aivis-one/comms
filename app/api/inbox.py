@@ -69,9 +69,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
+from app.api.deps import DbSession, require_service_auth
 from app.api.paging import PAGE_LIMIT_DEFAULT, decode_cursor, page, page_limit
-from app.core.database import get_db_reader, get_db_session
+from app.core.database import get_db_reader
 from app.engine.constants import DeliveryChannel
 from app.engine.service import (
     get_unread_count,
@@ -149,8 +149,8 @@ async def unread_count(
 
 @router.post("/read-all")
 async def read_all(
+    session: DbSession,
     recipient_id: UUID,
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
     """Mark every unread in_app delivery read; returns the fresh badge."""
     await mark_all_read(
@@ -164,9 +164,9 @@ async def read_all(
 
 @router.post("/{delivery_id}/read")
 async def read_one(
+    session: DbSession,
     recipient_id: UUID,
     delivery_id: UUID,
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
     """Mark one delivery read (idempotent); returns the fresh badge.
 

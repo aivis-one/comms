@@ -58,7 +58,7 @@ from app.engine.service import (
     delete_expired_notifications_batch,
     delete_terminal_notifications_batch,
 )
-from tests.helpers import notification_row_fields, sql_shape
+from tests.helpers import notification_row_fields, row_waiters, sql_shape
 from tests.test_recipient_schedule_field import (
     _channel,
     _declare,
@@ -327,13 +327,15 @@ async def _pid(session: AsyncSession) -> int:
 
 
 async def _waiting_deleters(exclude: int | None = None) -> list[int]:
-    async with get_session_factory()() as observer:
-        rows = (await observer.execute(text(
-            "SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-            "AND query ILIKE 'DELETE FROM notifications%' "
-            "AND datname = current_database()"
-        ))).scalars().all()
-    return [pid for pid in rows if pid != exclude]
+    """The backends waiting to DELETE a job row -- by their LOCKS
+    (tests/helpers.py row_waiters): a tuple lock FOR UPDATE under a
+    RowExclusiveLock of notifications. Until TX-3 by the text's prefix
+    (query ILIKE 'DELETE FROM notifications%'), right while the text was
+    the identity; a waiter is identified by what it waits with now."""
+    return [
+        pid for pid, wait in await row_waiters("notifications")
+        if wait.is_delete and pid != exclude
+    ]
 
 
 def _sqlstate(exc: BaseException | None) -> str | None:

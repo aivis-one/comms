@@ -78,15 +78,27 @@ def _variables(text: str) -> list[tuple[bool, str, str, int]]:
 
 
 def _compose_environment(text: str) -> set[str]:
-    """The keys every service of a compose file sets in `environment:`,
-    read as YAML -- a name in a comment is not one."""
+    """The keys every service of a compose file SETS in `environment:`,
+    read as YAML -- a name in a comment is not one.
+
+    A key that only passes its own variable through from .env
+    (`POSTGRES_USER: ${POSTGRES_USER:?...}`) is not set by compose: the
+    value is the template's. Until TX-4 every `environment:` key was
+    one compose set itself, and the subtraction was right as it was;
+    TX-4 gave comms-postgres and comms-redis their own variables this
+    way instead of the whole .env, and those stay the template's."""
     names: set[str] = set()
     for service in (yaml.safe_load(text).get("services") or {}).values():
         environment = service.get("environment") or {}
         if isinstance(environment, list):
-            names |= {item.split("=", 1)[0] for item in environment}
+            pairs = [[*item.split("=", 1), ""] for item in environment]
+            items = {pair[0]: pair[1] for pair in pairs}
         else:
-            names |= set(environment)
+            items = dict(environment)
+        for name, value in items.items():
+            if re.fullmatch(rf"\$\{{{name}(?::?[-?][^}}]*)?\}}", str(value or "")):
+                continue  # passed through from .env, not set here
+            names.add(name)
     return names
 
 

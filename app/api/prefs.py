@@ -31,14 +31,14 @@ from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
+from app.api.deps import DbSession, require_service_auth
 from app.audience.prefs import (
     RecipientPreferences,
     get_preferences,
     set_category_muted,
     set_schedule,
 )
-from app.core.database import get_db_reader, get_db_session
+from app.core.database import get_db_reader
 from app.core.exceptions import ValidationError
 from app.profile.registry import registry
 
@@ -230,9 +230,9 @@ async def get_preferences_form(
 
 @router.patch("")
 async def patch_preferences_form(
+    session: DbSession,
     recipient_id: UUID,
     patch: PreferencesPatch = Body(...),
-    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Partial write: listed toggles change, schedule replaces whole.
 

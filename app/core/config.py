@@ -162,8 +162,30 @@ from app.core.lanes import Lane
 # {subject, text, html?} -- sent to the provider exactly as it came; a
 # string the database cannot store (NUL, a lone surrogate) is refused at
 # intake, under the key for a request, to the DLQ for any other event.
+#
+# 3.13.0 is TX-1 and the fix of EM-1, a MINOR: a route that writes answers
+# only after its commit; a transient failure of the database is a 503
+# unavailable with an unknown outcome on a route and a retry in the
+# consumer, never a dead letter at once; anything no handler takes is a
+# 500 in the one error form. The data of every event is read by one
+# reader and checked once: NaN, Infinity, numbers past range, dates
+# outside a timestamp and nesting past 64 levels are refused at intake,
+# and any failure of the parse dead-letters the entry instead of stopping
+# the consumer; the subject of a ready email refuses a line break. And
+# TX-3: a transient failure of the database no longer spends a job's
+# pipeline attempts -- the job waits in its own fields (migration 0037,
+# its CHECKs added NOT VALID and validated outside the table lock); a dead
+# connection no longer takes the worker down; each maintenance pass fails
+# alone; auto-close rechecks idleness; a job comms cannot close at the
+# ceiling is left stuck, visible and no longer taken. And TX-4: update and
+# install dump a live database before migrating; db restore is honest;
+# dumps are 600; comms-postgres leaves the shared network; CI is pinned.
+# And the review's fixes: the consumer never goes down on a dead letter
+# (the entry stays pending), waits for its database while it does not
+# answer, and dead-letters an event only when the database answers;
+# update stops comms before the datastores; a hanging test is red.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.12.0"
+APP_VERSION = "3.13.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

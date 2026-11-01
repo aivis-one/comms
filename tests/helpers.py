@@ -342,6 +342,298 @@ def next_em1_telegram_id() -> int:
     return tid
 
 
+TX1_TELEGRAM_ID_BAND_START = 93860
+TX1_TELEGRAM_ID_BAND_END = 94259
+
+_tx1_telegram_id_counter = itertools.count(TX1_TELEGRAM_ID_BAND_START)
+
+
+def next_tx1_telegram_id() -> int:
+    """Next telegram_id from the TX-1 band (commit before the answer).
+
+    93860-94259, one past the highest id held above (93859, EM-1); no
+    literal in tests/ or app/ sits in it.
+    """
+    tid = next(_tx1_telegram_id_counter)
+    if tid > TX1_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 93860-94259 exhausted"
+        )
+    return tid
+
+
+# -----------------------------------------------------------------------------
+# REAL transient database failures (TX-1) -- raised by Postgres and the
+# driver on real sessions, never built by hand. A test that needs the
+# consumer or a route to meet one takes it from here.
+# -----------------------------------------------------------------------------
+
+
+async def _a_section(label: str = "tx1") -> UUID:
+    from app.core.database import get_session_factory
+
+    async with get_session_factory()() as s:
+        section = await create_section(s, key=f"tx1-{uuid4().hex[:10]}", label=label)
+        await s.commit()
+        return section.id
+
+
+async def real_serialization_failure(label: str = "tx1") -> Exception:
+    """40001 from Postgres: two SERIALIZABLE transactions read one row and
+    both write it; the second write fails. `label` is the second write's
+    bound parameter -- SQLAlchemy's text of the error carries it."""
+    import asyncio
+
+    from sqlalchemy import text
+
+    from app.core.database import get_session_factory
+
+    section = await _a_section()
+    factory = get_session_factory()
+    async with factory() as first, factory() as second:
+        for s in (first, second):
+            await s.connection(execution_options={"isolation_level": "SERIALIZABLE"})
+            await s.execute(text("SELECT label FROM sections WHERE id = :id"),
+                            {"id": section})
+        await first.execute(text("UPDATE sections SET label = 'one' WHERE id = :id"),
+                            {"id": section})
+        late = asyncio.ensure_future(second.execute(
+            text("UPDATE sections SET label = :label WHERE id = :id"),
+            {"label": label, "id": section},
+        ))
+        await asyncio.sleep(0.3)
+        await first.commit()
+        try:
+            await late
+        except Exception as exc:
+            await second.rollback()
+            return exc
+    raise AssertionError("no serialization failure")
+
+
+async def real_deadlock() -> Exception:
+    """40P01 from Postgres: two transactions take two rows crosswise."""
+    import asyncio
+
+    from sqlalchemy import text
+
+    from app.core.database import get_session_factory
+
+    one, two = await _a_section(), await _a_section()
+    factory = get_session_factory()
+    update = text("UPDATE sections SET label = label WHERE id = :id")
+    async with factory() as a, factory() as b:
+        await a.execute(update, {"id": one})
+        await b.execute(update, {"id": two})
+        cross = asyncio.ensure_future(a.execute(update, {"id": two}))
+        await asyncio.sleep(0.3)
+        failures: list[Exception] = []
+        try:
+            await b.execute(update, {"id": one})
+        except Exception as exc:
+            failures.append(exc)
+        try:
+            await cross
+        except Exception as exc:
+            failures.append(exc)
+        await a.rollback()
+        await b.rollback()
+    (failure,) = failures
+    return failure
+
+
+async def real_own_backend_terminated(*, mid_statement: bool) -> Exception:
+    """The connection gone: this test's OWN backend is terminated
+    (pg_terminate_backend of its own pid -- never another's). Idle, the
+    next statement meets a closed connection; mid-statement, the
+    statement itself dies (08003)."""
+    import asyncio
+
+    from sqlalchemy import text
+
+    from app.core.database import get_engine
+
+    engine = get_engine()
+    async with engine.connect() as victim:
+        pid = (await victim.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
+        async def terminate(after: float) -> None:
+            await asyncio.sleep(after)
+            async with engine.connect() as killer:
+                await killer.execute(
+                    text("SELECT pg_terminate_backend(:p)"), {"p": pid},
+                )
+                await killer.commit()
+
+        try:
+            if mid_statement:
+                killing = asyncio.ensure_future(terminate(0.3))
+                try:
+                    await victim.execute(text("SELECT pg_sleep(3)"))
+                finally:
+                    await killing
+            else:
+                await terminate(0)
+                await asyncio.sleep(0.2)
+                await victim.execute(text("SELECT 1"))
+        except Exception as exc:
+            return exc
+    raise AssertionError("the terminated connection answered")
+
+
+async def real_misuse_of_a_connection() -> Exception:
+    """The driver's InterfaceError for code that misuses a connection --
+    two statements at once on one: a bug of ours, not of the database."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    # SQLAlchemy serializes its own statements on a connection, so the
+    # misuse is built under it: a statement started on the DRIVER's
+    # connection, still running, when SQLAlchemy sends one -- the
+    # driver's "another operation is in progress", wrapped as
+    # SQLAlchemy's InterfaceError, exactly as a connection gone idle is.
+    # An engine of its own: the connection is left broken.
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as conn:
+            raw = await conn.get_raw_connection()
+            driver = raw.driver_connection
+            assert driver is not None
+            running = asyncio.ensure_future(driver.execute("SELECT pg_sleep(0.3)"))
+            await asyncio.sleep(0.05)
+            try:
+                await conn.exec_driver_sql("SELECT 1")
+            except Exception as exc:
+                return exc
+            finally:
+                await running
+    finally:
+        await engine.dispose()
+    raise AssertionError("no misuse error")
+
+
+async def real_pool_timeout() -> Exception:
+    """The pool's own timeout: a pool of one, held, asked again."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(
+        settings.database_url, pool_size=1, max_overflow=0, pool_timeout=0.2,
+    )
+    try:
+        async with engine.connect() as hold:
+            await hold.execute(text("SELECT 1"))
+            try:
+                async with engine.connect() as again:
+                    await again.execute(text("SELECT 1"))
+            except Exception as exc:
+                return exc
+    finally:
+        await engine.dispose()
+    raise AssertionError("no pool timeout")
+
+
+async def real_connection_refused() -> Exception:
+    """A connection that never opens: nothing listens on port 1."""
+    from sqlalchemy import text
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    url = make_url(settings.database_url).set(port=1)
+    engine = create_async_engine(url)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        return exc
+    finally:
+        await engine.dispose()
+    raise AssertionError("port 1 answered")
+
+
+async def real_combined_connect_failure() -> Exception:
+    """THE COMBINED FAILURE OF SEVERAL ADDRESSES (TX-1 FIX), raised by
+    asyncio itself: the database's name resolves to two addresses (a
+    patched getaddrinfo -- 127.0.0.1 and 127.0.0.2, both loopback), both
+    refuse on port 1 with texts that differ, and BaseEventLoop.
+    create_connection raises a new bare OSError('Multiple exceptions:
+    ...') with no errno. Through the app's real driver path: SQLAlchemy,
+    asyncpg, the loop. On the stand `localhost` resolves to ::1 and
+    127.0.0.1 and a refused connection comes as this."""
+    import asyncio
+    import socket as socket_module
+
+    from sqlalchemy import text
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    loop = asyncio.get_running_loop()
+    name = "comms-two-addresses.invalid"
+
+    async def two_addresses(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+        if host != name:
+            return await original(host, port, *args, **kwargs)
+        return [
+            (socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "",
+             (address, int(port)))
+            for address in ("127.0.0.1", "127.0.0.2")
+        ]
+
+    original = loop.getaddrinfo
+    loop.getaddrinfo = two_addresses  # type: ignore[method-assign]
+    engine = create_async_engine(
+        make_url(settings.database_url).set(host=name, port=1),
+    )
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        return exc
+    finally:
+        del loop.getaddrinfo
+        await engine.dispose()
+    raise AssertionError("two refusing addresses answered")
+
+
+async def real_constraint_violations() -> dict[str, Exception]:
+    """Not transient, by Postgres: a unique violation (23505), a CHECK
+    (23514), a foreign key (23503)."""
+    from sqlalchemy import text
+
+    from app.core.database import get_session_factory
+
+    key = f"tx1-{uuid4().hex[:10]}"
+    found: dict[str, Exception] = {}
+    factory = get_session_factory()
+    for name, statement, params in (
+        ("unique", "INSERT INTO sections (id, key, label, created_at) "
+                   "VALUES (gen_random_uuid(), :k, 'x', now())", {"k": key}),
+        ("check", "UPDATE recipients SET locale = '' WHERE id = :id",
+         {"id": None}),
+        ("foreign key", "INSERT INTO thread_read_states (thread_id, participant, "
+                        "last_read_at) VALUES (gen_random_uuid(), "
+                        "gen_random_uuid(), now())", {}),
+    ):
+        async with factory() as s:
+            if name == "unique":
+                await s.execute(text(statement), params)
+                await s.commit()
+            if name == "check":
+                rid = uuid4()
+                await create_recipient(s, recipient_id=rid,
+                                       telegram_id=next_tx1_telegram_id())
+                await s.commit()
+                params = {"id": rid}
+            try:
+                await s.execute(text(statement), params)
+                await s.commit()
+            except Exception as exc:
+                found[name] = exc
+                await s.rollback()
+    return found
+
+
 async def create_recipient(
     session: AsyncSession,
     *,
@@ -602,3 +894,87 @@ def sql_shape(statement: Any) -> SqlShape:
         lock=lock,
         sources=frozenset(_SOURCES.findall(text)),
     )
+
+
+# -----------------------------------------------------------------------------
+# A row-lock wait, identified by the LOCKS, never by the statement's text
+# -----------------------------------------------------------------------------
+#
+# pg_stat_activity.query is cut at track_activity_query_size (1024 bytes
+# by default): a SELECT of a whole job row grew past it in TX-3 (three
+# columns) and lost its FOR UPDATE from the text a test parsed. What a
+# backend waits FOR is in pg_locks: a backend waiting on a row holds the
+# row's TUPLE lock (granted) and waits on the holder's transaction; the
+# tuple lock's mode is the row lock asked for, and the relation lock the
+# statement took says what kind of statement it is.
+
+TUPLE_LOCK = {
+    "AccessShareLock": "FOR KEY SHARE",
+    "RowShareLock": "FOR SHARE",
+    "ExclusiveLock": "FOR NO KEY UPDATE",
+    # FOR UPDATE, and a DELETE (or a key-changing UPDATE) alike: the
+    # relation lock tells them apart (RowShareLock / RowExclusiveLock).
+    "AccessExclusiveLock": "FOR UPDATE",
+}
+
+
+@dataclass(frozen=True)
+class RowWait:
+    """What a backend waiting on a row lock waits with."""
+
+    relation: str
+    row_lock: str                  # TUPLE_LOCK of its tuple lock's mode
+    relation_modes: frozenset[str]  # the locks its transaction holds there
+
+    @property
+    def is_delete(self) -> bool:
+        return self.row_lock == "FOR UPDATE" and (
+            "RowExclusiveLock" in self.relation_modes
+        )
+
+
+async def row_wait(pid: int) -> RowWait | None:
+    """The row-lock wait of backend `pid` in this database, or None."""
+    from sqlalchemy import text as sql_text
+
+    from app.core.database import get_session_factory
+
+    async with get_session_factory()() as observer:
+        rows = (await observer.execute(sql_text(
+            "SELECT c.relname, t.mode, "
+            "array(SELECT r.mode FROM pg_locks r WHERE r.pid = a.pid "
+            "      AND r.locktype = 'relation' AND r.relation = t.relation) "
+            "FROM pg_stat_activity a "
+            "JOIN pg_locks t ON t.pid = a.pid AND t.locktype = 'tuple' "
+            "     AND t.granted "
+            "JOIN pg_class c ON c.oid = t.relation "
+            "WHERE a.pid = :pid AND a.wait_event_type = 'Lock' "
+            "AND a.datname = current_database()"
+        ), {"pid": pid})).all()
+    if not rows:
+        return None
+    (relation, mode, modes), = rows
+    return RowWait(relation, TUPLE_LOCK[mode], frozenset(modes))
+
+
+async def row_waiters(relation: str) -> list[tuple[int, RowWait]]:
+    """Every backend of this database waiting on a row of `relation`."""
+    from sqlalchemy import text as sql_text
+
+    from app.core.database import get_session_factory
+
+    async with get_session_factory()() as observer:
+        pids = (await observer.execute(sql_text(
+            "SELECT a.pid FROM pg_stat_activity a "
+            "JOIN pg_locks t ON t.pid = a.pid AND t.locktype = 'tuple' "
+            "     AND t.granted "
+            "WHERE a.wait_event_type = 'Lock' "
+            "AND a.datname = current_database() "
+            "AND t.relation = CAST(:rel AS regclass)"
+        ), {"rel": relation})).scalars().all()
+    found = []
+    for pid in pids:
+        wait = await row_wait(pid)
+        if wait is not None:
+            found.append((pid, wait))
+    return found

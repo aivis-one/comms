@@ -18,7 +18,7 @@
 
 [project]
 name = "comms-service"
-version = "3.12.0"
+version = "3.13.0"
 description = "COMMS -- standalone notifications + messaging service"
 requires-python = ">=3.12"
 
@@ -46,6 +46,9 @@ dependencies = [
 dev = [
     "pytest>=8.0.0,<9.0",
     "pytest-asyncio>=0.24.0,<1.0",
+    # A hung test is a red test, not a job that waits six hours
+    # (FIX review 3.13.0, the second).
+    "pytest-timeout>=2.4.0,<3.0",
     "httpx>=0.27.0,<1.0",
     "ruff>=0.7.0,<1.0",
     "mypy>=1.11.0,<2.0",
@@ -109,3 +112,15 @@ asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 pythonpath = ["."]
 cache_dir = "/tmp/.pytest_cache"
+# A TEST THAT HANGS IS RED (FIX review 3.13.0, the second): CI waited six
+# hours on one that never returned. 300 s per test -- setup, call and
+# teardown: the longest test (0037's measure, a 600 MB heap built) takes
+# ~50 s here and two to three times that in CI; the first test also
+# carries the session's setup (~6 s here). method = signal, by a measure:
+# a hung async test holding a real db_session, then a test using the
+# database -- with signal the hung one failed, the next one PASSED on a
+# clean database, no warning of an unclosed loop or connection (only the
+# hung test's own coroutine reported pending at exit); with thread the
+# whole process went down at the first timeout. Signal keeps the run.
+timeout = 300
+timeout_method = "signal"

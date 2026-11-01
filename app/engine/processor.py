@@ -97,6 +97,7 @@
 # =============================================================================
 
 import asyncio
+import enum
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -108,7 +109,7 @@ from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import get_session_factory
+from app.core.database import get_session_factory, is_transient_db_error
 from app.core.lanes import Lane
 from app.core.sanitize import sanitized_traceback
 from app.engine import journal
@@ -130,6 +131,7 @@ from app.engine.service import (
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
+    end_transient_wait,
     first_waiting_delivery,
     forget_llm_letter,
     purge_llm_answers,
@@ -240,7 +242,7 @@ def ready_now(now: datetime) -> ColumnElement[bool]:
     (app/engine/depth.py, H8), so the depth's "ready" is exactly what
     the next pass would select, its batch limit aside: pending, or
     processing with a delivery due; scheduled; past its pipeline gate
-    (T12); not expired."""
+    (T12); not expired; not stuck at the ceiling (not_stuck, TX-3)."""
     # The job's first due waiting delivery, correlated to the job row:
     # a scalar subquery of first_waiting_delivery, never an EXISTS -- an
     # EXISTS under an OR is planned as a hashed subplan that reads every
@@ -267,7 +269,18 @@ def ready_now(now: datetime) -> ColumnElement[bool]:
             Notification.pipeline_retry_at <= now,
         ),
         not_expired(now),
+        not_stuck(),
     )
+
+
+def not_stuck() -> ColumnElement[bool]:
+    """A job below the ceiling of attempts (TX-3). One that reached it
+    and is not closed is STUCK: comms could not close it
+    (_record_stuck), and no lane takes it again -- the state is the
+    database's, so a restart or a second worker process does not take
+    it either. A ceiling raised in the settings makes it selectable
+    again, on purpose (deploy/INTEGRATION.md)."""
+    return Notification.pipeline_attempts < settings.notification_max_pipeline_attempts
 
 
 class LaneJobs:
@@ -287,6 +300,58 @@ class LaneJobs:
         self.places = asyncio.Semaphore(LANE_JOBS[lane])
         self.slots = asyncio.Semaphore(LANE_CONCURRENCY[lane])
         self.in_work: set[UUID] = set()
+        # THE REST IN THE PROCESS (TX-3): a job whose failure could not
+        # be written onto it -- the database down for the record too --
+        # is not selected again before its backoff, so the lane does not
+        # spin on it every poll. job -> monotonic time it may be taken.
+        # Kept only in memory: a restart forgets it, and the job is
+        # taken once more -- harmless. Purged at every pass (expired
+        # entries go), and a job that ends gives its entry back, so the
+        # map holds only the lane's recently failed jobs.
+        self.resting: dict[UUID, float] = {}
+        # Failures of a job that could not be written for a reason no
+        # rest cures, counted in this process (TX-3, unrecordable).
+        self.unrecorded: dict[UUID, int] = {}
+
+    def unrecordable(self, notif_id: UUID) -> None:
+        """A failure that could not be written for a reason no rest will
+        cure (TX-3): not a quiet loop. The job rests for the longest
+        backoff; at the ceiling of attempts it is PARKED in this process
+        -- not taken again until a restart -- and said loudly. A flag on
+        the job cannot be written: every write to it just failed."""
+        count = self.unrecorded.get(notif_id, 0) + 1
+        self.unrecorded[notif_id] = count
+        ceiling = settings.notification_max_pipeline_attempts
+        logger.error(
+            "notification_pipeline_unrecordable",
+            notification_id=str(notif_id),
+            count=count,
+            ceiling=ceiling,
+        )
+        if count >= ceiling:
+            self.resting[notif_id] = float("inf")
+            logger.error(
+                "notification_pipeline_parked",
+                notification_id=str(notif_id),
+                lane=self.lane.value,
+            )
+            return
+        self.resting[notif_id] = time.monotonic() + float(
+            settings.notification_max_backoff_seconds
+        )
+
+    def rest(self, notif_id: UUID) -> None:
+        """Keep `notif_id` out of the lane's selection for the backoff."""
+        self.resting[notif_id] = time.monotonic() + float(
+            settings.notification_retry_backoff_base_seconds
+        )
+
+    def purge_rest(self) -> None:
+        """Drop every rest that has run out."""
+        now = time.monotonic()
+        for notif_id, until in list(self.resting.items()):
+            if until <= now:
+                del self.resting[notif_id]
 
 
 @dataclass
@@ -402,7 +467,10 @@ async def _pass(
         # dropped by THIS set, it is not counted as one of the batch's new
         # (a SENT job attempted again, a new one left behind). Only this
         # pass starts jobs of the lane, so no job enters it meanwhile.
-        in_work = set(jobs.in_work)
+        # A job at rest in the process (LaneJobs.rest) is left out the
+        # same way, until its rest runs out (TX-3).
+        jobs.purge_rest()
+        in_work = set(jobs.in_work) | set(jobs.resting)
         now = datetime.now(UTC)
         async with factory() as session:
             stmt = (
@@ -445,22 +513,64 @@ async def _attempt(
     """One job's attempt in its place: the place and the job's mark of
     work are given back when it ends, however it ends; then the pass is
     told, and a full portion wakes the lane (process_lane)."""
+    unrecorded: _Recorded | None = None
+
+    def rest(kind: _Recorded) -> None:
+        nonlocal unrecorded
+        unrecorded = kind
+
+    processed = portion_full = False
     try:
-        processed, portion_full = await _attempt_job(notif_id, jobs.slots)
+        processed, portion_full = await _attempt_job(
+            notif_id, jobs.slots, rest=rest,
+        )
+    except Exception as exc:
+        # THE LAST LINE (TX-3): nothing an attempt raises reaches the
+        # lane's task group -- an Exception there cancels the group,
+        # ends the lane's loop and takes the worker process down with
+        # the other loops (app/worker.py run_worker_loop). The job is
+        # left as it was and rests; the log gets the class and the place.
+        logger.error(
+            "notification_attempt_error",
+            notification_id=str(notif_id),
+            error=pipeline_error_of(exc),
+        )
+        unrecorded = _Recorded.NO
     finally:
         jobs.in_work.discard(notif_id)
         jobs.places.release()
+    if unrecorded is _Recorded.TRANSIENT:
+        jobs.rest(notif_id)
+    elif unrecorded is _Recorded.NO:
+        jobs.unrecordable(notif_id)
+    else:
+        jobs.resting.pop(notif_id, None)
+        jobs.unrecorded.pop(notif_id, None)
     tally.end(processed)
     if portion_full and on_more is not None:
         on_more()
 
 
 async def _attempt_job(
-    notif_id: UUID, slots: asyncio.Semaphore,
+    notif_id: UUID,
+    slots: asyncio.Semaphore,
+    rest: Callable[["_Recorded"], None] | None = None,
 ) -> tuple[bool, bool]:
     """Lock, resolve, deliver one portion in the lane's `slots`, roll up
-    and commit one job. Returns (processed, portion full); a pipeline
-    failure is recorded on the job (_record_pipeline_failure)."""
+    and commit one job. Returns (processed, portion full).
+
+    A FAILURE OF THE ATTEMPT (TX-3) is recorded on the job by its kind:
+    a TRANSIENT failure of the database (app/core/database.py
+    is_transient_db_error) gates the job without spending an attempt
+    (_record_transient_gate); any other spends one, up to the ceiling
+    (_record_pipeline_failure). The rule reads only what reaches here:
+    a provider's error -- aiohttp, httpx, the body's download -- is
+    caught inside _deliver_single and becomes the delivery's outcome,
+    never this step's exception (the TX-3 report). The rollback is
+    guarded: on a connection that died while the session held a
+    transaction it raises too. When nothing could be recorded, `rest`
+    is told why (_Recorded): the lane rests or parks the job.
+    """
     factory = get_session_factory()
     step = PipelineStep.LOCK
     async with factory() as session:
@@ -499,6 +609,17 @@ async def _attempt_job(
             ):
                 return False, False
 
+            # A gate that let this attempt through has done its job, and
+            # so has an open transient wait: both go HERE, at the start,
+            # in the attempt's own transaction (TX-3) -- the fold below
+            # never meets a gate with no ground (ck_notifications_
+            # pipeline_gate), and an attempt that fails rolls this back
+            # with the rest: a transient failure again finds its wait
+            # open, the same episode. The failure record (attempts,
+            # step, error) stays.
+            notification.pipeline_retry_at = None
+            end_transient_wait(notification)
+
             # resolve (idempotent -- skips if deliveries exist)
             step = PipelineStep.RESOLVE
             await resolve_notification(session, notification)
@@ -513,24 +634,150 @@ async def _attempt_job(
             step = PipelineStep.ROLLUP
             await rollup_notification(session, notification)
 
-            # A gate that let this attempt through has done its job;
-            # the failure record (attempts, step, error) stays.
-            notification.pipeline_retry_at = None
-
             step = PipelineStep.COMMIT
             await session.commit()
             return True, portion_full
 
         except Exception as exc:
-            await session.rollback()
+            await _guarded_rollback(session, notif_id)
             logger.error(
                 "notification_pipeline_error",
                 notification_id=str(notif_id),
                 step=step.value,
                 exception=sanitized_traceback(exc),
             )
-            await _record_pipeline_failure(notif_id, step, exc)
+            recorded = await _record_failure(notif_id, step, exc)
+            if recorded is not _Recorded.YES and rest is not None:
+                rest(recorded)
             return False, False
+
+
+class _Recorded(enum.Enum):
+    """Whether a failure of an attempt was written onto its job."""
+
+    YES = "yes"
+    # The record failed on a TRANSIENT failure of the database: the job
+    # rests in the process for the backoff and is taken again.
+    TRANSIENT = "transient"
+    # The record failed on anything else -- a constraint, a bug: no rest
+    # will cure it, so it is not a quiet loop (_attempt parks the job).
+    NO = "no"
+
+
+async def _record_failure(
+    notif_id: UUID, step: PipelineStep, exc: BaseException,
+) -> "_Recorded":
+    """Record a failure of an attempt by its kind (TX-3). A transient
+    failure of the database gates the job without spending an attempt;
+    if that gate cannot be written for any reason but a transient one,
+    the ordinary path is taken instead -- an attempt counted, the
+    ceiling reachable -- so a gate the database refuses never becomes a
+    job retried forever. Any other failure takes the ordinary path."""
+    if is_transient_db_error(exc):
+        recorded = await _record_transient_gate(notif_id, step, exc)
+        if recorded is not _Recorded.NO:
+            return recorded
+        logger.error(
+            "notification_transient_gate_refused",
+            notification_id=str(notif_id),
+            step=step.value,
+        )
+    return await _record_pipeline_failure(notif_id, step, exc)
+
+
+def _kind_of(record_exc: BaseException) -> "_Recorded":
+    return _Recorded.TRANSIENT if is_transient_db_error(record_exc) else _Recorded.NO
+
+
+async def _guarded_rollback(
+    session: AsyncSession, notif_id: UUID | None,
+) -> None:
+    """Roll back, and survive a rollback that cannot be done (TX-3):
+    measured on a real session, a connection that died while the session
+    held a transaction raises on ROLLBACK too (one that died under a
+    failed statement does not). The transaction is gone either way."""
+    try:
+        await session.rollback()
+    except Exception as exc:
+        logger.error(
+            "notification_rollback_error",
+            notification_id=str(notif_id) if notif_id else None,
+            error=pipeline_error_of(exc),
+        )
+
+
+async def _record_transient_gate(
+    notif_id: UUID, step: PipelineStep, exc: BaseException,
+) -> "_Recorded":
+    """A TRANSIENT failure of the database on a step (TX-3): gate the job
+    for the base backoff WITHOUT spending an attempt -- the database's
+    moment, not the job's fault, never closes it. No counter is kept,
+    so the gate does not grow; the job goes on until the failure passes
+    or its expiry.
+
+    THE WAIT HAS ITS OWN FIELDS (migration 0037): pipeline_transient_since,
+    _step, _error. pipeline_attempts / _step / _error are left alone --
+    they are the counted failures and the last of them, and a wait is
+    not one. THE JOURNAL DOES NOT GROW WITH THE WAIT: a row is written
+    when a wait begins (no open wait) or when, within one, the step or
+    the failure's class changes; a repeat only moves the gate."""
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            notification = (
+                await session.execute(
+                    select(Notification)
+                    .where(Notification.id == notif_id)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalar_one_or_none()
+            if notification is None or notification.status not in (
+                NotificationStatus.PENDING,
+                NotificationStatus.PROCESSING,
+            ):
+                return _Recorded.YES  # another's, or closed: nothing owed
+            error = pipeline_error_of(exc)
+            opening = notification.pipeline_transient_since is None
+            changed = not opening and (
+                notification.pipeline_transient_step != step.value
+                or _error_class(notification.pipeline_transient_error)
+                != _error_class(error)
+            )
+            now = datetime.now(UTC)
+            if opening:
+                notification.pipeline_transient_since = now
+            notification.pipeline_transient_step = step.value
+            notification.pipeline_transient_error = error
+            notification.pipeline_retry_at = now + timedelta(
+                seconds=settings.notification_retry_backoff_base_seconds,
+            )
+            if opening or changed:
+                journal.record_job(
+                    session, notification, JournalStep(step.value),
+                    error=error, wait_until=notification.pipeline_retry_at,
+                )
+            await session.commit()
+            logger.warning(
+                "notification_pipeline_transient",
+                notification_id=str(notif_id),
+                step=step.value,
+                error=error,
+                attempts=notification.pipeline_attempts,
+            )
+            return _Recorded.YES
+        except Exception as record_exc:
+            await _guarded_rollback(session, notif_id)
+            logger.error(
+                "notification_pipeline_record_error",
+                notification_id=str(notif_id),
+                error=pipeline_error_of(record_exc),
+            )
+            return _kind_of(record_exc)
+
+
+def _error_class(error: str | None) -> str | None:
+    """The class part of a pipeline error ("module.Class at place")."""
+    return None if error is None else error.split(" at ", 1)[0]
 
 
 def _pipeline_backoff(attempts: int) -> timedelta:
@@ -546,7 +793,7 @@ def _pipeline_backoff(attempts: int) -> timedelta:
 
 async def _record_pipeline_failure(
     notif_id: UUID, step: PipelineStep, exc: BaseException,
-) -> None:
+) -> "_Recorded":
     """Write one pipeline failure onto the job, in its own transaction
     (the attempt's own was rolled back). Below the ceiling: gate the
     job. At the ceiling: close it (see the module header).
@@ -558,6 +805,10 @@ async def _record_pipeline_failure(
     transactions, stay -- so a letter the channel accepted before the
     attempt tore is closed SENT here at the ceiling, and SENT without
     a second send by the next attempt below it.
+
+    Returns whether the failure was written (_Recorded); its own
+    rollback is guarded (TX-3), so a database down for the record too is
+    an answer, not an exception into the lane's task group.
     """
     factory = get_session_factory()
     async with factory() as session:
@@ -575,7 +826,12 @@ async def _record_pipeline_failure(
             ):
                 # Taken by another worker, or closed meanwhile (expiry,
                 # cancellation): nothing to record on.
-                return
+                return _Recorded.YES
+            # An ordinary failure ends a transient wait (TX-3) -- BEFORE
+            # the count grows: with no attempt counted yet, the wait's
+            # gate goes with it, and the counted failure sets its own
+            # below. The next transient failure begins a new wait.
+            end_transient_wait(notification)
             notification.pipeline_attempts += 1
             notification.pipeline_step = step.value
             notification.pipeline_error = pipeline_error_of(exc)
@@ -599,7 +855,7 @@ async def _record_pipeline_failure(
                     attempts=attempts,
                     ceiling=ceiling,
                 )
-                return
+                return _Recorded.YES
             notification.pipeline_retry_at = None
             # The last failure itself, under the step that tore, then
             # the closing rows under the ceiling.
@@ -607,8 +863,21 @@ async def _record_pipeline_failure(
                 session, notification, torn,
                 error=notification.pipeline_error,
             )
-            closed = await _close_at_ceiling(session, notification)
-            await session.commit()
+            try:
+                closed = await _close_at_ceiling(session, notification)
+                await session.commit()
+            except Exception as close_exc:
+                # THE CLOSE ITSELF FAILED (TX-3): it goes through the same
+                # fold the attempts failed in, and its failure took the
+                # whole record back with it -- the count never reached the
+                # ceiling, the job was never closed and was taken again
+                # forever. A transient failure of the database is a wait
+                # like any other; anything else leaves the job STUCK,
+                # recorded so (_record_stuck) and no longer selected.
+                await _guarded_rollback(session, notif_id)
+                if is_transient_db_error(close_exc):
+                    return await _record_transient_gate(notif_id, step, close_exc)
+                return await _record_stuck(notif_id, close_exc)
             logger.error(
                 "notification_pipeline_failed",
                 notification_id=str(notif_id),
@@ -617,13 +886,63 @@ async def _record_pipeline_failure(
                 deliveries_closed=closed,
                 status=notification.status,
             )
+            return _Recorded.YES
         except Exception as record_exc:
-            await session.rollback()
+            await _guarded_rollback(session, notif_id)
             logger.error(
                 "notification_pipeline_record_error",
                 notification_id=str(notif_id),
                 exception=sanitized_traceback(record_exc),
             )
+            return _kind_of(record_exc)
+
+
+async def _record_stuck(notif_id: UUID, exc: BaseException) -> "_Recorded":
+    """A job comms could not close at the ceiling (TX-3): its count set
+    to the ceiling, its last failure the close's (class and place), no
+    gate, no open wait; a journal row under the ceiling. The lane's
+    selection leaves a job at the ceiling that is not closed
+    (ready_now, not_stuck) -- so it is said once, here, and not taken
+    again; the job's answer shows it (attempts at the ceiling, a status
+    not closed). A defect of comms, not of the product."""
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            notification = (
+                await session.execute(
+                    select(Notification)
+                    .where(Notification.id == notif_id)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalar_one_or_none()
+            if notification is None or notification.status not in (
+                NotificationStatus.PENDING,
+                NotificationStatus.PROCESSING,
+            ):
+                return _Recorded.YES
+            error = pipeline_error_of(exc)
+            end_transient_wait(notification)
+            notification.pipeline_attempts = settings.notification_max_pipeline_attempts
+            notification.pipeline_step = PipelineStep.ROLLUP.value
+            notification.pipeline_error = error
+            notification.pipeline_retry_at = None
+            journal.record_job(session, notification, JournalStep.CEILING, error=error)
+            await session.commit()
+            logger.error(
+                "notification_pipeline_stuck",
+                notification_id=str(notif_id),
+                error=error,
+                attempts=notification.pipeline_attempts,
+            )
+            return _Recorded.YES
+        except Exception as record_exc:
+            await _guarded_rollback(session, notif_id)
+            logger.error(
+                "notification_pipeline_record_error",
+                notification_id=str(notif_id),
+                error=pipeline_error_of(record_exc),
+            )
+            return _kind_of(record_exc)
 
 
 async def _close_at_ceiling(
@@ -685,6 +1004,7 @@ async def _close_at_ceiling(
         if not resolved:
             # Nothing to fold: the resolve failed (branch (a) above).
             notification.status = NotificationStatus.FAILED
+            end_transient_wait(notification)
             journal.record_job(session, notification, JournalStep.CEILING)
             await forget_llm_letter(session, notification)
             return 0
@@ -907,13 +1227,16 @@ async def cleanup_terminal_notifications() -> int:
             )
             await session.commit()
         except Exception as exc:
-            await session.rollback()
+            await _guarded_rollback(session, None)
             logger.error(
                 "retention_pass_error",
                 deleted=total,
                 exception=sanitized_traceback(exc),
             )
-            return total
+            # Raised on (TX-3): a failed retention must not look like a
+            # done one -- the worker moves its cadence mark only after a
+            # pass that succeeded (app/worker.py run_maintenance_pass).
+            raise
 
     # Logged EVERY pass, empty ones included: a slow empty scan is
     # exactly the BL-3 trigger signal.

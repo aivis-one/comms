@@ -63,6 +63,8 @@ def _drain(
         env_lines,
         _function("rotate_predrain_dumps"),
         _function("drain_driver"),
+        # the one dump of the script, which cmd_drain calls since TX-4
+        _function("dump_db"),
         _function("cmd_drain"),
         'cmd_drain "$@"',
     ])

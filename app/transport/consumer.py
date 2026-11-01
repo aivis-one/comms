@@ -23,9 +23,22 @@
 #              unregistered type, invalid channel) -> log + DLQ + XACK:
 #              the event can never succeed; the stream MUST keep
 #              moving.
+#   waiting    a TRANSIENT failure of the database while the database
+#              does NOT answer (SELECT 1): waited for, uncounted, the
+#              delay doubling to 30 s, said loudly on the 1st and every
+#              10th wait -- the event is not lost (FIX review 3.13.0).
+#              While it DOES answer, the transient failure is the
+#              event's: the bounded budget below, then the DLQ.
 #   retryable  (NotFoundError: group_changed before its user_upserted;
-#              OperationalError: transient DB hiccup) -> bounded
-#              inline backoff, then DLQ + XACK.
+#              a TRANSIENT failure of the database by the one rule,
+#              app/core/database.py is_transient_db_error -- a deadlock,
+#              a serialization failure, a lost or refused connection, a
+#              restart, an overload) -> bounded inline backoff, then
+#              DLQ + XACK, "retries exhausted". Until TX-1 only an
+#              OperationalError was retried here -- which asyncpg's
+#              adapter never raises: a deadlock or a dropped connection
+#              reached the DLQ on the first try, and the event (a
+#              user_deleted among them) was lost.
 #   duplicate  (same key, same bytes) -> XACK only: a replay is the
 #              at-least-once contract working, not an error.
 #   rejected / conflict (a notification request not accepted, F1.2)
@@ -75,16 +88,17 @@
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 from redis.typing import EncodableT, FieldT
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.database import get_session_factory
+from app.core.database import get_engine, get_session_factory, is_transient_db_error
 from app.core.exceptions import (
     ConflictError,
     NotFoundError,
@@ -103,6 +117,7 @@ from app.transport.events import (
     NOTIFICATION_REQUEST_ENVELOPE_FIELDS,
     NOTIFICATION_REQUEST_FRAME_FIELDS,
     entry_field_name,
+    event_data_or_none,
     parse_event,
 )
 from app.transport.handlers import HandleResult, handle_event
@@ -118,6 +133,29 @@ _BACKOFF_DELAYS: tuple[float, ...] = (0.2, 0.4, 0.8, 1.6, 3.2)
 # Redis has already waited server-side (BLOCK), so this only guards
 # against clients whose blocking read returns immediately.
 _IDLE_SLEEP_SECONDS = 0.05
+
+# WAITING FOR THE DATABASE (FIX review 3.13.0): the delay doubles from
+# _BACKOFF_DELAYS[0] to this ceiling, uncounted, while the database does
+# not answer -- a restart of Postgres takes seconds to minutes, and 30 s
+# keeps the stream within half a minute of its return without growing
+# the log. Said loudly on the first wait and every _WAIT_LOUD_EVERY-th.
+_WAIT_CEILING = 30.0
+_WAIT_LOUD_EVERY = 10
+# How long "does the database answer" may take to say no.
+_PROBE_TIMEOUT = 5.0
+
+
+async def _database_answers() -> bool:
+    """Whether the database answers a SELECT 1 on a short connection of
+    its own -- whatever an event's failure was."""
+    try:
+        async with get_engine().connect() as connection:
+            await asyncio.wait_for(
+                connection.execute(text("SELECT 1")), _PROBE_TIMEOUT,
+            )
+        return True
+    except Exception:
+        return False
 
 # The fields of a dead letter -- the contract's list
 # (deploy/INTEGRATION.md, "How long comms keeps things"), held to this
@@ -147,8 +185,16 @@ _DLQ_WITHHELD_ENVELOPE_FIELDS = frozenset({"llm_audio"})
 class StreamConsumer:
     """One consumer-group reader over the product's event stream."""
 
-    def __init__(self, redis: Redis) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        database_probe: Callable[[], Awaitable[bool]] | None = None,
+    ) -> None:
         self._redis = redis
+        # Does the database answer at all (FIX review 3.13.0)? Asked when
+        # an event meets a transient failure: a database that does not
+        # answer is waited for; one that does makes it the EVENT's.
+        self._database_answers = database_probe or _database_answers
         self._stream = settings.comms_events_stream
         self._group = settings.comms_consumer_group
         self._consumer = settings.comms_consumer_name
@@ -215,7 +261,24 @@ class StreamConsumer:
                 continue
             for _stream_name, entries in response:
                 for entry_id, fields in entries:
-                    await self._process_entry(entry_id, fields)
+                    await self._process_guarded(entry_id, fields)
+
+    async def _process_guarded(
+        self, entry_id: str | bytes, fields: dict[Any, Any],
+    ) -> None:
+        """THE LAST LINE (FIX review 3.13.0): whatever _process_entry
+        still raises is the entry's, not the process's -- logged with its
+        class and place, the entry left pending for the next start. A
+        failure of the loop's own read (Redis down) is outside this and
+        still ends run(): the restart policy reconnects."""
+        try:
+            await self._process_entry(entry_id, fields)
+        except Exception as exc:
+            logger.error(
+                "event_left_pending",
+                entry_id=_id_str(entry_id),
+                error=pipeline_error_of(exc),
+            )
 
     async def _drain_pending(self) -> int:
         """Replay entries delivered to THIS consumer but never acked
@@ -223,70 +286,88 @@ class StreamConsumer:
         returns the pending list of this consumer name; a stable name
         makes restart recovery this one loop."""
         drained = 0
+        # A CURSOR, not "0" every time (FIX review 3.13.0): an entry left
+        # pending on purpose (a dead letter that could not be written)
+        # stays in the pending list, and reading from "0" again would meet
+        # it forever -- no new event would ever be read. Each read starts
+        # after the last entry seen: a held entry is met once per start.
+        cursor: str | bytes = "0"
         while True:
             response = await self._redis.xreadgroup(
                 groupname=self._group,
                 consumername=self._consumer,
-                streams={self._stream: "0"},
+                streams={self._stream: cursor},
                 count=settings.consumer_batch_size,
             )
             if not response or not response[0][1]:
                 return drained
             for _stream_name, entries in response:
                 for entry_id, fields in entries:
-                    await self._process_entry(entry_id, fields)
+                    await self._process_guarded(entry_id, fields)
                     drained += 1
+                    cursor = entry_id
 
     # -- per-entry processing ----------------------------------------------
 
     async def _process_entry(
         self, entry_id: str | bytes, fields: dict[Any, Any]
     ) -> None:
-        """Parse -> handle (with bounded retry) -> ack. Never raises
-        for a bad EVENT (poison-pill rule); only infrastructure
-        failures (Redis down, DB down past the backoff budget) surface
-        via the DLQ or propagate out of the loop."""
+        """Parse -> handle -> ack. Never raises for a bad EVENT
+        (poison-pill rule), and never for a dead letter or an ack that
+        cannot be written either (FIX review 3.13.0): those leave the
+        entry pending (_dead_letter_or_hold, _ack_or_hold).
+
+        RETRIES:
+          - NotFoundError (the address book has not caught up) and a
+            transient failure of the database WHILE THE DATABASE
+            ANSWERS -- the bounded budget, _BACKOFF_DELAYS, then the dead
+            letter, "retries exhausted": one event failing over and
+            over must not stop the stream behind it;
+          - a transient failure while the database does NOT answer
+            (_database_answers) -- WAIT, uncounted, the delay doubling to
+            _WAIT_CEILING, said loudly on the first and every
+            _WAIT_LOUD_EVERY-th wait: it says nothing of the event, and
+            the event is not lost. Until this fix a restart of Postgres
+            longer than the budget (~6 s) dead-lettered every event of
+            the window, a user_deleted among them.
+        See the KNOWN CEILING (BL-4) in the module header: the inline
+        sleep blocks the whole stream -- as a database that does not
+        answer would anyway."""
         try:
             event = parse_event(fields)
         except ValidationError as exc:
-            await self._to_dlq(entry_id, fields, reason=str(exc), attempts=0)
-            await self._ack(entry_id)
+            await self._dead_letter_or_hold(
+                entry_id, fields, reason=str(exc), attempts=0,
+            )
+            return
+        except Exception as exc:
+            # ANY failure of the parse is the entry's, never the
+            # process's (poison-pill rule, EM-1 FIX-2). The class and the
+            # place -- in the dead letter and in the log alike, no
+            # traceback: what the parse raises may quote the data it was
+            # reading, and a request's data is the letter.
+            logger.error(
+                "event_unexpected_error",
+                entry_id=_id_str(entry_id),
+                stage="parse",
+                error=pipeline_error_of(exc),
+            )
+            await self._dead_letter_or_hold(
+                entry_id, fields,
+                reason=f"unexpected: {pipeline_error_of(exc)}",
+                attempts=0,
+            )
             return
 
-        attempt = 0
+        attempt = 0  # tries while the database answered
+        waited = 0  # waits while it did not
         while True:
             attempt += 1
             try:
                 async with self._session_factory() as session:
                     result = await handle_event(session, event)
-                    # COMMIT BEFORE XACK -- see DURABILITY OF INTAKE.
                     await session.commit()
-                if result is HandleResult.DUPLICATE:
-                    logger.info(
-                        "event_duplicate_acked",
-                        entry_id=_id_str(entry_id),
-                    )
-                elif result in (HandleResult.REJECTED, HandleResult.CONFLICT):
-                    logger.info(
-                        "event_not_accepted_recorded",
-                        entry_id=_id_str(entry_id),
-                        result=result.value,
-                    )
-                else:
-                    logger.info(
-                        "event_processed",
-                        entry_id=_id_str(entry_id),
-                        # NB: "event" is structlog's reserved key for
-                        # the message itself -- hence event_type.
-                        event_type=type(event).__name__,
-                        attempt=attempt,
-                    )
-                await self._ack(entry_id)
-                return
             except ConflictError as exc:
-                # Late or repeated, not broken (F1.4): the event cannot
-                # change what is recorded, and replaying it never will.
-                # Refused by CLASS, acknowledged, no dead letter.
                 logger.warning(
                     "event_refused",
                     entry_id=_id_str(entry_id),
@@ -294,20 +375,46 @@ class StreamConsumer:
                     refusal_class=conflict_class(exc),
                     reason=sanitize_text(str(exc)),
                 )
-                await self._ack(entry_id)
+                await self._ack_or_hold(entry_id)
                 return
             except ValidationError as exc:
-                # Terminal by classification (e.g. unregistered type):
-                # retrying cannot fix a wrong event.
-                await self._to_dlq(
+                await self._dead_letter_or_hold(
                     entry_id, fields, reason=str(exc), attempts=attempt,
                 )
-                await self._ack(entry_id)
                 return
-            except (NotFoundError, OperationalError) as exc:
-                # Retryable: sync ordering lag / transient DB failure.
-                # See the KNOWN CEILING (BL-4) in the module header:
-                # this inline sleep blocks the whole stream.
+            except Exception as exc:
+                if not _retryable(exc):
+                    # Unknown bug in ONE event must not wedge the stream
+                    # (poison-pill rule): preserve the evidence, move on.
+                    # Not logger.exception(): the renderer would print
+                    # the chain raw -- a database error's text is its SQL
+                    # and bound parameters. Same event, level and
+                    # `exception` key, redacted (app/core/sanitize.py).
+                    logger.error(
+                        "event_unexpected_error",
+                        entry_id=_id_str(entry_id),
+                        exception=sanitized_traceback(exc),
+                    )
+                    await self._dead_letter_or_hold(
+                        entry_id, fields,
+                        reason=f"unexpected: {pipeline_error_of(exc)}",
+                        attempts=attempt,
+                    )
+                    return
+                if is_transient_db_error(exc) and not await self._database_answers():
+                    attempt -= 1  # the database's moment, not the event's
+                    waited += 1
+                    delay = min(_WAIT_CEILING, _BACKOFF_DELAYS[0] * 2 ** (waited - 1))
+                    if waited == 1 or waited % _WAIT_LOUD_EVERY == 0:
+                        logger.warning(
+                            "event_waiting_for_database",
+                            entry_id=_id_str(entry_id),
+                            waits=waited,
+                            delay=delay,
+                            error=pipeline_error_of(exc),
+                        )
+                    await asyncio.sleep(delay)
+                    continue
                 if attempt > len(_BACKOFF_DELAYS):
                     logger.warning(
                         "event_retries_exhausted",
@@ -315,16 +422,15 @@ class StreamConsumer:
                         attempts=attempt,
                         error=sanitize_text(str(exc)),
                     )
-                    # The class and the place, never the text: an
-                    # OperationalError's text is its SQL and bound
-                    # parameters -- the letter, on a job's insert. The
-                    # text stays in the log line above (redacted).
-                    await self._to_dlq(
+                    # The class and the place, never the text: a database
+                    # error's text is its SQL and bound parameters -- the
+                    # letter, on a job's insert. The text stays in the
+                    # log line above (redacted).
+                    await self._dead_letter_or_hold(
                         entry_id, fields,
                         reason=f"retries exhausted: {pipeline_error_of(exc)}",
                         attempts=attempt,
                     )
-                    await self._ack(entry_id)
                     return
                 delay = _BACKOFF_DELAYS[attempt - 1]
                 logger.info(
@@ -335,27 +441,66 @@ class StreamConsumer:
                     error=sanitize_text(str(exc)),
                 )
                 await asyncio.sleep(delay)
-            except Exception as exc:
-                # Unknown bug in ONE event must not wedge the stream
-                # (poison-pill rule): preserve the evidence, move on.
-                # Not logger.exception(): the renderer would print the
-                # chain raw -- an OperationalError's text is its SQL and
-                # bound parameters. Same event, level and `exception`
-                # key, redacted (app/core/sanitize.py).
-                logger.error(
-                    "event_unexpected_error",
+                continue
+            if result is HandleResult.DUPLICATE:
+                logger.info("event_duplicate_acked", entry_id=_id_str(entry_id))
+            elif result in (HandleResult.REJECTED, HandleResult.CONFLICT):
+                logger.info(
+                    "event_not_accepted_recorded",
                     entry_id=_id_str(entry_id),
-                    exception=sanitized_traceback(exc),
+                    result=result.value,
                 )
-                await self._to_dlq(
-                    entry_id, fields,
-                    reason=f"unexpected: {pipeline_error_of(exc)}",
-                    attempts=attempt,
+            else:
+                logger.info(
+                    "event_processed",
+                    entry_id=_id_str(entry_id),
+                    event_type=type(event).__name__,
+                    attempt=attempt,
                 )
-                await self._ack(entry_id)
-                return
+            # Acknowledged OUTSIDE the try (FIX review 3.13.0): an XACK
+            # that fails is no failure of the event to dead-letter; the
+            # entry stays pending, and its replay is a duplicate.
+            await self._ack_or_hold(entry_id)
+            return
 
-    # -- plumbing ------------------------------------------------------------
+    async def _ack_or_hold(self, entry_id: str | bytes) -> None:
+        """Acknowledge; if Redis refuses, the entry stays pending (said
+        loudly) -- never an exception out of an entry's handling."""
+        try:
+            await self._ack(entry_id)
+        except Exception as exc:
+            logger.error(
+                "event_ack_failed",
+                entry_id=_id_str(entry_id),
+                error=pipeline_error_of(exc),
+            )
+
+    async def _dead_letter_or_hold(
+        self,
+        entry_id: str | bytes,
+        fields: dict[Any, Any],
+        *,
+        reason: str,
+        attempts: int,
+    ) -> None:
+        """THE ONE WAY an entry goes to the dead letter (FIX review
+        3.13.0): written, then acknowledged. If the writing or the ack
+        fails -- Redis down, a dead letter that cannot be built -- the
+        entry STAYS PENDING: not lost, seen in XPENDING and in this log
+        line, offered again at the next start (_drain_pending, its
+        cursor past it). Never an exception out of an except clause:
+        before, a TypeError of the dead letter's own JSON left
+        _process_entry from inside one and took the consumer down, again
+        at every restart."""
+        try:
+            await self._to_dlq(entry_id, fields, reason=reason, attempts=attempts)
+            await self._ack(entry_id)
+        except Exception as exc:
+            logger.error(
+                "dead_letter_write_failed",
+                entry_id=_id_str(entry_id),
+                error=pipeline_error_of(exc),
+            )
 
     async def _ack(self, entry_id: str | bytes) -> None:
         await self._redis.xack(self._stream, self._group, entry_id)
@@ -399,6 +544,13 @@ class StreamConsumer:
             reason=reason,
             attempts=attempts,
         )
+
+
+def _retryable(exc: BaseException) -> bool:
+    """Whether the consumer tries an event again: an ordering lag (a
+    NotFoundError -- the address book has not caught up) or a transient
+    failure of the database, by the one rule (TX-1)."""
+    return isinstance(exc, NotFoundError) or is_transient_db_error(exc)
 
 
 def dlq_kept_data_fields(event: str | None) -> frozenset[str] | None:
@@ -457,7 +609,9 @@ def dead_letter_fields(
         dead["_dlq_data_fingerprint"] = stream_fingerprint(raw_data)
         dead["_dlq_data_bytes"] = str(len(raw_data))
         kept = dlq_kept_data_fields(event)
-        data = _json_object_or_none(raw_data)
+        # Read by the one reader of event data (app/transport/events.py):
+        # a bomb is not recursed into here, a NaN is not written back.
+        data = event_data_or_none(raw_data)
         if kept is None or data is None:
             dropped.append(ENVELOPE_DATA_FIELD)
         else:
@@ -481,17 +635,6 @@ def _utf8_or_none(raw: bytes) -> str | None:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
-
-
-def _json_object_or_none(raw: bytes) -> dict[str, Any] | None:
-    text = _utf8_or_none(raw)
-    if text is None:
-        return None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _id_str(entry_id: str | bytes) -> str:

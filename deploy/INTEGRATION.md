@@ -462,12 +462,14 @@ email. Nothing of the profile is used for that email -- neither the
 `subject` and `body` templates of the email channel nor the job's
 `title` and `body`, which stay the letter of the other channels. comms
 rewrites nothing: no variables are filled in, nothing is escaped, cut
-or cleaned, the HTML is not sanitized or checked, and a subject with a
-line break goes as it is -- if the provider refuses it, that is a
-refusal of that job like any other. Send the text always: it is the
-version of the message for a client that shows no HTML, and an HTML
-message without one is a common reason to be filed as spam. One block
-per job -- every recipient of a group job gets the same email; a
+or cleaned, the HTML is not sanitized or checked. The subject is one
+line: a subject with a line break (`\r` or `\n`) is rejected at intake
+-- comms refuses it rather than clean it, for the email is yours; a tab
+or two spaces in a row go as they are. The sender and the single
+recipient are comms', whatever the block holds. Send the text always:
+it is the version of the message for a client that shows no HTML, and
+an HTML message without one is a common reason to be filed as spam. One
+block per job -- every recipient of a group job gets the same email; a
 person who muted the type's category gets none, as before. Without the
 block the email is composed from the profile as described above, byte
 for byte as before.
@@ -548,8 +550,25 @@ body, with a class a program can branch on:
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 422 | `validation` | the input is wrong; `fields` names each input |
 | 500 | `internal` | our defect; the text carries nothing from it |
+| 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
 The message is for a human; the class is the contract.
+
+**A write is answered after its commit.** Every route that writes
+answers only once what it wrote is committed: a 2xx means the row is
+there. A commit that fails is the answer -- a 503 or a 500 -- never a
+success with nothing behind it.
+
+**503 `unavailable`: the outcome is unknown -- repeat the same
+request.** A connection lost on the commit itself may have taken the
+commit with it or not; comms cannot tell, and neither can you. So
+repeat the request as it was -- with the same `Idempotency-Key` where
+the call takes one (`POST /threads`, `POST /threads/{id}/messages`, the
+variant routes); every other write is safe to repeat by construction
+(the table below). A repeat after a write that did land answers as the
+first would have. A 503 that comes back every time is a defect of ours,
+not a moment of the database: a misuse of a connection looks to comms
+like a lost one, and is retried the same way until it is not.
 
 **One way to page.** Every listing -- the inbox, the visible threads, a
 thread's messages, a job's deliveries and its path, the address book,
@@ -878,7 +897,7 @@ never interprets.
 | `body` | by type | letter | 1..5000; as `title` |
 | `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
-| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
+| `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500, one line: no `\r` or `\n`), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
 
 There is no channel and no priority on a request. The channel is the
@@ -904,6 +923,19 @@ other event (`user_upserted`, `user_deleted`, `group_changed`,
 `section_membership_changed`, `reminder_cancel`) goes to the
 dead-letter stream at once, naming the field -- the event is malformed,
 not failing.
+
+**The same holds for every value of that class -- one comms cannot
+store -- and for data nested too deep.** A number that is no JSON
+number comms can store -- `NaN`, `Infinity`, `-Infinity` (some JSON
+writers emit them), a literal past the float range (`1e309`), an
+integer of more than 4300 digits -- is rejected naming the field; so
+is `data` nested deeper than 64 levels (the `data` object itself the
+first), and a `scheduled_at` or `expiry_at` that lies, in UTC, before
+the year 1 or after 9999 (the year 1 at `+01:00`, say). A request is
+rejected under its key whenever the key can be read. Data that cannot
+be read at all -- broken JSON, a nesting past what the reader can
+follow -- leaves no key, and the request goes to the dead-letter
+stream.
 
 **What intake answers.** A request is decided the moment it is read:
 
@@ -1043,6 +1075,13 @@ comms has not been told about yet is retried, the same lag
 
 ### Ordering the producer relies on
 
+**comms' own database down does not lose your event.** When it does not
+answer at all, comms waits -- without a limit, the delay growing to 30 s
+-- and processes the event once it is back. When it does answer and one
+event keeps meeting a transient failure, that event goes to the
+dead-letter stream after a short bounded series of retries, so the
+events behind it are not held.
+
 - `user_upserted` for a new user precedes `group_changed` for them; a
   momentary inversion is retried by comms with a bounded backoff, a
   persistent one ends in the dead-letter stream.
@@ -1167,10 +1206,18 @@ job's outcome, within `keep_until`.
 
 | field | value |
 |---|---|
-| `attempts` | failed pipeline attempts; 0 when none |
-| `step` | the step that tore last: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
-| `error` | the class and the place of the failure, or `null` |
-| `retry_at` | when the job is tried again, or `null` |
+| `attempts` | failed pipeline attempts; 0 when none. A transient failure of comms' own database (a deadlock, a lost connection, a restart) is not counted |
+| `step` | the step of the last counted failure: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null`. A transient failure of comms' database is not one |
+| `error` | the class and the place of the last counted failure, or `null` |
+| `retry_at` | when the job is tried again, or `null`. With `attempts` 0 it is a wait on a transient failure of comms' database; that wait is recorded in the job's path, one row per wait |
+
+**A job STUCK at the ceiling.** A job whose `attempts` equal comms' ceiling
+(`NOTIFICATION_MAX_PIPELINE_ATTEMPTS`) while its `status` is not an
+outcome is stuck: comms failed at the ceiling to close it. That is a
+defect of comms, not of your request -- its `error` names the class and
+the place, and comms says it once in its log. No worker takes it again;
+raising the ceiling in comms' settings makes it selectable once more, on
+purpose.
 
 ### `delivery_count`
 
@@ -1214,6 +1261,17 @@ One row per transition, in order.
 | `category` | the category a mute gate decided by, or `null` |
 | `error` | an exception of comms' own: class and place, never its text; or `null` |
 | `provider_text` | the provider's answer, sanitized; `null` when it said nothing or its recipient was forgotten |
+
+**A wait on a transient failure of comms' database is one row, not one
+per retry.** Such a failure does not spend an attempt; the job waits
+behind its retry gate (`wait_reason: pipeline_retry`) and is tried again.
+Its row in the path -- the step, the failure's class and place,
+`wait_until` -- is written when the wait begins, and again only when the
+step or the failure's class changes within it. The job's `pipeline`
+(`attempts`, `step`, `error`) keeps the counted failures only; a wait
+leaves them as they were. A step that succeeds ends the wait,
+and so does an ordinary failure: the next transient failure begins a new
+wait, with a row of its own.
 
 ## 9. What changed since a cursor
 
