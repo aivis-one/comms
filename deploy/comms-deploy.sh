@@ -1059,74 +1059,6 @@ cmd_test() {
     echo -e "${GREEN}✓ suite passed against ${POSTGRES_DB}_test${NC}"
 }
 
-# ------------------------------------------------------------------------------
-# dlq-scrub -- bring the dead letters already kept to today's rule (ST-1)
-# ------------------------------------------------------------------------------
-#
-# The dead-letter stream has no expiry, and an entry written by an older
-# comms keeps its older rule: a person's contacts (an address-book event
-# before ST-1), the whole letter of a request and an exception's text
-# (before G4). The rule of the code is app/transport/consumer.py's; the
-# pass is app/transport/dlq_scrub.py, run in a one-off container of the
-# built image -- one copy of the rule, and the module header says what
-# each form becomes. Once, by hand: it is no step of `update`.
-#
-#   dlq-scrub           CHECK: counts by form and event, changes nothing.
-#   dlq-scrub --apply   confirm (`yes`, no flag skips it: what it removes
-#                       does not come back), then rewrite the stream in one
-#                       optimistic transaction -- ids, order and number
-#                       kept. comms keeps running: a dead letter written
-#                       meanwhile restarts the pass.
-#
-# A stream with a consumer group is refused, nothing touched: someone
-# reads it. Exit codes: 0 done (or nothing to do), 1 refused (a group, or
-# the confirmation declined), 2 cannot (redis down, the stream kept
-# changing), 3 the check found entries to bring to the rule.
-cmd_dlq_scrub() {
-    cd_compose
-    load_env
-    local apply=0 arg
-    for arg in "$@"; do
-        case "$arg" in
-            --apply) apply=1 ;;
-            *)
-                echo -e "${RED}Usage: $0 dlq-scrub [--apply]${NC}"
-                exit 2
-                ;;
-        esac
-    done
-
-    if ! $COMPOSE_CMD ps --status running --services 2>/dev/null \
-            | grep -qx comms-redis; then
-        echo -e "${RED}✗ comms-redis is not running -- start it first${NC}"
-        echo "  Next: $COMPOSE_CMD up -d comms-redis"
-        exit 2
-    fi
-
-    local rc=0
-    dlq_scrub_driver --script "$0" || rc=$?
-    if [ "$apply" -eq 0 ] || [ "$rc" -ne 3 ]; then
-        exit "$rc"
-    fi
-
-    echo -e "${YELLOW}This rewrites the dead letters above; what it removes does not come back.${NC}"
-    read -r -p "Type 'yes' to proceed: " answer
-    if [ "$answer" != "yes" ]; then
-        echo "Aborted -- nothing changed."
-        exit 1
-    fi
-    rc=0
-    dlq_scrub_driver --apply --script "$0" || rc=$?
-    exit "$rc"
-}
-
-# The driver: one-off container of the built image, the module of the
-# image. Prints its own report; its exit code is cmd_dlq_scrub's.
-dlq_scrub_driver() {
-    $COMPOSE_CMD run --rm --no-deps -T --entrypoint python comms-app \
-        -m app.transport.dlq_scrub "$@"
-}
-
 cmd_status() {
     cd_compose
     $COMPOSE_CMD ps
@@ -1144,7 +1076,7 @@ cmd_status() {
 # invisible to the product, and the product will keep reporting that
 # this service cannot do it. Products parse these labels with a regular
 # expression: the verbs are the case at column zero, and EVERY nested
-# case in this file is indented (cmd_db, cmd_drain, cmd_dlq_scrub) so its labels are
+# case in this file is indented (cmd_db, cmd_drain) so its labels are
 # never read as verbs.
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;
@@ -1157,9 +1089,8 @@ case "${1:-}" in
     test)    shift; cmd_test "$@" ;;
     status)  shift; cmd_status "$@" ;;
     drain)   shift; cmd_drain "$@" ;;
-    dlq-scrub) shift; cmd_dlq_scrub "$@" ;;
     *)
-        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|test|status|drain [--apply]|dlq-scrub [--apply]}"
+        echo "Usage: $0 {install|update|start|stop|restart|logs [service]|db {dump|restore <file>|migrate}|test|status|drain [--apply]}"
         exit 1
         ;;
 esac

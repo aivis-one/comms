@@ -132,7 +132,7 @@ from app.engine.service import (
     deliver_notification,
     end_transient_wait,
     first_waiting_delivery,
-    forget_channel_letters,
+    forget_llm_letter,
     purge_llm_answers,
     resolve_notification,
     rollup_notification,
@@ -1005,7 +1005,7 @@ async def _close_at_ceiling(
             notification.status = NotificationStatus.FAILED
             end_transient_wait(notification)
             journal.record_job(session, notification, JournalStep.CEILING)
-            await forget_channel_letters(session, notification)
+            await forget_llm_letter(session, notification)
             return 0
     closed = await close_waiting_deliveries(
         session,

@@ -454,9 +454,6 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_notifications_transient_wait_gated",
     # ...and a state of a job not closed yet: no close leaves it behind.
     "ck_notifications_transient_wait_open",
-    # The product's own email lives until the job's outcome (ST-1,
-    # migration 0038): a job at an outcome holds no block.
-    "ck_notifications_email_open",
 })
 
 

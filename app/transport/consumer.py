@@ -64,15 +64,12 @@
 # the DLQ back into the stream: the product resends from its outbox, the
 # source of the request (deploy/INTEGRATION.md, "How long comms keeps
 # things"). So a dead letter keeps the ADDRESS of the entry, never its
-# letter: the event name, the keys of `data` the event's dead letter
-# keeps (DLQ_KEPT_DATA_FIELDS) -- an address-book event only who it is
-# about, never the person's contacts (ST-1) -- the fingerprint and
-# length of the `data` bytes, by which the product finds the event at
-# home, the names of everything dropped, the reason, the attempts and the
-# source entry id. The stream lives in the shared redis with no expiry;
-# a letter kept there would outlive every promise of the contract, and a
-# contact kept there would outlive the person's forgetting (spec §10.4):
-# forgetting does not reach the stream, so the stream never holds one.
+# letter: the event name, the keys of `data` named by the event's own
+# field set (dead_letter_fields), the fingerprint and length of the
+# `data` bytes -- by which the product finds the event at home -- the
+# names of everything dropped, the reason, the attempts and the source
+# entry id. The stream lives in the shared redis with no expiry; a
+# letter kept there would outlive every promise of the contract.
 #
 # KNOWN CEILING -- head-of-line blocking on the ordering retry (BL-4).
 # Mechanics: a group_changed that arrived before its user_upserted is
@@ -120,12 +117,7 @@ from app.transport.events import (
     ENVELOPE_DATA_FIELD,
     ENVELOPE_EVENT_FIELD,
     EVENT_FIELDS,
-    EVENT_GROUP_CHANGED,
     EVENT_NOTIFICATION_REQUEST,
-    EVENT_REMINDER_CANCEL,
-    EVENT_SECTION_MEMBERSHIP_CHANGED,
-    EVENT_USER_DELETED,
-    EVENT_USER_UPSERTED,
     NOTIFICATION_REQUEST_ENVELOPE_FIELDS,
     NOTIFICATION_REQUEST_FRAME_FIELDS,
     entry_field_name,
@@ -192,35 +184,6 @@ DLQ_FIELDS: tuple[str, ...] = (
 # for as long as the object lives. The one place this exception is
 # written.
 _DLQ_WITHHELD_ENVELOPE_FIELDS = frozenset({"llm_audio"})
-
-# What a dead letter keeps of `data`, by event -- ONE copy, every event
-# named (ST-1). An event missing here keeps nothing of its data: a new
-# event is not kept whole by default, it must be added here, with a
-# reason, and tests/test_dlq_identity.py holds every event of
-# EVENT_FIELDS to an entry of this table and every entry to a subset of
-# its event's own field set.
-#   notification_request -- the frame and the envelope, without the
-#     withheld link (G4, deploy/INTEGRATION.md section 7);
-#   the address book -- who the event is about and nothing else: the
-#     person's id, the snapshot's version where the event has one, and
-#     the frame's `v`. The contacts, `active`, the group or section a
-#     person joined or left, and the section's label are dropped by
-#     name: with the person's id they say something about the person,
-#     and that would outlive the forgetting (spec §16.3, 1 November
-#     2026). The product finds the event at home by the fingerprint;
-#   reminder_cancel -- not the address book: its fields are the
-#     envelope of the jobs it cancels, the same class the request keeps.
-DLQ_KEPT_DATA_FIELDS: dict[str, frozenset[str]] = {
-    EVENT_NOTIFICATION_REQUEST: (
-        NOTIFICATION_REQUEST_FRAME_FIELDS
-        | (NOTIFICATION_REQUEST_ENVELOPE_FIELDS - _DLQ_WITHHELD_ENVELOPE_FIELDS)
-    ),
-    EVENT_USER_UPSERTED: frozenset({"v", "recipient_id", "version"}),
-    EVENT_USER_DELETED: frozenset({"v", "recipient_id", "version"}),
-    EVENT_GROUP_CHANGED: frozenset({"v", "recipient_id"}),
-    EVENT_SECTION_MEMBERSHIP_CHANGED: frozenset({"v", "operator_id"}),
-    EVENT_REMINDER_CANCEL: EVENT_FIELDS[EVENT_REMINDER_CANCEL],
-}
 
 
 class StreamConsumer:
@@ -598,14 +561,20 @@ def dlq_kept_data_fields(event: str | None) -> frozenset[str] | None:
     """The keys of `data` a dead letter keeps for this event; None when
     it keeps none.
 
-    A list of what is ALLOWED (DLQ_KEPT_DATA_FIELDS): a key that is not
-    in it -- `titel` is the letter under another name, `email` is a
-    person's contact -- is dropped by name. An unknown or absent event
-    has no entry: nothing of its `data` is kept.
+    A list of what is ALLOWED, the event's own field set: a key that is
+    not in it -- `titel` is the letter under another name -- is dropped
+    like the letter. notification_request keeps its frame and envelope
+    (deploy/INTEGRATION.md section 7) without the withheld link; the
+    other events are the address book comms keeps anyway. An unknown or
+    absent event has no field set: nothing of its `data` is kept.
     """
+    if event == EVENT_NOTIFICATION_REQUEST:
+        return NOTIFICATION_REQUEST_FRAME_FIELDS | (
+            NOTIFICATION_REQUEST_ENVELOPE_FIELDS - _DLQ_WITHHELD_ENVELOPE_FIELDS
+        )
     if event is None:
         return None
-    return DLQ_KEPT_DATA_FIELDS.get(event)
+    return EVENT_FIELDS.get(event)
 
 
 def dead_letter_fields(

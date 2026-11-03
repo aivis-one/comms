@@ -993,7 +993,6 @@ async def resolve_notification(
         notification.status = NotificationStatus.NO_RECIPIENTS
         end_transient_wait(notification)
         journal.record_job(session, notification, JournalStep.RESOLVE)
-        await forget_channel_letters(session, notification)
         logger.warning(
             "notification_no_targets",
             notification_id=str(notification.id),
@@ -1032,7 +1031,6 @@ async def resolve_notification(
             notification.status = NotificationStatus.SUPPRESSED
             end_transient_wait(notification)
             journal.record_job(session, notification, JournalStep.RESOLVE)
-            await forget_channel_letters(session, notification)
             logger.info(
                 "notification_all_muted",
                 notification_id=str(notification.id),
@@ -1954,7 +1952,7 @@ async def rollup_notification(
     notification.status = verdict
     end_transient_wait(notification)
     journal.record_job(session, notification, step)
-    await forget_channel_letters(session, notification)
+    await forget_llm_letter(session, notification)
     await session.flush()
     logger.info(
         "notification_rollup",
@@ -1963,43 +1961,30 @@ async def rollup_notification(
     )
 
 
-async def forget_channel_letters(
+async def forget_llm_letter(
     session: AsyncSession, notification: Notification,
 ) -> None:
-    """Clear the parts of a job's letter that only its channel ever
-    needed, once the job reached its outcome -- ONE function, called at
-    EVERY transition that gives a job its outcome (ST-1):
+    """Clear the model's letter of a job that reached its outcome (P5-1,
+    spec §14.12 item 5), and the link to its audio body with it (P5-2):
+    both were only ever needed to ask; the letter's hash stays
+    (llm_calls.letter_hash), and the body's is on the answer. A no-op
+    for a job for people, and for one still active.
 
-      - the product's own email (EM-1), notifications.email: read by the
-        email channel at its attempts and by nothing else -- no answer
-        of comms carries it (spec §16.3, 1 November 2026). title, body
-        and action_data stay until the retention: the in_app inbox reads
-        them;
-      - the model's letter and the link to its audio body (P5-1, P5-2,
-        spec §14.12 item 5), llm_calls.letter / audio: both were only
-        ever needed to ask; the letter's hash stays
-        (llm_calls.letter_hash), and the body's is on the answer.
-
-    The transitions, the five writes of an outcome status: the fold
-    (rollup_notification -- the attempt, expiry, cancellation and
-    forgetting of a resolved job, the pipeline's ceiling), the direct
-    close of a job not resolved yet (close_notifications), the
+    Called beside the three transitions that give an llm job its
+    outcome: the fold (rollup_notification -- the attempt, expiry and
+    cancellation of a resolved job, the pipeline's ceiling), the direct
+    close of a job not resolved yet (close_notifications), and the
     ceiling's close of a job whose resolve failed
-    (app/engine/processor.py _close_at_ceiling), and the resolve's
-    NO_RECIPIENTS and SUPPRESSED (resolve_notification). The database
-    holds the email half: ck_notifications_email_open refuses a job at
-    an outcome with its block (migration 0038), so a transition that
-    forgets this call fails instead of keeping the email.
-
-    A no-op for a job still active -- its attempts read the block. The
-    caller holds the job's row lock: the block is a column of that row,
-    written in the same flush as its status, and the llm_calls UPDATE
-    leaves its foreign key alone, so it takes no lock on the job.
+    (app/engine/processor.py _close_at_ceiling). The caller holds the
+    job's row lock. The row written is llm_calls, whose other writers are
+    intake and the cascade -- and its foreign key is not changed, so the
+    UPDATE takes no lock on the job.
     """
-    if notification.status in ACTIVE_STATUSES:
-        return
-    notification.email = None
     if not is_llm_route(notification.channels):
+        return
+    if notification.status in (
+        NotificationStatus.PENDING, NotificationStatus.PROCESSING,
+    ):
         return
     await session.execute(
         update(LLMCall)
@@ -2174,7 +2159,7 @@ async def close_notifications(
             notification.status = outcome
             end_transient_wait(notification)
             journal.record_job(session, notification, step)
-            await forget_channel_letters(session, notification)
+            await forget_llm_letter(session, notification)
             continue
         await close_waiting_deliveries(
             session, notification, delivery_outcome, step,

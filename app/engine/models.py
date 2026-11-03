@@ -261,12 +261,7 @@ class Notification(UUIDMixin, Base):
     # Its form is held by ck_notifications_email_form and its SQL-NULL
     # by ck_notifications_email_not_json_null (migration 0036); its
     # lengths by the intake (app/transport/events.py
-    # validate_email_letter). Lives until the job's OUTCOME, not with the
-    # row like title and body (ST-1): cleared by
-    # app/engine/service.py forget_channel_letters, and
-    # ck_notifications_email_open (migration 0038) refuses a job at an
-    # outcome that still holds it. On such a job NULL says nothing of
-    # whether a block came.
+    # validate_email_letter). Lives with the row, like title and body.
     email: Mapped[dict[str, str] | None] = mapped_column(
         JSON_VALUE,
         nullable=True,
@@ -697,7 +692,7 @@ class LLMCall(Base):
     schema, the model's parameters -- and comms never reads it: the
     adapter hands it to the model as it came (app/engine/formatters.py
     LLMFormatter). It is kept only until the job's outcome and is then
-    cleared (app/engine/service.py forget_channel_letters); its HASH stays, so
+    cleared (app/engine/service.py forget_llm_letter); its HASH stays, so
     "which letter was this answer to" outlives the letter (§14.11): a
     comparison of bytes, not a reading.
 
