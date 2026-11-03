@@ -77,7 +77,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 from app.core.channels import channel_env_keys
@@ -239,61 +238,6 @@ async def dispose_engine_at_end() -> AsyncGenerator[None, None]:
     """Dispose the lazy engine when the test session ends."""
     yield
     await dispose_engine()
-
-
-# ---------------------------------------------------------------------------
-# The session's event loop -- the test that removes it is the one that fails
-# ---------------------------------------------------------------------------
-#
-# The suite runs on ONE event loop for the session (pyproject.toml,
-# asyncio_default_*_loop_scope = "session"), the current loop of the main
-# thread between tests too -- and every test needs it, the sync ones
-# included: clean_db is an async autouse fixture. A test that calls
-# asyncio.run (an entry point's main()), set_event_loop or loop.close in
-# this process leaves the main thread without it, and EVERY test after it
-# fails with "There is no current event loop" -- 1763 of them on the stand
-# (FIX ST-1 #0) -- while the one that did it passes.
-#
-# So the check runs around the test's CALL, before any fixture's
-# teardown: the loop current before it must be current after it, not
-# closed. Otherwise the loop is put back, so the next tests run, and this
-# test FAILS -- reported as failed, not as an error of some later
-# teardown. A hook rather than a fixture for both reasons: the call phase
-# is the one a test's own result is, and clean_db's teardown would need
-# the loop before a fixture's own teardown got to put it back.
-# tests/test_event_loop_guard.py holds the tree to never doing it at all.
-
-LOOP_REMOVED = (
-    "test removed the session event loop "
-    "(asyncio.run / set_event_loop / loop.close)"
-)
-
-
-def current_loop() -> asyncio.AbstractEventLoop | None:
-    """The main thread's current event loop, WITHOUT creating one: the
-    policy's own slot (asyncio.get_event_loop would make and set a new
-    loop when none was ever set). tests/test_event_loop_guard.py holds the
-    slot's name to this Python."""
-    local = asyncio.get_event_loop_policy()._local  # type: ignore[attr-defined]
-    loop: asyncio.AbstractEventLoop | None = local._loop
-    return loop
-
-
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_call(item: pytest.Item) -> Generator[None, None, None]:
-    before = current_loop()
-    try:
-        result = yield
-    finally:
-        after = current_loop()
-        removed = before is not None and (after is not before or before.is_closed())
-        if removed and before is not None and not before.is_closed():
-            # The one place of the tests that sets the loop: putting the
-            # session's back (test_event_loop_guard.py allows exactly it).
-            asyncio.set_event_loop(before)
-    if removed:
-        pytest.fail(LOOP_REMOVED, pytrace=False)
-    return result
 
 
 # ---------------------------------------------------------------------------

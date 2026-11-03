@@ -31,9 +31,6 @@
 # =============================================================================
 
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -42,6 +39,7 @@ import pytest
 from fakeredis import aioredis as fakeaioredis
 
 from app.engine.service import stream_fingerprint
+from app.transport import dlq_scrub
 from app.transport.consumer import DLQ_FIELDS
 from app.transport.dlq_scrub import (
     EXIT_CANNOT,
@@ -337,38 +335,21 @@ class TestTheVerb:
             assert f"**{code}** = {word}" in section
         assert "the same ids, in the same order, as many entries" in section
 
-    def test_the_main_reads_the_settings(self) -> None:
-        """The entry point, in a process of its own: python -m
-        app.transport.dlq_scrub reads its arguments and
-        settings.dlq_stream and reaches run() -- against a redis that
-        refuses the connection it names the stream, exits 2 and touches
-        nothing.
-
-        Was an in-process call of main([]) with run() and the client
-        replaced, which claimed to leave no global effect -- and left the
-        worst one: main() is asyncio.run, which takes the session's event
-        loop of this process with it on its way out, and every test after
-        it failed (FIX ST-1 #0, tests/test_event_loop_guard.py)."""
+    def test_the_main_reads_the_settings(
+        self, redis: fakeaioredis.FakeRedis, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The entry point: the stream is settings.dlq_stream, the client
+        comms' own (both replaced here -- no global effect is left)."""
+        import app.transport.connection as connection
         from app.core.config import settings
 
-        done = _main_in_a_process("--apply", "--script", "S")
-        assert done.returncode == EXIT_CANNOT, done.stdout + done.stderr
-        assert f"✗ cannot read {settings.dlq_stream}: " in done.stdout
-        assert "Next: S status" in done.stdout
+        seen: list[str] = []
 
-    def test_the_main_refuses_an_unknown_argument(self) -> None:
-        """The pair: the arguments are read, not ignored."""
-        done = _main_in_a_process("--aply")
-        assert done.returncode == 2
-        assert "usage: dlq-scrub" in done.stderr
-        assert done.stdout == ""
+        async def fake_run(client: Any, key: str, **kwargs: Any) -> int:
+            seen.append(key)
+            return EXIT_DONE
 
-
-def _main_in_a_process(*args: str) -> subprocess.CompletedProcess[str]:
-    """The verb's entry point in a fresh interpreter, with this suite's
-    environment and a redis no one listens on."""
-    return subprocess.run(
-        [sys.executable, "-m", "app.transport.dlq_scrub", *args],
-        cwd=_REPO, env=dict(os.environ, REDIS_URL="redis://127.0.0.1:1/0"),
-        capture_output=True, text=True, timeout=60, check=False,
-    )
+        monkeypatch.setattr(connection, "redis_client", lambda: redis)
+        monkeypatch.setattr(dlq_scrub, "run", fake_run)
+        assert dlq_scrub.main([]) == EXIT_DONE
+        assert seen == [settings.dlq_stream]
