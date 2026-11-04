@@ -6,6 +6,8 @@
 #   api pool x comms-app's uvicorn --workers
 #   + worker pool + its wake listener (one connection, own engine)
 #   + consumer pool (the push relay shares it)
+#   + the database probe's connection, outside the pool, in the worker
+#     and in the consumer (PROBE_CONNECTIONS each, WK-2)
 #   + RESERVED_CONNECTIONS (migration, psql / pg_dump, the deploy probe)
 #   <= max_connections - superuser_reserved_connections
 # max_connections is the number written in the compose file -- never a
@@ -34,6 +36,7 @@ import app.main as api_entry
 import app.worker as worker_entry
 from app.core.database import (
     POOLS,
+    PROBE_CONNECTIONS,
     RESERVED_CONNECTIONS,
     ProcessRole,
     dispose_engine,
@@ -91,6 +94,10 @@ def _budget() -> dict[str, int]:
         held[name] = processes * POOLS[role].capacity
         if role is ProcessRole.WORKER:
             held[f"{name} listener"] = _LISTENER
+        if role in (ProcessRole.WORKER, ProcessRole.CONSUMER):
+            # Does the database answer (WK-2): its own connection, outside
+            # the pool, one at a time (app/core/database.py database_answers).
+            held[f"{name} probe"] = PROBE_CONNECTIONS
     held["reserved"] = RESERVED_CONNECTIONS
     return held
 
@@ -104,15 +111,17 @@ class TestTheSum:
             "comms-app": 2 * 20,
             "comms-worker": 35,
             "comms-worker listener": 1,
+            "comms-worker probe": 1,
             "comms-consumer": 10,
+            "comms-consumer probe": 1,
             "reserved": 3,
         }
-        assert sum(held.values()) == 89
+        assert sum(held.values()) == 91
         assert _max_connections() == 100
         assert sum(held.values()) <= _max_connections() - _SUPERUSER_RESERVED
 
     def test_one_more_api_worker_would_not(self) -> None:
-        """The edge, computed: a third uvicorn worker is 109 > 97 -- the
+        """The edge, computed: a third uvicorn worker is 111 > 97 -- the
         compose file cannot grow it without this test going red."""
         third = sum(_budget().values()) + POOLS[ProcessRole.API].capacity
         assert third > _max_connections() - _SUPERUSER_RESERVED

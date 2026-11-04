@@ -81,9 +81,9 @@ class NotificationStatus(enum.StrEnum):
 
 
 # The statuses of a job not closed yet -- ONE copy (TX-3): the code reads
-# it (app/engine/service.py), and migration 0037 builds its CHECK
-# ck_notifications_transient_wait_open from it; tests/test_worker_keeps_its_work.py
-# holds the database's CHECK to this set.
+# it (app/engine/service.py), and migrations 0037 and 0038 build
+# ck_notifications_transient_wait_open from it (0037's up, 0038's down;
+# the CHECK is gone at head since 0038).
 ACTIVE_STATUSES: tuple[NotificationStatus, ...] = (
     NotificationStatus.PENDING,
     NotificationStatus.PROCESSING,

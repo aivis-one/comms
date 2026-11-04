@@ -95,10 +95,13 @@ import structlog
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 from redis.typing import EncodableT, FieldT
-from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.database import get_engine, get_session_factory, is_transient_db_error
+from app.core.database import (
+    database_answers,
+    get_session_factory,
+    is_transient_db_error,
+)
 from app.core.exceptions import (
     ConflictError,
     NotFoundError,
@@ -145,21 +148,6 @@ _IDLE_SLEEP_SECONDS = 0.05
 # the log. Said loudly on the first wait and every _WAIT_LOUD_EVERY-th.
 _WAIT_CEILING = 30.0
 _WAIT_LOUD_EVERY = 10
-# How long "does the database answer" may take to say no.
-_PROBE_TIMEOUT = 5.0
-
-
-async def _database_answers() -> bool:
-    """Whether the database answers a SELECT 1 on a short connection of
-    its own -- whatever an event's failure was."""
-    try:
-        async with get_engine().connect() as connection:
-            await asyncio.wait_for(
-                connection.execute(text("SELECT 1")), _PROBE_TIMEOUT,
-            )
-        return True
-    except Exception:
-        return False
 
 # The fields of a dead letter -- the contract's list
 # (deploy/INTEGRATION.md, "How long comms keeps things"), held to this
@@ -197,8 +185,10 @@ class StreamConsumer:
         self._redis = redis
         # Does the database answer at all (FIX review 3.13.0)? Asked when
         # an event meets a transient failure: a database that does not
-        # answer is waited for; one that does makes it the EVENT's.
-        self._database_answers = database_probe or _database_answers
+        # answer is waited for; one that does makes it the EVENT's. The
+        # probe is the worker's too -- one rule (app/core/database.py
+        # database_answers).
+        self._database_answers = database_probe or database_answers
         self._stream = settings.comms_events_stream
         self._group = settings.comms_consumer_group
         self._consumer = settings.comms_consumer_name
@@ -328,9 +318,10 @@ class StreamConsumer:
             letter, "retries exhausted": one event failing over and
             over must not stop the stream behind it;
           - a transient failure while the database does NOT answer
-            (_database_answers) -- WAIT, uncounted, the delay doubling to
-            _WAIT_CEILING, said loudly on the first and every
-            _WAIT_LOUD_EVERY-th wait: it says nothing of the event, and
+            (app/core/database.py database_answers) -- WAIT, uncounted,
+            the delay doubling to _WAIT_CEILING, said loudly on the
+            first and every _WAIT_LOUD_EVERY-th wait: it says nothing of
+            the event, and
             the event is not lost. Until this fix a restart of Postgres
             longer than the budget (~6 s) dead-lettered every event of
             the window, a user_deleted among them.

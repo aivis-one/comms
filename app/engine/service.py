@@ -991,7 +991,6 @@ async def resolve_notification(
         # Nobody to deliver to: the product's sync, not comms, is what
         # to look at -- and not the recipients' choice either.
         notification.status = NotificationStatus.NO_RECIPIENTS
-        end_transient_wait(notification)
         journal.record_job(session, notification, JournalStep.RESOLVE)
         logger.warning(
             "notification_no_targets",
@@ -1029,7 +1028,6 @@ async def resolve_notification(
         if not recipient_ids:
             # Every recipient muted it: their decision, not a failure.
             notification.status = NotificationStatus.SUPPRESSED
-            end_transient_wait(notification)
             journal.record_job(session, notification, JournalStep.RESOLVE)
             logger.info(
                 "notification_all_muted",
@@ -1891,22 +1889,6 @@ def first_waiting_delivery(
     )
 
 
-def end_transient_wait(notification: Notification) -> None:
-    """End the job's open wait on a transient failure of the database
-    (TX-3): a step that succeeded, an ordinary failure, or the job's
-    close. Every such place calls this -- the field never outlives
-    them (ck_notifications_transient_wait_open holds it in the database).
-    The wait's own three fields, and -- with no attempt counted -- the
-    gate too: such a gate had no other ground than the wait
-    (ck_notifications_pipeline_gate). The counted failures' trace
-    (pipeline_attempts / _step / _error) and their gate stay."""
-    notification.pipeline_transient_since = None
-    notification.pipeline_transient_step = None
-    notification.pipeline_transient_error = None
-    if not notification.pipeline_attempts:
-        notification.pipeline_retry_at = None
-
-
 async def rollup_notification(
     session: AsyncSession,
     notification: Notification,
@@ -1950,7 +1932,6 @@ async def rollup_notification(
     if verdict is None:
         return
     notification.status = verdict
-    end_transient_wait(notification)
     journal.record_job(session, notification, step)
     await forget_llm_letter(session, notification)
     await session.flush()
@@ -2157,7 +2138,6 @@ async def close_notifications(
         if notification.status == NotificationStatus.PENDING:
             # Not resolved: no deliveries exist to carry the outcome.
             notification.status = outcome
-            end_transient_wait(notification)
             journal.record_job(session, notification, step)
             await forget_llm_letter(session, notification)
             continue

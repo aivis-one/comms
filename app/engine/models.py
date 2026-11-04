@@ -301,7 +301,9 @@ class Notification(UUIDMixin, Base):
 
     # -- The pipeline's own failures (T12, migration 0015) --
     # How many attempts of the pipeline ended in an exception of comms'
-    # own (not a channel answer -- those are the deliveries' business).
+    # own (not a channel answer -- those are the deliveries' business);
+    # a transient failure of the database counts while the database
+    # answers, and is not written while it does not (WK-2).
     # At settings.notification_max_pipeline_attempts the job gets its
     # outcome (app/engine/processor.py, _record_pipeline_failure).
     pipeline_attempts: Mapped[int] = mapped_column(
@@ -314,28 +316,6 @@ class Notification(UUIDMixin, Base):
     # neither starves the healthy ones nor is starved by them.
     pipeline_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
-        nullable=True,
-    )
-    # THE JOB'S OPEN WAIT on a TRANSIENT failure of the database (TX-3,
-    # migration 0037): when it began, the step it waits on, the failure's
-    # class and place. Its own fields -- pipeline_attempts / _step /
-    # _error stay the COUNTED failures and the last of them. Set together
-    # by the first transient failure of a wait (step and error refreshed
-    # when they change within it), cleared together by a step that
-    # succeeds, an ordinary failure and the job's close
-    # (service.end_transient_wait). The journal's row of a wait is
-    # written when it begins, not on every retry. Internal: no answer of
-    # the API carries them.
-    pipeline_transient_since: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-    pipeline_transient_step: Mapped[str | None] = mapped_column(
-        String(10),
-        nullable=True,
-    )
-    pipeline_transient_error: Mapped[str | None] = mapped_column(
-        String(300),
         nullable=True,
     )
     # Where it tore: a PipelineStep value.

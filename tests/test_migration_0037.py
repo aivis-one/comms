@@ -6,6 +6,11 @@
 # its CHECKs and replaces 0015's pipeline gate; down removes exactly
 # those and puts 0015's gate back; up again restores them -- definitions
 # compared, not names.
+#
+# AT 0037, NOT AT HEAD (WK-2): 0038 removes what 0037 adds, so this file
+# holds 0037 at its own revision (_0037) -- up to it, down from it.
+# Before 0038, head WAS 0037 and "upgrade head" said the same thing.
+# The fixture still leaves the database at head.
 # =============================================================================
 
 import asyncio
@@ -27,6 +32,7 @@ from tests.helpers import intake_fields
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _BEFORE = "0036_notification_email"
+_0037 = "0037_pipeline_transient_since"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
@@ -105,14 +111,15 @@ def _after(found: dict[str, Any]) -> None:
 
 
 async def test_up_down_up(at_head_afterwards: None) -> None:
+    await _migrate("downgrade", _0037)
     _after(await _objects())
     await _migrate("downgrade", _BEFORE)
     _before(await _objects())
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     _after(await _objects())
     await _migrate("downgrade", _BEFORE)
     _before(await _objects())
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     _after(await _objects())
 
 
@@ -142,7 +149,7 @@ async def _execute(*statements: str) -> None:
 async def test_every_constraint_is_validated(at_head_afterwards: None) -> None:
     """Added NOT VALID, then VALIDATEd: at head every one is valid."""
     await _migrate("downgrade", _BEFORE)
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     assert await _validated() == dict.fromkeys(_CONSTRAINTS_0037, True)
 
 
@@ -161,7 +168,7 @@ async def test_a_half_applied_run_goes_through(at_head_afterwards: None) -> None
         "(pipeline_transient_since IS NULL OR pipeline_retry_at IS NOT NULL) "
         "NOT VALID",
     )
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     assert await _validated() == dict.fromkeys(_CONSTRAINTS_0037, True)
     _after(await _objects())
 
@@ -173,6 +180,7 @@ async def test_down_with_an_open_wait_at_zero_attempts(
     takes that gate away with the wait, first, and passes. (A CLOSED job
     holding a wait's fields cannot be built: ck_notifications_transient_
     wait_open refuses it -- so it is not a case down meets.)"""
+    await _migrate("downgrade", _0037)
     async with get_session_factory()() as session:
         job = await create_notification(
             session, **intake_fields(), type="unit_event_in_app", title="T",
@@ -232,7 +240,7 @@ async def _bloat(rows: int) -> int:
 
 
 async def _measure() -> tuple[float, float, float]:
-    """Run 0036 -> head through the CLI; meanwhile watch pg_locks for a
+    """Run 0036 -> 0037 through the CLI; meanwhile watch pg_locks for a
     granted AccessExclusiveLock on notifications and time an UPDATE of
     a job row in a loop. Returns (held, longest write, the migration)."""
     await _migrate("downgrade", _BEFORE)
@@ -269,7 +277,7 @@ async def _measure() -> tuple[float, float, float]:
     await asyncio.sleep(0.2)
     started = time.monotonic()
     await dispose_engine()
-    done = await asyncio.to_thread(_alembic, "upgrade", "head")
+    done = await asyncio.to_thread(_alembic, "upgrade", _0037)
     took = time.monotonic() - started
     stop.set()
     await asyncio.gather(*tasks)
@@ -332,6 +340,7 @@ async def test_a_downgrade_that_fails_later_keeps_stamp_and_schema_together(
     so the stamp and the schema stay at head together. With an
     autocommit_block in 0037's downgrade, its undoing was committed while
     the stamp rolled back to 0037 -- the stamp ahead of the schema."""
+    await _migrate("downgrade", _0037)
     await _execute("CREATE VIEW zz_holds_email AS SELECT email FROM notifications")
     try:
         await dispose_engine()
@@ -379,9 +388,13 @@ async def test_upgrade_runs_again_after_its_stamp_was_left_behind(
     """An upgrade() with an autocommit_block commits its first part before
     alembic stamps it: when a later step of the same run fails, the stamp
     goes back to the revision before while the schema stays. Upgrading
-    again must go through, to the same schema, every constraint valid."""
+    again must go through, to the same schema, every constraint valid.
+    The database is brought to `revision` itself from head, down as well
+    as up (WK-2): with 0038 after it, "upgrade 0037" at head moved
+    nothing and the run compared head's schema with 0037's."""
     revision, previous = _revisions(path)
-    await _migrate("upgrade", revision)
+    await _migrate("upgrade", "head")
+    await _migrate("downgrade", revision)
     before = await _objects()
     await _migrate("stamp", previous)  # the stamp left behind
     await _migrate("upgrade", revision)

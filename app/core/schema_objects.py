@@ -448,12 +448,6 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # or an object of subject, text and an optional html, none blank.
     "ck_notifications_email_not_json_null",
     "ck_notifications_email_form",
-    # A transient wait's fields go together (TX-3, migration 0037)...
-    "ck_notifications_transient_wait_whole",
-    # ...it is a gated state...
-    "ck_notifications_transient_wait_gated",
-    # ...and a state of a job not closed yet: no close leaves it behind.
-    "ck_notifications_transient_wait_open",
 })
 
 

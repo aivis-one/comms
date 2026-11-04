@@ -39,7 +39,7 @@ from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import settings
-from app.core.database import get_session_factory
+from app.core.database import database_answers, get_session_factory
 from app.transport import consumer as consumer_module
 from app.transport.consumer import StreamConsumer
 from app.transport.events import event_data_or_none
@@ -248,7 +248,8 @@ class TestTheCursor:
 
 def _probe_down_for(times: int) -> tuple[Callable[[], Awaitable[bool]], list[int]]:
     """A REAL probe: a SELECT 1 against a port nothing listens on, for the
-    first `times` asks (the database down), then the real one."""
+    first `times` asks (the database down), then the real one -- the
+    worker's too since WK-2 (app/core/database.py database_answers)."""
     calls = [0]
 
     async def probe() -> bool:
@@ -256,7 +257,7 @@ def _probe_down_for(times: int) -> tuple[Callable[[], Awaitable[bool]], list[int
         if calls[0] <= times:
             await real_connection_refused()  # a real refusal, returned
             return False
-        return await consumer_module._database_answers()
+        return await database_answers()
 
     return probe, calls
 
