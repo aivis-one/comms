@@ -54,14 +54,25 @@ from app.core.exceptions import ValidationError
 
 logger = structlog.get_logger()
 
-# Constant 401 payload: never reflect anything from the request.
-_UNAUTHORIZED = HTTPException(
-    status_code=status.HTTP_401_UNAUTHORIZED,
-    detail="Invalid or missing service token",
-    headers={"WWW-Authenticate": "Bearer"},
-)
+def _unauthorized() -> HTTPException:
+    """The 401, a NEW object for every refusal (API-1).
 
-_BEARER_PREFIX = "Bearer "
+    Constant payload: nothing from the request is reflected. Not one
+    module-level instance: every `raise` of the same exception object
+    appends the raising frames to its __traceback__, so a shared
+    instance carried the frames of every refused request -- and their
+    locals -- for the life of the process, growing with each refusal.
+    """
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing service token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+# The scheme name is compared without regard to case (RFC 9110 §11.1);
+# exactly one space separates it from the token, as before.
+_BEARER_SCHEME = "bearer"
 
 
 async def require_service_auth(
@@ -70,27 +81,28 @@ async def require_service_auth(
     """FastAPI dependency: verify the service-to-service bearer token.
 
     Raises HTTP 401 when the Authorization header is missing, is not
-    a Bearer scheme, or carries a token that does not match
-    COMMS_SERVICE_TOKEN. No-op when the token is unset (development
-    only -- any other APP_ENV refuses to start without it).
+    a Bearer scheme (in any case: `bearer`, `BEARER`), or carries a
+    token that does not match COMMS_SERVICE_TOKEN. No-op when the token
+    is unset (development only -- any other APP_ENV refuses to start
+    without it).
     """
     expected = settings.comms_service_token
     if not expected:
         # Development with auth disabled (warned at startup).
         return
 
-    if authorization is None or not authorization.startswith(_BEARER_PREFIX):
+    scheme, separator, presented = (authorization or "").partition(" ")
+    if not separator or scheme.lower() != _BEARER_SCHEME:
         logger.warning("service_auth_failed", reason="missing_or_not_bearer")
-        raise _UNAUTHORIZED
+        raise _unauthorized()
 
-    presented = authorization[len(_BEARER_PREFIX) :]
     if not secrets.compare_digest(
         presented.encode("utf-8"), expected.encode("utf-8")
     ):
         # Do NOT log the presented value -- a near-miss token is still
         # a secret (e.g. the prod token hitting the test deploy).
         logger.warning("service_auth_failed", reason="token_mismatch")
-        raise _UNAUTHORIZED
+        raise _unauthorized()
 
 
 async def refuse_repeated_query(request: Request) -> None:

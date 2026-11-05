@@ -1166,8 +1166,13 @@ async def claim(
     thread_id: UUID,
     payload: ClaimIn = Body(...),
 ) -> dict[str, Any]:
-    """Claim an unassigned thread; report whether THIS call won it."""
-    thread = await _require_thread(session, thread_id)
+    """Claim an unassigned thread; report whether THIS call won it.
+
+    The row is taken before WHO is decided, and WHO is decided on locked
+    rows (API-1, app/messaging/membership.py THE RIGHT IS TAKEN): a
+    removal from the roster cannot land between the check and the
+    claim."""
+    thread = await take_thread(session, thread_id)
     if not await can_claim(session, thread, payload.operator):
         raise AuthorizationError(
             "thread is not claimable (only section threads are claimed)"
@@ -1190,8 +1195,11 @@ async def assign(
     thread_id: UUID,
     payload: AssignIn = Body(...),
 ) -> dict[str, Any]:
-    """Hand a section thread to an operator who serves its section."""
-    thread = await _require_thread(session, thread_id)
+    """Hand a section thread to an operator who serves its section.
+
+    Taken, then decided on locked rows -- the actor's right and the new
+    assignee's seat alike (API-1, as claim)."""
+    thread = await take_thread(session, thread_id)
     if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
             "actor is not the serving operator of this thread"
@@ -1208,8 +1216,10 @@ async def release(
     thread_id: UUID,
     payload: ReleaseIn = Body(...),
 ) -> dict[str, Any]:
-    """Return a section thread to its section's pool."""
-    thread = await _require_thread(session, thread_id)
+    """Return a section thread to its section's pool.
+
+    Taken, then decided on locked rows (API-1, as claim)."""
+    thread = await take_thread(session, thread_id)
     if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
             "actor is not the serving operator of this thread"
@@ -1227,7 +1237,8 @@ async def change_status(
     """Apply a manual status transition (D5 matrix)."""
     # Taken, not read (TK-1): the role is decided on the row set_status
     # will change, so a hand-over landing in between cannot leave the
-    # previous holder deciding on a thread that is no longer theirs.
+    # previous holder deciding on a thread that is no longer theirs --
+    # and on locked roster rows (API-1, as claim).
     thread = await take_thread(session, thread_id)
     if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(
@@ -1249,7 +1260,7 @@ async def retag(
 
     The row is taken before WHO is decided (TK-2): a thread being
     deleted is waited for, and the role is checked on the row retag
-    writes."""
+    writes -- and on locked roster rows (API-1, as claim)."""
     thread = await take_thread(session, thread_id)
     if not await can_operate(session, thread, payload.operator):
         raise AuthorizationError(

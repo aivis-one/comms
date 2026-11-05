@@ -67,6 +67,7 @@ from app.notifier import TYPE_THREAD_CLOSED, consume_close_notifications
 from tests.helpers import (
     create_recipient,
     create_section,
+    declare_member,
     intake_fields,
     next_tk1_telegram_id,
 )
@@ -97,7 +98,7 @@ async def _section(*members: UUID) -> UUID:
     async with get_session_factory()() as s:
         section = await create_section(s, key=f"tk1-{uuid4().hex[:8]}")
         for member in members:
-            s.add(SectionMember(section_id=section.id, operator_id=member))
+            await declare_member(s, section, member)
         await s.commit()
         return section.id
 

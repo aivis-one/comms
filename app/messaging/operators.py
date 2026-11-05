@@ -149,7 +149,8 @@ async def can_claim(
     open door, not a restriction.
 
     An undeclared section is served by any operator (membership.py), so
-    a product with no roster sees no change at all.
+    a product with no roster sees no change at all. The answer is taken,
+    not read (serves_section): it holds until the caller commits.
     """
     scope = resolve_operator(
         OperatorKind(thread.operator_kind), thread.operator_value
@@ -173,7 +174,8 @@ async def can_operate(
 
     A user thread is served only by its master (its assignee). An
     undeclared section is served by anybody, so a product without a
-    roster keeps today's behaviour exactly.
+    roster keeps today's behaviour exactly. The answer is taken, not
+    read (serves_section): it holds until the caller commits.
     """
     if actor == thread.assignee:
         return True
@@ -286,8 +288,11 @@ async def assign_thread(
 
     Refused: a user thread (422); an assignee who is not a recipient
     (404) or was deleted (409 recipient_deleted); an assignee who does
-    not serve the section (422) -- unreachable for a section with no
-    declared roster, which everybody serves (membership.py).
+    not serve the section (422) -- unreachable for a section whose
+    roster was never declared, which everybody serves, and the answer
+    for everybody once a declared roster is emptied (membership.py).
+    The assignee's seat is taken with the check (serves_section): a
+    removal cannot land between it and the write.
 
     Pings nobody: the new assignee learns from the product, and the
     next message pings them as the assignee (notifier.notify_new_message).

@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.models import GroupMembership, Recipient
 from app.audience.sync import apply_snapshot, snapshot_fingerprint
 from app.core.config import settings
-from app.messaging.models import Section
+from app.messaging.models import Section, SectionMember
 
 TELEGRAM_ID_BAND_START = 80000
 TELEGRAM_ID_BAND_END = 80999
@@ -358,6 +358,26 @@ def next_tx1_telegram_id() -> int:
     if tid > TX1_TELEGRAM_ID_BAND_END:
         raise RuntimeError(
             "comms test telegram_id band 93860-94259 exhausted"
+        )
+    return tid
+
+
+API1_TELEGRAM_ID_BAND_START = 94260
+API1_TELEGRAM_ID_BAND_END = 94659
+
+_api1_telegram_id_counter = itertools.count(API1_TELEGRAM_ID_BAND_START)
+
+
+def next_api1_telegram_id() -> int:
+    """Next telegram_id from the API-1 band (operator rights at the write).
+
+    94260-94659, one past the highest id held above (94259, TX-1); no
+    literal in tests/ or app/ sits in it.
+    """
+    tid = next(_api1_telegram_id_counter)
+    if tid > API1_TELEGRAM_ID_BAND_END:
+        raise RuntimeError(
+            "comms test telegram_id band 94260-94659 exhausted"
         )
     return tid
 
@@ -690,6 +710,20 @@ async def create_section(
     session.add(section)
     await session.flush()
     return section
+
+
+async def declare_member(
+    session: AsyncSession, section: Section, operator: UUID
+) -> None:
+    """Put `operator` on the section's roster the way the product's event
+    does (membership.set_membership, API-1): the roster becomes DECLARED
+    and the member row is added. A bare SectionMember insert would build
+    "members, roster undeclared" -- a state no code path produces since
+    migration 0039.
+    """
+    section.roster_declared = True
+    session.add(SectionMember(section_id=section.id, operator_id=operator))
+    await session.flush()
 
 
 # -- Intake (F1.2) -------------------------------------------------------------

@@ -51,6 +51,7 @@ from app.notifier import notify_new_message
 from tests.helpers import (
     create_recipient,
     create_section,
+    declare_member,
     intake_fields,
     next_t67_telegram_id,
 )
@@ -83,7 +84,8 @@ async def _visible_ids(
 
 
 # ---------------------------------------------------------------------------
-# 1. An empty roster is not a gap -- it is the old behaviour, exactly
+# 1. An undeclared roster is not a gap -- it is the old behaviour, exactly
+#    (an emptied DECLARED one serves nobody: tests/test_operator_rights.py)
 # ---------------------------------------------------------------------------
 
 
@@ -158,10 +160,7 @@ class TestDeclaredMembership:
         thread = await _section_thread(
             db_session, client=client, section_id=section.id
         )
-        db_session.add(
-            SectionMember(section_id=section.id, operator_id=member)
-        )
-        await db_session.flush()
+        await declare_member(db_session, section, member)
 
         assert thread.id in await _visible_ids(db_session, member)
         assert thread.id not in await _visible_ids(db_session, outsider)
@@ -179,10 +178,7 @@ class TestDeclaredMembership:
         thread = await _section_thread(
             db_session, client=client, section_id=section.id
         )
-        db_session.add(
-            SectionMember(section_id=section.id, operator_id=member)
-        )
-        await db_session.flush()
+        await declare_member(db_session, section, member)
 
         assert await can_operate(db_session, thread, member) is True
         assert await can_claim(db_session, thread, member) is True
@@ -203,10 +199,7 @@ class TestDeclaredMembership:
             db_session, client=client, section_id=section.id
         )
         thread.assignee = former
-        db_session.add(
-            SectionMember(section_id=section.id, operator_id=other)
-        )
-        await db_session.flush()
+        await declare_member(db_session, section, other)
 
         assert await can_operate(db_session, thread, former) is True
 
@@ -222,10 +215,7 @@ class TestDeclaredMembership:
             db_session, client=client, section_id=section.id
         )
         for operator in (first, second):
-            db_session.add(
-                SectionMember(section_id=section.id, operator_id=operator)
-            )
-        await db_session.flush()
+            await declare_member(db_session, section, operator)
         message = await post_message(
             db_session,
                 **intake_fields(), thread_id=thread.id, sender=client, body="help"
@@ -251,10 +241,7 @@ class TestDeclaredMembership:
             db_session, client=staff, section_id=section.id
         )
         for operator in (staff, colleague):
-            db_session.add(
-                SectionMember(section_id=section.id, operator_id=operator)
-            )
-        await db_session.flush()
+            await declare_member(db_session, section, operator)
         message = await post_message(
             db_session,
                 **intake_fields(), thread_id=thread.id, sender=staff, body="mine"
@@ -281,10 +268,7 @@ class TestDeclaredMembership:
         )
         thread.assignee = assignee
         for operator in (assignee, bystander):
-            db_session.add(
-                SectionMember(section_id=section.id, operator_id=operator)
-            )
-        await db_session.flush()
+            await declare_member(db_session, section, operator)
         message = await post_message(
             db_session,
                 **intake_fields(), thread_id=thread.id, sender=client, body="again"

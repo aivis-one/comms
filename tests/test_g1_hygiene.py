@@ -539,6 +539,10 @@ class TestTheInsertRace:
         async with factory() as session:
             operator = await create_recipient(session)
             section = await get_or_create_section(session, key="sec-m", label="M")
+            # A declared roster (API-1): the race is two inserts of one
+            # member row. On an undeclared section the first event's
+            # declaration would serialize the two before either inserts.
+            section.roster_declared = True
             await session.commit()
         async with factory() as first:
             first.add(SectionMember(section_id=section.id, operator_id=operator.id))

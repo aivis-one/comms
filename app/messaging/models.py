@@ -45,6 +45,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    false,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -68,12 +69,13 @@ from app.messaging.constants import (
 
 
 class Section(UUIDMixin, Base):
-    """A first-class support section (arch doc §2.4, v1 minimal).
+    """A first-class support section (arch doc §2.4).
 
-    Only id / key / label. The operator<->section MEMBERSHIP is
-    trivial in v1 (any agent serves every section) and belongs to
-    Phase 4b -- this table exists so that a thread's
-    operator_target=section:<id> can point at a real row.
+    id / key / label, and whether the product has DECLARED a roster for
+    it (API-1). The roster itself is section_members; who serves the
+    section by it is the one rule in app/messaging/membership.py. This
+    table also lets a thread's operator_target=section:<id> point at a
+    real row.
     """
 
     __tablename__ = "sections"
@@ -95,6 +97,19 @@ class Section(UUIDMixin, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+        nullable=False,
+    )
+
+    # THE ROSTER WAS DECLARED (API-1, migration 0039): set by the first
+    # section_membership_changed with `member: true` and never cleared.
+    # It is what tells "the product removed everybody" (declared, empty
+    # roster -> nobody serves) from "the product never kept a roster"
+    # (undeclared -> every operator serves). Written only by
+    # membership.set_membership; read by membership.serves_section and
+    # membership.section_serves_clause.
+    roster_declared: Mapped[bool] = mapped_column(
+        Boolean,
+        server_default=false(),
         nullable=False,
     )
 
@@ -393,9 +408,10 @@ class SectionMember(Base):
     whereas a membership row is a current fact with no history to
     protect.
 
-    EMPTY IS NOT UNCONFIGURED. A section with no rows here is served by
-    ANY operator -- that is the definition, not a migration window (see
-    messaging/membership.py).
+    EMPTY IS NOT ONE STATE (API-1). A section with no rows here is
+    served by ANY operator while its roster was never declared, and by
+    NOBODY once it was (Section.roster_declared) -- that is the
+    definition, not a migration window (see messaging/membership.py).
     """
 
     __tablename__ = "section_members"

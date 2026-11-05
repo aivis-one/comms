@@ -10,14 +10,26 @@
 #   - the right token -> through;
 #   - empty configured token (development) -> auth disabled;
 #   - /health and /ready stay open regardless (installer/docker
-#     healthchecks carry no secret).
+#     healthchecks carry no secret);
+#   - the scheme name in any case (API-1, RFC 9110 §11.1), one space;
+#   - every refusal is a NEW exception object, so no traceback grows
+#     across refusals (API-1).
+#
+# MUTATIONS (API-1, each turns one red):
+#   M8 one module-level 401 instance raised again and again ->
+#      TestEveryRefusalIsItsOwn test_the_traceback_does_not_grow
+#   M9 the scheme compared case-sensitively (startswith("Bearer ")) ->
+#      TestTheSchemeInAnyCase test_the_right_token_passes[bearer|BEARER]
 # =============================================================================
 
+from types import TracebackType
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 
+from app.api.deps import require_service_auth
 from app.core.config import settings
 
 _TOKEN = "phase3b-unit-test-token"
@@ -112,3 +124,80 @@ class TestHealthStaysOpen:
     ) -> None:
         assert (await client.get("/health")).status_code == 200
         assert (await client.get("/ready")).status_code == 200
+
+
+def _depth(tb: TracebackType | None) -> int:
+    n = 0
+    while tb is not None:
+        n += 1
+        tb = tb.tb_next
+    return n
+
+
+class TestEveryRefusalIsItsOwn:
+    async def test_the_traceback_does_not_grow(
+        self, auth_enabled: None,
+    ) -> None:
+        """Before API-1 one instance was raised for every refusal and its
+        traceback grew by the raising frames each time (2, 4, 6, ...),
+        keeping every refused request's frames alive."""
+        refused: list[HTTPException] = []
+        for header in (None, "Basic x", "Bearer nope") * 4:
+            with pytest.raises(HTTPException) as caught:
+                await require_service_auth(header)
+            refused.append(caught.value)
+        assert len({id(exc) for exc in refused}) == len(refused)
+        depths = {_depth(exc.__traceback__) for exc in refused}
+        assert len(depths) == 1, depths
+        assert depths != {0}
+
+    async def test_the_answer_is_the_same(
+        self, client: AsyncClient, auth_enabled: None,
+    ) -> None:
+        presented = "-".join(("not", "the", "token"))
+        answers = [
+            await client.get(
+                _inbox_url(), headers={"Authorization": f"bearer {presented}"}
+            )
+            for _ in range(3)
+        ]
+        for response in answers:
+            assert response.status_code == 401
+            assert response.headers["WWW-Authenticate"] == "Bearer"
+            assert response.json() == answers[0].json()
+            assert presented not in response.text
+        assert answers[0].json() != {}
+
+
+class TestTheSchemeInAnyCase:
+    @pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER"])
+    async def test_the_right_token_passes(
+        self, client: AsyncClient, auth_enabled: None, scheme: str,
+    ) -> None:
+        response = await client.get(
+            _inbox_url(), headers={"Authorization": f"{scheme} {_TOKEN}"},
+        )
+        assert response.status_code == 200, response.text
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "bearer wrong",
+            "BEARER wrong",
+            "bearer ",
+            "BEARER",
+            f"bearer  {_TOKEN}",
+            f"Bearer{_TOKEN}",
+        ],
+        ids=[
+            "lower-wrong", "upper-wrong", "lower-empty", "no-token",
+            "two-spaces", "no-space",
+        ],
+    )
+    async def test_a_wrong_or_empty_token_is_401(
+        self, client: AsyncClient, auth_enabled: None, header: str,
+    ) -> None:
+        response = await client.get(
+            _inbox_url(), headers={"Authorization": header},
+        )
+        assert response.status_code == 401

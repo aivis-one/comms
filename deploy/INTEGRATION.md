@@ -1068,7 +1068,11 @@ already delivered.
 | `operator_id` | the operator's user uuid; `user_upserted` comes first |
 | `member` | `true` adds the operator to the section, `false` removes them |
 
-Idempotent both ways. The section may arrive before any thread is
+Idempotent both ways. The first `member: true` declares the section's
+roster, for good: from then on only its members serve it, and once you
+remove them all nobody does ("Serves the section", section 14). A
+`member: false` for somebody who was never on the roster declares
+nothing. The section may arrive before any thread is
 opened in it: operators are hired before anybody writes in. An operator
 comms has not been told about yet is retried, the same lag
 `group_changed` has.
@@ -1858,11 +1862,20 @@ operator from its own session and never forwards one the user sent.
 | `POST /threads/{id}/status` | `operator`, `status` | the thread's assignee; on a section thread also an operator who serves its section | `<thread>` |
 | `POST /threads/{id}/retag` | `operator`, `section`, `subject_type`, `subject_id` | as for `status` | `<thread>`, back in the new section's pool (section 5) |
 
-"Serves the section": a section with members declared
-(`section_membership_changed`, section 7) is served by its members; a
-section with none declared is served by every operator. The thread's
+"Serves the section": a section whose roster was declared
+(`section_membership_changed` with `member: true`, section 7) is served
+by its members, and a section whose operators were all removed is served
+by nobody -- its pool shows to nobody, nobody may claim it, and a new
+message in it pings nobody; a section whose roster was never declared
+is served by every operator, as before any roster existed. The thread's
 assignee may act on it even after leaving the roster -- whoever took a
-conversation can finish it or hand it on.
+conversation can finish it or hand it on. A section emptied before comms
+3.14.0 has no record of its roster and is served by every operator until
+you declare a member of it again.
+
+The right is decided when the call writes: an operator removed from the
+roster while their call is in flight either acted before the removal or
+gets 403 -- the removal never lands between the check and the write.
 
 ### Handing a ticket over -- `assign` and `release`
 

@@ -38,8 +38,12 @@
 #   - FOR NO KEY UPDATE -- the paths that write the thread row itself:
 #     set_status here, a message (post_message and its route -- the
 #     activity bump), retag; claim / assign / release write it by a
-#     conditional UPDATE, which takes the same lock as it writes (TK-1).
-#     Non-key columns only, hence not FOR UPDATE.
+#     conditional UPDATE (TK-1), and their routes take the row first,
+#     as status and retag do (API-1). Non-key columns only, hence not
+#     FOR UPDATE.
+#   After the thread's row, an operator verb takes the roster rows that
+#   decide WHO may act -- recipients, sections, section_members, in that
+#   order: app/messaging/membership.py THE ORDER OF ROW LOCKS.
 #   - FOR KEY SHARE -- the paths that only insert children: a read
 #     pointer (read_state.mark_read), a variant request and a variant
 #     (app/variants.py). KEY SHARE conflicts with a deletion and with
