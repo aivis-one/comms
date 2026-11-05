@@ -93,6 +93,7 @@ from app.core.channels import (
     evaluate_channels,
 )
 from app.core.config import Settings, settings
+from app.core.constants import MAX_LLM_ANSWER_BYTES
 from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine.constants import DeliveryChannel
 from app.engine.models import Notification, NotificationDelivery
@@ -692,22 +693,28 @@ class TelegramFormatter:
 # EmailFormatter
 # ===================================================================
 
-# Response statuses that mean the provider ACCEPTED the message. Accepted
-# is not delivered: what happens after -- the provider's own queue, the
-# receiving MX, greylisting -- is outside this service and, without
-# inbound status webhooks, not measurable here. The provider's message
-# id is logged for exactly that reason (see below).
-_EMAIL_ACCEPTED_STATUSES = frozenset({200, 202})
+# A 2xx -- ANY 2xx -- means the provider ACCEPTED the message (CH-2):
+# Mailgun answers a send with 200 and "Queued. Thank you." and says its
+# codes follow the standard HTTP definitions, where 2xx is "received and
+# accepted" (RFC 9110 15.3). Calling another 2xx a refusal wrote failed
+# for a message that may have gone, and nothing retries a failure; the
+# opposite risk -- a 2xx from something that did not pass the message
+# on -- is the one a 200 carries already. Accepted is not delivered:
+# what happens after -- the provider's own queue, the receiving MX,
+# greylisting -- is outside this service and, without inbound status
+# webhooks, not measurable here. The provider's message id is logged for
+# exactly that reason (see below).
 
 # Statuses that mean the CHANNEL is wrong, not the message: a bad API
 # key, an account out of credit, a forbidden operation. Every message
 # will die the same way until a human changes the configuration.
 _EMAIL_CONFIG_STATUSES = frozenset({401, 402, 403})
 
-# Substrings in the provider's own error text that place a 400 on the
-# SENDER rather than on the recipient -- an unverified domain or a from
-# address outside it kills the channel, not one message, and the status
-# code alone cannot tell the two apart. Lower-cased before matching.
+# Substrings in the provider's own error text that place a 400 or a 404
+# (_EMAIL_SENDER_FAULT_STATUSES) on the SENDER rather than on the
+# recipient -- an unverified domain or a from address outside it kills
+# the channel, not one message, and the status code alone cannot tell
+# the two apart. Lower-cased before matching.
 _EMAIL_SENDER_FAULT_MARKERS = (
     "domain not found",
     "domain is not verified",
@@ -717,6 +724,24 @@ _EMAIL_SENDER_FAULT_MARKERS = (
     "from address",
     "invalid domain",
 )
+
+# The statuses the sender-fault markers are read on (CH-2). 400: the
+# domain is not verified, the sender is outside it. 404: Mailgun's
+# answer to a domain it does not have -- "Domain not found: <domain>"
+# in the JSON message (mailgun-go mocks/mock_domains.go); on a send the
+# domain is the only resource there is, and a recipient is never a 404
+# (a bad address is a 400). A 404 that names no sender -- no JSON, a
+# proxy's page, another message -- stays ONE message: the markers are
+# read from the JSON body only, as on the 400.
+_EMAIL_SENDER_FAULT_STATUSES = frozenset({400, 404})
+
+# Statuses a retry can fix besides 429 and 5xx (CH-2). 408: the server
+# did not receive the whole request in the time it was prepared to wait
+# -- "it MAY repeat that request" (RFC 9110 15.5.9); no message was made
+# of half a request, so a repeat sends no second email. Not 425: a
+# server answers it only to a request sent in TLS early data or with
+# Early-Data: 1 (RFC 8470 5.2), and this client sends neither.
+_EMAIL_TRANSIENT_STATUSES = frozenset({408})
 
 # The characters a provider splits a RECIPIENT LIST on. The `to` field
 # below carries one address, and the provider parses that field as a
@@ -930,7 +955,7 @@ class EmailFormatter:
         status = int(response.status_code)
         payload = _response_payload(response)
 
-        if status in _EMAIL_ACCEPTED_STATUSES:
+        if 200 <= status < 300:
             # THE FORENSIC HANDLE. A message accepted here and never
             # seen in a mailbox is invisible in every log we own; the
             # provider's id is the only thing that can be looked up in
@@ -945,6 +970,7 @@ class EmailFormatter:
                 notification_id=str(notification.id),
                 delivery_id=str(delivery.id),
                 recipient_id=str(delivery.recipient_id),
+                status=status,
                 provider_message_id=payload.get("id"),
             )
             return True
@@ -975,17 +1001,19 @@ class EmailFormatter:
             )
 
         if status in _EMAIL_CONFIG_STATUSES or (
-            status == 400 and _looks_like_sender_fault(message)
+            status in _EMAIL_SENDER_FAULT_STATUSES
+            and _looks_like_sender_fault(message)
         ):
             self._fail_configured(status, reason, notification, delivery)
 
-        if status >= 500:
+        if status >= 500 or status in _EMAIL_TRANSIENT_STATUSES:
             raise EmailTransientError(
                 f"provider error ({status}){_reason_tail(reason, 200)}"
             )
 
-        # Everything else -- a 400 on the recipient, and any 4xx whose
-        # body did not name the sender -- is ONE message failing.
+        # Everything else -- a 400 on the recipient, a 400 or 404 whose
+        # body did not name the sender, any other 4xx and a 3xx -- is ONE
+        # message failing.
         # Deliberately conservative: mistaking a channel fault for a
         # single message costs one email, the opposite declares a live
         # channel dead on an unparsed reply. The body is logged so the
@@ -1472,15 +1500,46 @@ class LLMFormatter:
         content = json.dumps(
             build_llm_request(letter, key_set, body), ensure_ascii=False,
         ).encode("utf-8")
+        import httpx
+
+        # THE ANSWER IS READ WITH A CEILING (CH-2), as the audio body is
+        # (_fetch_body): a declared length above MAX_LLM_ANSWER_BYTES is
+        # not read at all, and a body is counted while it is read and
+        # left the moment it passes it -- never taken whole into the
+        # worker's memory first. What was read is then the response the
+        # boundary reads, unchanged (interpret_llm_response).
         try:
-            response = await self._client.post(
+            async with self._client.stream(
+                "POST",
                 f"{key_set.endpoint}{_LLM_PATH}",
                 content=content,
                 headers={
                     "Authorization": f"Bearer {key_set.key}",
                     "Content-Type": "application/json",
                 },
-            )
+            ) as streamed:
+                status = int(streamed.status_code)
+                declared = streamed.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > MAX_LLM_ANSWER_BYTES:
+                    return _answer_too_large(
+                        key_set.name, status, "by its Content-Length")
+                received = bytearray()
+                async for chunk in streamed.aiter_bytes():
+                    received.extend(chunk)
+                    if len(received) > MAX_LLM_ANSWER_BYTES:
+                        return _answer_too_large(
+                            key_set.name, status, "counted while reading")
+                # The body is DECODED already (aiter_bytes undoes the
+                # Content-Encoding): the rebuilt response carries neither
+                # that header nor the length of the encoded body.
+                headers = [
+                    (name, value) for name, value in streamed.headers.multi_items()
+                    if name.lower() not in ("content-encoding", "content-length")
+                ]
+                response = httpx.Response(
+                    status, headers=headers, content=bytes(received),
+                    request=streamed.request,
+                )
         except Exception as exc:
             # Transient by construction. Class only, never the text: an
             # exception of the client may carry the request.
@@ -1491,6 +1550,19 @@ class LLMFormatter:
                 f"{'; it may have reached the provider' if arrived else ''})",
             )
         return interpret_llm_response(key_set.name, response)
+
+
+def _answer_too_large(set_name: str, status: int, how: str) -> _SetFailure:
+    """A provider's answer above MAX_LLM_ANSWER_BYTES (CH-2): the set's
+    TRANSPORT failure, as an answer that is not a chat completion is --
+    no model's answer to a letter comms takes is that large, so this is a
+    broken gateway or another server at the set's address, and the next
+    set is asked. Its size and the ceiling, never a byte of it."""
+    return _SetFailure(
+        set_name, _SetOutcome.TRANSIENT,
+        f"status {status}; the answer is larger than {MAX_LLM_ANSWER_BYTES} "
+        f"bytes ({how}; not read further)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1657,7 +1729,7 @@ def _retry_after_seconds(response: Any) -> float | None:
 
 
 def _looks_like_sender_fault(message: str) -> bool:
-    """Whether a 400 blames the SENDER (the channel), not the recipient.
+    """Whether a 400 or a 404 blames the SENDER (the channel), not the recipient.
 
     Read from the provider's own text, which says what it objects to.
     A "several 400s in a row" counter was deliberately not built: it is

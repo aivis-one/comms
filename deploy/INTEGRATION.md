@@ -452,6 +452,17 @@ to the message is logged as `email_channel_not_viable`, once, naming
 the channel; the messages after it are ordinary per-message lines, so a
 dead channel is a signal instead of a thousand identical entries.
 
+**What the provider's answer means.** For each email, by the provider's
+status: any `2xx` is its acceptance -- the delivery is `sent` (accepted is
+not delivered; what happens after is the provider's). `401`, `402`, `403`,
+and a `400` or `404` whose JSON message names the sender -- a domain the
+provider does not have (`404`, "Domain not found"), one not verified, a
+sender outside it -- are the channel: `failed`, `configuration`, logged as
+above. `429` waits the provider's `Retry-After`, or is retried without
+one; `408` and `5xx` are retried. Every other answer -- a `400` on the
+recipient, a `404` that names no sender, a redirect -- is this email:
+`failed`, `message_rejected`.
+
 **What email reads from the profile.** Its own fields under its own
 channel: `{type: {email: {subject, body}}}`. Nothing new enters the
 profile contract, and a profile that declares neither field stays
@@ -1619,7 +1630,9 @@ and to ask again with a new letter, under a new key.
 the list asked, in the same call: the status of the response (401, 402,
 403, 404 -- the set is wrong; 429; 408, 409, 5xx), a failure the
 provider puts inside a 200 (an `error` object), an answer that is not a
-chat completion, no answer in time. A request the provider refuses
+chat completion, an answer larger than 4194304 bytes (by its
+`Content-Length`, or counted while reading -- read no further), no
+answer in time. A request the provider refuses
 (another 4xx) goes to the next set too. When every set failed:
 
 | the sets | the delivery |

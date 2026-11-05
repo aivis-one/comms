@@ -102,6 +102,16 @@ MAX_EMAIL_HTML_LEN = 256_000
 # -- 20 MiB is about 50 MiB of one attempt's memory.
 MAX_LLM_AUDIO_BYTES = 20 * 1024 * 1024
 
+# The largest answer of an llm provider comms reads (CH-2): the response
+# body, as decoded, counted while it is read -- a guard of the worker's
+# memory, never a judgement of the answer. The largest letter comms takes
+# (MAX_LLM_LETTER_CHARS) answered at its length, every character escaped
+# as \uXXXX (6 bytes), is about 1.2 MB; the answers products ask for
+# today -- a support message translated, at most MAX_MESSAGE_BODY_LEN
+# characters -- are tens of kilobytes. Above it the answer is not a
+# model's: a broken gateway, another server at the set's address.
+MAX_LLM_ANSWER_BYTES = 4 * 1024 * 1024
+
 # The longest signed link to a body (P5-2, `llm_audio.url`): a presigned
 # object URL of an S3-compatible store is a few hundred characters.
 MAX_LLM_AUDIO_URL_LEN = 4096
