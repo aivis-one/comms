@@ -1,9 +1,15 @@
 # =============================================================================
 # COMMS Service -- CI (handoff item 5)
 # =============================================================================
-# Two jobs, side by side:
+# Three jobs. First, alone (CI-1):
+#   checks what reads the tree and the schema and takes seconds: ruff,
+#          mypy, the two fences, `alembic upgrade head` + `alembic
+#          check`, the suite's collection, the tree's guards -- a small
+#          mistake is red in minutes, and the two full jobs do not start.
+# Then, side by side, both after `checks` (needs):
 #   test   the suite on the runner's Python 3.12 against Postgres; schema
-#          via `alembic upgrade head`; then ruff, the fences, mypy.
+#          via `alembic upgrade head`; the slowest nodes and the time of
+#          every file printed (--durations, the junit report).
 #   image  the comms image built from the Dockerfile -- its base pinned
 #          by digest -- and the suite run INSIDE it, as the `test` verb of
 #          deploy/comms-deploy.sh does on a box: the Python and Debian the
@@ -22,12 +28,97 @@ on:
   pull_request:
 
 # THE TOKEN GETS NOTHING BY DEFAULT (TX-4): each job says what it needs,
-# and both only read the repository. tests/test_deploy_hardening.py holds
+# and every one only reads the repository. tests/test_deploy_hardening.py holds
 # every job to a `permissions` of its own.
 permissions: {}
 
 jobs:
+  # THE FAST CHECKS FIRST (CI-1): until CI-1 ruff, mypy and the fences
+  # ran after the whole suite, and a broken reference in a comment (the
+  # guard in tests/test_g2_hygiene.py) was red only at its end -- a
+  # one-line fix cost the full run. Everything here reads the tree or the
+  # schema; the guards are listed by file (a file renamed or gone is an
+  # error of pytest, red), and they stay in the full suite too.
+  checks:
+    runs-on: ubuntu-latest
+    # Its commands take ~30 s, the setup ~2 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    env:
+      APP_ENV: ci
+      DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
+      COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (pinned)
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Domain-literal fence (arch doc §2.6 / decision 13)
+        run: python scripts/check_domain_literals.py
+
+      - name: Product-literal fence (arch doc #15, Release-Hardening)
+        run: python scripts/check_product_literals.py
+
+      - name: Type check (mypy)
+        run: mypy app
+
+      # Every test module imports: a syntax or import error in one is red
+      # here, not after the suite's first 3000 nodes.
+      - name: The suite collects
+        run: pytest --collect-only -q
+
+      # The same step as in `test` below.
+      - name: Start Postgres (the image deploy/docker-compose.yml pins)
+        run: |
+          image=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-postgres']['image'])")
+          echo "comms-postgres image: $image"
+          docker run -d --name comms-postgres -p 5432:5432 \
+            -e POSTGRES_USER=comms -e POSTGRES_PASSWORD=comms \
+            -e POSTGRES_DB=comms_test "$image"
+          for _ in $(seq 60); do
+            if docker exec comms-postgres pg_isready -h 127.0.0.1 -U comms -d comms_test; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs comms-postgres
+          exit 1
+
+      - name: Apply migrations (alembic upgrade head)
+        run: alembic upgrade head
+
+      - name: Schema matches the models (alembic check)
+        run: alembic check
+
+      # The guards that read the tree and take seconds: references in
+      # comments, the pytest cache, SQL by shape, the fences' own tests.
+      # Not here: tests/test_g1_hygiene.py (it calls the API and races
+      # real sessions) and tests/test_hygiene_r7.py (it starts the app).
+      - name: The tree's guards
+        run: >-
+          pytest -q
+          tests/test_g2_hygiene.py
+          tests/test_fence_roots.py
+          tests/test_domain_literal_fence.py
+          tests/test_product_literal_fence.py
+
   test:
+    needs: checks
     runs-on: ubuntu-latest
     # A HANG IS RED (FIX review 3.13.0, the second): the last green run's
     # suite took 931 s (~16 min with its setup) -- 40 gives ~2.5x.
@@ -92,22 +183,28 @@ jobs:
       - name: Schema matches the models (alembic check)
         run: alembic check
 
+      # The whole suite; the 50 slowest nodes are printed at its end
+      # (CI-1, the measure before the suite is split), and every node's
+      # time goes to a junit report outside the checkout.
       - name: Run tests
-        run: pytest -q
+        run: >-
+          pytest -q --durations=50
+          -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/suite.xml"
 
-      - name: Lint (ruff)
-        run: ruff check .
-
-      - name: Domain-literal fence (arch doc §2.6 / decision 13)
-        run: python scripts/check_domain_literals.py
-
-      - name: Product-literal fence (arch doc #15, Release-Hardening)
-        run: python scripts/check_product_literals.py
-
-      - name: Type check (mypy)
-        run: mypy app
+      # The suite's time by file, from that report, the slowest first --
+      # what the split is made of. Run whether the suite was green or red.
+      - name: Suite time by file
+        if: always()
+        run: >-
+          test -f "$RUNNER_TEMP/suite.xml" &&
+          python -c "import collections, sys, xml.etree.ElementTree as E;
+          t = collections.Counter();
+          [t.update({c.get('file'): float(c.get('time', 0))}) for c in E.parse(sys.argv[1]).getroot().iter('testcase')];
+          [print(f'{s:8.1f}s  {f}') for f, s in t.most_common()];
+          print(f'{sum(t.values()):8.1f}s  total')" "$RUNNER_TEMP/suite.xml"
 
   image:
+    needs: checks
     runs-on: ubuntu-latest
     # The image's build plus the same suite inside it.
     timeout-minutes: 45
@@ -209,4 +306,4 @@ jobs:
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
-            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q"
+            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50"
