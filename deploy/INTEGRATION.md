@@ -540,6 +540,7 @@ body, with a class a program can branch on:
 
 | status | class | when |
 |---|---|---|
+| 400 | `bad_request` | the request could not be read -- a body that is not UTF-8 JSON; any other client status this table does not list travels with this class too. Fix the request; repeating it changes nothing |
 | 401 | `unauthorized` | the service token is missing or wrong |
 | 403 | `forbidden` | the actor has no role in this thread |
 | 404 | `not_found` | the entity or the route does not exist |
@@ -548,7 +549,7 @@ body, with a class a program can branch on:
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
-| 422 | `validation` | the input is wrong; `fields` names each input |
+| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
@@ -845,6 +846,11 @@ would store the opposite of what the person chose.
 - `schedule` -- FULL REPLACE when present; `null` clears it; omitted,
   it is left untouched.
 - An unknown key -- `timezone` included -- is a 422, never ignored.
+- A PATCH that writes anything -- a toggle, a schedule, `null` -- for a
+  recipient you deleted (`user_deleted`, `DELETE /recipients/{id}`) is a
+  409 `recipient_deleted`, and nothing is written: a deleted person has
+  no preferences. A deletion that lands while a PATCH is in flight
+  waits for it and then forgets what it wrote.
 
 A period:
 

@@ -40,9 +40,10 @@
 # `validation`, naming the key.
 # =============================================================================
 
+import json
 import secrets
 from collections import Counter
-from typing import Annotated
+from typing import Annotated, Any
 
 import structlog
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -51,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db_session
 from app.core.exceptions import ValidationError
+from app.core.storable import UNSTORABLE, holds_unstorable, storable
 
 logger = structlog.get_logger()
 
@@ -114,6 +116,42 @@ async def refuse_repeated_query(request: Request) -> None:
             f"query parameter given more than once: {', '.join(repeated)}; "
             f"each is read once -- send it once"
         )
+
+
+async def refuse_unstorable_body(request: Request) -> None:
+    """Refuse a JSON body holding a string the database cannot store.
+
+    API-2: a NUL or a lone surrogate in any string of a REST body -- a
+    value or a key, at any depth -- reached the INSERT and came back as a
+    500 from the driver. It is the caller's input, so it is a 422
+    `validation` here, before any model or route runs, by the one rule
+    the stream uses (app/core/storable.py). The refusal names the
+    top-level field, never the value.
+
+    One check for every route, as refuse_repeated_query is: a route
+    added later is covered without being named. A body that is not JSON
+    is left alone -- the framework refuses it (422, or 400 for one it
+    cannot decode). The body is read once by Starlette and cached; the
+    route's model reads the same bytes.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    raw = await request.body()
+    if not raw:
+        return
+    try:
+        data: Any = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(data, dict):
+        if holds_unstorable(data):
+            raise ValidationError(f"the body holds {UNSTORABLE}")
+        return
+    for name, value in data.items():
+        if not storable(name):
+            raise ValidationError(f"a field name is {UNSTORABLE}")
+        if holds_unstorable(value):
+            raise ValidationError(f"field {name!r} is {UNSTORABLE}")
 
 
 # THE WRITE SESSION OF A ROUTE (TX-1) -- the one place the transaction's

@@ -75,6 +75,7 @@ from app.core.constants import (
 )
 from app.core.exceptions import ValidationError
 from app.core.sanitize import exception_text
+from app.core.storable import UNSTORABLE, storable
 from app.engine.constants import TargetType
 from app.engine.service import stream_fingerprint
 from app.messaging.constants import MAX_SECTION_KEY_LEN, MAX_SECTION_LABEL_LEN
@@ -391,7 +392,7 @@ def _is_scalar(value: Any) -> bool:
 # read. What cannot be read at all -- a nesting past the decoder's own
 # recursion, broken JSON -- leaves no key: the dead letter. (A date is a
 # value of the same class; it is a field's own rule, _datetime.)
-_UNSTORABLE = "a string the database cannot store (a NUL character or a lone surrogate)"
+# The string rule is the one the REST bodies use too: app/core/storable.py.
 _NO_NUMBER = (
     "a number comms cannot store (NaN, Infinity, past the float range or "
     "past the digit limit)"
@@ -446,18 +447,6 @@ def load_event_data(text: str, event: str) -> dict[str, Any]:
     return data
 
 
-def _storable(text: str) -> bool:
-    """Whether Postgres can hold this string: no NUL, and UTF-8 for it
-    exists (no lone surrogate)."""
-    if "\x00" in text:
-        return False
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
 def _defects(data: dict[str, Any]) -> Iterator[tuple[str, str]]:
     """Every thing in the data that comms cannot take, as (kind, the
     top-level field) -- kind "name", "string", "number" or "depth" -- in
@@ -465,7 +454,7 @@ def _defects(data: dict[str, Any]) -> Iterator[tuple[str, str]]:
     parse (the first defect, _first_defect) and the dead letter (every
     defect, event_data_or_none)."""
     for name, value in data.items():
-        if not _storable(name):
+        if not storable(name):
             yield "name", name
             continue
         stack: list[tuple[Any, int]] = [(value, 2)]
@@ -474,7 +463,7 @@ def _defects(data: dict[str, Any]) -> Iterator[tuple[str, str]]:
             if item is _NOT_STORABLE:
                 yield "number", name
             elif isinstance(item, str):
-                if not _storable(item):
+                if not storable(item):
                     yield "string", name
             elif isinstance(item, dict | list):
                 if depth > MAX_JSON_DEPTH:
@@ -482,7 +471,7 @@ def _defects(data: dict[str, Any]) -> Iterator[tuple[str, str]]:
                     continue
                 if isinstance(item, dict):
                     for key, child in item.items():
-                        if not _storable(key):
+                        if not storable(key):
                             yield "string", name
                         stack.append((child, depth + 1))
                 else:
@@ -504,9 +493,9 @@ def check_event_data(data: dict[str, Any], event: str) -> None:
         return
     kind, name = defect
     if kind == "name":
-        raise ValidationError(f"{event}: a field name is {_UNSTORABLE}")
+        raise ValidationError(f"{event}: a field name is {UNSTORABLE}")
     if kind == "string":
-        raise ValidationError(f"{event}: field {name!r} is {_UNSTORABLE}")
+        raise ValidationError(f"{event}: field {name!r} is {UNSTORABLE}")
     if kind == "number":
         raise ValidationError(f"{event}: field {name!r} holds {_NO_NUMBER}")
     raise ValidationError(
@@ -995,12 +984,12 @@ def _parse_notification_intake(
         _require(data, "idempotency_key", event),
         "idempotency_key", event, max_len=MAX_IDEMPOTENCY_KEY_LEN,
     )
-    if not _storable(idempotency_key):
+    if not storable(idempotency_key):
         # A key that cannot be stored cannot carry a refusal either:
         # this is the unreadable key's path -- the dead letter (spec
         # §6.3), keeping the address and never the letter.
         raise ValidationError(
-            f"{event}: field 'idempotency_key' is {_UNSTORABLE}; a refusal "
+            f"{event}: field 'idempotency_key' is {UNSTORABLE}; a refusal "
             f"cannot be recorded under it"
         )
     fingerprint = stream_fingerprint(raw)

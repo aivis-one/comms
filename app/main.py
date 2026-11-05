@@ -31,7 +31,7 @@ from sqlalchemy import select
 
 from app.api.changes import router as changes_router
 from app.api.channels import router as channels_router
-from app.api.deps import refuse_repeated_query
+from app.api.deps import refuse_repeated_query, refuse_unstorable_body
 from app.api.errors import register_error_handlers
 from app.api.inbox import router as inbox_router
 from app.api.jobs import router as jobs_router
@@ -48,6 +48,7 @@ from app.core.database import (
     set_process_role,
 )
 from app.core.logging import setup_logging
+from app.core.sanitize import db_error_summary, pipeline_error_of
 from app.engine.formatters import channel_map, close_formatters, llm_set_map
 from app.profile.loader import install_profile_from_settings
 
@@ -131,8 +132,12 @@ app = FastAPI(
     docs_url=_DOCS["docs_url"],
     redoc_url=_DOCS["redoc_url"],
     # Before every route: a key given twice is refused, not read as its
-    # last value (app/api/deps.py).
-    dependencies=[Depends(refuse_repeated_query)],
+    # last value; a body string the database cannot store is a 422, not
+    # the driver's 500 (app/api/deps.py).
+    dependencies=[
+        Depends(refuse_repeated_query),
+        Depends(refuse_unstorable_body),
+    ],
 )
 register_error_handlers(app)
 app.include_router(inbox_router)
@@ -147,15 +152,21 @@ app.include_router(channels_router)
 app.include_router(lanes_router)
 
 
-async def _db_ok() -> bool:
-    """Probe database connectivity via an ORM expression."""
+async def _db_failure() -> Exception | None:
+    """Probe database connectivity via an ORM expression: None when it
+    answers, else what it raised -- for the caller to log or not."""
     try:
         engine = get_engine()
         async with engine.connect() as conn:
             await conn.execute(select(1))
-    except Exception:
-        return False
-    return True
+    except Exception as exc:
+        return exc
+    return None
+
+
+async def _db_ok() -> bool:
+    """Probe database connectivity; the failure itself is not kept."""
+    return await _db_failure() is None
 
 
 @app.get("/health")
@@ -189,8 +200,23 @@ async def health() -> JSONResponse:
 
 @app.get("/ready")
 async def ready() -> JSONResponse:
-    """Readiness probe -- 503 if the database is unreachable."""
-    db_ok = await _db_ok()
+    """Readiness probe -- 503 if the database is unreachable.
+
+    A 503 SAYS WHY, IN THE LOG (API-2): the class and the place of the
+    failure as DB-1 writes them -- a database error as its summary
+    (db_error_summary: class, place, SQLSTATE), anything else (a refused
+    connection is an OSError) as its class and place alone. Never a text:
+    the database's words and an OS error's (it quotes the address) stay
+    out. The answer is unchanged; /health stays silent (its form is
+    v4.0's).
+    """
+    failure = await _db_failure()
+    db_ok = failure is None
+    if failure is not None:
+        logger.warning(
+            "ready_db_unreachable",
+            error=db_error_summary(failure) or pipeline_error_of(failure),
+        )
     return JSONResponse(
         status_code=200 if db_ok else 503,
         content={

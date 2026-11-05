@@ -89,6 +89,10 @@ async def forget_recipient(
     )
     if not forgotten:
         return False
+    # The recipient row is held FOR UPDATE by the tombstone from here on:
+    # a preference write takes the same row first, so it is ordered
+    # against these deletions, never between them (app/audience/prefs.py
+    # THE ORDER OF ROW LOCKS).
     for statement in (
         delete(GroupMembership).where(GroupMembership.recipient_id == recipient_id),
         delete(CategoryMute).where(CategoryMute.recipient_id == recipient_id),

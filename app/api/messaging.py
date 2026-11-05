@@ -1174,8 +1174,14 @@ async def claim(
     claim."""
     thread = await take_thread(session, thread_id)
     if not await can_claim(session, thread, payload.operator):
+        # Two refusals, one class (API-2): the form, or the roster.
+        if thread.operator_kind != OperatorKind.SECTION:
+            raise AuthorizationError(
+                "a user thread's operator is fixed by the form; only a "
+                "section thread is claimed"
+            )
         raise AuthorizationError(
-            "thread is not claimable (only section threads are claimed)"
+            "the operator does not serve the thread's section"
         )
     await claim_thread(session, thread_id=thread_id, operator=payload.operator)
     await session.refresh(thread)

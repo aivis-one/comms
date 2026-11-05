@@ -24,6 +24,28 @@
 #     muted recipients before deliveries are created;
 #   - service.deliver_notification calls schedule.recipient_deferred_until
 #     to defer a send that falls outside the allowed periods.
+#
+# A FORGOTTEN RECIPIENT HAS NO PREFERENCES (API-2). Every write here --
+# a mute, an unmute, a schedule set or cleared -- TAKES the recipient's
+# row first and refuses a tombstone (deleted_at set) with
+# RecipientDeletedError: 409 `recipient_deleted`, the answer every other
+# write naming a forgotten person gets (deploy/INTEGRATION.md). Before,
+# a schedule on a tombstone met CHECK ck_recipients_tombstone (a 500),
+# and a mute was STORED -- data about a person the product told comms to
+# forget.
+#
+# THE ORDER OF ROW LOCKS (recipients, category_mutes). A write takes the
+# recipient's row FOR NO KEY UPDATE, then writes its category_mutes rows
+# or its schedule column -- the order forgetting keeps (app/forgetting.py:
+# the tombstone takes the row FOR UPDATE, then the mutes are deleted).
+# So the two queue on the recipient row: forgetting first -> the write
+# waits and finds the tombstone; the write first -> forgetting waits and
+# then deletes the mutes and clears the schedule. ONE strength for every
+# write, though a mute alone would need only KEY SHARE: one PATCH writes
+# mutes AND the schedule in one transaction, and a KEY SHARE raised to
+# NO KEY UPDATE behind a queued FOR UPDATE (the tombstone, a snapshot)
+# is the upgrade that deadlocks. The price: two PATCHes of one recipient
+# run one after the other. A read (get_preferences) takes nothing.
 # =============================================================================
 
 from dataclasses import dataclass
@@ -36,7 +58,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.models import CategoryMute, Recipient
 from app.audience.schedule import MINUTES_PER_DAY
 from app.core.database import once_more_on_insert_race
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import (
+    NotFoundError,
+    RecipientDeletedError,
+    ValidationError,
+)
 from app.profile.registry import registry
 
 logger = structlog.get_logger()
@@ -61,10 +87,33 @@ async def _get_recipient(
     session: AsyncSession,
     recipient_id: UUID,
 ) -> Recipient:
-    """Load a recipient or raise NotFoundError."""
+    """Load a recipient or raise NotFoundError. For reads."""
     recipient = await session.get(Recipient, recipient_id)
     if recipient is None:
         raise NotFoundError(f"Recipient {recipient_id} does not exist")
+    return recipient
+
+
+async def _take_live_recipient(
+    session: AsyncSession,
+    recipient_id: UUID,
+) -> Recipient:
+    """The recipient's row for a write: TAKEN, FOR NO KEY UPDATE, and
+    refreshed -- or NotFoundError, or RecipientDeletedError for a
+    tombstone (module header, A FORGOTTEN RECIPIENT and THE ORDER OF ROW
+    LOCKS)."""
+    recipient = await session.get(
+        Recipient,
+        recipient_id,
+        with_for_update={"key_share": True},
+        populate_existing=True,
+    )
+    if recipient is None:
+        raise NotFoundError(f"Recipient {recipient_id} does not exist")
+    if recipient.deleted_at is not None:
+        raise RecipientDeletedError(
+            f"recipient {recipient_id} was deleted; it has no preferences"
+        )
     return recipient
 
 
@@ -124,7 +173,7 @@ async def set_category_muted(
     of the same PATCH -- was rolled back.
     """
     _validate_category(category)
-    await _get_recipient(session, recipient_id)
+    await _take_live_recipient(session, recipient_id)
 
     if muted:
         await once_more_on_insert_race(
@@ -170,7 +219,7 @@ async def set_schedule(
     merge would change what the person entered, and the caller would
     never learn its input was ambiguous.
     """
-    recipient = await _get_recipient(session, recipient_id)
+    recipient = await _take_live_recipient(session, recipient_id)
 
     if windows is None:
         recipient.allowed_windows = None

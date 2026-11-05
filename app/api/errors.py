@@ -19,6 +19,9 @@
 #   ConflictError (by subclass)          -> 409  conflict | stale_snapshot
 #                                                | recipient_deleted
 #   CursorExpiredError                   -> 410  cursor_expired
+#   any other 4xx of the framework       -> its status, bad_request
+#     (today a 400: a body it cannot read as JSON) -- the caller's
+#     request, never `internal` (API-2)
 #   DBAPIError                           -> 500  internal
 #   a TRANSIENT failure of the database  -> 503  unavailable
 #     (is_transient_db_error: a deadlock, a lost or refused connection,
@@ -96,6 +99,9 @@ class ErrorClass(StrEnum):
     INTERNAL = "internal"
     # A transient failure of the database (TX-1): repeat the request.
     UNAVAILABLE = "unavailable"
+    # A 4xx the framework raised that no class above names (API-2): the
+    # request could not be read; fix it, do not repeat it.
+    BAD_REQUEST = "bad_request"
 
 
 # What the caller is told on a TRANSIENT database failure (TX-1). Fixed
@@ -192,8 +198,17 @@ def register_error_handlers(app: FastAPI) -> None:
     async def _http(
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
-        """The token dependency's 401 and the router's 404 / 405."""
-        error_class = _HTTP_CLASSES.get(exc.status_code, ErrorClass.INTERNAL)
+        """The token dependency's 401, the router's 404 / 405 -- and any
+        other client status the framework raises (a 400 for a body it
+        cannot read): `bad_request`, never `internal`, which says the
+        failure is ours (API-2)."""
+        error_class = _HTTP_CLASSES.get(exc.status_code)
+        if error_class is None:
+            error_class = (
+                ErrorClass.BAD_REQUEST
+                if 400 <= exc.status_code < 500
+                else ErrorClass.INTERNAL
+            )
         return error_response(
             exc.status_code, error_class, str(exc.detail),
             headers=getattr(exc, "headers", None),
