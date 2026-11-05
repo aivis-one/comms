@@ -178,6 +178,17 @@ fields further, and do not repeat them.
 | `answer_keep` | a duration, as `expires_after`, not longer than `NOTIFICATION_RETENTION_DAYS` (the llm kind only) | `24h` | how long the model's answer is kept after it came (section 11) |
 | `max_audio_bytes` | an integer, 1..20971520 (the llm kind only) | `2097152` | the largest audio body a job may link to, in bytes as fetched (section 11) |
 
+**A telegram letter has Telegram's limits.** `max_body_chars` bounds the
+body a request carries; Telegram bounds the whole text it is sent -- the
+title, the body and the template's own text together: at most 4096 characters
+once its markup is read (an emoji is one character, a tag none, `&amp;`
+one), at most 32768 bytes as sent, and not empty once read. A letter
+certain to be past one of them is `failed`, `message_rejected` on its first
+attempt, Telegram not asked; the delivery's text names the size and the
+limit, never the letter. A letter Telegram itself refuses for the same
+reasons is `failed`, `message_rejected` on that attempt too -- never
+retried until it expires.
+
 ### `PROFILE_OVERLAY_DIR` -- the text overlay
 
 One image and one profile can serve several installations whose

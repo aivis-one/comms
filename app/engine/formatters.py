@@ -76,7 +76,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from html import escape
+from html import escape, unescape
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 
 import structlog
@@ -303,7 +303,101 @@ _PERMANENT_ERRORS = frozenset({
     # Review 1.2: the button URL is built from immutable action_data --
     # an invalid URL is deterministic, retrying cannot fix it.
     "button_url_invalid",
+    # CH-1: the letter itself does not fit, and no retry changes it. The
+    # descriptions as the Bot API sends them (tdlib/telegram-bot-api,
+    # Client.cpp fail_query_with_error: "Bad Request: " and the first
+    # letter lowered), and as aiogram raises them (TelegramBadRequest,
+    # "Telegram server says - <description>"):
+    #   - more characters than message_text_length_max once the markup
+    #     is read -- TDLib MessageContent.cpp, "Message is too long";
+    "message is too long",
+    #   - nothing but whitespace once the markup is read -- TDLib
+    #     MessageEntity.cpp fix_formatted_text, "Text must be non-empty".
+    #     ("message text is empty" is the Bot API's answer to an EMPTY
+    #     raw text, which comms never sends: the title and the body are
+    #     joined by "\n\n");
+    "text must be non-empty",
+    #   - more than 1 << 15 bytes as sent -- Client.cpp
+    #     get_formatted_text, "Text is too long".
+    "text is too long",
 })
+
+# THE TELEGRAM LETTER'S LIMITS (CH-1), checked before the call
+# (TelegramFormatter.deliver): what is certain not to fit is refused
+# without asking Telegram, with its size and the limit, never its text.
+#
+# KNOWN CEILING -- the limits are Telegram's, copied here.
+#   1. Mechanics: TELEGRAM_MAX_TEXT_CHARS is the server option
+#      message_text_length_max (TDLib OptionManager.cpp, default 4096)
+#      and TELEGRAM_MAX_TEXT_BYTES the Bot API's 1 << 15 (Client.cpp
+#      get_formatted_text). If Telegram raises either, comms refuses
+#      letters Telegram would now take; if it lowers either, the letters
+#      between go to Telegram and come back refused -- the answers above
+#      make that a message_rejected on the first attempt.
+#   2. Status: acknowledged by design.
+#   3. Task: none -- the Bot API does not report the option to a bot.
+#   4. Unfreeze trigger: a Telegram delivery refused here while the same
+#      text goes through the Bot API by hand, or a "message is too long"
+#      answer for a letter this check let through by more than the
+#      lower-bound gap described in telegram_text_length.
+#   5. Agreed fix: the new numbers here, and the paragraph in
+#      deploy/INTEGRATION.md with them (tests/test_telegram_letter_limits.py
+#      holds the two equal).
+#   6. Rejected: refusing at profile load a telegram type whose
+#      max_body_chars is above the limit (the template adds text, so it
+#      proves nothing, and every profile without max_body_chars -- 5000
+#      by default -- would refuse the start); splitting a long letter
+#      into several messages (how a text is cut is the product's call).
+TELEGRAM_MAX_TEXT_CHARS = 4096
+TELEGRAM_MAX_TEXT_BYTES = 1 << 15
+# A tag of the HTML parse mode; a quoted attribute may hold ">".
+_TELEGRAM_TAG_RE = re.compile(r"<(?:[^>\"']|\"[^\"]*\"|'[^']*')*>")
+# What TDLib deletes from a text (tdutils misc.cpp clean_input_string):
+# \r, U+2028..U+202E, and the combining U+0333, U+033F, U+030A ...
+_TELEGRAM_DROPPED_RE = re.compile("[\r\u2028-\u202e\u0333\u033f\u030a]")
+# ... and the control characters it turns into a space (\n stays).
+_TELEGRAM_CONTROL_RE = re.compile("[\x00-\x09\x0b\x0c\x0e-\x1f]")
+
+
+def _telegram_read_text(text: str) -> str:
+    """The text as Telegram is left with once the markup is read and the
+    text cleaned -- before trimming: tags out, entities in (unescape
+    reads every entity Telegram reads, and more), the dropped characters
+    out, the control characters a space."""
+    read = unescape(_TELEGRAM_TAG_RE.sub("", text))
+    return _TELEGRAM_CONTROL_RE.sub(" ", _TELEGRAM_DROPPED_RE.sub("", read))
+
+
+def telegram_text_length(text: str) -> int:
+    """A LOWER BOUND of the characters Telegram counts for `text` (code
+    points, TDLib utf8_length -- not UTF-16): every step can only make
+    it shorter than Telegram's count -- str.strip trims a superset of
+    the spaces and newlines Telegram trims, and an entity Telegram does
+    not know stays longer there. So a count above the limit is certain,
+    and a letter refused for it is one Telegram refuses too; the gap
+    goes to Telegram and its own answer (_PERMANENT_ERRORS)."""
+    return len(_telegram_read_text(text).strip())
+
+
+def _telegram_text_refusal(text: str) -> str | None:
+    """Why Telegram is certain to refuse `text`, as sizes and limits, or
+    None. Empty: nothing but spaces and newlines once read -- what
+    Telegram trims and then finds nothing."""
+    if not _telegram_read_text(text).strip(" \n"):
+        return "telegram: the text is empty once its markup is read"
+    size = len(text.encode("utf-8"))
+    if size > TELEGRAM_MAX_TEXT_BYTES:
+        return (
+            f"telegram: the text is {size} bytes as sent, "
+            f"the limit is {TELEGRAM_MAX_TEXT_BYTES}"
+        )
+    length = telegram_text_length(text)
+    if length > TELEGRAM_MAX_TEXT_CHARS:
+        return (
+            f"telegram: the text is at least {length} characters once its "
+            f"markup is read, the limit is {TELEGRAM_MAX_TEXT_CHARS}"
+        )
+    return None
 
 
 # Deep-link encoding limits (Phase 3a item 3, arch doc §2.6).
@@ -496,6 +590,11 @@ class TelegramFormatter:
         )
 
         text = f"{title}\n\n{body}"
+        # CH-1: a letter certain not to fit is refused here, Telegram not
+        # asked -- the refusal is sizes and limits, never the letter.
+        refusal = _telegram_text_refusal(text)
+        if refusal is not None:
+            raise MessageRejectedError(refusal)
 
         # Build inline keyboard if a deep link is available.
         deep_link = self.format_deep_link(notification.action_data)
