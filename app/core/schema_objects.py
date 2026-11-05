@@ -177,6 +177,17 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "ON public.notifications USING btree (lane, status, scheduled_at)"
         ),
     ),
+    # The reminder cancel's select by correlation (PERF-2, migration
+    # 0041): app/engine/reminders.py cancel_reminders. Partial -- a job
+    # without a correlation is never looked up by it.
+    "ix_notifications_correlation": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notifications_correlation "
+            "ON public.notifications USING btree (correlation) "
+            "WHERE (correlation IS NOT NULL)"
+        ),
+    ),
     # The expiry cleanup's batch select, in expiry order, over the rows
     # it may delete (H5, migration 0023). The status list is
     # app/engine/service.py _EXPIRED_DELETABLE_STATUSES.
