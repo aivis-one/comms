@@ -127,12 +127,23 @@ delivery is the inbox entry, which shows the `title`/`body` the product
 sent -- a template there would never be shown. Nor is there a sheet for
 `llm`: its letter is the product's own.
 
-**A variable the job does not carry is not printed.** A template field
-that names a variable absent from the job -- or a path into one that
-does not resolve, `{user[name]}` with no `user` or no `name` in it --
-does not render: the field comes out as it does with no template for
-it (see "What it can change" under `PROFILE_OVERLAY_DIR` below, and
-"What email reads from the profile" in §3a).
+**A variable the job does not carry is printed as its placeholder.** A
+template field that names a variable absent from the job, a path into
+one that does not resolve (`{user[name]}` with no `user` or no `name` in
+it), or a variable that is `null` prints its path in braces --
+`{paid_amount}`, `{user[name]}` -- where its value would stand; the rest
+of the letter renders as usual, in every field: the telegram title,
+body and button, the email subject and body. The job is accepted and
+the letter goes: the channel's `accepted` row in the job's path names
+the paths (`template_unresolved`, section 8). A type with no template
+for a field still takes the stored title or body you sent -- your own
+text, not a hole in one (see "What it can change" under
+`PROFILE_OVERLAY_DIR` below, and "What email reads from the profile" in §3a).
+
+**What a template field may not do.** The start refuses a template that
+takes an attribute of a variable (`{user.name}`, `{x.__class__}` -- use
+`{user[name]}`), puts a field inside a format spec (`{amount:{width}}`),
+or asks a width or a precision above 4096 (`{x:99999999}`).
 
 It is delivered by BIND, not by a copy: the product installer writes
 `PROFILE_DIR=/opt/velo/repo/comms-profile` into `/opt/comms/.env` on
@@ -1293,6 +1304,7 @@ One row per transition, in order.
 | `category` | the category a mute gate decided by, or `null` |
 | `error` | an exception of comms' own: class and place, never its text; or `null` |
 | `provider_text` | the provider's answer, sanitized; `null` when it said nothing or its recipient was forgotten |
+| `template_unresolved` | on a `channel` row with `accepted`: the template's paths that did not resolve in the letter the channel took, as the template writes them (`["paid_amount", "user[name]"]`), their placeholders in the letter; `null` when every field resolved, and on every other row |
 
 **A transient failure of comms' database.** While comms' database
 answers, such a failure -- a deadlock that keeps coming back, say -- is

@@ -102,6 +102,7 @@ from app.engine.formatters import (
     NoAddressError,
     PermanentDeliveryError,
     RateLimitedError,
+    Sent,
     get_formatter,
     get_model_channel,
 )
@@ -1713,9 +1714,13 @@ async def _deliver_single(
                 error=journal.answer_text(answer, exc),
             )
         else:
-            outcome = _DeliveryOutcome(success=success)
+            outcome = _DeliveryOutcome(success=bool(success))
+            # A letter rendered with fields that did not resolve (TPL-1):
+            # their paths go with the channel's answer, into the journal.
             answer = (
-                journal.ACCEPTED
+                journal.accepted(
+                    success.unresolved if isinstance(success, Sent) else ()
+                )
                 if success
                 else journal.Answer(outcome=ChannelAnswer.TRANSIENT)
             )

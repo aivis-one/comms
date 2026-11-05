@@ -45,6 +45,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
+    ARRAY,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -622,6 +623,14 @@ class NotificationTransition(Base):
     # The provider's answer, sanitized before it is cut.
     provider_text: Mapped[str | None] = mapped_column(
         String(2000), nullable=True,
+    )
+    # TPL-1: on a channel row whose outcome is `accepted`, the paths of
+    # the template that did not resolve in the letter the channel took --
+    # the template's text, never the letter's. NULL when every field
+    # resolved; never an empty array (ck_transitions_template_unresolved,
+    # migration 0040).
+    template_unresolved: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True,
     )
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

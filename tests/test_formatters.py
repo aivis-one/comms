@@ -256,14 +256,11 @@ class TestTelegramDeliver:
         markup. Flags fall to channel defaults (no sheet flags for
         unit_event).
 
-        The job now carries `extra`, the one variable of the sheet's
-        body that is not a core field. It used to be left out, and the
-        test expected the body as "World [{extra}]": right while the
-        engine printed a missing variable back as "{extra}" (SafeDict).
-        G5 removed that -- a missing variable makes the field fall back
-        to the stored text (tests/test_template_missing_variable.py) --
-        so without `extra` the body would no longer come from the sheet
-        and this test would not be about the template path at all."""
+        The job carries `extra`, the one variable of the sheet's body
+        that is not a core field: this test is about a sheet with every
+        variable present. Without it the body prints "{extra}" -- its
+        placeholder (TPL-1, tests/test_template_missing_variable.py);
+        under G5 it fell back to the stored text."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
         recipient = _recipient()
@@ -787,11 +784,10 @@ class TestComposition:
         """Template path: no injected markup at all -- the sheet's own
         markup (here: none) is the whole story.
 
-        The job carries `extra` now. Without it the body was
-        "World [{extra}]" from the sheet while a missing variable was
-        printed back literally (SafeDict); since G5 it makes the body
-        fall back to the stored text, which would turn this "both from
-        the template" case into a mixed one."""
+        The job carries `extra`: both fields from the template, every
+        variable present. Without it the body still comes from the
+        sheet, with the placeholder "{extra}" (TPL-1); under G5 it fell
+        back to the stored text, which made this case a mixed one."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
 

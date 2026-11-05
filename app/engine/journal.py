@@ -286,9 +286,23 @@ class Answer:
     failure_class: FailureClass | None = None
     provider_text: str | None = None
     error: str | None = None
+    # TPL-1: on an `accepted` answer only -- the template's paths that
+    # did not resolve in the letter the channel took (their placeholders
+    # stood in it). The template's text, never a value of the letter.
+    template_unresolved: tuple[str, ...] = ()
 
 
 ACCEPTED = Answer(outcome=ChannelAnswer.ACCEPTED)
+
+
+def accepted(template_unresolved: tuple[str, ...] = ()) -> Answer:
+    """The channel took the letter -- with the paths of its template
+    that did not resolve, when there are any (TPL-1)."""
+    if not template_unresolved:
+        return ACCEPTED
+    return Answer(
+        outcome=ChannelAnswer.ACCEPTED, template_unresolved=template_unresolved,
+    )
 
 
 def answer_of(
@@ -452,6 +466,7 @@ async def record_channel_answer(
         failure_class=answer.failure_class,
         provider_text=answer.provider_text,
         error=answer.error,
+        template_unresolved=list(answer.template_unresolved) or None,
     )
     write = asyncio.ensure_future(_write_channel_answer(row, llm_answer, names))
     try:

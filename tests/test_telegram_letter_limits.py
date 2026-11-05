@@ -57,6 +57,7 @@ from app.engine.service import (
     deliver_notification,
     resolve_notification,
 )
+from app.engine.template_engine import RenderedField
 from tests.helpers import create_recipient, intake_fields
 
 _DOC = (Path(__file__).resolve().parents[1] / "deploy" / "INTEGRATION.md").read_text(
@@ -288,10 +289,12 @@ async def _with_title(
 ) -> NotificationDelivery:
     """_deliver with the title as a template renders it (trusted markup,
     verbatim); every other field falls back to the stored text."""
-    def render(**kwargs: Any) -> str | None:
-        return title if kwargs["field"] == "title" else None
+    def render_field(**kwargs: Any) -> RenderedField | None:
+        if kwargs["field"] != "title":
+            return None
+        return RenderedField(text=title, unresolved=())
 
-    with patch("app.engine.formatters.render", side_effect=render):
+    with patch("app.engine.formatters.render_field", side_effect=render_field):
         return await _deliver(session, api)
 
 

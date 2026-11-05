@@ -522,7 +522,7 @@ class TestSubjectAndBody:
     async def test_subject_falls_back_to_the_title(self) -> None:
         provider = _Provider()
         with patch(
-            "app.engine.formatters.render",
+            "app.engine.formatters.render_field",
             side_effect=lambda **kwargs: None,
         ):
             await _send(provider, title="Reset your password")
@@ -536,7 +536,7 @@ class TestSubjectAndBody:
         there."""
         provider = _Provider()
         with patch(
-            "app.engine.formatters.render",
+            "app.engine.formatters.render_field",
             side_effect=lambda **kwargs: None,
         ):
             await _send(
@@ -553,7 +553,7 @@ class TestSubjectAndBody:
         the deliverability this channel exists for."""
         provider = _Provider()
         with patch(
-            "app.engine.formatters.render",
+            "app.engine.formatters.render_field",
             side_effect=lambda **kwargs: None,
         ):
             await _send(provider, title=title)
@@ -572,7 +572,7 @@ class TestSubjectAndBody:
         same trust boundary HTML escaping guards on the telegram side."""
         provider = _Provider()
         with patch(
-            "app.engine.formatters.render",
+            "app.engine.formatters.render_field",
             side_effect=lambda **kwargs: None,
         ):
             await _send(provider, title=title)

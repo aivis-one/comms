@@ -97,7 +97,7 @@ from app.core.constants import MAX_LLM_ANSWER_BYTES
 from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine.constants import DeliveryChannel
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.template_engine import render, resolve_flag
+from app.engine.template_engine import RenderedField, render_field, resolve_flag
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -179,6 +179,26 @@ class LLMTransientError(Exception):
     answer, set by set, as the journal records it."""
 
 
+@dataclass(frozen=True)
+class Sent:
+    """A letter the channel took, rendered from a template in which some
+    fields did not resolve (TPL-1): their paths, the template's text --
+    never a value of the letter. Truthy, like the True it stands for."""
+
+    unresolved: tuple[str, ...]
+
+
+def sent_letter(rendered: Sequence[RenderedField | None]) -> bool | Sent:
+    """What a channel returns for a letter it sent: True, or Sent with
+    every path that did not resolve in its fields, once, in order."""
+    unresolved: list[str] = []
+    for field_ in rendered:
+        for path in () if field_ is None else field_.unresolved:
+            if path not in unresolved:
+                unresolved.append(path)
+    return Sent(tuple(unresolved)) if unresolved else True
+
+
 class ChannelFormatter(Protocol):
     """Protocol for channel-specific notification delivery."""
 
@@ -187,7 +207,7 @@ class ChannelFormatter(Protocol):
         notification: Notification,
         delivery: NotificationDelivery,
         recipient: Recipient,
-    ) -> bool:
+    ) -> bool | Sent:
         """Attempt to deliver a notification via this channel.
 
         Args:
@@ -196,7 +216,12 @@ class ChannelFormatter(Protocol):
             recipient: The recipient (telegram_id, email, locale).
 
         Returns:
-            True if delivery succeeded, False otherwise.
+            True if delivery succeeded, False otherwise -- or Sent: the
+            letter went, and fields of its template did not resolve
+            (TPL-1; the service writes their paths with the channel's
+            answer). Two forms on purpose: a channel without templates
+            (in_app) and every stand-in that returns True stay what they
+            are, and Sent is truthy wherever the answer is only "sent".
 
         Raises:
             PermanentDeliveryError: If delivery failed permanently.
@@ -509,7 +534,7 @@ class TelegramFormatter:
         notification: Notification,
         delivery: NotificationDelivery,
         recipient: Recipient,
-    ) -> bool:
+    ) -> bool | Sent:
         """Send a Telegram message to the recipient.
 
         COMPOSITION RULE (Phase 3a item 2): the markup source follows
@@ -563,32 +588,37 @@ class TelegramFormatter:
             else settings.default_locale
         )
 
-        rendered_title = render(
+        # A placeholder (TPL-1) enters ParseMode.HTML too: escaped like a
+        # value, so a path cannot open a tag.
+        rendered_title = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.TELEGRAM,
             field="title",
             locale=locale,
             variables=variables,
+            escape=escape,
         )
         # Markup follows the content source (see docstring): only the
         # stored-fallback title gets the service-supplied <b> wrap.
         title = (
-            rendered_title
+            rendered_title.text
             if rendered_title is not None
             else f"<b>{escape(notification.letter_text()[0])}</b>"
         )
-        rendered_body = render(
+        rendered_body = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.TELEGRAM,
             field="body",
             locale=locale,
             variables=variables,
+            escape=escape,
         )
         body = (
-            rendered_body
+            rendered_body.text
             if rendered_body is not None
             else escape(notification.letter_text()[1])
         )
+        rendered = [rendered_title, rendered_body]
 
         text = f"{title}\n\n{body}"
         # CH-1: a letter certain not to fit is refused here, Telegram not
@@ -615,7 +645,7 @@ class TelegramFormatter:
             # there is no injection surface -- markup is not
             # interpreted, and the URL is validated separately.
             button_text = "Open"
-            rendered_button = render(
+            rendered_button = render_field(
                 notification_type=notification.type,
                 channel=DeliveryChannel.TELEGRAM,
                 field="button_text",
@@ -623,7 +653,8 @@ class TelegramFormatter:
                 variables=raw_variables,
             )
             if rendered_button is not None:
-                button_text = rendered_button
+                button_text = rendered_button.text
+            rendered.append(rendered_button)
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text=button_text, url=deep_link)]
@@ -652,7 +683,7 @@ class TelegramFormatter:
                 disable_web_page_preview=disable_preview,
                 disable_notification=silent,
             )
-            return True
+            return sent_letter(rendered)
 
         except TelegramAPIError as exc:
             # 429 first: TelegramRetryAfter IS-A TelegramAPIError, and
@@ -819,8 +850,9 @@ class EmailFormatter:
         notification: Notification,
         delivery: NotificationDelivery,
         recipient: Recipient,
-    ) -> bool:
-        """Send one email; True when the provider accepted it."""
+    ) -> bool | Sent:
+        """Send one email; True (or Sent, TPL-1) when the provider
+        accepted it."""
         address = _usable_email_address(recipient.email)
         if address is None:
             # The recipient snapshot arrives over the bus and an address
@@ -835,6 +867,7 @@ class EmailFormatter:
             )
 
         data: dict[str, Any]
+        rendered: list[RenderedField | None] = []
         if notification.email is not None:
             # The product's own email: its fields as they came -- html
             # only when it sent one -- and comms' own AFTER them: the
@@ -850,7 +883,7 @@ class EmailFormatter:
         else:
             # Composed from the profile, the request byte for byte as
             # before EM-1 -- the same fields in the same order.
-            subject, body = self._compose(notification, recipient)
+            subject, body, rendered = self._compose(notification, recipient)
             data = {
                 "from": self._from_address,
                 "to": [address],
@@ -880,15 +913,18 @@ class EmailFormatter:
             )
             raise
 
-        return self._interpret(response, notification, delivery)
+        self._interpret(response, notification, delivery)
+        return sent_letter(rendered)
 
     # -- composition --------------------------------------------------
 
     def _compose(
         self, notification: Notification, recipient: Recipient,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[RenderedField | None]]:
         """Subject and body for this notification, in the recipient's
-        locale, with the fallbacks the channel needs."""
+        locale, with the fallbacks the channel needs -- and the two
+        rendered fields, for the paths that did not resolve (TPL-1). The
+        text is plain: a placeholder goes as it is."""
         variables = build_variables(notification)
         # NULL is "no language" (F1.4) -- the one way to say it; a blank
         # string can no longer arrive (ck_recipients_locale_not_blank).
@@ -898,7 +934,7 @@ class EmailFormatter:
             else settings.default_locale
         )
 
-        rendered_subject = render(
+        rendered_subject = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.EMAIL,
             field="subject",
@@ -918,11 +954,14 @@ class EmailFormatter:
         #      derived from the body, not invented copy in one language
         #      on a multi-locale service, and traceable to the producer.
         stored_title, stored_body = notification.letter_text()
-        subject = _clean_subject(rendered_subject or stored_title)
+        subject = _clean_subject(
+            (rendered_subject.text if rendered_subject is not None else "")
+            or stored_title
+        )
         if not subject:
             subject = notification.type
 
-        rendered_body = render(
+        rendered_body = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.EMAIL,
             field="body",
@@ -932,8 +971,8 @@ class EmailFormatter:
         # BODY FALLBACK goes to the STORED body and never to another
         # channel's template: the telegram body carries HTML markup,
         # which would arrive as raw characters in a text email.
-        body = rendered_body if rendered_body is not None else stored_body
-        return subject, body
+        body = rendered_body.text if rendered_body is not None else stored_body
+        return subject, body, [rendered_subject, rendered_body]
 
     # -- response handling --------------------------------------------
 
@@ -1757,19 +1796,28 @@ def _escape_html_variables(variables: dict[str, Any]) -> dict[str, Any]:
     """Escape variable VALUES for ParseMode.HTML (review 1.1).
 
     Strings are HTML-escaped; numbers/bools/None pass through so
-    numeric format specs ("{amount:,.2f}") keep working; anything else
-    is stringified and escaped -- an unexpected repr must not be able
-    to break entity parsing.
+    numeric format specs ("{amount:,.2f}") keep working; a JSON object
+    -- `params`, the one object the intake lets into action_data
+    (app/transport/events.py: every other variable is a scalar) -- keeps
+    its shape with every value escaped (TPL-1), so a path into it
+    ("{params[practice_id]}") resolves as it does for the button and the
+    email. It was stringified whole before, and such a path never
+    resolved in a telegram title or body, a defect G5's fallback hid.
+    Anything else is stringified and escaped -- an unexpected repr must
+    not be able to break entity parsing.
     """
-    escaped: dict[str, Any] = {}
-    for key, value in variables.items():
-        if isinstance(value, str):
-            escaped[key] = escape(value)
-        elif isinstance(value, (int, float)) or value is None:
-            escaped[key] = value
-        else:
-            escaped[key] = escape(str(value))
-    return escaped
+    return {key: _escape_html_value(value) for key, value in variables.items()}
+
+
+def _escape_html_value(value: Any) -> Any:
+    """One value, escaped for ParseMode.HTML (see _escape_html_variables)."""
+    if isinstance(value, str):
+        return escape(value)
+    if isinstance(value, (int, float)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {key: _escape_html_value(item) for key, item in value.items()}
+    return escape(str(value))
 
 
 def build_variables(notification: Notification) -> dict[str, Any]:

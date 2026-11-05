@@ -104,14 +104,15 @@ class TestTemplateEngine:
             is None
         )
 
-    def test_missing_variable_falls_back_without_raising(self) -> None:
-        """A missing variable: no KeyError out of render, and no literal
-        placeholder either -- None, the stored-text fallback.
+    def test_missing_variable_prints_its_placeholder(self) -> None:
+        """A missing variable: no KeyError out of render, and its
+        placeholder where the value would stand (TPL-1).
 
-        It asserted "hello [{extra}]": right while SafeDict printed a
-        missing variable back as "{extra}". G5 removed SafeDict -- the
-        literal reached the person -- and "no KeyError" now holds by
-        the fallback. The pair: with `extra` the sheet renders."""
+        It asserted None -- the stored-text fallback G5 made the rule,
+        right while it was. Before G5 it asserted "hello [{extra}]",
+        right while SafeDict printed a missing top-level variable back.
+        The owner's decision of 4 November withdrew G5: the hole is
+        printed. The pair: with `extra` the sheet renders."""
         text = render(
             notification_type="unit_event",
             channel="telegram",
@@ -119,7 +120,7 @@ class TestTemplateEngine:
             locale="en",
             variables={"body": "hello"},
         )
-        assert text is None
+        assert text == "hello [{extra}]"
         assert render(
             notification_type="unit_event",
             channel="telegram",
@@ -146,15 +147,14 @@ class TestTemplateEngine:
             is None
         )
 
-    def test_a_missing_variable_is_not_printed_back(self) -> None:
-        """"{missing}" with no `missing` renders to None -- never to
-        "{missing}".
+    def test_a_missing_variable_is_printed_back(self) -> None:
+        """"{missing}" with no `missing` renders to "{missing}" (TPL-1).
 
-        It replaces test_safedict_direct, which asserted that SafeDict
-        returns "{key}" for a missing key: true of the class, and the
-        reason a template typo reached the person as braces. G5 deleted
-        the class with its behaviour (no legacy); the property now
-        asserted is render's own, on the rendered value."""
+        It asserted None under G5, and replaced test_safedict_direct,
+        which asserted SafeDict's "{key}" for a missing key. The value
+        is the same as SafeDict's for a top-level name, by another
+        mechanism -- render's own formatter, which also covers a path
+        into a dict and a null, where SafeDict raised or printed None."""
         registry.register_templates(
             "en", {"unit_event": {"telegram": {"body": "{missing}"}}},
         )
@@ -164,7 +164,7 @@ class TestTemplateEngine:
             field="body",
             locale="en",
             variables={},
-        ) is None
+        ) == "{missing}"
 
     def test_field_granularity(self) -> None:
         """{type}.{channel}.{field} addressing (email subject)."""

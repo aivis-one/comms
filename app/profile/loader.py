@@ -218,6 +218,7 @@ from app.profile.registry import (
     TypeRecord,
     registry,
 )
+from app.profile.template_fields import field_problem
 
 logger = structlog.get_logger()
 
@@ -1328,9 +1329,11 @@ class _FormatProbe:
     pre-formatted strings (same principle as pre-rendered digests).
 
     Item access returns another probe ({user[name]} works on the JSON
-    dicts that actually arrive). Attribute access is deliberately NOT
-    provided: getattr on a dict fails at runtime, so {user.name} must
-    die at validation, not on the delivery path.
+    dicts that actually arrive). Attribute access is not what refuses
+    {user.name}: the probe has the attributes every object has
+    (__class__, __doc__ ...), so the dry run alone let {x.__class__}
+    through -- the path is refused before the probe is asked
+    (app/profile/template_fields.py, TPL-1).
     """
 
     def __format__(self, spec: str) -> str:
@@ -1395,18 +1398,25 @@ def _leaf_complaint(fname: str, template: Any) -> str | None:
     if not isinstance(template, str):
         return f"must be a string, got {type(template).__name__}"
     try:
+        # The fields themselves first (TPL-1, app/profile/template_fields.py):
+        # an attribute anywhere in a path, a field inside a format spec,
+        # a width or precision wider than a letter. BEFORE the dry run --
+        # a width of 10**8 would make the dry run itself build the string.
+        # A template the parser refuses is the dry run's to name.
+        problem = field_problem(template)
+    except ValueError:
+        problem = None
+    if problem is not None:
+        return problem
+    try:
         # Dry run against probes: parser errors (unbalanced braces,
         # bad conversions) and specs no JSON scalar accepts surface
         # here -- exactly what must kill startup instead of the
         # delivery path. Specs valid for SOME runtime value pass.
+        # Attribute access no longer reaches it: field_problem above
+        # refuses every attribute by the path, which the probe could not
+        # (every object has __class__).
         template.format_map(_ProbeDict())
-    except AttributeError as exc:
-        return (
-            f"uses attribute access on a template variable "
-            f"({exception_text(exc)}). "
-            f"Variables are JSON values, so `{{user.name}}` fails at "
-            f"runtime -- use item access (`{{user[name]}}`)."
-        )
     except (ValueError, TypeError, IndexError, KeyError) as exc:
         return (
             f"has a broken format spec or field path: "

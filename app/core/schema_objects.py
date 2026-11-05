@@ -401,6 +401,9 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_transitions_provider_text",
     "ck_transitions_error_not_blank",
     "ck_transitions_attempt_not_negative",
+    # The template's unresolved paths only on a channel's `accepted`
+    # row, and never an empty array (TPL-1, migration 0040).
+    "ck_transitions_template_unresolved",
     # What a job pushes is one of the three PushOn values, never NULL
     # (P3-1, migration 0020).
     "ck_notifications_push_on",
