@@ -53,14 +53,32 @@ CORRELATION_FIELDS = frozenset({
 })
 
 
-def _sanitized(value: Any) -> Any:
+# The containers _sanitized walks, by EXACT type: a subclass (a
+# namedtuple, whose constructor takes its fields one by one, a deque, a
+# list subclass) is not rebuilt -- it goes to the log as its repr,
+# sanitized, like any other value it cannot walk (SAN-1).
+_WALKED = (list, tuple, set, frozenset)
+_SCALARS = (bool, int, float)
+
+
+def _sanitized(value: Any, path: frozenset[int] = frozenset()) -> Any:
+    """A value of a log event with every string in it through the one
+    sanitizer. Never raises: what it cannot walk -- an object, a
+    container it does not rebuild, a container that holds itself (`path`
+    is the ids above this one; the same object twice side by side is
+    walked twice, it is not a cycle) -- becomes sanitize_text(repr(v)),
+    which is what the JSON renderer's fallback would print anyway."""
     if isinstance(value, str):
         return sanitize_text(value)
+    if value is None or isinstance(value, _SCALARS):
+        return value
+    walked = isinstance(value, dict) or type(value) in _WALKED
+    if not walked or id(value) in path:
+        return sanitize_text(repr(value))
+    inner = path | {id(value)}
     if isinstance(value, dict):
-        return {key: _sanitized(item) for key, item in value.items()}
-    if isinstance(value, list | tuple | set | frozenset):
-        return type(value)(_sanitized(item) for item in value)
-    return value
+        return {key: _sanitized(item, inner) for key, item in value.items()}
+    return type(value)(_sanitized(item, inner) for item in value)
 
 
 def sanitize_event(

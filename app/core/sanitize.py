@@ -15,7 +15,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-# Secret-redaction patterns (review 1.1, widened in F0-comms item 2).
+# Secret-redaction patterns (review 1.1, widened in F0-comms item 2 and
+# in SAN-1).
 #
 # THE LIST IS DRIVEN BY THE SECRETS THIS SERVICE ACTUALLY HOLDS, in the
 # form each takes where it can surface in an error text -- not by what a
@@ -49,7 +50,34 @@ from typing import Any
 #      to the LAST @ of the authority (a raw @ in a password must not
 #      leave its tail behind);
 #   4. token-shaped values with no keyword next to them;
-#   5. key=value / key: value for credential keywords.
+#   5. key=value / key: value for credential keywords (SAN-1), in two
+#      passes -- a query parameter first, then every other form:
+#      - THE KEY is a credential word (password, passwd, pwd, token,
+#        secret, api_key/api-key/apikey, authorization) with any
+#        prefix joined by _ or - (access_token, db_password,
+#        comms_service_token, x-api-key), quoted or not ("password":,
+#        'password':). A word that only CONTAINS one does not count:
+#        max_tokens, tokenizer, password_changed, passwords,
+#        AuthorizationError -- the separator must follow the credential
+#        word itself (an optional closing quote between them).
+#      - THE VALUE runs: inside quotes -- to the closing quote, the
+#        quotes kept (JSON, a dict's repr); after ? or & (a URL query)
+#        -- to the next &, #, quote or whitespace (a URL holds no raw
+#        space, and an access line keeps its ' HTTP/1.1" 200'); any
+#        other -- to the first , ; & ) ] } or the end of the line, so
+#        a value with a space in it leaves no tail.
+#      - A value that is already [redacted] (pattern 1's output, or
+#        this pattern's own on the second pass) is not extended: that
+#        is what keeps the text after a redacted header and makes the
+#        pass idempotent.
+#    The separator is kept as written (key: [redacted], key=[redacted]).
+#    THE PRICE of pattern 5, by design: a secret that itself contains
+#    , ; & ) ] } leaves the part after that character behind; the text
+#    after an unquoted value on the same line, up to that boundary, is
+#    eaten with it ("token=abc rest" -> "token=[redacted]"). The limit:
+#    a camelCase key (accessToken, apiKey) is not recognised -- with no
+#    _ or - before the credential word there is no boundary to stop at
+#    without also matching ordinary words that end in one.
 _AUTH_HEADER_RE = re.compile(
     r"(?i)\b(authorization)\b\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+"
 )
@@ -85,10 +113,35 @@ _LLM_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
 #      demand of a provider credential, and a red start on a valid
 #      configuration).
 _LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{48,}\b")
-_KEYVAL_RE = re.compile(
-    r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key|apikey"
-    r"|authorization)\b\s*[=:]\s*\S+"
+_KEY = (
+    r"\b(?:[a-z0-9]+[_-])*"
+    r"(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|authorization)"
 )
+_REDACTED = "[redacted]"
+_QUERY_KEYVAL_RE = re.compile(
+    rf"(?i)(?<=[?&])({_KEY}=)(?!\[redacted\])[^&#\s\"']+"
+)
+# One piece of an unquoted value: a mark an earlier pattern left (its ]
+# is not the value's end) or a character that is not a boundary.
+_UNQUOTED = r"(?:\[redacted\]|[^\s,;&)\]}])"
+_KEYVAL_RE = re.compile(
+    rf"(?i)({_KEY}[\"']?\s*[=:]\s*)"
+    r"(\[redacted\]"
+    r"|\"(?:[^\"\\\r\n]|\\.)*\""
+    r"|'(?:[^'\\\r\n]|\\.)*'"
+    r"|[\"'][^\r\n]*"
+    rf"|{_UNQUOTED}(?:[ \t]*{_UNQUOTED})*)"
+)
+
+
+def _keyval_redacted(match: re.Match[str]) -> str:
+    """Pattern 5's replacement: the key and separator as written, the
+    value's quotes kept around [redacted]."""
+    head, value = match.group(1), match.group(2)
+    if value[0] in "\"'":
+        closed = len(value) > 1 and value[-1] == value[0]
+        return f"{head}{value[0]}{_REDACTED}{value[0] if closed else ''}"
+    return f"{head}{_REDACTED}"
 
 
 def sanitize_text(text: str) -> str:
@@ -97,7 +150,8 @@ def sanitize_text(text: str) -> str:
     Idempotent: sanitize_text(sanitize_text(x)) == sanitize_text(x).
     Callers cut AFTER calling this, never before: a cut through the
     middle of a secret can leave a prefix no pattern recognises. The
-    one gap in coverage is the KNOWN CEILING on _LONG_HEX_RE.
+    gaps in coverage: the KNOWN CEILING on _LONG_HEX_RE, and pattern 5's
+    price and its camelCase limit (the list above).
     """
     text = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
     text = _BEARER_RE.sub("bearer [redacted]", text)
@@ -106,7 +160,8 @@ def sanitize_text(text: str) -> str:
     text = _MAILGUN_KEY_RE.sub("[redacted]", text)
     text = _LLM_KEY_RE.sub("[redacted]", text)
     text = _LONG_HEX_RE.sub("[redacted]", text)
-    return _KEYVAL_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _QUERY_KEYVAL_RE.sub(rf"\1{_REDACTED}", text)
+    return _KEYVAL_RE.sub(_keyval_redacted, text)
 
 
 _APP_ROOT = Path(__file__).resolve().parents[1]
@@ -168,13 +223,20 @@ def _database_classes() -> tuple[type[BaseException], ...]:
     StatementError (DBAPIError's base; it carries [SQL] and [parameters]
     without a driver too), the asyncpg adapter's errors, asyncpg's own --
     the server's (PostgresError) and the client's (InterfaceError, its
-    DataError for a parameter of the wrong type quoting the value)."""
+    DataError for a parameter of the wrong type quoting the value) -- and
+    SQLAlchemy's PendingRollbackError (SAN-1): a session used again after
+    a failed flush raises it with the failed flush's error PASTED into its
+    own text ("Original exception was: ...", orm/session.py) -- its [SQL]
+    and the driver's message, which can quote a value (22P02, a
+    parameter of the wrong type) -- and with NO chain to that error (no
+    __cause__, no __context__): only its class can tell it is the
+    database's."""
     from asyncpg.exceptions import InterfaceError, PostgresError
     from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
-    from sqlalchemy.exc import StatementError
+    from sqlalchemy.exc import PendingRollbackError, StatementError
 
     return (StatementError, AsyncAdapt_asyncpg_dbapi.Error, PostgresError,
-            InterfaceError)
+            InterfaceError, PendingRollbackError)
 
 
 def _is_database_error(exc: BaseException) -> bool:

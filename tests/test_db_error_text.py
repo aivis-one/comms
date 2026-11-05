@@ -18,6 +18,8 @@
 #   M8 bound_contextvars around resolve_targets taken off -> TestTheResolver
 #   M6 a new logger with str(exc) -> TestTheGuard
 #   M7 SanitizingFormatter off uvicorn's handler -> TestUvicorn
+#   S11 PendingRollbackError out of the database classes (SAN-1)
+#      -> TestTheRule ("pending rollback"), TestPendingRollback
 # =============================================================================
 
 import ast
@@ -25,7 +27,7 @@ import io
 import logging
 import logging.config
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -34,7 +36,9 @@ import asyncpg
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, InvalidRequestError, PendingRollbackError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from structlog.testing import capture_logs
 
 from app.core.config import settings
@@ -130,6 +134,36 @@ async def real_client_data_error() -> Exception:  # the client's DataError
     raise AssertionError("nothing failed")
 
 
+class _PendingBase(DeclarativeBase):
+    """A mapping of this test's own temp table -- not the app's metadata."""
+
+
+class _ZzPending(_PendingBase):
+    __tablename__ = "zz_pending"
+    k: Mapped[str] = mapped_column(primary_key=True)
+    n: Mapped[int]
+
+
+async def real_pending_rollback() -> Exception:
+    """SQLAlchemy's PendingRollbackError: a session used again after a
+    failed flush. Its text is the flush's error pasted in, with no chain
+    to it. The flush fails on a parameter of the wrong type -- asyncpg's
+    DataError quotes the value in its message, which hide_parameters does
+    not reach -- so the sentinel is in the pasted text (the instrument
+    check of TestTheRule)."""
+    async with get_session_factory()() as session:
+        await session.execute(text(
+            "CREATE TEMP TABLE zz_pending (k text PRIMARY KEY, n int)"))
+        session.add(_ZzPending(k="k", n=SENTINEL))  # type: ignore[arg-type]
+        with suppress(DBAPIError):
+            await session.flush()
+        try:
+            await session.execute(text("SELECT 1"))
+        except PendingRollbackError as exc:
+            return exc
+    raise AssertionError("nothing failed")
+
+
 _REAL: dict[str, Callable[[], Awaitable[Exception]]] = {
     "23505": real_unique,
     "23514": real_check,
@@ -137,6 +171,7 @@ _REAL: dict[str, Callable[[], Awaitable[Exception]]] = {
     "23503": real_foreign_key,
     "bare asyncpg": real_bare_asyncpg,
     "client DataError": real_client_data_error,
+    "pending rollback": real_pending_rollback,
 }
 
 
@@ -190,6 +225,28 @@ class TestTheRule:
         assert db_error_summary(mine) is None
         assert exception_text(mine) == "our own words"
         assert "our own words" in sanitized_traceback(_raised(mine))
+
+
+class TestPendingRollback:
+    """SAN-1 item 5: the one wrapper a library builds around a database
+    error's TEXT with no chain to the error -- recognised by its class."""
+
+    async def test_no_chain_and_the_summary(self) -> None:
+        exc = await real_pending_rollback()
+        # The instrument: the text IS the database's, and nothing links to it.
+        assert SENTINEL in str(exc) and "Original exception was" in str(exc)
+        assert exc.__cause__ is None and exc.__context__ is None
+        line = exception_text(exc)
+        assert line.startswith("sqlalchemy.exc.PendingRollbackError at ")
+        assert SENTINEL not in line
+        trace = sanitized_traceback(exc)
+        assert SENTINEL not in trace
+        assert "sqlalchemy.exc.PendingRollbackError at " in trace
+
+    def test_the_pair_its_parent_class_keeps_its_words(self) -> None:
+        mine = InvalidRequestError("our own words")
+        assert db_error_summary(mine) is None
+        assert exception_text(mine) == "our own words"
 
 
 def _links(exc: BaseException) -> list[BaseException]:

@@ -574,8 +574,10 @@ class TelegramFormatter:
             # ending as "transient attempts exhausted" -- a dead channel
             # disguised as weather.
             if isinstance(exc, TelegramUnauthorizedError):
+                # Not "token: <text>": the sanitizer would take the
+                # provider's words for the token's value (SAN-1).
                 raise ConfigurationError(
-                    f"Telegram rejected the bot token: {exception_text(exc)}"
+                    f"Telegram rejected the bot token -- {exception_text(exc)}"
                 ) from exc
             error_msg = str(exc).lower()
             for perm_error in _PERMANENT_ERRORS:

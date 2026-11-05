@@ -34,6 +34,7 @@ from aiogram.exceptions import (
     TelegramAPIError,
     TelegramNetworkError,
     TelegramRetryAfter,
+    TelegramUnauthorizedError,
 )
 from structlog.testing import capture_logs
 
@@ -1046,6 +1047,21 @@ class TestTelegramFailuresReachTheLogRedacted:
             e for e in logs if e["event"] == "delivery_permanent_failure"
         ]
         assert "bot was blocked by the user" in entry["error"]
+
+    async def test_a_rejected_token_keeps_telegram_words(self) -> None:
+        """SAN-1: the text is not "bot token: <words>" -- the sanitizer's
+        key=value pattern would take Telegram's words for the token's
+        value and redact them to the end of the line."""
+        error = TelegramUnauthorizedError(
+            method=SimpleNamespace(),  # type: ignore[arg-type]
+            message="Unauthorized",
+        )
+        outcome, _ = await _tg_outcome(error)
+        assert outcome.failure_class is FailureClass.CONFIGURATION
+        assert outcome.error == (
+            "Telegram rejected the bot token -- "
+            "Telegram server says - Unauthorized"
+        )
 
     async def test_rate_limit_carries_telegram_words(self) -> None:
         error = TelegramRetryAfter(

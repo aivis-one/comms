@@ -20,6 +20,18 @@
 #   M6  sys.excepthook / threading.excepthook not set -> TestThePaths uncaught
 #   M7  a copy of sanitize_text outside app/core      -> TestOneSanitizer
 #   W1  idempotency_key out of CORRELATION_FIELDS     -> TestCorrelationFields
+# SAN-1 (the forms pattern 5 of app/core/sanitize.py missed, and values
+# the processor could not walk):
+#   S1  the key without its _/- prefix               -> TestPrefixedKeys
+#   S2  no quote allowed after the key               -> TestQuotedKeys
+#   S3  the unquoted value to the first space        -> TestValueWithSpaces
+#   S4  no quoted-value branch                       -> TestValueWithSpaces
+#   S5  the query value runs like any other          -> TestValueWithSpaces
+#   S6  [redacted] extended like any value           -> TestValueWithSpaces
+#   S7  word characters let in after the key         -> TestPrefixedKeys
+#   S8  a namedtuple rebuilt from one iterable       -> TestTheProcessorNeverRaises
+#   S9  no cycle guard                               -> TestTheProcessorNeverRaises
+#   S10 the cycle guard global, not per path         -> TestTheProcessorNeverRaises
 # =============================================================================
 
 import ast
@@ -29,7 +41,9 @@ import logging
 import os
 import subprocess
 import sys
+from collections import deque, namedtuple
 from pathlib import Path
+from typing import Any
 
 import pytest
 import structlog
@@ -40,6 +54,7 @@ from app.core.logging import (
     processors,
     sanitize_event,
 )
+from app.core.sanitize import sanitize_text
 
 _REPO = Path(__file__).resolve().parents[1]
 _APP = _REPO / "app"
@@ -245,3 +260,174 @@ class TestOneSanitizer:
         # The pair: the callers exist, and all of them import from core.
         assert len(importers) >= 10
         assert set(importers.values()) == {"app.core.sanitize"}
+
+
+# =============================================================================
+# SAN-1 -- the key=value forms, and values the processor cannot walk
+# =============================================================================
+
+# A value in a credential's place, glued at run time.
+_SECRET = "zq" + "SANone" + "7k"
+
+
+def _once_and_twice(text: str) -> str:
+    """sanitize_text's output, checked idempotent on the way."""
+    once = sanitize_text(text)
+    assert sanitize_text(once) == once
+    return once
+
+
+class TestPrefixedKeys:
+    """Item 1: a credential word with a prefix joined by _ or - is a key
+    -- the settings' names, the deploy's env names, a gateway's header,
+    an OAuth pair; a word that only contains one is not. S1, S7."""
+
+    @pytest.mark.parametrize("key", [
+        "access_token", "refresh_token", "db_password", "client_secret",
+        "comms_service_token", "telegram_bot_token", "email_mailgun_api_key",
+        "postgres_password", "redis_password", "x-api-key", "X_API_KEY",
+    ])
+    @pytest.mark.parametrize("sep", ["=", ": "])
+    def test_the_value_goes_the_key_stays(self, key: str, sep: str) -> None:
+        cleaned = _once_and_twice(f"refused {key}{sep}{_SECRET}; retry")
+        assert cleaned == f"refused {key}{sep}[redacted]; retry"
+
+    @pytest.mark.parametrize("text", [
+        "max_tokens=1000 is over the limit",
+        "tokenizer: cl100k",
+        "token_mismatch: 2 of 3",
+        "password_changed: true",
+        "passwords match",
+        "AuthorizationError: no scope",
+        "TokenValidationError: bad padding",
+        "secrets: 3 configured",
+        "a token-shaped value",
+    ])
+    def test_ordinary_words_pass_whole(self, text: str) -> None:
+        assert sanitize_text(text) == text
+
+
+class TestQuotedKeys:
+    """Item 2: a key in quotes -- JSON, a dict's repr -- and its value
+    in quotes; the quotes and the rest of the structure stay. S2."""
+
+    def test_json(self) -> None:
+        text = json.dumps({"password": _SECRET, "n": 1, "event": "x"})
+        cleaned = _once_and_twice(text)
+        assert json.loads(cleaned) == {
+            "password": "[redacted]", "n": 1, "event": "x",
+        }
+
+    def test_a_dict_repr(self) -> None:
+        cleaned = _once_and_twice(repr({"db_password": _SECRET, "b": 2}))
+        assert ast.literal_eval(cleaned) == {"db_password": "[redacted]", "b": 2}
+
+    def test_a_header_dict_repr(self) -> None:
+        """The secret and the key only: the bearer pattern (2) runs to
+        the next whitespace, and in a repr that is past the closing
+        quote -- a shape of pattern 2, not of this one."""
+        text = repr({"Authorization": f"Bearer {_SECRET}", "Accept": "*/*"})
+        cleaned = _once_and_twice(text)
+        assert _SECRET not in cleaned
+        assert cleaned.startswith("{'Authorization': '[redacted]'")
+
+
+class TestValueWithSpaces:
+    """Item 3: a value with a space leaves no piece of itself; the text
+    after its boundary stays. S3-S6."""
+
+    def test_unquoted_runs_to_the_boundary(self) -> None:
+        cleaned = _once_and_twice(f"login password=my {_SECRET} x; then 2")
+        assert cleaned == "login password=[redacted]; then 2"
+
+    def test_unquoted_runs_to_the_end_of_the_line(self) -> None:
+        cleaned = _once_and_twice(f"token: my {_SECRET}\nnext line")
+        assert cleaned == "token: [redacted]\nnext line"
+
+    def test_the_query_string(self) -> None:
+        cleaned = _once_and_twice(f"GET /x?a=1&password={_SECRET}&b=2")
+        assert cleaned == "GET /x?a=1&password=[redacted]&b=2"
+
+    def test_the_access_line_keeps_its_tail(self) -> None:
+        cleaned = _once_and_twice(f'"GET /x?token={_SECRET} HTTP/1.1" 200')
+        assert cleaned == '"GET /x?token=[redacted] HTTP/1.1" 200'
+
+    def test_a_json_string_with_a_space_and_a_quote(self) -> None:
+        text = json.dumps({"api_key": f'my "{_SECRET}" key', "ok": True})
+        cleaned = _once_and_twice(text)
+        assert _SECRET not in cleaned
+        assert json.loads(cleaned) == {"api_key": "[redacted]", "ok": True}
+
+    def test_a_quote_cut_short(self) -> None:
+        cleaned = _once_and_twice(f'"password": "my {_SECRET}')
+        assert cleaned == '"password": "[redacted]'
+
+    def test_a_redacted_header_keeps_the_text_after_it(self) -> None:
+        cleaned = _once_and_twice(f"sent Authorization: Bearer {_SECRET} upstream")
+        assert cleaned == "sent Authorization=[redacted] upstream"
+
+    def test_a_value_an_earlier_pattern_took_part_of(self) -> None:
+        cleaned = _once_and_twice(f"token: Bearer {_SECRET} and more")
+        assert cleaned == "token: [redacted]"
+
+    def test_two_keys_on_one_line(self) -> None:
+        cleaned = _once_and_twice(
+            f"access_token=a {_SECRET}, 'client_secret': '{_SECRET} b' end")
+        assert cleaned == "access_token=[redacted], 'client_secret': '[redacted]' end"
+
+    @pytest.mark.parametrize("text", ["password=", "password=&b=2", ""])
+    def test_no_value_nothing_to_take(self, text: str) -> None:
+        assert sanitize_text(text) == text
+
+
+_Pair = namedtuple("_Pair", "label secret")
+
+
+def _logged(value: Any) -> dict[str, Any]:
+    """One event with `value`, through the real chain, rendered as JSON."""
+    stream = io.StringIO()
+    logger = structlog.wrap_logger(
+        structlog.PrintLogger(file=stream),
+        processors=processors(structlog.processors.JSONRenderer()),
+    )
+    logger.info("san1_probe", value=value)
+    line = stream.getvalue()
+    assert _SECRET not in line
+    parsed: dict[str, Any] = json.loads(line)
+    return parsed
+
+
+class TestTheProcessorNeverRaises:
+    """Item 4: a value _sanitized cannot walk goes to the log as its
+    repr, sanitized -- never as an exception out of the chain. S8-S10."""
+
+    def test_a_namedtuple(self) -> None:
+        line = _logged(_Pair("x", f"token={_SECRET}"))
+        # The repr's own field name is a key too: the whole quoted value goes.
+        assert line["value"] == "_Pair(label='x', secret='[redacted]')"
+
+    def test_a_dict_that_holds_itself(self) -> None:
+        loop: dict[str, Any] = {"dsn": f"password={_SECRET}"}
+        loop["self"] = loop
+        line = _logged(loop)
+        assert line["value"]["dsn"] == "password=[redacted]"
+        assert "{...}" in line["value"]["self"]
+        assert "[redacted]" in line["value"]["self"]
+
+    def test_a_list_that_holds_itself(self) -> None:
+        loop: list[Any] = [f"token={_SECRET}"]
+        loop.append(loop)
+        line = _logged(loop)
+        assert line["value"][0] == "token=[redacted]"
+        assert "[...]" in line["value"][1]
+
+    def test_the_same_list_twice_is_not_a_cycle(self) -> None:
+        shared = [f"token={_SECRET}"]
+        line = _logged({"a": shared, "b": shared})
+        assert line["value"] == {
+            "a": ["token=[redacted]"], "b": ["token=[redacted]"],
+        }
+
+    def test_what_it_does_not_rebuild(self) -> None:
+        line = _logged([deque([f"token={_SECRET}"]), (), {}, 3, None])
+        assert line["value"] == ["deque(['token=[redacted]])", [], {}, 3, None]
