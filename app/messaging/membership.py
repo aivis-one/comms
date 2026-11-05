@@ -73,11 +73,10 @@ from collections.abc import Sequence
 from uuid import UUID
 
 import structlog
-from sqlalchemy import ColumnElement, or_, select, update
+from sqlalchemy import ColumnElement, column, or_, select, table, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
-from app.audience.models import Recipient
 from app.core.database import once_more_on_insert_race
 from app.core.exceptions import NotFoundError
 from app.messaging.models import Section, SectionMember
@@ -85,6 +84,12 @@ from app.messaging.sections import get_or_create_section
 from app.messaging.threads import recipient_exists
 
 logger = structlog.get_logger()
+
+# Lightweight, by-name reference to the audience-owned recipients table.
+# Lets serves_section take the operator's recipient row (step 2 of THE
+# ORDER OF ROW LOCKS) without importing an app.audience model (package
+# DAG: core <- messaging; the same reference as app/messaging/threads.py).
+_recipients = table("recipients", column("id"))
 
 
 def section_serves_clause(
@@ -133,8 +138,8 @@ async def serves_section(
     verbs meet.
     """
     await session.execute(
-        select(Recipient.id)
-        .where(Recipient.id == operator)
+        select(_recipients.c.id)
+        .where(_recipients.c.id == operator)
         .with_for_update(read=True, key_share=True)
     )
     declared = await session.scalar(
