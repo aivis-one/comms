@@ -208,6 +208,17 @@ async def expire_overdue_notifications(lanes: Sequence[Lane]) -> int:
     contract is that the processes' lanes cover all four
     (deploy/INTEGRATION.md).
 
+    IN PORTIONS (PERF-1): at most _EXPIRY_PORTION jobs per transaction,
+    committed one portion after the other, in id order, until a portion
+    comes back short. A backlog after a worker's downtime no longer sits
+    in one transaction -- its row locks, its objects, the attempts of
+    these lanes queued behind it. Each portion WAITS for an attempt that
+    holds one of its jobs (no SKIP LOCKED, the rule above): the job is
+    closed after the attempt, in that portion. A failure rolls back the
+    portion it happened in; the portions before stay committed, and the
+    next pass closes the rest -- every job's outcome is the one it would
+    have had in one transaction.
+
     The worker runs this in its maintenance loop, beside the lane loops:
     the sweep waits for an attempt of this process too, while the
     attempt's channel answers are journaled in their own sessions -- a
@@ -216,27 +227,33 @@ async def expire_overdue_notifications(lanes: Sequence[Lane]) -> int:
     """
     factory = get_session_factory()
     now = datetime.now(UTC)
+    overdue = and_(
+        Notification.lane.in_([lane.value for lane in lanes]),
+        Notification.expiry_at.isnot(None),
+        Notification.expiry_at < now,
+    )
+    expired_count = 0
     async with factory() as session:
         try:
-            expired_count = await close_notifications(
-                session,
-                and_(
-                    Notification.lane.in_([lane.value for lane in lanes]),
-                    Notification.expiry_at.isnot(None),
-                    Notification.expiry_at < now,
-                ),
-                NotificationStatus.EXPIRED,
-            )
-            if expired_count:
-                logger.info("notifications_expired", count=expired_count)
-            await session.commit()
+            while True:
+                portion = await close_notifications(
+                    session, overdue, NotificationStatus.EXPIRED,
+                    limit=_EXPIRY_PORTION,
+                )
+                await session.commit()
+                expired_count += portion
+                if portion < _EXPIRY_PORTION:
+                    break
         except Exception as exc:
             await session.rollback()
             logger.error(
                 "notification_expire_error",
                 exception=sanitized_traceback(exc),
+                committed=expired_count,
             )
-            return 0
+            return expired_count
+    if expired_count:
+        logger.info("notifications_expired", count=expired_count)
     return expired_count
 
 
@@ -1107,6 +1124,12 @@ async def purge_expired_llm_answers() -> int:
         logger.info("llm_answers_purged", count=total)
     return total
 
+
+# PERF-1: jobs the expiry sweep closes per transaction
+# (expire_overdue_notifications). Jobs, not deliveries: one job's waiting
+# deliveries close in one UPDATE whatever their number. Module-level so
+# tests can shrink it to force a multi-portion sweep.
+_EXPIRY_PORTION = 500
 
 # Phase 3a item 5: rows deleted per retention batch. One batch = one
 # transaction (bounded FK cascade); the drain loops commit between

@@ -2043,6 +2043,35 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     journal row of theirs loses its provider_text, for the same reason.
 
     Returns the number of deliveries closed.
+
+    # KNOWN CEILING (forgetting is one transaction over every job of the
+    # person; acknowledged by design):
+    #   1. Mechanics: the select below takes FOR UPDATE on EVERY job that
+    #      has a delivery of this recipient -- finished ones too, until
+    #      retention deletes them -- and holds them all until the
+    #      caller's one transaction (forget_recipient: the tombstone, the
+    #      deletions, this) commits. A person in many jobs holds that
+    #      many job rows at once, and the attempts and sweeps of those
+    #      jobs wait behind it. The expiry sweep takes its jobs in
+    #      portions (app/engine/processor.py _EXPIRY_PORTION, PERF-1);
+    #      this does not.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: none -- no product forgets a recipient today (no
+    #      user_deleted, no DELETE /api/v1/recipients/{id} in aivis or
+    #      velo, PERF-1), so the width has no consumer.
+    #   4. Promotion trigger: a product starts sending user_deleted or
+    #      DELETE /api/v1/recipients/{id}; OR a recipient has more jobs
+    #      than one portion of the expiry sweep (_EXPIRY_PORTION).
+    #   5. Agreed fix: the caller commits the tombstone, the deletions and
+    #      a first portion of jobs, then withdraws the rest in portions,
+    #      one commit each, in id order; a repeated forgetting no longer
+    #      returns early on a tombstone but withdraws again, so a failure
+    #      in the middle is finished by the repeat the consumer or the
+    #      product already makes.
+    #   6. Rejected: a deferred worker pass over the tombstones -- the
+    #      DELETE would be answered before the deliveries are withdrawn;
+    #      portions inside the one transaction -- a row lock is held to
+    #      the commit, so they would hold exactly as many rows.
     """
     touched = (
         await session.execute(
@@ -2111,8 +2140,14 @@ async def close_notifications(
     session: AsyncSession,
     condition: Any,
     outcome: NotificationStatus,
+    *,
+    limit: int | None = None,
 ) -> int:
-    """Expire or cancel every ACTIVE job matching `condition`.
+    """Expire or cancel every ACTIVE job matching `condition` -- or, with
+    `limit`, the first `limit` of them in id order: ONE PORTION, for a
+    caller that commits between portions (the expiry sweep, PERF-1). The
+    order and the lock are the same either way, so portions keep THE
+    ORDER OF ROW LOCKS; a portion shorter than `limit` is the last one.
 
     The waiting deliveries take the outcome (one the channel already
     accepted is closed SENT -- close_waiting_deliveries) and the job is
@@ -2127,12 +2162,15 @@ async def close_notifications(
     """
     delivery_outcome = _CLOSING[outcome]
     step = _CLOSING_STEP[outcome]
-    rows = await session.execute(
+    stmt = (
         select(Notification)
         .where(condition, Notification.status.in_(_ACTIVE_STATUSES))
         .order_by(Notification.id)
         .with_for_update()
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    rows = await session.execute(stmt)
     notifications = list(rows.scalars().all())
     for notification in notifications:
         if notification.status == NotificationStatus.PENDING:
