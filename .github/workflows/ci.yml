@@ -6,7 +6,10 @@
 #          mypy, the two fences, `alembic upgrade head` + `alembic
 #          check`, the suite's collection, the tree's guards -- a small
 #          mistake is red in minutes, and the two full jobs do not start.
-# Then, side by side, both after `checks` (needs):
+#          It also makes the suite's THREE PARTS (CI-2, step `parts`) and
+#          holds that together they are the whole suite, nothing twice.
+# Then, side by side, both after `checks` (needs), each in the same three
+# parts at once -- a matrix, every part run to its end:
 #   test   the suite on the runner's Python 3.12 against Postgres; schema
 #          via `alembic upgrade head`; the slowest nodes and the time of
 #          every file printed (--durations, the junit report).
@@ -41,10 +44,16 @@ jobs:
   # error of pytest, red), and they stay in the full suite too.
   checks:
     runs-on: ubuntu-latest
-    # Its commands take ~30 s, the setup ~2 min.
+    # Its commands take ~1 min, the setup ~2 min.
     timeout-minutes: 10
     permissions:
       contents: read
+    # The pytest arguments of the three parts, read by `test` and `image`
+    # (needs.checks.outputs): made once, held once, below.
+    outputs:
+      part1: ${{ steps.parts.outputs.part1 }}
+      part2: ${{ steps.parts.outputs.part2 }}
+      part3: ${{ steps.parts.outputs.part3 }}
 
     env:
       APP_ENV: ci
@@ -81,6 +90,61 @@ jobs:
       # here, not after the suite's first 3000 nodes.
       - name: The suite collects
         run: pytest --collect-only -q
+
+      # THE THREE PARTS (CI-2), the one place they are written. Parts 1
+      # and 2 are lists of files, by the time of each file measured in CI
+      # (the step `Suite time by file`, run #299: ~247 s and ~237 s);
+      # part 3 is every other file -- `tests` without them (--ignore),
+      # so a new test file is in part 3 by itself. Held here: the parts
+      # together collect as many nodes as the whole suite and share no
+      # file. By count and by file, not by node id: one id is made at
+      # collection from the clock (tests/test_changes_feed.py, the
+      # malformed cursor) and differs between two collections. A file
+      # of a list that is not in the tree fails its collection: red.
+      - name: The three parts are the suite
+        id: parts
+        env:
+          PART_1: >-
+            tests/test_migration_0037.py
+            tests/test_migration_0013.py
+            tests/test_migration_0038.py
+            tests/test_migration_0012.py
+            tests/test_migration_0014.py
+            tests/test_migration_0035.py
+          PART_2: >-
+            tests/test_lane_wake.py
+            tests/test_lane_jobs.py
+            tests/test_unread_index.py
+            tests/test_waiting_probe.py
+            tests/test_h9_release.py
+            tests/test_json_null.py
+        run: |
+          set -o pipefail
+          part3=tests
+          for f in $PART_1 $PART_2; do part3="$part3 --ignore=$f"; done
+          nodes() { pytest --collect-only -q "$@" | grep '::'; }
+          nodes > "$RUNNER_TEMP/whole"
+          whole=$(wc -l < "$RUNNER_TEMP/whole")
+          total=0
+          : > "$RUNNER_TEMP/files"
+          for n in 1 2 3; do
+            case $n in 1) args=$PART_1 ;; 2) args=$PART_2 ;; 3) args=$part3 ;; esac
+            # unquoted on purpose: a list of arguments
+            nodes $args > "$RUNNER_TEMP/part$n"
+            count=$(wc -l < "$RUNNER_TEMP/part$n")
+            echo "part $n: $count nodes"
+            total=$((total + count))
+            cut -d: -f1 "$RUNNER_TEMP/part$n" | sort -u >> "$RUNNER_TEMP/files"
+          done
+          echo "the whole suite: $whole nodes; the three parts: $total"
+          shared=$(sort "$RUNNER_TEMP/files" | uniq -d)
+          if [ -n "$shared" ]; then echo "in more than one part: $shared"; exit 1; fi
+          if [ "$total" -ne "$whole" ]; then echo "the parts are not the suite"; exit 1; fi
+          {
+            echo "part1=$PART_1"
+            echo "part2=$PART_2"
+            echo "part3=$part3"
+          } >> "$GITHUB_OUTPUT"
 
       # The same step as in `test` below.
       - name: Start Postgres (the image deploy/docker-compose.yml pins)
@@ -119,6 +183,14 @@ jobs:
 
   test:
     needs: checks
+    # THE SUITE IN THREE PARTS AT ONCE (CI-2): the arguments are the
+    # `checks` job's (step `parts`); every part runs to its end -- a red
+    # part does not cancel the others, whose defects would surface only
+    # on the next round.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     runs-on: ubuntu-latest
     # A HANG IS RED (FIX review 3.13.0, the second): the last green run's
     # suite took 931 s (~16 min with its setup) -- 40 gives ~2.5x.
@@ -133,6 +205,7 @@ jobs:
       # builds the settings before the suite's own fence runs. A test
       # value -- the suite replaces it anyway (tests/conftest.py).
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+      PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
 
     steps:
       - name: Check out
@@ -183,16 +256,16 @@ jobs:
       - name: Schema matches the models (alembic check)
         run: alembic check
 
-      # The whole suite; the 50 slowest nodes are printed at its end
-      # (CI-1, the measure before the suite is split), and every node's
-      # time goes to a junit report outside the checkout.
+      # This part of the suite (PART_ARGS); the 50 slowest nodes are
+      # printed at its end (CI-1), and every node's time goes to a junit
+      # report outside the checkout.
       - name: Run tests
         run: >-
-          pytest -q --durations=50
+          pytest -q --durations=50 $PART_ARGS
           -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/suite.xml"
 
-      # The suite's time by file, from that report, the slowest first --
-      # what the split is made of. Run whether the suite was green or red.
+      # This part's time by file, from that report, the slowest first --
+      # what the split is made of. Run whether the part was green or red.
       - name: Suite time by file
         if: always()
         run: >-
@@ -205,11 +278,20 @@ jobs:
 
   image:
     needs: checks
+    # The same three parts as `test` (CI-2), each on its own runner with
+    # its own build of the image.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     runs-on: ubuntu-latest
-    # The image's build plus the same suite inside it.
+    # The image's build plus a part of the suite inside it.
     timeout-minutes: 45
     permissions:
       contents: read
+
+    env:
+      PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
 
     steps:
       - name: Check out
@@ -269,7 +351,10 @@ jobs:
       # deploy/docker-compose.yml gives comms-app (tests/test_deploy_hardening.py
       # holds both: every /app path of this step is in the image or
       # mounted, and TEMPLATES_DIR is the compose file's).
+      # Once per build is enough: in part 1 only (CI-2) -- the same image
+      # is built in each part, and the start says the same of each.
       - name: The image starts (GET /ready)
+        if: matrix.part == 1
         run: |
           token="123456789:$(printf 'A%.0s' $(seq 35))"
           docker run -d --name comms-app --network host \
@@ -306,4 +391,4 @@ jobs:
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
-            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50"
+            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50 $PART_ARGS"
