@@ -19,16 +19,12 @@
 
 from collections.abc import AsyncGenerator
 from typing import Any
-from uuid import UUID
 
 import pytest
 from sqlalchemy import text
 
 from app.core.database import get_session_factory
-from app.engine.constants import TargetType
-from app.engine.service import create_notification
-from tests.helpers import intake_fields
-from tests.test_migration_0037 import _migrate
+from tests.test_migration_0037 import _job_at_0037, _migrate
 
 _0037 = "0037_pipeline_transient_since"
 _0038 = "0038_drop_transient_wait"
@@ -112,22 +108,12 @@ async def test_up_down_up(at_head_afterwards: None) -> None:
     _at_0038(await _objects())
 
 
-async def _job() -> UUID:
-    async with get_session_factory()() as session:
-        job = await create_notification(
-            session, **intake_fields(), type="unit_event_in_app", title="T",
-            body="B", target_type=TargetType.ALL, target_value="*",
-        )
-        await session.commit()
-        return job.id
-
-
 async def test_the_open_waits_and_the_counted_gates(at_head_afterwards: None) -> None:
     """At 0037: a wait at zero attempts (its gate's only ground) and a
     wait behind a counted failure. Up: the first gate goes with its
     wait, the second stays; the CHECK validates."""
     await _migrate("downgrade", _0037)
-    waiting, counted = await _job(), await _job()
+    waiting, counted = await _job_at_0037(), await _job_at_0037()
     await _execute(
         "UPDATE notifications SET pipeline_retry_at = now() + interval '1 hour', "
         "pipeline_transient_since = now(), pipeline_transient_step = 'rollup', "

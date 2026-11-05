@@ -21,8 +21,9 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import text
 
+from app.audience.sync import snapshot_fingerprint
 from app.core.database import dispose_engine, get_session_factory
-from tests.helpers import create_recipient, next_api1_telegram_id
+from tests.helpers import next_api1_telegram_id
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _0038 = "0038_drop_transient_wait"
@@ -76,12 +77,28 @@ async def _declared(section: UUID) -> Any:
 
 
 async def _sections_at_0038() -> tuple[UUID, UUID]:
-    """At 0038 (no column): a section with a member, one without."""
+    """At 0038 (no column): a section with a member, one without.
+
+    Every row by an explicit INSERT of 0038's columns (FIX TPL-1 #1): the
+    operator went through create_recipient -- the current Recipient model
+    -- right only while the model had no column 0038 lacks."""
     operator = uuid4()
     with_member, without = uuid4(), uuid4()
+    telegram_id = next_api1_telegram_id()
     async with get_session_factory()() as session:
-        await create_recipient(
-            session, recipient_id=operator, telegram_id=next_api1_telegram_id()
+        await session.execute(
+            text(
+                "INSERT INTO recipients (id, telegram_id, locale, active, "
+                "version, snapshot_fingerprint) VALUES (:id, :tg, 'en', true, "
+                "1, :fp)"
+            ),
+            {
+                "id": operator, "tg": telegram_id,
+                "fp": snapshot_fingerprint(
+                    telegram_id=telegram_id, email=None, locale="en",
+                    timezone=None, active=True,
+                ),
+            },
         )
         for sid in (with_member, without):
             await session.execute(

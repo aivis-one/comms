@@ -22,14 +22,12 @@ import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
 
 from app.core.database import dispose_engine, get_engine, get_session_factory
-from app.engine.constants import TargetType
-from app.engine.service import create_notification
-from tests.helpers import intake_fields
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _BEFORE = "0036_notification_email"
@@ -140,6 +138,34 @@ async def _validated() -> dict[str, bool]:
         return {name: valid for name, valid in rows.all()}
 
 
+# A job as revision 0037 holds it, by an explicit INSERT of that
+# revision's columns -- never through the current ORM model, which carries
+# the columns of later revisions (FIX TPL-1 #1: 0040's
+# notification_transitions.template_unresolved reached this schema through
+# create_notification's journal row). No journal row: the tests read the
+# job's gate and wait only.
+_JOB_AT_0037 = (
+    "INSERT INTO notifications (id, type, title, body, target_type, "
+    "target_value, idempotency_key, fingerprint, channels, expiry_layer, "
+    "push_on, retry_max_attempts, retry_backoff_seconds, recipient_schedule, "
+    "lane) VALUES (:id, 'unit_event_in_app', 'T', 'B', 'all', '*', :key, "
+    ":fp, '[\"in_app\"]'::jsonb, 'default', 'none', 3, 0, 'respect', "
+    "'normal')"
+)
+
+
+async def _job_at_0037() -> UUID:
+    """One pending job written in the form of revision 0037."""
+    job_id = uuid4()
+    async with get_session_factory()() as session:
+        await session.execute(
+            text(_JOB_AT_0037),
+            {"id": job_id, "key": f"m0037:{job_id}", "fp": "a" * 64},
+        )
+        await session.commit()
+    return job_id
+
+
 async def _execute(*statements: str) -> None:
     async with get_session_factory()() as session:
         for statement in statements:
@@ -182,13 +208,7 @@ async def test_down_with_an_open_wait_at_zero_attempts(
     holding a wait's fields cannot be built: ck_notifications_transient_
     wait_open refuses it -- so it is not a case down meets.)"""
     await _migrate("downgrade", _0037)
-    async with get_session_factory()() as session:
-        job = await create_notification(
-            session, **intake_fields(), type="unit_event_in_app", title="T",
-            body="B", target_type=TargetType.ALL, target_value="*",
-        )
-        await session.commit()
-        job_id = job.id
+    job_id = await _job_at_0037()
     await _execute(
         "UPDATE notifications SET pipeline_retry_at = now(), "
         "pipeline_transient_since = now(), pipeline_transient_step = 'rollup', "

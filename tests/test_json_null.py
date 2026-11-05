@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 import fakeredis.aioredis as fakeaioredis
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import JSON, insert, select, text
+from sqlalchemy import JSON, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -36,6 +36,7 @@ import app.engine.models
 import app.messaging.models  # noqa: F401 -- every model on the metadata
 from app.audience.models import Recipient
 from app.audience.prefs import set_schedule
+from app.audience.sync import snapshot_fingerprint
 from app.core.config import settings
 from app.core.database import (
     Base,
@@ -46,7 +47,11 @@ from app.core.database import (
 )
 from app.engine.models import LLMCall, Notification, NotificationDelivery
 from app.transport.consumer import StreamConsumer
-from tests.helpers import create_recipient, notification_row_fields
+from tests.helpers import (
+    create_recipient,
+    next_telegram_id,
+    notification_row_fields,
+)
 
 _REPO = Path(__file__).resolve().parents[1]
 _MIGRATION = _REPO / "migrations" / "versions" / "2026_10_15_0030_json_null_is_null.py"
@@ -327,71 +332,106 @@ async def at_head_afterwards() -> AsyncGenerator[None, None]:
     await _migrate("upgrade", "head")
 
 
-async def _job_before(session: AsyncSession, **fields: Any) -> Any:
-    """A job written with the columns it names and their defaults only,
-    so a row is insertable into the schema BEFORE a later migration
-    added a column of its own.
+# The rows of revision 0029, by explicit INSERTs of that revision's
+# columns -- never through the current models, whose tables carry the
+# columns of later revisions. Until EM-1 the jobs went through the ORM;
+# 0036's notifications.email broke that, and the jobs moved to a Core
+# insert of the named columns. FIX TPL-1 #1 takes the rest the same way:
+# the recipient, the delivery and the call were still the ORM's, right
+# only while their models had no column 0029 lacks (0040's journal column
+# broke the same assumption in tests/test_migration_0037.py).
+_JOB_BEFORE = (
+    "INSERT INTO notifications (id, type, title, body, target_type, "
+    "target_value, action_data, idempotency_key, fingerprint, channels, "
+    "expiry_layer, push_on, retry_max_attempts, retry_backoff_seconds, "
+    "recipient_schedule, lane) VALUES (:id, :type, :title, :body, "
+    ":target_type, :target_value, CAST(:action_data AS jsonb), :key, :fp, "
+    "CAST(:channels AS jsonb), 'default', 'none', 3, 0, 'respect', 'normal')"
+)
+_RECIPIENT_BEFORE = (
+    "INSERT INTO recipients (id, telegram_id, locale, active, version, "
+    "snapshot_fingerprint) VALUES (:id, :tg, 'en', true, 1, :fp)"
+)
+_DELIVERY_BEFORE = (
+    "INSERT INTO notification_deliveries (id, notification_id, recipient_id, "
+    "channel) VALUES (:id, :job, :rid, 'in_app')"
+)
+_CALL_BEFORE = (
+    "INSERT INTO llm_calls (notification_id, sets, letter, letter_hash, "
+    "answer_keep_seconds) VALUES (:job, CAST(:sets AS jsonb), "
+    "CAST(:letter AS jsonb), :hash, 60)"
+)
 
-    Until EM-1 _seed_before wrote its jobs through the ORM; that was
-    right while every column of the model existed at 0029. 0036 added
-    notifications.email, which an ORM insert names and 0029 lacks."""
-    base: dict[str, Any] = {
-        "type": "unit_event_in_app", "title": "T", "body": "B",
-        "target_type": "all", "target_value": "*",
-        **notification_row_fields(),
-    }
-    base.update(fields)
-    return (await session.execute(
-        insert(Notification.__table__).values(**base)
-        .returning(Notification.__table__.c.id)
-    )).scalar_one()
+
+async def _job_before(
+    session: AsyncSession, *, action_data: Any = None, llm: bool = False,
+) -> UUID:
+    """A job written in the form of revision 0029: an in_app one, or an
+    llm one (no letter fields, ck_notifications_letter_by_kind)."""
+    job_id = uuid4()
+    await session.execute(text(_JOB_BEFORE), {
+        "id": job_id,
+        "type": "ask.model" if llm else "unit_event_in_app",
+        "title": None if llm else "T", "body": None if llm else "B",
+        "target_type": None if llm else "all",
+        "target_value": None if llm else "*",
+        "action_data": None if action_data is None else json.dumps(action_data),
+        "key": f"jn:{job_id}", "fp": "a" * 64,
+        "channels": json.dumps(["llm"] if llm else ["in_app"]),
+    })
+    return job_id
+
+
+async def _recipient_before(session: AsyncSession) -> UUID:
+    """A recipient in the form of revision 0029, standing for a snapshot
+    the product sent at version 1, as tests/helpers.create_recipient's."""
+    rid, tg = uuid4(), next_telegram_id()
+    await session.execute(text(_RECIPIENT_BEFORE), {
+        "id": rid, "tg": tg,
+        "fp": snapshot_fingerprint(
+            telegram_id=tg, email=None, locale="en", timezone=None, active=True,
+        ),
+    })
+    return rid
 
 
 async def _seed_before(session: AsyncSession) -> dict[str, Any]:
     """Rows as the code before 0030 left them: a JSON `null` beside a
     nested null and an ordinary value, in every nullable column."""
-    cleared = await create_recipient(session)
-    windows = await create_recipient(session)
+    cleared = await _recipient_before(session)
+    windows = await _recipient_before(session)
     job_null = await _job_before(session)
     job_nested = await _job_before(session, action_data={"a": None})
-    delivery = NotificationDelivery(
-        notification_id=await _job_before(session),
-        recipient_id=(await create_recipient(session)).id, channel="in_app",
-    )
-    session.add(delivery)
-    await session.flush()
-    call = LLMCall(
-        notification_id=await _job_before(
-            session, type="ask.model", title=None, body=None,
-            target_type=None, target_value=None,
-            **notification_row_fields(channels=["llm"]),
-        ),
-        sets=["llm.gw"], letter={"messages": []}, letter_hash="a" * 64,
-        answer_keep_seconds=60,
-    )
-    session.add(call)
-    await session.flush()
+    delivery = uuid4()
+    await session.execute(text(_DELIVERY_BEFORE), {
+        "id": delivery, "job": await _job_before(session),
+        "rid": await _recipient_before(session),
+    })
+    call = await _job_before(session, llm=True)
+    await session.execute(text(_CALL_BEFORE), {
+        "job": call, "sets": json.dumps(["llm.gw"]),
+        "letter": json.dumps({"messages": []}), "hash": "a" * 64,
+    })
     await session.commit()
     for statement, params in (
         ("UPDATE recipients SET allowed_windows = 'null'::jsonb WHERE id = :v",
-         {"v": cleared.id}),
+         {"v": cleared}),
         ("UPDATE recipients SET allowed_windows = "
          "'[{\"day\": 1, \"from\": 0, \"to\": 60}]'::jsonb WHERE id = :v",
-         {"v": windows.id}),
+         {"v": windows}),
         ("UPDATE notifications SET action_data = 'null'::jsonb WHERE id = :v",
          {"v": job_null}),
         ("UPDATE notification_deliveries SET channel_options = 'null'::jsonb "
-         "WHERE id = :v", {"v": delivery.id}),
+         "WHERE id = :v", {"v": delivery}),
         # P5-1's cleared letter; its audio was SQL NULL from 0028 on.
         ("UPDATE llm_calls SET letter = 'null'::jsonb "
-         "WHERE notification_id = :v", {"v": call.notification_id}),
+         "WHERE notification_id = :v", {"v": call}),
     ):
         await session.execute(text(statement), params)
     await session.commit()
     return {
-        "cleared": cleared.id, "windows": windows.id, "job_null": job_null,
-        "job_nested": job_nested, "delivery": delivery.id,
-        "call": call.notification_id,
+        "cleared": cleared, "windows": windows, "job_null": job_null,
+        "job_nested": job_nested, "delivery": delivery, "call": call,
     }
 
 
