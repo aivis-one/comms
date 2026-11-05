@@ -8,7 +8,9 @@
 #     then 1e999) is dead-lettered without its data;
 #   2 an entry held pending is met ONCE per start (_drain_pending's
 #     cursor), goes to the dead letter at a start where it can, and stays
-#     at one where it cannot -- new events flow either way;
+#     at one where it cannot -- new events flow either way; and (WK-3)
+#     it is met again while the process runs, once per pass over the
+#     pending list (_PENDING_REDRAIN_SECONDS), not only at a restart;
 #   3 a transient failure of the database: waited for, uncounted, while
 #     the database does not answer -- the event applied once it does;
 #     the bounded budget, then the dead letter, while it answers;
@@ -24,9 +26,15 @@
 #   M5 convergence before the stop -> TestTheOrder
 #   M6 no start of the old containers on a failure -> TestTheOrder
 #   M7 the success's ack back inside the try -> TestHeld::test_an_ack
+#   M8 no pass over the pending list while running (WK-3) ->
+#      TestNotUntilARestart (the entry waits for a restart)
+#   M9 that pass at every read, the interval not kept ->
+#      TestNotUntilARestart::test_an_entry_held_for_good_once_per_pass
 # =============================================================================
 
+import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
@@ -244,6 +252,96 @@ class TestTheCursor:
         await _run_until(StreamConsumer(fake_redis), emptied)
         (dead,) = await _dlq(fake_redis)
         assert dead["event"] == "user_deleted"
+
+
+class TestNotUntilARestart:
+    """WK-3. Before, the own pending list was read once, in run()'s
+    start: an entry left pending waited for the next start of the
+    process, however long that was (reproduced before the fix: the
+    entry still pending past the interval). Now run() reads it again
+    every _PENDING_REDRAIN_SECONDS (0.2 s here), its cursor rule kept."""
+
+    _INTERVAL = 0.2
+    _TOLERANCE = 1.0
+
+    @pytest.fixture(autouse=True)
+    def _short_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(consumer_module, "_PENDING_REDRAIN_SECONDS", self._INTERVAL)
+
+    async def test_an_entry_that_failed_once_goes_out_while_running(
+        self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
+        db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Its handling raises once (left pending, event_left_pending),
+        then works: in the same run, within the interval and a
+        tolerance, it is processed and acknowledged; a new event between
+        is read and processed as well."""
+        failed, later = uuid4(), uuid4()
+        real = StreamConsumer._process_entry
+        raised: list[float] = []
+        tore = asyncio.Event()
+
+        async def once(self: StreamConsumer, entry_id: Any, fields: Any) -> None:
+            if not raised:
+                raised.append(time.monotonic())
+                tore.set()
+                raise RuntimeError("one entry's handling tore")
+            await real(self, entry_id, fields)
+
+        monkeypatch.setattr(StreamConsumer, "_process_entry", once)
+        await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(failed))
+        task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
+        try:
+            await asyncio.wait_for(tore.wait(), 5)
+            await _xadd(fake_redis, a_stream, "user_upserted",
+                        _user_upserted_data(later))
+            deadline = raised[0] + self._INTERVAL + self._TOLERANCE
+            while not (await _recipient(failed) and await _recipient(later)
+                       and await _pending(fake_redis, a_stream) == 0):
+                assert time.monotonic() < deadline, "not without a restart"
+                assert not task.done()
+                await asyncio.sleep(0.02)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    async def test_an_entry_held_for_good_once_per_pass(
+        self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
+        db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A dead letter that can never be written: the entry is met once
+        per pass over the pending list -- more than once in a second of
+        running, never round and round -- and new events keep flowing."""
+        _failing_dead_letters(monkeypatch, times=10_000)
+        await fake_redis.xadd(a_stream, _BAD)
+        met: list[float] = []
+        real = StreamConsumer._process_entry
+
+        async def counted(self: StreamConsumer, entry_id: Any, fields: Any) -> None:
+            if fields.get(b"event") == b"user_deleted":
+                met.append(time.monotonic())
+            await real(self, entry_id, fields)
+
+        monkeypatch.setattr(StreamConsumer, "_process_entry", counted)
+        task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
+        try:
+            await asyncio.sleep(1.0)
+            later = uuid4()
+            await _xadd(fake_redis, a_stream, "user_upserted",
+                        _user_upserted_data(later))
+            deadline = time.monotonic() + self._TOLERANCE
+            while not await _recipient(later):
+                assert time.monotonic() < deadline, "new events must flow"
+                await asyncio.sleep(0.02)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        span = met[-1] - met[0]
+        assert len(met) >= 3, met  # met again while running
+        assert len(met) <= span / self._INTERVAL + 2, (len(met), span)
+        assert await _pending(fake_redis, a_stream) == 1
 
 
 def _probe_down_for(times: int) -> tuple[Callable[[], Awaitable[bool]], list[int]]:

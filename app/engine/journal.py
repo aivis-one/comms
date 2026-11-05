@@ -42,6 +42,8 @@
 # job's outcome that follows is its own row.
 # =============================================================================
 
+import asyncio
+import contextlib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -349,6 +351,18 @@ def answer_text(answer: Answer, exc: Exception) -> str:
     )
 
 
+# How long a STOP of the worker waits for a channel's answer to be
+# written (WK-3, record_channel_answer): under the 10 s Docker gives a
+# container between SIGTERM and SIGKILL, with the rest left for the
+# attempts' rollbacks, the formatters' close and the engine's dispose
+# (app/worker.py _main).
+_RECORD_ON_STOP_SECONDS = 5.0
+
+# How long a write cut at that bound is given to unwind (its session
+# rolled back and closed) before the stop goes on.
+_CUT_UNWIND_SECONDS = 0.5
+
+
 async def record_channel_answer(
     delivery: NotificationDelivery,
     answer: Answer,
@@ -357,6 +371,25 @@ async def record_channel_answer(
 ) -> bool:
     """Write one channel answer in its OWN transaction, now. Returns
     whether it committed.
+
+    A STOP DOES NOT CUT IT (WK-3). It is called only once the channel
+    answered -- the letter, if accepted, is out -- and a SIGTERM of the
+    worker cancels every attempt at its current await (app/worker.py,
+    SHUTDOWN). Until WK-3 a cancellation that landed here cut the
+    write: no "accepted" row, the attempt rolled back, and the next
+    attempt sent the letter again, at every ordinary stop that met the
+    window. Now the write runs in a task of its own and the caller
+    waits for it through the cancellation, for _RECORD_ON_STOP_SECONDS
+    at most; then the CancelledError goes on and the attempt rolls back
+    as before, the row already there. One wait is enough: the task
+    groups cancel an attempt once -- a second signal cancels the loop's
+    task again, and a TaskGroup already aborting does not cancel its
+    children again (tests/test_worker_stop.py, the second stop). The
+    write is awaited inside the attempt itself, so the task groups that
+    cancel the attempts wait for it and _main disposes the engine only
+    after it (no task outlives the loop for asyncio.run to cancel). A
+    write that outlasts the bound is cut and said
+    (journal_channel_answer_cut_by_stop): KNOWN CEILING P2-1 below.
 
     Called from inside the attempt while it holds its row lock on the
     job. The insert's foreign key takes FOR KEY SHARE on that row,
@@ -382,7 +415,10 @@ async def record_channel_answer(
          transaction committing, a process that dies (OOM, kill -9, a
          lost database connection) leaves no "accepted" row; the next
          attempt sends the letter again. At-least-once, in a window of
-         one INSERT.
+         one INSERT. So does an ordinary stop of the worker whose write
+         does not end within _RECORD_ON_STOP_SECONDS (WK-3) -- a stop
+         that lands in the channel call itself, before its answer, is
+         the same at-least-once.
       2. Status: acknowledged by design.
       3. Backlog ref: none -- neither channel offers idempotency on its
          send endpoint today (app/engine/formatters.py,
@@ -399,21 +435,42 @@ async def record_channel_answer(
          across transactions and breaks the one-lock-per-attempt rule
          expiry and cancellation rely on).
     """
+    names = {
+        "notification_id": str(delivery.notification_id),
+        "recipient_id": str(delivery.recipient_id),
+        "channel": delivery.channel,
+        "answer": answer.outcome.value,
+    }
+    row = NotificationTransition(
+        notification_id=delivery.notification_id,
+        recipient_id=delivery.recipient_id,
+        channel=delivery.channel,
+        subject=JournalSubject.CHANNEL,
+        step=JournalStep.DELIVER,
+        outcome=answer.outcome,
+        attempt=(delivery.attempts or 0) + 1,
+        failure_class=answer.failure_class,
+        provider_text=answer.provider_text,
+        error=answer.error,
+    )
+    write = asyncio.ensure_future(_write_channel_answer(row, llm_answer, names))
+    try:
+        return await asyncio.shield(write)
+    except asyncio.CancelledError:
+        await _finish_through_a_stop(write, names)
+        raise
+
+
+async def _write_channel_answer(
+    row: NotificationTransition,
+    llm_answer: LLMAnswer | None,
+    names: dict[str, str],
+) -> bool:
+    """The channel's answer (and the model's) in one transaction of its own."""
     factory = get_session_factory()
     async with factory() as session:
         try:
-            session.add(NotificationTransition(
-                notification_id=delivery.notification_id,
-                recipient_id=delivery.recipient_id,
-                channel=delivery.channel,
-                subject=JournalSubject.CHANNEL,
-                step=JournalStep.DELIVER,
-                outcome=answer.outcome,
-                attempt=(delivery.attempts or 0) + 1,
-                failure_class=answer.failure_class,
-                provider_text=answer.provider_text,
-                error=answer.error,
-            ))
+            session.add(row)
             if llm_answer is not None:
                 session.add(llm_answer)
             await session.commit()
@@ -421,14 +478,27 @@ async def record_channel_answer(
             await session.rollback()
             logger.error(
                 "journal_channel_answer_error",
-                notification_id=str(delivery.notification_id),
-                recipient_id=str(delivery.recipient_id),
-                channel=delivery.channel,
-                answer=answer.outcome.value,
+                **names,
                 exception=sanitized_traceback(exc),
             )
             return False
     return True
+
+
+async def _finish_through_a_stop(
+    write: "asyncio.Future[bool]", names: dict[str, str],
+) -> None:
+    """The caller was cancelled while its answer was being written: wait
+    for the write up to _RECORD_ON_STOP_SECONDS; past it, cut it and say
+    so."""
+    await asyncio.wait({write}, timeout=_RECORD_ON_STOP_SECONDS)
+    if write.done():
+        return
+    write.cancel()
+    logger.error("journal_channel_answer_cut_by_stop", **names,
+                 bound_seconds=_RECORD_ON_STOP_SECONDS)
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait({write}, timeout=_CUT_UNWIND_SECONDS)
 
 
 async def accepted_answers(

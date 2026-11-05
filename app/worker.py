@@ -56,10 +56,15 @@
 # cancels its task group, and with it every attempt the lane has in
 # work: each is cancelled at its current await and rolled back with its
 # session; what its channel calls already journaled stays
-# (app/engine/journal.py). A loop -- or an attempt in its group -- that
-# ends any other way ends the process: the task groups cancel the rest
-# and the error propagates -- the container restarts with every lane,
-# instead of running on with some of them.
+# (app/engine/journal.py). An answer the channel already gave is
+# written first (WK-3, journal.record_channel_answer): the attempt
+# waits for its row through the cancellation, within a bound, and the
+# groups wait for the attempt -- so a stop does not send the letter a
+# second time. A loop -- or an attempt in its group -- that ends any
+# other way ends the process: the task groups cancel the rest and the
+# error propagates -- the container restarts with every lane, instead
+# of running on with some of them. Either way _main closes the
+# formatters and the engine, and an error goes on to the process.
 # =============================================================================
 
 import asyncio
@@ -399,7 +404,13 @@ async def run_worker_loop() -> None:
 
 
 async def _main() -> None:
-    """Run the worker loop with graceful shutdown on signals."""
+    """Run the worker loop with graceful shutdown on signals; however it
+    ends -- stopped, or raising -- close the formatters, then the engine
+    (WK-3: before, both stood after `await task` with no finally, and a
+    loop that raised left the bot's session and the connections open).
+    A loop's error is said and raised on, after the closes: the process
+    ends with it and the restart policy brings it back -- the form of
+    app/consumer.py _main."""
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(run_worker_loop())
 
@@ -410,12 +421,21 @@ async def _main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _request_shutdown)
 
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-
-    # Review 1.1: close the aiogram session before dropping the engine.
-    await close_formatters()
-    await dispose_engine()
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    except Exception as exc:
+        logger.error(
+            "worker_loop_failed", exception=sanitized_traceback(exc),
+        )
+        raise
+    finally:
+        # Review 1.1: close the aiogram session before dropping the
+        # engine -- and drop the engine even if that close fails.
+        try:
+            await close_formatters()
+        finally:
+            await dispose_engine()
 
 
 def main() -> None:

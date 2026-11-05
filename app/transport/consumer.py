@@ -16,7 +16,9 @@
 #   steady:   blocking XREADGROUP ">" in batches; each entry is
 #             processed in ITS OWN DB transaction and acked
 #             individually -- a failed neighbor never holds back an
-#             acked one.
+#             acked one; and every _PENDING_REDRAIN_SECONDS the own
+#             pending list once more (WK-3), so an entry left pending
+#             does not wait for a restart.
 #
 # ERROR DISCIPLINE (item 6, poison-pill rule from Phase 2):
 #   terminal   (ValidationError: broken envelope/JSON/schema/version,
@@ -51,7 +53,9 @@
 # that disappears on a crash). The entry is acknowledged only after
 # the transaction that wrote the job -- or the record of its refusal --
 # has committed. A crash between the two leaves the entry pending; the
-# next start replays it (_drain_pending), and the replay is collapsed
+# next start replays it (_drain_pending) -- and, an entry left pending
+# without a crash, the next pass over the pending list in the running
+# process (WK-3) -- and the replay is collapsed
 # by the key: same bytes -> duplicate, nothing created twice. An ack
 # before the commit would lose the job on a crash in between; batching
 # acks or acknowledging on read would do exactly that.
@@ -88,6 +92,7 @@
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -148,6 +153,15 @@ _IDLE_SLEEP_SECONDS = 0.05
 # the log. Said loudly on the first wait and every _WAIT_LOUD_EVERY-th.
 _WAIT_CEILING = 30.0
 _WAIT_LOUD_EVERY = 10
+
+# THE PENDING LIST AGAIN, WHILE RUNNING (WK-3): every this many seconds
+# run() reads its own pending list once more (_drain_pending, its cursor
+# rule kept) between its reads of new entries. An entry left pending --
+# a dead letter or an ack that could not be written, an entry whose
+# handling raised -- is offered again in the running process, no longer
+# only at the next start. The cost, named: an entry pending for good is
+# handled again every interval, an ordering retry of it (BL-4) included.
+_PENDING_REDRAIN_SECONDS = 60.0
 
 # The fields of a dead letter -- the contract's list
 # (deploy/INTEGRATION.md, "How long comms keeps things"), held to this
@@ -217,7 +231,12 @@ class StreamConsumer:
     # -- main loop ---------------------------------------------------------
 
     async def run(self) -> None:
-        """Consume forever: drain own pending, then follow new entries.
+        """Consume forever: drain own pending, then follow new entries --
+        and the own pending list again every _PENDING_REDRAIN_SECONDS
+        (WK-3), checked before each read of new entries: one task, no
+        second reader of the stream. A blocking read waits at most
+        consumer_block_ms, so a pass comes within the interval and one
+        block.
 
         Cancellation-safe in the at-least-once sense (review 3c.1
         wording fix): a CancelledError landing on an INNER await
@@ -236,7 +255,13 @@ class StreamConsumer:
             consumer=self._consumer,
             pending_replayed=drained,
         )
+        next_drain = time.monotonic() + _PENDING_REDRAIN_SECONDS
         while True:
+            if time.monotonic() >= next_drain:
+                again = await self._drain_pending()
+                next_drain = time.monotonic() + _PENDING_REDRAIN_SECONDS
+                if again:
+                    logger.info("consumer_pending_redrained", entries=again)
             response = await self._redis.xreadgroup(
                 groupname=self._group,
                 consumername=self._consumer,
@@ -262,9 +287,11 @@ class StreamConsumer:
     ) -> None:
         """THE LAST LINE (FIX review 3.13.0): whatever _process_entry
         still raises is the entry's, not the process's -- logged with its
-        class and place, the entry left pending for the next start. A
-        failure of the loop's own read (Redis down) is outside this and
-        still ends run(): the restart policy reconnects."""
+        class and place, the entry left pending for the next pass over
+        the pending list (WK-3: every _PENDING_REDRAIN_SECONDS, and at
+        the next start). A failure of the loop's own read (Redis down)
+        is outside this and still ends run(): the restart policy
+        reconnects."""
         try:
             await self._process_entry(entry_id, fields)
         except Exception as exc:
@@ -276,15 +303,16 @@ class StreamConsumer:
 
     async def _drain_pending(self) -> int:
         """Replay entries delivered to THIS consumer but never acked
-        (crash between XREADGROUP and XACK). Reading from id "0"
-        returns the pending list of this consumer name; a stable name
-        makes restart recovery this one loop."""
+        (crash between XREADGROUP and XACK, or an entry left pending).
+        Reading from id "0" returns the pending list of this consumer
+        name; a stable name makes restart recovery this one loop. Run at
+        the start and every _PENDING_REDRAIN_SECONDS (run, WK-3)."""
         drained = 0
         # A CURSOR, not "0" every time (FIX review 3.13.0): an entry left
         # pending on purpose (a dead letter that could not be written)
         # stays in the pending list, and reading from "0" again would meet
         # it forever -- no new event would ever be read. Each read starts
-        # after the last entry seen: a held entry is met once per start.
+        # after the last entry seen: a held entry is met once per pass.
         cursor: str | bytes = "0"
         while True:
             response = await self._redis.xreadgroup(
@@ -482,9 +510,11 @@ class StreamConsumer:
         3.13.0): written, then acknowledged. If the writing or the ack
         fails -- Redis down, a dead letter that cannot be built -- the
         entry STAYS PENDING: not lost, seen in XPENDING and in this log
-        line, offered again at the next start (_drain_pending, its
-        cursor past it). Never an exception out of an except clause:
-        before, a TypeError of the dead letter's own JSON left
+        line, offered again at the next pass over the pending list
+        (_drain_pending, its cursor past it: every
+        _PENDING_REDRAIN_SECONDS and at the next start, WK-3). Never an
+        exception out of an except clause: before, a TypeError of the
+        dead letter's own JSON left
         _process_entry from inside one and took the consumer down, again
         at every restart."""
         try:
