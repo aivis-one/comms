@@ -45,7 +45,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.routing import APIRoute
 from httpx import AsyncClient
-from sqlalchemy import func, select, text
+from sqlalchemy import func, make_url, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
@@ -496,9 +496,15 @@ class TestReadySaysWhy:
     ) -> None:
         """A database error: its summary (class, place, SQLSTATE), never
         the database's words."""
-        bad = settings.database_url.replace("comms:comms@", "comms:not-it@")
-        assert bad != settings.database_url
-        monkeypatch.setattr(main_module, "get_engine", _engine_at(bad))
+        # The same field-by-field form as below: the password of the
+        # parsed URL, whatever the URL's spelling.
+        real = make_url(settings.database_url)
+        bad = real.set(password="not-it")
+        assert bad.password != real.password
+        monkeypatch.setattr(
+            main_module, "get_engine",
+            _engine_at(bad.render_as_string(hide_password=False)),
+        )
         with capture_logs() as logs:
             resp = await client.get("/ready")
         assert resp.status_code == 503
@@ -512,9 +518,15 @@ class TestReadySaysWhy:
     async def test_nobody_listening(
         self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        bad = settings.database_url.replace("localhost:5432", "127.0.0.1:1")
-        assert bad != settings.database_url
-        monkeypatch.setattr(main_module, "get_engine", _engine_at(bad))
+        # Built from the parsed URL, field by field -- not by replacing a
+        # substring, which held only while the URL said "localhost:5432".
+        real = make_url(settings.database_url)
+        bad = real.set(host="127.0.0.1", port=1)
+        assert bad.port == 1 and bad.port != real.port
+        monkeypatch.setattr(
+            main_module, "get_engine",
+            _engine_at(bad.render_as_string(hide_password=False)),
+        )
         with capture_logs() as logs:
             resp = await client.get("/ready")
         assert resp.status_code == 503

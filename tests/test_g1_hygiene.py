@@ -116,6 +116,8 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         _NOT_A_JOB + "the product's event, its address in the log",
     ("app/api/idempotency.py", "request_fingerprint", "body"):
         _NOT_A_JOB + "Request.body(), the request digested whole",
+    ("app/api/deps.py", "refuse_unstorable_body", "body"):
+        _NOT_A_JOB + "Request.body(), the raw request checked for storability",
     ("app/api/jobs.py", "_answer", "body"):
         _NOT_A_JOB + "LLMAnswer.body, the model's answer for the product",
     ("app/engine/service.py", "_answer_row", "body"):
