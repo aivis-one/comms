@@ -5,10 +5,11 @@
 # three columns and three CHECKs and puts 0015's gate back, validated;
 # the gate of an open wait at zero attempts goes with the wait, a counted
 # failure's gate stays. Down puts 0037's objects back in 0037's
-# definitions. A run whose stamp was left behind goes through again
-# (tests/test_migration_0037.py test_upgrade_runs_again_after_its_stamp_
-# was_left_behind, parametrized over every migration with a block, holds
-# that for 0038 too) -- here, a run that stopped after its columns went.
+# definitions. A run whose stamp was left behind goes through again --
+# tests/test_migration_0037.py
+# test_upgrade_runs_again_after_its_stamp_was_left_behind, parametrized
+# over every migration with a block, holds that for 0038 too; here, a
+# run that stopped after its columns went.
 #
 # MUTATIONS (each turns one red):
 #   G1 down without 0037's gate -> test_up_down_up
