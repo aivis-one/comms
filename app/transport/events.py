@@ -55,12 +55,14 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from app.core.constants import (
+    MAX_ACTION_DATA_BYTES,
     MAX_BODY_LEN,
     MAX_CORRELATION_LEN,
     MAX_EMAIL_HTML_LEN,
     MAX_EMAIL_LEN,
     MAX_EMAIL_SUBJECT_LEN,
     MAX_EMAIL_TEXT_LEN,
+    MAX_EVENT_DATA_BYTES,
     MAX_GROUP_KEY_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_JSON_DEPTH,
@@ -509,6 +511,10 @@ def event_data_or_none(raw: bytes) -> dict[str, Any] | None:
     cannot write and no depth a writer would recurse into -- or None,
     and the dead letter keeps none of it. A string the database cannot
     store is fine here: the dead letter writes JSON with ensure_ascii."""
+    if len(raw) > MAX_EVENT_DATA_BYTES:
+        # Refused for its size before it was read (parse_event): the
+        # dead letter does not read it either (PERF-3).
+        return None
     try:
         data = load_event_data(raw.decode("utf-8"), "dead letter")
     except (UnicodeDecodeError, ValidationError):
@@ -592,10 +598,23 @@ def validate_action_data(
     variable and no parameter, a list variable would render as
     "['a', 'b']" in a user-facing message, a non-scalar param would
     blow up deep-link encoding at delivery after burning a resolve.
+
+    AND A SIZE (PERF-3): at most MAX_ACTION_DATA_BYTES of compact UTF-8
+    JSON, the whole object -- it is written to the job's row and read at
+    every delivery. Measured, never read: the refusal names the field
+    and the limit.
     """
     if not isinstance(action_data, dict):
         raise ValidationError(
             f"{event}: action_data must be a JSON object"
+        )
+    size = len(json.dumps(
+        action_data, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8", "surrogatepass"))
+    if size > MAX_ACTION_DATA_BYTES:
+        raise ValidationError(
+            f"{event}: field 'action_data' is larger than "
+            f"{MAX_ACTION_DATA_BYTES} bytes of JSON"
         )
     for key, value in action_data.items():
         if not isinstance(key, str) or not key:
@@ -869,6 +888,7 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
     whose key is readable, which comes back as a
     RejectedNotificationRequest (see _parse_notification_intake).
     """
+    _check_data_size(fields)
     decoded = _decode_entry(fields)
 
     if ENVELOPE_EVENT_FIELD not in decoded:
@@ -903,6 +923,25 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
     if event == EVENT_SECTION_MEMBERSHIP_CHANGED:
         return _parse_section_membership_changed(data)
     return _parse_reminder_cancel(data)
+
+
+def _check_data_size(fields: dict[Any, Any]) -> None:
+    """Refuse an entry whose `data` is larger than MAX_EVENT_DATA_BYTES
+    -- by its length, BEFORE a byte of it is decoded or parsed (PERF-3).
+    The refusal names the field and the limit, never the value; it is a
+    defect like any other here, a dead letter with its reason, and the
+    dead letter does not read the data either (event_data_or_none)."""
+    for key, value in fields.items():
+        if entry_field_name(key) != ENVELOPE_DATA_FIELD:
+            continue
+        size = len(value) if isinstance(value, bytes) else len(
+            str(value).encode("utf-8")
+        )
+        if size > MAX_EVENT_DATA_BYTES:
+            raise ValidationError(
+                f"envelope: field {ENVELOPE_DATA_FIELD!r} is larger than "
+                f"{MAX_EVENT_DATA_BYTES} bytes"
+            )
 
 
 def _raw_data(fields: dict[Any, Any]) -> bytes:

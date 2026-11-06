@@ -97,6 +97,24 @@ MAX_EMAIL_SUBJECT_LEN = 500
 MAX_EMAIL_TEXT_LEN = 64_000
 MAX_EMAIL_HTML_LEN = 256_000
 
+# THE SIZE OF WHAT COMES IN (PERF-3). Each is checked BEFORE the bytes are
+# decoded or parsed, and a refusal names the field and the number, never
+# the value. Each sits above the largest input comms accepts by its own
+# field limits, so no input accepted before PERF-3 is refused by it.
+#
+# A stream entry's `data`, in bytes (app/transport/events.py
+# parse_event): the largest entry the field limits allow is an email job
+# -- title, body, subject, text and html at their limits, 4 bytes a
+# character in UTF-8, about 1.28 MB -- an llm job about 0.8 MB.
+MAX_EVENT_DATA_BYTES = 4 * 1024 * 1024
+# A job's action_data, in bytes of its compact UTF-8 JSON (the deep-link
+# intent and the template's scalars, hundreds of bytes at the products).
+MAX_ACTION_DATA_BYTES = 64 * 1024
+# A REST request's body, in bytes (app/api/body_limit.py): the largest
+# body the field limits allow is a message or a variant -- 5000
+# characters, up to 6 bytes each as JSON escapes -- about 30 KB.
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+
 # The ceiling of a type's max_audio_bytes (P5-2): an audio body is held
 # in the attempt's memory whole, and once more as base64 in the request
 # -- 20 MiB is about 50 MiB of one attempt's memory.

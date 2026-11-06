@@ -29,6 +29,7 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from app.api.body_limit import LimitRequestBody
 from app.api.changes import router as changes_router
 from app.api.channels import router as channels_router
 from app.api.deps import refuse_repeated_query, refuse_unstorable_body
@@ -140,6 +141,9 @@ app = FastAPI(
     ],
 )
 register_error_handlers(app)
+# Every request's body bounded at MAX_REQUEST_BODY_BYTES, refused 413
+# before a byte past it is read or parsed (app/api/body_limit.py, PERF-3).
+app.add_middleware(LimitRequestBody)
 app.include_router(inbox_router)
 app.include_router(jobs_router)
 app.include_router(changes_router)

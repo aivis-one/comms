@@ -595,6 +595,7 @@ body, with a class a program can branch on:
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
+| 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
 | 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
@@ -947,7 +948,7 @@ never interprets.
 | `correlation` | optional | envelope | string, 1..200 -- the product's own reference, stored untouched (see below) |
 | `title` | by type | letter | 1..500 -- the stored fallback; templates override it at delivery. Required for a type delivered to people, refused for an llm type |
 | `body` | by type | letter | 1..5000; as `title` |
-| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
+| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; at most 65536 bytes as compact UTF-8 JSON, the whole object; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
 | `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500, one line: no `\r` or `\n`), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
@@ -988,6 +989,13 @@ rejected under its key whenever the key can be read. Data that cannot
 be read at all -- broken JSON, a nesting past what the reader can
 follow -- leaves no key, and the request goes to the dead-letter
 stream.
+
+**The size of an entry.** An entry whose `data` is larger than 4194304
+bytes (4 MiB) is refused for its size before any of it is read, and goes
+to the dead-letter stream with that reason, naming the field and the
+limit; the dead letter keeps its size and fingerprint, not its data.
+The number sits above the largest entry the field limits of this
+section allow (an email job at its limits, about 1.3 MB in UTF-8).
 
 **What intake answers.** A request is decided the moment it is read:
 

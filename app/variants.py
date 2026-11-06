@@ -289,8 +289,8 @@ async def reader_states(
 ) -> dict[UUID, tuple[VariantState, MessageVariant | None]]:
     """The state of every message of a feed page for a reader in
     `locale`: three queries for the page, whatever its size -- the
-    variants of its messages, their requests in `locale`, and those
-    requests' jobs by id, each by a unique index."""
+    variants of its messages, the latest of their requests in `locale`,
+    and those requests' jobs by id, each by a unique index."""
     if not message_ids:
         return {}
     ids = list(message_ids)
@@ -299,19 +299,29 @@ async def reader_states(
         select(MessageVariant).where(MessageVariant.message_id.in_(ids))
     )).all():
         variants.setdefault(variant.message_id, []).append(variant)
-    latest: dict[UUID, MessageVariantRequest] = {}
-    for request in (await session.scalars(
-        select(MessageVariantRequest)
-        .where(
-            MessageVariantRequest.message_id.in_(ids),
-            MessageVariantRequest.locale == locale,
-        )
-        .order_by(
-            MessageVariantRequest.created_at.desc(),
-            MessageVariantRequest.id.desc(),
-        )
-    )).all():
-        latest.setdefault(request.message_id, request)
+    # The LATEST request per message, chosen by the database (PERF-3):
+    # DISTINCT ON keeps the first row of each message in this order, so
+    # one row per message comes back however often the translation was
+    # asked again -- not every request of the page, for Python to keep
+    # the first. The server still reads and sorts the page's requests in
+    # the language (no index holds created_at); what no longer grows
+    # with the repeats is what is sent and turned into objects.
+    latest: dict[UUID, MessageVariantRequest] = {
+        request.message_id: request
+        for request in (await session.scalars(
+            select(MessageVariantRequest)
+            .where(
+                MessageVariantRequest.message_id.in_(ids),
+                MessageVariantRequest.locale == locale,
+            )
+            .distinct(MessageVariantRequest.message_id)
+            .order_by(
+                MessageVariantRequest.message_id,
+                MessageVariantRequest.created_at.desc(),
+                MessageVariantRequest.id.desc(),
+            )
+        )).all()
+    }
     statuses: dict[UUID, str] = {}
     jobs = sorted({request.job_id for request in latest.values()})
     if jobs:
