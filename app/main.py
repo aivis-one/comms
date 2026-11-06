@@ -32,7 +32,11 @@ from sqlalchemy import select
 from app.api.body_limit import LimitRequestBody
 from app.api.changes import router as changes_router
 from app.api.channels import router as channels_router
-from app.api.deps import refuse_repeated_query, refuse_unstorable_body
+from app.api.deps import (
+    refuse_repeated_query,
+    refuse_unstorable_body,
+    refuse_unstorable_query,
+)
 from app.api.errors import register_error_handlers
 from app.api.inbox import router as inbox_router
 from app.api.jobs import router as jobs_router
@@ -133,10 +137,11 @@ app = FastAPI(
     docs_url=_DOCS["docs_url"],
     redoc_url=_DOCS["redoc_url"],
     # Before every route: a key given twice is refused, not read as its
-    # last value; a body string the database cannot store is a 422, not
-    # the driver's 500 (app/api/deps.py).
+    # last value; a query or body string the database cannot store is a
+    # 422, not the driver's 500 (app/api/deps.py).
     dependencies=[
         Depends(refuse_repeated_query),
+        Depends(refuse_unstorable_query),
         Depends(refuse_unstorable_body),
     ],
 )

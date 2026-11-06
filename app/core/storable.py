@@ -8,9 +8,10 @@
 # the driver fails there: a 500 for what is the caller's input. So it is
 # refused where it comes in, by this rule, written once:
 #   - the stream (app/transport/events.py check_event_data);
-#   - the REST bodies (app/api/deps.py refuse_unstorable_body).
-# Both doors are rank 5 and may not import each other (app/__init__.py,
-# H9); the rule lives here, below both.
+#   - the REST bodies (app/api/deps.py refuse_unstorable_body);
+#   - the REST query strings (app/api/deps.py refuse_unstorable_query).
+# The stream and the API are rank 5 and may not import each other
+# (app/__init__.py, H9); the rule lives here, below both.
 #
 # THE RULE DOES NOT READ THE LETTER: it asks whether the database can
 # hold the string, never what the string says, and a refusal names the

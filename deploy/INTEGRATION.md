@@ -596,7 +596,7 @@ body, with a class a program can branch on:
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
-| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value |
+| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
@@ -625,7 +625,10 @@ the changes feed -- takes `limit` (1..100, default 20) and `cursor`
 `{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
 `unread` badge beside them, and the changes feed's `next_cursor` is
 never `null` (section 9). A `limit` outside 1..100 is **refused**
-(422), not clamped, and so is a malformed cursor.
+(422), not clamped, and so is a malformed cursor -- anything comms did
+not hand out: a cursor of another listing, one whose time lost its
+zone, one whose number is past the 64-bit range. The refusal names
+the cursor, never its value.
 
 **A query key given twice is refused**, on every route: 422
 `validation`, naming the key. `?limit=5&limit=500` is not read as its
@@ -907,6 +910,11 @@ A period:
 | `from` | `HH:MM`, `00:00`..`23:59` | the start |
 | `to` | `HH:MM`, up to `24:00` | after `from` on the same day; `24:00` = end of the day |
 
+`HH:MM` is exact: two digits `0`-`9`, a colon, two digits -- nothing
+before or after it (`"09:00\n"`, `"09:00 "` are refused) and no other
+script's digits; hour 24 only as `24:00`, only in `to`. Anything else
+is a 422 `validation` naming `from` or `to`.
+
 A list is refused (422) when it is empty -- send `null` to clear --
 or when two periods of one day overlap or touch: one stretch is one
 period.
@@ -1169,7 +1177,8 @@ non-ASCII all survive. One trap: a `+` sent **unencoded** reads as a
 space; encode it as `%2B` (every standard query encoder does).
 
 **Answers.** The same service token as every route (401 without it).
-`key` empty, missing or longer than 200 -> 422 `validation`. The
+`key` empty, missing, longer than 200 or holding a NUL (`%00`, which
+no accepted key holds -- intake refuses it) -> 422 `validation`. The
 deliveries and path pages take `limit` and `cursor` like every listing
 (section 5); a cursor from one listing is refused by the other (422).
 

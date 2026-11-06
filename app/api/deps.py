@@ -38,6 +38,12 @@
 # refuses for a limit out of bounds. No route of comms takes a list in
 # its query, so a key given twice is never meaningful: 422, class
 # `validation`, naming the key.
+#
+# A STRING THE DATABASE CANNOT STORE is refused at the door it comes
+# through, by the one rule of app/core/storable.py: in a JSON body
+# (refuse_unstorable_body, API-2) and in the query string
+# (refuse_unstorable_query, TIME-1) -- both application-level
+# dependencies in app/main.py.
 # =============================================================================
 
 import json
@@ -116,6 +122,29 @@ async def refuse_repeated_query(request: Request) -> None:
             f"query parameter given more than once: {', '.join(repeated)}; "
             f"each is read once -- send it once"
         )
+
+
+async def refuse_unstorable_query(request: Request) -> None:
+    """Refuse a query string holding a string the database cannot store.
+
+    TIME-1: a NUL in a query parameter that a route reads as a string --
+    the job's key on the reads by key -- reached the SELECT and came back
+    as a 500 from the driver; in a cursor it was dropped by the base64
+    decoder and the cursor read as another. It is the caller's input: a
+    422 `validation` here, before any route runs, by the rule of the
+    bodies and the stream (app/core/storable.py), naming the parameter,
+    never the value. Names are held to it as well, as a body's keys are.
+
+    One check for every route, as refuse_repeated_query is. Only the NUL
+    can arrive: the query string is percent-decoded with
+    errors="replace", so the bytes of a lone surrogate come in as U+FFFD,
+    which the database stores; the rule is the one rule all the same.
+    """
+    for name, value in request.query_params.multi_items():
+        if not storable(name):
+            raise ValidationError(f"a query parameter name is {UNSTORABLE}")
+        if not storable(value):
+            raise ValidationError(f"query parameter {name!r} is {UNSTORABLE}")
 
 
 async def refuse_unstorable_body(request: Request) -> None:

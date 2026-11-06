@@ -83,7 +83,11 @@ def _codes_to_iso_days(codes: list[str]) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-_TIME_RE = re.compile(r"^([01]\d|2[0-4]):([0-5]\d)$")
+# Matched WHOLE (fullmatch) and in ASCII digits (TIME-1): with match and
+# `$` a trailing newline passed ("09:00\n" -- `$` also matches before a
+# final newline), and `\d` took any script's digits ("0\u0669:00" read as
+# 09:00); both were stored as a time the product never wrote.
+_TIME_RE = re.compile(r"([01][0-9]|2[0-4]):([0-5][0-9])")
 
 
 def _minutes(value: str, field: str) -> int:
@@ -99,7 +103,7 @@ def _minutes(value: str, field: str) -> int:
     24:xx is not a time, and a period is rejected later if it starts
     at 24:00 (a start has nothing after it).
     """
-    match = _TIME_RE.match(value)
+    match = _TIME_RE.fullmatch(value)
     if match is None:
         raise ValueError(
             f"{field} must be HH:MM between 00:00 and 24:00, got {value!r}"
