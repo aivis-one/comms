@@ -145,6 +145,19 @@ takes an attribute of a variable (`{user.name}`, `{x.__class__}` -- use
 `{user[name]}`), puts a field inside a format spec (`{amount:{width}}`),
 or asks a width or a precision above 4096 (`{x:99999999}`).
 
+**What else the start refuses in the templates.** A text that is blank
+(`""`, or spaces only) in `templates/{locale}.yaml` -- leave the field out
+instead, and the letter takes your own title and body (the default label
+for a button). A telegram title and body whose HTML Telegram would not
+parse, checked together as they are sent -- a tag Telegram does not
+support (`<div>`, `<br>`), one left open or closed out of order, a raw
+`<` (write `&lt;`): every letter of the type would be refused. An entry
+in `templates/` that is not a `<locale>.yaml` file (`en.yml`, a
+directory); a hidden entry (`.gitkeep`, `.DS_Store`) is skipped. No
+`templates/` at all is a profile whose letters come as
+you write them; a directory beside `types.yaml` and `templates/` is only
+logged (`profile_unknown_directory`) -- the start goes on.
+
 It is delivered by BIND, not by a copy: the product installer writes
 `PROFILE_DIR=/opt/velo/repo/comms-profile` into `/opt/comms/.env` on
 the same seam as above, and compose bind-mounts that path read-only

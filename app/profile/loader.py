@@ -218,6 +218,7 @@ from app.profile.registry import (
     TypeRecord,
     registry,
 )
+from app.profile.telegram_html import telegram_html_problem
 from app.profile.template_fields import field_problem
 
 logger = structlog.get_logger()
@@ -444,11 +445,45 @@ class FileProfileSource:
 
         templates_by_locale: dict[str, Any] = {}
         templates_dir = root / _TEMPLATES_SUBDIR
+        # No templates/ at all is a profile whose letters come as the
+        # product wrote them -- lawful, said nothing about (TPL-2). What
+        # IS in it is read whole: an entry that is not a <locale>.yaml
+        # file (en.yml, a directory, any other file) was skipped
+        # silently, its texts with it -- a typo that took a locale's
+        # templates away. Refused.
+        # A hidden entry (.gitkeep, .DS_Store) is a tool's, not the
+        # profile's: skipped, said nothing about -- a service file must
+        # not keep comms from starting.
         if templates_dir.is_dir():
-            for path in sorted(templates_dir.glob("*.yaml")):
-                locale = path.stem
-                templates_by_locale[locale] = self._read_yaml(
-                    path, f"{_TEMPLATES_SUBDIR}/{path.name}", violations,
+            for path in sorted(templates_dir.iterdir()):
+                if path.name.startswith("."):
+                    continue
+                where = f"{_TEMPLATES_SUBDIR}/{path.name}"
+                if not (path.is_file() and path.suffix == ".yaml"):
+                    violations.append(Violation(
+                        where, "", "",
+                        f"is not a templates file: {_TEMPLATES_SUBDIR}/ holds "
+                        f"<locale>.yaml files only, and anything else in it "
+                        f"would be skipped with its texts",
+                    ))
+                    continue
+                templates_by_locale[path.stem] = self._read_yaml(
+                    path, where, violations,
+                )
+        # A directory beside types.yaml and templates/ is no part of the
+        # profile -- `template/` may be templates/ mistyped. Said, not
+        # refused: in v3 a refused profile is a comms that does not start,
+        # and a product may keep its own directory there (TPL-2). A file
+        # (a README) is not a directory, a hidden one (.git, .idea) is a
+        # tool's: neither is said.
+        for path in sorted(root.iterdir()):
+            if (
+                path.is_dir() and path.name != _TEMPLATES_SUBDIR
+                and not path.name.startswith(".")
+            ):
+                logger.warning(
+                    "profile_unknown_directory", directory=path.name,
+                    templates=_TEMPLATES_SUBDIR,
                 )
 
         _raise_if_any(violations)
@@ -859,9 +894,53 @@ def parse_profile(
         templates[locale] = _parse_template_tree(
             locale, doc, declared, violations,
         )
+        for type_key, channels in templates[locale].items():
+            problem = _telegram_markup_problem(channels.get("telegram"))
+            if problem is not None:
+                violations.append(Violation(
+                    f"{_TEMPLATES_SUBDIR}/{locale}.yaml", type_key,
+                    _TELEGRAM_TEXT,
+                    f"{type_key}.{_TELEGRAM_TEXT}: {problem}",
+                ))
 
     _raise_if_any(violations)
     return Profile(types=declared, templates=templates)
+
+
+# THE TELEGRAM TEXT IS CHECKED AS IT IS SENT (TPL-2): the title and the
+# body in one string, "\n\n" between, with ParseMode.HTML -- a tag may
+# open in the title and close in the body. A field without a template
+# stands as what the formatter puts there (the stored title in <b>, the
+# stored body), a template field as "1" (app/profile/telegram_html.py:
+# the values are escaped, so only the template's own text makes markup).
+_TELEGRAM_TEXT = "telegram.title+body"
+
+
+def _telegram_markup_problem(fields: Mapping[str, Any] | None) -> str | None:
+    """Why Telegram refuses the text these telegram templates make, or
+    None (no title or body template, or markup it parses)."""
+    if not fields:
+        return None
+    title, body = fields.get("title"), fields.get("body")
+    if not isinstance(title, str) and not isinstance(body, str):
+        return None
+    text = (
+        (_fields_as_one(title) if isinstance(title, str) else "<b>1</b>")
+        + "\n\n"
+        + (_fields_as_one(body) if isinstance(body, str) else "1")
+    )
+    problem = telegram_html_problem(text)
+    if problem is None:
+        return None
+    return f"Telegram would not parse the HTML of every letter -- {problem}"
+
+
+def _fields_as_one(template: str) -> str:
+    """The template with every field as "1" and "{{" "}}" as braces."""
+    return "".join(
+        literal + ("" if name is None else "1")
+        for literal, name, _, _ in string.Formatter().parse(template)
+    )
 
 
 def _versioned_body(doc: Any) -> dict[Any, Any]:
@@ -1298,6 +1377,18 @@ def _parse_template_tree(
                     ))
                     continue
                 complaint = _leaf_complaint(fname, template)
+                if (
+                    complaint is None and isinstance(template, str)
+                    and not template.strip()
+                ):
+                    # TPL-2: a blank base text renders blank on every
+                    # letter of the type -- refused here, never at the send.
+                    complaint = (
+                        "is blank: every letter of the type would carry "
+                        "nothing there -- write the text, or leave the field "
+                        "out for the product's own title and body (the "
+                        "default label for a button)"
+                    )
                 if complaint is None and isinstance(template, str):
                     domain = _domain_literal(template)
                     if domain is not None:
@@ -1510,17 +1601,15 @@ def _overlay_subject(root: Path | str) -> str:
 def _variable_roots(template: str) -> set[str]:
     """The variable names a template reads, by their root.
 
-    {user[name]} reads `user`; a nested spec ({amount:{width}}) reads
-    `width` too. Only called on a template that passed the dry run, so
-    parsing cannot fail here and positional fields never get this far.
+    {user[name]} reads `user`. Only called on a template that passed
+    the leaf check, so parsing cannot fail here, positional fields never
+    get this far, and no format spec holds a field (TPL-1 refuses one --
+    the walk into a spec this did is gone with it, TPL-2).
     """
     roots: set[str] = set()
-    for _, name, spec, _ in string.Formatter().parse(template):
-        if name is None:
-            continue
-        roots.add(re.split(r"[.\[]", name, maxsplit=1)[0])
-        if spec:
-            roots |= _variable_roots(spec)
+    for _, name, _, _ in string.Formatter().parse(template):
+        if name is not None:
+            roots.add(re.split(r"[.\[]", name, maxsplit=1)[0])
     return roots
 
 
@@ -1662,6 +1751,18 @@ def _parse_overlay_file(
                 tree_channels[channel] = tree_fields
         if tree_channels:
             tree[type_key] = tree_channels
+            # The telegram text as it will be sent: the overlay's
+            # leaves over the base's (TPL-2).
+            replaced = tree_channels.get("telegram")
+            if replaced:
+                problem = _telegram_markup_problem(
+                    {**base_sheets.get("telegram", {}), **replaced},
+                )
+                if problem is not None:
+                    violations.append(Violation(
+                        where, type_key, _TELEGRAM_TEXT,
+                        f"{type_key}.{_TELEGRAM_TEXT}: {problem}",
+                    ))
     return tree
 
 
