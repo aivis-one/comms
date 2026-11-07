@@ -246,6 +246,30 @@ class TestFormatDeepLink:
         with pytest.raises(PermanentDeliveryError, match=r"^deep link:"):
             fmt.format_deep_link({"action": "open practice"})
 
+    def test_a_null_param_is_no_param(self) -> None:
+        """null means absent (TPL-1): the link is the bare action, as for
+        an action without params -- not `open_thread__None`. The pair is
+        test_single_param: a value is still carried."""
+        fmt = TelegramFormatter(bot=_FakeBot(), bot_url=BOT_URL)
+        link = fmt.format_deep_link({
+            "action": "open_thread", "params": {"thread_id": None},
+        })
+        assert link == f"{BOT_URL}?startapp=open_thread"
+
+    def test_null_params_are_dropped_before_they_are_counted(self) -> None:
+        """A null beside a value leaves ONE parameter: the link carries
+        the value, it is not refused as two; nulls alone leave none."""
+        fmt = TelegramFormatter(bot=_FakeBot(), bot_url=BOT_URL)
+        link = fmt.format_deep_link({
+            "action": "open_practice",
+            "params": {"slot_id": None, "practice_id": "p1"},
+        })
+        assert link == f"{BOT_URL}?startapp=open_practice__p1"
+        bare = fmt.format_deep_link({
+            "action": "dashboard", "params": {"a": None, "b": None},
+        })
+        assert bare == f"{BOT_URL}?startapp=dashboard"
+
 
 class TestTelegramDeliver:
     """Send path merged from velo (message building) + cbshome contract."""

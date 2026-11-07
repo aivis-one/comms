@@ -73,8 +73,11 @@
 #   here -- _deliver_single turns every one of them into an outcome)
 #   rolls the attempt back, and then, in a SEPARATE transaction, the
 #   failure is written onto the job: attempts + 1, the step, the
-#   exception's class and place (never its text). Below the ceiling
-#   (settings.notification_max_pipeline_attempts) the job waits behind
+#   exception's class and place (never its text). The count is of the
+#   failures IN A ROW (REV-2): an attempt that commits ends the run --
+#   count, step and error back to 0 / null in its own transaction
+#   (_attempt_job); every failure stays in the journal. Below the
+#   ceiling (settings.notification_max_pipeline_attempts) the job waits behind
 #   a gate, pipeline_retry_at, and the selection skips it until then:
 #   oldest-first stays the order, the gate is what keeps a failing job
 #   from starving the healthy ones and keeps the healthy ones from
@@ -93,7 +96,7 @@
 #   database_answers), nothing is written -- the job rests in the
 #   process, uncounted; while it answers, the failure is counted like
 #   any other, the ceiling included: the budget is
-#   NOTIFICATION_MAX_PIPELINE_ATTEMPTS, no other.
+#   NOTIFICATION_MAX_PIPELINE_ATTEMPTS failures in a row, no other.
 #
 # A LETTER THE CHANNEL TOOK IS NOT SENT TWICE (the T12 resend, closed
 # in P2-1): every channel answer is journaled in its own transaction
@@ -210,7 +213,10 @@ async def expire_overdue_notifications(lanes: Sequence[Lane]) -> int:
 
     IN PORTIONS (PERF-1): at most _EXPIRY_PORTION jobs per transaction,
     committed one portion after the other, in id order, until a portion
-    comes back short. A backlog after a worker's downtime no longer sits
+    comes back short -- where THIS pass ends, not a proof that nothing
+    is left: under READ COMMITTED a row the portion's lock re-checks and
+    drops (closed or changed meanwhile) shortens it, and the tail goes
+    on the next pass. A backlog after a worker's downtime no longer sits
     in one transaction -- its row locks, its objects, the attempts of
     these lanes queued behind it. Each portion WAITS for an attempt that
     holds one of its jobs (no SKIP LOCKED, the rule above): the job is
@@ -665,6 +671,24 @@ async def _attempt_job(
             step = PipelineStep.ROLLUP
             await rollup_notification(session, notification)
 
+            # A SUCCESS ENDS THE RUN OF FAILURES (REV-2): the budget is
+            # the failures IN A ROW. A job in portions takes thousands of
+            # attempts, and three transient failures scattered over its
+            # life must not close it at the ceiling. The record goes as
+            # one -- count, step, error (ck_notifications_pipeline: 0
+            # exactly with no step and no error); every failure stays in
+            # the journal, its history. Written in this attempt's own
+            # transaction, so only a commit that lands ends the run. A
+            # failure of comms that is deterministic tears every attempt
+            # that reaches it, and a torn attempt rolls its portion back:
+            # the next takes the same due deliveries in id order
+            # (deliver_notification), so it fails again, in a row, up to
+            # the ceiling -- at worst after the other deliveries are done.
+            if notification.pipeline_attempts > 0:
+                notification.pipeline_attempts = 0
+                notification.pipeline_step = None
+                notification.pipeline_error = None
+
             step = PipelineStep.COMMIT
             await session.commit()
             return True, portion_full
@@ -1053,7 +1077,10 @@ async def cleanup_expired_notifications() -> int:
     pass stops at the ceiling and leaves the rest of a backlog to the
     next pass -- which comes at the poll interval, since a pass that
     deleted something keeps the loop from backing off. A pass also
-    stops on a short batch: nothing more is expired. (Since P4-1 the
+    stops on a short batch -- where the pass ends, not a proof that
+    nothing more is expired: under READ COMMITTED a row another deleter
+    took meanwhile shortens a batch, and the tail goes on the next
+    pass. (Since P4-1 the
     loop runs beside the lane loops, not on the delivery path.)
 
     Returns:
@@ -1151,7 +1178,10 @@ async def cleanup_terminal_notifications() -> int:
     Orchestration only (fix C): the service supplies ONE commit-free
     batch (delete_terminal_notifications_batch); this loop owns the
     commits -- one per batch, so a 90-day backlog never becomes one
-    long transaction -- and drains until a batch comes back short.
+    long transaction -- and drains until a batch comes back short:
+    where the pass ends, not a proof that nothing is left -- under READ
+    COMMITTED a row another deleter took meanwhile shortens a batch, and
+    the tail goes on the next pass.
 
     DISABLED (fix I): settings.notification_retention_days == 0 means
     retention is OFF (a negative value refuses startup -- D1 / R3) --
@@ -1166,16 +1196,20 @@ async def cleanup_terminal_notifications() -> int:
     the observable value of the BL-3 promotion trigger.
 
     KNOWN CEILING (acknowledged by design -- dispatch plan BL-3):
-      1. Mechanics: the batch select filters on (status, created_at)
-         with no matching index -> each pass seq-scans the
-         notifications table as it grows.
+      1. Mechanics: the batch select filters on status and on
+         greatest(created_at, scheduled_at) (REV-2), with an anti-join
+         on push_outbox, and no index serves the filter -> each pass
+         seq-scans the notifications table as it grows (REV-2 measured
+         it at 200k rows: its report).
       2. Status: acknowledged by design.
       3. Backlog ref: BL-3 (dispatch plan §6a).
       4. Promotion trigger (observable, via the retention_pass log):
          a pass stably longer than ~1 second OR terminal rows on the
          order of a million.
-      5. Agreed fix: ONE migration -- a partial index on created_at
-         with a predicate over the terminal statuses.
+      5. Agreed fix: ONE migration -- a partial index on the expression
+         greatest(created_at, scheduled_at) with a predicate over the
+         terminal statuses (an index on created_at alone no longer
+         serves the filter since REV-2).
       6. Rejected: an index NOW (write amplification on a hot table
          for a query that is cheap at current scale and rare by
          cadence); an unbounded DELETE (one long transaction + its FK

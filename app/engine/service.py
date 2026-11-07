@@ -2301,14 +2301,52 @@ async def delete_terminal_notifications_batch(
     cascade -- an unbounded DELETE over a 90-day backlog was rejected
     in the handoff (one long transaction + cascade).
 
-    Age is measured on created_at: terminal rows are immutable and the
-    model carries no updated_at.
+    AGE FROM THE LATER OF created_at AND scheduled_at (REV-2): a job is
+    not deleted before it has lived its retention from the moment it
+    was due. Measured on created_at alone, a reminder scheduled past
+    the horizon was deleted within the hour of its send -- gone from
+    the inbox, 404 by its key. The model carries no updated_at; what a
+    job does after it was due is still bounded by created_at only
+    (app/engine/changes.py KNOWN CEILING P2-3).
+
+    NOT WHILE A PUSH IS OWED (REV-2, as the expiry cleanup since H7):
+    a job with a row in push_outbox is skipped -- the cascade would
+    take the push with the job before the product got it. The relay
+    deletes the row once it has published; the next pass deletes the
+    job. An anti-join on push_outbox (measured at 200k jobs: a hash
+    anti-join over the outbox, beside BL-3's scan). A push row is
+    written only in the transaction of a job's transition, and a job's
+    outcome row with it: a job this select sees terminal has every
+    push row it will ever have committed, and visible here.
+
+    KNOWN CEILING (acknowledged by design -- REV-2, a push never
+    published):
+      1. Mechanics: a job whose push the relay never publishes (redis
+         away for good, the consumer process not running) is never
+         deleted -- retention is no longer the one bound on how long a
+         job is kept.
+      2. Status: acknowledged by design.
+      3. Backlog ref: none -- the relay down that long is an incident
+         of its own, said in its log (push_relay_error).
+      4. Promotion trigger (observable): a push_outbox row whose job
+         is older than the retention period.
+      5. Agreed fix: none needed -- mend the relay; its next ticks
+         publish the backlog and the next retention pass deletes.
+      6. Rejected: deleting the job past a deadline whatever it owes
+         (the product loses a result it was promised -- the reason for
+         the skip); a second horizon for owed pushes (a new setting for
+         a failure that is an incident).
+
+    BY SCAN: the select has no index of its own -- KNOWN CEILING BL-3
+    on app/engine/processor.py cleanup_terminal_notifications.
     """
     batch_ids = (
         select(Notification.id)
         .where(
             Notification.status.in_(_RETENTION_TERMINAL_STATUSES),
-            Notification.created_at < cutoff,
+            func.greatest(Notification.created_at, Notification.scheduled_at)
+            < cutoff,
+            ~exists().where(PushOutbox.notification_id == Notification.id),
         )
         .order_by(Notification.created_at)
         .limit(limit)
@@ -2385,12 +2423,12 @@ async def delete_expired_notifications_batch(
     product, told nothing and finding nothing by its key, would lose
     the result itself (deploy/INTEGRATION.md section 10: a push may be
     lost, the result may not). The relay deletes the row once it has
-    published; the next pass deletes the job. No deadline of its own:
-    a push still owed when general retention reaches the job
-    (delete_terminal_notifications_batch, by created_at) goes with it
-    -- retention is the one bound on how long anything is kept. The
-    check is an anti-join on ix_push_outbox_notification, beside the
-    partial index, not instead of it (tests/test_push_survives_cleanup.py).
+    published; the next pass deletes the job. No deadline of its own,
+    and none in general retention either since REV-2: it skips such a
+    job the same way (delete_terminal_notifications_batch, its KNOWN
+    CEILING for a push never published). The check is an anti-join on
+    ix_push_outbox_notification, beside the partial index, not instead
+    of it (tests/test_push_survives_cleanup.py).
 
     NOT WHILE AN ANSWER IS KEPT (P5-1): a job whose model answer still
     has its body is skipped the same way -- an anti-join on the primary

@@ -301,10 +301,13 @@ class Notification(UUIDMixin, Base):
     )
 
     # -- The pipeline's own failures (T12, migration 0015) --
-    # How many attempts of the pipeline ended in an exception of comms'
-    # own (not a channel answer -- those are the deliveries' business);
-    # a transient failure of the database counts while the database
-    # answers, and is not written while it does not (WK-2).
+    # How many attempts of the pipeline IN A ROW ended in an exception
+    # of comms' own (not a channel answer -- those are the deliveries'
+    # business); an attempt that commits sets it back to 0, with the
+    # step and the error (REV-2, app/engine/processor.py _attempt_job),
+    # and every failure stays in the journal. A transient failure of
+    # the database counts while the database answers, and is not
+    # written while it does not (WK-2).
     # At settings.notification_max_pipeline_attempts the job gets its
     # outcome (app/engine/processor.py, _record_pipeline_failure).
     pipeline_attempts: Mapped[int] = mapped_column(

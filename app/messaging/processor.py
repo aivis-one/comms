@@ -58,7 +58,10 @@ async def auto_close_idle_threads(
     Orchestration only: status.auto_close_idle_threads_batch supplies
     ONE commit-free batch; this loop owns the commits -- one per batch,
     so a large backlog never becomes one long transaction -- and drains
-    until a batch comes back short.
+    until a batch comes back short: where the pass ends, not a proof
+    that nothing idle is left -- under READ COMMITTED a thread written
+    meanwhile (a message, a status) is dropped by the batch's re-check
+    and shortens it, and the tail goes on the next pass.
 
     DISABLED: settings.thread_auto_close_days == 0 (or days=0) means
     auto-close is OFF (a negative setting refuses startup -- D1 / R3) --

@@ -482,7 +482,8 @@ class TelegramFormatter:
 
         Args:
             action_data: {"action": "open_thread",
-                          "params": {"thread_id": "<uuid>"}}
+                          "params": {"thread_id": "<uuid>"}}; a param
+                whose value is null is treated as absent.
 
         Returns:
             Deep link URL, or None when there is nothing to link
@@ -499,7 +500,14 @@ class TelegramFormatter:
         if not action:
             return None
 
-        params = action_data.get("params") or {}
+        # A parameter whose value is null is no parameter (TPL-1): it is
+        # dropped BEFORE the count, so {"x": null} links like an action
+        # without params, never as `{action}__None`.
+        params = {
+            key: value
+            for key, value in (action_data.get("params") or {}).items()
+            if value is not None
+        }
         if len(params) > 1:
             # The refusal names counts and limits, never a value of the
             # letter: its text is kept as the answer of this call in the

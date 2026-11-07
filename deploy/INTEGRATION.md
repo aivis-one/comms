@@ -962,7 +962,7 @@ never interprets.
 | `correlation` | optional | envelope | string, 1..200 -- the product's own reference, stored untouched (see below) |
 | `title` | by type | letter | 1..500 -- the stored fallback; templates override it at delivery. Required for a type delivered to people, refused for an llm type |
 | `body` | by type | letter | 1..5000; as `title` |
-| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; at most 65536 bytes as compact UTF-8 JSON, the whole object; refused for an llm type |
+| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters; one whose value is `null` is no parameter -- the telegram link is built as if it were absent), every other key a scalar template variable; at most 65536 bytes as compact UTF-8 JSON, the whole object; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
 | `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500, one line: no `\r` or `\n`), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
@@ -1285,9 +1285,9 @@ job's outcome, within `keep_until`.
 
 | field | value |
 |---|---|
-| `attempts` | failed pipeline attempts; 0 when none. A transient failure of comms' own database (a deadlock, a lost connection, a restart) counts while that database answers; while it does not answer, nothing is counted or written |
-| `step` | the step of the last counted failure: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
-| `error` | the class and the place of the last counted failure, or `null` |
+| `attempts` | failed pipeline attempts **in a row**; 0 when none. An attempt that succeeds ends the run: `attempts` goes back to 0, `step` and `error` to `null` -- every failure stays in the job's path (`by-key/path`). The ceiling (`NOTIFICATION_MAX_PIPELINE_ATTEMPTS`) is of failures in a row: a long send in portions is not closed by a few failures spread over it. A transient failure of comms' own database (a deadlock, a lost connection, a restart) counts while that database answers; while it does not answer, nothing is counted or written |
+| `step` | the step of the last failure of the current run: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
+| `error` | the class and the place of the last failure of the current run, or `null` |
 | `retry_at` | when the job is tried again after its last counted failure, or `null`; never with `attempts` 0 |
 
 **A job STUCK at the ceiling.** A job whose `attempts` equal comms' ceiling
@@ -1333,7 +1333,7 @@ One row per transition, in order.
 | `outcome` | the status after it; for `channel`: `accepted`, `refused`, `rate_limited`, `transient`, `timeout`, `error`; for `gate`: `suppressed` |
 | `recipient_id` | for `delivery`, `channel`, `gate`; else `null` |
 | `channel` | for `delivery`, `channel`; else `null` |
-| `attempt` | the attempt number |
+| `attempt` | the attempt number: on a `delivery` or `channel` row, the delivery's; on a `job` row, the job's pipeline failures in a row at that row -- a failure's row carries its number in its run, which starts again at 1 after an attempt that succeeded |
 | `wait_reason` | a wait: the delivery's, or `pipeline_retry` for the job; else `null` |
 | `wait_until` | until when, or `null` |
 | `failure_class` | as on a delivery, or `null` |
@@ -1346,9 +1346,10 @@ One row per transition, in order.
 answers, such a failure -- a deadlock that keeps coming back, say -- is
 a failure like any other: an attempt is counted, its row in the path
 carries the step, the class and the place and `wait_until`, and at the
-ceiling the job gets its outcome. While the database does not answer,
-nothing can be written: the job keeps its state, no attempt is counted,
-and comms takes it again once the database is back.
+ceiling of failures in a row the job gets its outcome. While the
+database does not answer, nothing can be written: the job keeps its
+state, no attempt is counted, and comms takes it again once the
+database is back.
 
 ## 9. What changed since a cursor
 
@@ -2202,8 +2203,13 @@ too. A model's answer is kept by its type.
 
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is
-  removed by the worker's retention pass after that many days. Nothing
-  is removed while a delivery is still pending.
+  removed by the worker's retention pass after that many days, counted
+  from the later of its creation and its `scheduled_at`: a job sent
+  late lives its days from when it was due, and one cancelled or
+  expired before a `scheduled_at` in the future is kept until that
+  moment plus the period. Nothing is removed while a delivery is still
+  pending, nor while a push of the job (section 10) is still owed --
+  it goes once comms has published it.
 - **A model's answer** (section 11): the type's `answer_keep`, default
   **24h**, counted from the answer; the letter it answered, and the
   link to its audio body, are deleted at the job's outcome; the body

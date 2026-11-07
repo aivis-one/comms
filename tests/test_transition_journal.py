@@ -953,11 +953,14 @@ class TestAppendOnly:
             await process_pending_notifications()
         assert await _rows(nid)
         monkeypatch.setattr(settings, "notification_retention_days", 1)
+        # Created and due two days ago: retention ages a job from the
+        # later of the two (REV-2), so both go back.
+        two_days_ago = datetime.now(UTC) - timedelta(days=2)
         async with get_session_factory()() as session:
             await session.execute(
                 update(Notification)
                 .where(Notification.id == nid)
-                .values(created_at=datetime.now(UTC) - timedelta(days=2))
+                .values(created_at=two_days_ago, scheduled_at=two_days_ago)
             )
             await session.commit()
         assert await cleanup_terminal_notifications() == 1
@@ -1005,7 +1008,10 @@ _POINTS: dict[tuple[str, str], str] = {
         "by caller: deliver_notification"
     ),
     # Not a transition: the gate that let a successful attempt through
-    # is cleared; the attempt's transitions are recorded by its steps.
+    # is cleared, and a success ends the run of failures (REV-2: the
+    # count, step and error back to 0 / null -- the failures themselves
+    # stay in the journal); the attempt's transitions are recorded by
+    # its steps.
     # (The attempt moved into the lane's pass in P4-1, and into a task
     # of its own, one per job in work, in P5-L.)
     ("app/engine/processor.py", "_attempt_job"): ("not a transition"),

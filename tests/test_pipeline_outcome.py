@@ -39,17 +39,30 @@ from structlog.testing import capture_logs
 
 from app.core.config import settings
 from app.core.database import dispose_engine, get_session_factory
+from app.core.lanes import Lane
 from app.engine import processor
 from app.engine.constants import (
     DeliveryStatus,
     FailureClass,
+    JournalStep,
+    JournalSubject,
     NotificationStatus,
     PipelineStep,
     TargetType,
 )
-from app.engine.models import Notification, NotificationDelivery
-from app.engine.processor import pipeline_error_of, process_pending_notifications
-from tests.helpers import create_recipient, notification_row_fields
+from app.engine.models import (
+    Notification,
+    NotificationDelivery,
+    NotificationTransition,
+)
+from app.engine.processor import (
+    pipeline_error_of,
+    process_lane,
+    process_pending_notifications,
+)
+from app.engine.service import create_notification
+from app.profile.registry import Decided, Layer, TypeRecord, registry
+from tests.helpers import create_recipient, intake_fields, notification_row_fields
 
 _REAL_DELIVER = processor.deliver_notification
 
@@ -221,11 +234,18 @@ class TestOutcome:
         assert row.pipeline_step == PipelineStep.RESOLVE
         assert await _deliveries(job) == []
 
-    async def test_a_job_that_recovers_keeps_its_record_and_loses_its_gate(
+    async def test_a_job_that_recovers_ends_its_run_and_keeps_its_history(
         self, db_session: AsyncSession,
     ) -> None:
-        """Below the ceiling a success closes the gate (the CHECK allows a
-        gate only behind a record, and the record stays as history)."""
+        """Below the ceiling a success closes the gate AND ends the run of
+        failures (REV-2): the count, the step and the error go back to 0 /
+        null together (ck_notifications_pipeline), and the failure stays
+        in the journal, its history.
+
+        This test used to assert that the record stayed on the job
+        (attempts 1, step `deliver`): right while the count was the job's
+        lifetime total -- REV-2 made it the run of failures in a row, so
+        a big send no longer dies of three scattered transient ones."""
         recipient = await create_recipient(db_session)
         job = await _job(db_session, recipient.id, age_minutes=5)
         await db_session.commit()
@@ -238,9 +258,210 @@ class TestOutcome:
 
         row = await _fetch(job)
         assert row.status == NotificationStatus.SENT
-        assert row.pipeline_attempts == 1
-        assert row.pipeline_step == PipelineStep.DELIVER
+        assert (row.pipeline_attempts, row.pipeline_step, row.pipeline_error) == (
+            0, None, None,
+        )
         assert row.pipeline_retry_at is None
+        failures = await _failure_rows(job)
+        assert [(r.step, r.attempt) for r in failures] == [
+            (JournalStep.DELIVER, 1),
+        ]
+        error = failures[0].error
+        assert error is not None and "_PlantedDefectError" in error
+
+
+# -----------------------------------------------------------------------------
+# REV-2 item 1 -- the budget is the failures IN A ROW
+# -----------------------------------------------------------------------------
+#
+# MUTATIONS these tests were written against (each turns one red):
+#   R1 no reset on a successful attempt     -> both TestTheRunOfFailures
+#      alternating tests
+#   R2 the reset only when the attempt's portion is not full (the job's
+#      last portion) -> test_scattered_failures_do_not_close_a_big_send
+#   R3 the count reset, the step and the error left (CHECK
+#      ck_notifications_pipeline refuses the commit) -> the same
+
+
+_BULK_TYPE = "unit_event_in_app"
+
+
+def _bulk_lane() -> None:
+    """The test type on the bulk lane: one slot, a portion of ONE
+    delivery per attempt (app/engine/service.py delivery_portion)."""
+    record = registry.record_of(_BULK_TYPE)
+    assert record is not None
+    fields = dict(record.fields)
+    fields["lane"] = Decided(Lane.BULK.value, Layer.PROFILE, "test")
+    registry.register_type(
+        _BULK_TYPE, category=registry.category_of(_BULK_TYPE),
+        record=TypeRecord(fields=fields),
+    )
+
+
+async def _send_to_all(recipients: int) -> UUID:
+    """One bulk job to `recipients` people (target: all), via intake."""
+    _bulk_lane()
+    async with get_session_factory()() as session:
+        for _ in range(recipients):
+            await create_recipient(session)
+        job = await create_notification(
+            session, **intake_fields(), type=_BULK_TYPE, title="T", body="B",
+            target_type=TargetType.ALL, target_value="*",
+        )
+        await session.commit()
+        return job.id
+
+
+async def _failure_rows(nid: UUID) -> list[NotificationTransition]:
+    """The job's failure rows in the journal: JOB rows with an error."""
+    async with get_session_factory()() as session:
+        return list((await session.execute(
+            select(NotificationTransition)
+            .where(
+                NotificationTransition.notification_id == nid,
+                NotificationTransition.subject == JournalSubject.JOB,
+                NotificationTransition.error.is_not(None),
+            )
+            .order_by(NotificationTransition.id)
+        )).scalars())
+
+
+_REAL_ROLLUP = processor.rollup_notification
+
+
+def _scripted_rollup(script: list[bool]):  # type: ignore[no-untyped-def]
+    """rollup that tears an attempt when the next entry of `script` is
+    True and is real otherwise. Only the attempt's own rollup reads the
+    script; the ceiling's (JournalStep.CEILING) is always real."""
+
+    async def rollup(
+        session: AsyncSession,
+        notification: Notification,
+        step: JournalStep = JournalStep.ROLLUP,
+    ) -> None:
+        if step == JournalStep.ROLLUP and script.pop(0):
+            raise _PlantedDefectError("planted defect")
+        await _REAL_ROLLUP(session, notification, step)
+
+    return rollup
+
+
+async def _passes(script: list[bool]) -> None:
+    """One pass per entry of `script`, the gate opened after each."""
+    with patch.object(processor, "rollup_notification", _scripted_rollup(script)):
+        while script:
+            left = len(script)
+            torn = script[0]
+            processed = await process_lane(Lane.BULK)
+            # Attempted every pass (the script was read), and as scripted.
+            assert (len(script), processed) == (left - 1, 0 if torn else 1)
+            await _open_gates()
+
+
+class TestTheRunOfFailures:
+    async def test_scattered_failures_do_not_close_a_big_send(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A send in portions -- fail, succeed, four times over: more
+        failures than the ceiling in all, never a ceiling in a row. The
+        job is not closed by the ceiling; every delivery is tried and
+        goes out; the journal keeps all four failures, each the first of
+        its run. R1, R2, R3."""
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 3)
+        nid = await _send_to_all(4)
+        await _passes([True, False] * 4)
+
+        status, deliveries = await _statuses(nid)
+        assert status == NotificationStatus.SENT
+        assert deliveries == [DeliveryStatus.SENT] * 4
+        row = await _fetch(nid)
+        assert (row.pipeline_attempts, row.pipeline_step, row.pipeline_error) == (
+            0, None, None,
+        )
+        failures = await _failure_rows(nid)
+        assert [(r.step, r.attempt) for r in failures] == [
+            (JournalStep.ROLLUP, 1),
+        ] * 4
+        assert not [
+            r for r in await _job_rows(nid) if r.step == JournalStep.CEILING
+        ]
+
+    async def test_a_run_reaching_the_ceiling_closes_as_before(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The pair: one portion goes, then the attempts fail in a row up
+        to the ceiling -- the job is closed there (_close_at_ceiling), as
+        before REV-2: the delivery that went stays SENT, the one the
+        channel took in the first torn attempt is closed SENT from the
+        journal, the two never tried are FAILED with class `pipeline`;
+        the journal counts the run 1, 2, 3."""
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 3)
+        nid = await _send_to_all(4)
+        await _passes([False, True, True, True])
+
+        status, deliveries = await _statuses(nid)
+        assert status == NotificationStatus.PARTIAL_SENT
+        assert sorted(deliveries) == sorted(
+            [DeliveryStatus.SENT] * 2 + [DeliveryStatus.FAILED] * 2
+        )
+        assert await _failure_classes(nid) == [FailureClass.PIPELINE] * 2
+        row = await _fetch(nid)
+        assert (row.pipeline_attempts, row.pipeline_step) == (3, PipelineStep.ROLLUP)
+        failures = await _failure_rows(nid)
+        assert [r.attempt for r in failures] == [1, 2, 3]
+        assert [
+            r.outcome for r in await _job_rows(nid) if r.step == JournalStep.CEILING
+        ] == [NotificationStatus.PARTIAL_SENT]
+
+    async def test_a_failure_after_a_success_starts_a_new_run(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two failures, a success, two failures: under a ceiling of 3
+        the job is still open after the last -- the success reset the
+        count, and the second run is at 2. R1."""
+        monkeypatch.setattr(settings, "notification_max_pipeline_attempts", 3)
+        nid = await _send_to_all(4)
+        await _passes([True, True, False, True, True])
+
+        row = await _fetch(nid)
+        assert row.status == NotificationStatus.PROCESSING
+        assert (row.pipeline_attempts, row.pipeline_step) == (2, PipelineStep.ROLLUP)
+        assert [r.attempt for r in await _failure_rows(nid)] == [1, 2, 1, 2]
+
+
+async def _statuses(nid: UUID) -> tuple[str, list[str]]:
+    async with get_session_factory()() as session:
+        job = await session.get(Notification, nid)
+        assert job is not None
+        deliveries = list((await session.execute(
+            select(NotificationDelivery.status)
+            .where(NotificationDelivery.notification_id == nid)
+            .order_by(NotificationDelivery.id)
+        )).scalars())
+        return job.status, deliveries
+
+
+async def _failure_classes(nid: UUID) -> list[str | None]:
+    async with get_session_factory()() as session:
+        return list((await session.execute(
+            select(NotificationDelivery.failure_class).where(
+                NotificationDelivery.notification_id == nid,
+                NotificationDelivery.status == DeliveryStatus.FAILED,
+            )
+        )).scalars())
+
+
+async def _job_rows(nid: UUID) -> list[NotificationTransition]:
+    async with get_session_factory()() as session:
+        return list((await session.execute(
+            select(NotificationTransition)
+            .where(
+                NotificationTransition.notification_id == nid,
+                NotificationTransition.subject == JournalSubject.JOB,
+            )
+            .order_by(NotificationTransition.id)
+        )).scalars())
 
 
 class TestNoStarvation:
