@@ -595,12 +595,15 @@ class Settings(BaseSettings):
     notification_max_delivery_attempts: int = 3
     # T12: how many attempts of the PIPELINE (resolve / deliver /
     # rollup, not a channel call) may end in an exception of comms' own
-    # before the job gets its outcome -- FAILED, its waiting deliveries
-    # closed with failure class `pipeline`. Between attempts the job
-    # waits behind the same backoff as a delivery
-    # (NOTIFICATION_RETRY_BACKOFF_*), so it never starves the healthy
-    # jobs behind it. A separate knob from the delivery attempts: the
-    # channel being down and comms being broken are different facts.
+    # IN A ROW before the job gets its outcome -- FAILED, its waiting
+    # deliveries closed with failure class `pipeline`. An attempt that
+    # commits sets the count back to 0 (REV-2, app/engine/processor.py
+    # _attempt_job): failures scattered over a long job never add up
+    # to the ceiling. Between attempts the job waits behind the same
+    # backoff as a delivery (NOTIFICATION_RETRY_BACKOFF_*), so it never
+    # starves the healthy jobs behind it. A separate knob from the
+    # delivery attempts: the channel being down and comms being broken
+    # are different facts.
     notification_max_pipeline_attempts: int = 3
     # -- Lanes (P4-1, spec §8) --
     # The lanes THIS worker process takes, comma-separated

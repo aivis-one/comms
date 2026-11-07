@@ -15,9 +15,15 @@
 #     skipped hour is waited for at its start read with fold=0 and then
 #     goes to the next week; a period partly inside opens at its start so
 #     read (later than the clock allows -- the accepted error bar);
+#   - autumn, a period that runs ON INTO the repeated hour, or ends
+#     inside it: closed after the first pass, it opens again when the
+#     clocks go back -- the deferral goes there, not to next week (REV-5:
+#     only period STARTS were candidates, and its start is not in the
+#     repeated hour);
 #   - the invariant over every 10 minutes of both days: the answer is None
-#     or strictly after `now`, and at that moment the recipient may be
-#     reached -- except the accepted spring case.
+#     or strictly after `now`, at that moment the recipient may be
+#     reached, and NO earlier moment after `now` could -- except the
+#     accepted spring cases.
 #
 # MUTATIONS these tests were written against (each turns one red):
 #   M10 starts compared as wall times again -> the second pass, the
@@ -25,6 +31,13 @@
 #   M11 no fold=1 candidate -> test_the_second_pass_waits_for_the_second
 #   M12 fold=1 taken without the existence check -> test_before_the_jump,
 #       the invariant
+#   M13 no clocks-back candidate (REV-5) -> TestAutumnBackIntoAPeriod,
+#       the invariant
+#   M14 the clocks-back candidate taken without asking whether it is
+#       open -> the invariant (an answer the recipient may not be
+#       reached at)
+#   M15 any change of the offset a candidate, spring's too ->
+#       test_partly_inside_opens_at_its_start_so_read
 # =============================================================================
 
 from datetime import UTC, datetime, timedelta
@@ -80,6 +93,29 @@ class TestAutumnRepeatedHour:
         assert _next(_at("10-25", "02:00"), _INSIDE) == _at("11-01", "01:30")
 
 
+class TestAutumnBackIntoAPeriod:
+    """00:00-02:30 closes at 02:30 CEST (00:30 UTC); at 03:00 CEST the
+    clocks go back to 02:00 CET (01:00 UTC), inside the period again
+    until 02:30 CET (01:30 UTC)."""
+
+    def test_running_on_into_the_repeated_hour(self) -> None:
+        windows = _period(0, 150)
+        now = _at("10-25", "00:45")  # 02:45 CEST, closed
+        assert not _allowed(now, windows)
+        assert _next(now, windows) == _at("10-25", "01:00")
+        assert _allowed(_at("10-25", "01:00"), windows)
+
+    def test_ending_inside_the_repeated_hour(self) -> None:
+        """01:00-02:15 closes at 02:15 CEST and is open again from 02:00
+        to 02:15 CET."""
+        windows = _period(60, 135)
+        assert _next(_at("10-25", "00:20"), windows) == _at("10-25", "01:00")
+
+    def test_after_the_second_pass_the_next_week(self) -> None:
+        windows = _period(0, 150)
+        assert _next(_at("10-25", "01:40"), windows) == _at("10-31", "23:00")
+
+
 class TestSpringSkippedHour:
     def test_wholly_inside_is_waited_for_then_skipped(self) -> None:
         """The accepted rule: 02:00-03:00 does not open on that date. Its
@@ -112,7 +148,15 @@ _SHAPES = {
     "wholly_skipped": _period(120, 180),
     "before": _period(60, 90),
     "after": _period(600, 660),
+    "into_repeated": _period(0, 150),
+    "ends_in_repeated": _period(60, 135),
 }
+
+# Opens later than the clock allows: the accepted spring error bar
+# (the schedule's header, DST) -- the start of a period partly in the
+# skipped hour is read with fold=0.
+_LATE_BY_THE_RULE = {("03-29", "partly_inside")}
+_STEP = timedelta(minutes=5)  # every shape's edges lie on it
 
 
 # The fold=0 readings of the starts that lie in the skipped hour.
@@ -142,4 +186,13 @@ def test_never_into_the_past_and_open_when_due(day: str, shape: str) -> None:
             # skipped hour, waited for at its fold=0 reading.
             assert day == "03-29", (now, answer)
             assert answer == _SKIPPED_READING[shape], (now, answer)
+        if (day, shape) in _LATE_BY_THE_RULE:
+            continue
+        # The earliest: nothing open between `now` and the answer, within
+        # the two days walked (past them every day is a plain one).
+        moment = now + _STEP
+        horizon = min(answer, start + timedelta(hours=30))
+        while moment < horizon:
+            assert not _allowed(moment, windows), (now, moment, answer)
+            moment += _STEP
     assert checked > 50, "the pair: the walk met deferrals"

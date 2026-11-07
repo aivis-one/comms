@@ -59,20 +59,29 @@ jobs:
       APP_ENV: ci
       DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+      # The package from the checkout, as the image has it from /app
+      # (Dockerfile, PYTHONPATH) -- not installed (REV-5, see below).
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # No token left in .git/config: the checkout is mounted into the
+        # containers the suite runs in (REV-5).
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
+      # Every package from the lock, hash-checked; the project itself is
+      # not installed (REV-5): `pip install -e .` built it with whatever
+      # setuptools the index served, no pin and no hash. PYTHONPATH
+      # (above) finds it, as the image does.
       - name: Install dependencies (pinned)
-        run: |
-          pip install -r requirements.lock
-          pip install -e . --no-deps
+        run: pip install -r requirements.lock
 
       - name: Lint (ruff)
         run: ruff check .
@@ -206,23 +215,27 @@ jobs:
       # value -- the suite replaces it anyway (tests/conftest.py).
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
       PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
+      # The package from the checkout, as in `checks` (REV-5).
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # No token left in .git/config: the checkout is mounted into the
+        # containers the suite runs in (REV-5).
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
-      # From the lock, so CI tests the package set the image ships --
-      # the project itself without deps, since the lock already has
-      # them and re-resolving would defeat the pin.
+      # From the lock, so CI tests the package set the image ships; the
+      # project itself is not installed -- PYTHONPATH (above), as the
+      # image (REV-5).
       - name: Install dependencies (pinned)
-        run: |
-          pip install -r requirements.lock
-          pip install -e . --no-deps
+        run: pip install -r requirements.lock
 
       # The pinned image, from deploy/docker-compose.yml. Ready is asked
       # over TCP: during initdb the image's temporary server listens on
@@ -296,6 +309,10 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # No token left in .git/config: the checkout is mounted into the
+        # containers the suite runs in (REV-5).
+        with:
+          persist-credentials: false
 
       # Only to read the compose file (PyYAML at the lock's version).
       - name: Set up Python 3.12
@@ -303,8 +320,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # PyYAML's own stanza of the lock -- its version and its hashes, one
+      # source -- installed hash-checked (REV-5; was a bare pin).
       - name: Read the compose file's pins
-        run: pip install pyyaml==6.0.3
+        run: |
+          awk '/^pyyaml==/{on=1} on && /^[a-z]/ && !/^pyyaml==/{exit} on && !/^ *#/{print}' requirements.lock > "$RUNNER_TEMP/pyyaml.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/pyyaml.txt"
 
       # Every image the compose file pins is pulled by its digest -- a pin
       # that does not resolve (a typo, a digest withdrawn) is red here,
