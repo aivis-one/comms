@@ -44,17 +44,21 @@ from app.profile.telegram_html import telegram_html_problem
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "profile"
 
 
-def _profile(tmp_path: Path, **changes: Any) -> Path:
+def _profile(
+    tmp_path: Path, ru: dict[str, str] | None = None, **changes: Any,
+) -> Path:
     """The fixture profile under tmp_path, en.yaml's leaves changed:
-    changes are "type.channel.field" (dots as "__") -> text."""
+    changes are "type.channel.field" (dots as "__") -> text; `ru` the
+    same for ru.yaml."""
     root = tmp_path / "profile"
     shutil.copytree(_FIXTURE, root)
-    path = root / "templates" / "en.yaml"
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    for dotted, text in changes.items():
-        type_key, channel, field = dotted.split("__")
-        doc.setdefault(type_key, {}).setdefault(channel, {})[field] = text
-    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    for locale, leaves in (("en", changes), ("ru", ru or {})):
+        path = root / "templates" / f"{locale}.yaml"
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for dotted, text in leaves.items():
+            type_key, channel, field = dotted.split("__")
+            doc.setdefault(type_key, {}).setdefault(channel, {})[field] = text
+        path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
     return root
 
 
@@ -119,9 +123,17 @@ class TestTelegramMarkup:
         assert words in refusal
 
     def test_a_tag_across_title_and_body_loads(self, tmp_path: Path) -> None:
-        """Telegram parses the title and the body as one text."""
+        """Telegram parses the title and the body as one text.
+
+        The ru body closes the tag too: a ru recipient gets the en title
+        (ru has none) over the ru body -- the check walks that chain since
+        it was found to check one locale alone (tests/
+        test_template_review_fixes.py); with the fixture's ru body
+        ("RU: {body}") the ru letter left "<i>" open, and this test, right
+        under the one-locale check, no longer held."""
         load_profile(FileProfileSource(_profile(
             tmp_path,
+            ru={"unit_event__telegram__body": "{body}</i>"},
             unit_event__telegram__title="<i>{title}",
             unit_event__telegram__body="{body}</i>",
         )))
@@ -144,8 +156,11 @@ class TestTelegramMarkup:
     def test_the_overlay_text_is_checked_over_the_base(
         self, tmp_path: Path,
     ) -> None:
+        # The ru body closes the tag as well, for the base to load under
+        # the chain check (see test_a_tag_across_title_and_body_loads).
         base = load_profile(FileProfileSource(_profile(
-            tmp_path, unit_event__telegram__title="<i>{title}",
+            tmp_path, ru={"unit_event__telegram__body": "{body}</i>"},
+            unit_event__telegram__title="<i>{title}",
             unit_event__telegram__body="{body}</i>",
         )))
         overlay = tmp_path / "overlay"

@@ -149,9 +149,13 @@ or asks a width or a precision above 4096 (`{x:99999999}`).
 (`""`, or spaces only) in `templates/{locale}.yaml` -- leave the field out
 instead, and the letter takes your own title and body (the default label
 for a button). A telegram title and body whose HTML Telegram would not
-parse, checked together as they are sent -- a tag Telegram does not
-support (`<div>`, `<br>`), one left open or closed out of order, a raw
-`<` (write `&lt;`): every letter of the type would be refused. An entry
+parse, checked together as they are sent, for a recipient of every
+locale of the profile -- each field by the chain the send walks (the
+recipient's locale, then `DEFAULT_LOCALE`), and a variable standing as a
+value with a link's characters -- a tag Telegram does not support
+(`<div>`, `<br>`), one left open or closed out of order, a raw `<`
+(write `&lt;`), a variable in an unquoted attribute (`<a href={link}>`
+-- quote it): every letter of the type would be refused. An entry
 in `templates/` that is not a `<locale>.yaml` file (`en.yml`, a
 directory); a hidden entry (`.gitkeep`, `.DS_Store`) is skipped. No
 `templates/` at all is a profile whose letters come as
@@ -194,7 +198,7 @@ fields further, and do not repeat them.
 | `lane` | one of `interactive`, `critical`, `normal`, `bulk` | `normal` | the lane its jobs travel in (`lane`, below) |
 | `push_on` | one of `outcome`, `outcome_and_deferral`, `none` | `none` | what comes back on the push stream (section 10) |
 | `recipient_schedule` | one of `respect`, `bypass` (not on an llm type) | `respect` | whether its deliveries wait for the recipient's allowed periods (`recipient_schedule`, below) |
-| `expires_after` | a duration: a whole number and `s`, `m`, `h` or `d` -- `30s`, `15m`, `24h`, `7d` | none | how long a request of the type stays deliverable; a request's own `expiry_at` wins (section 7) |
+| `expires_after` | a duration: a whole number and `s`, `m`, `h` or `d` -- `30s`, `15m`, `24h`, `7d`; at most `3650d` | none | how long a request of the type stays deliverable; a request's own `expiry_at` wins (section 7) |
 | `retry_max_attempts` | an integer, 1..100 | the deploy's `NOTIFICATION_MAX_DELIVERY_ATTEMPTS` | how many times one delivery is attempted -- a number, never a condition |
 | `retry_backoff_seconds` | an integer, 0..86400, not above the deploy's `NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS` | the deploy's `NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS` | the first wait between attempts, in seconds (0 = none); the waits grow from it up to that cap |
 | `max_body_chars` | an integer, 1..5000 (not on an llm type) | `5000` | the longest body a request of the type may carry; a longer one is refused at intake |

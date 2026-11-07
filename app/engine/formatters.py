@@ -1816,7 +1816,14 @@ def _escape_html_value(value: Any) -> Any:
     if isinstance(value, (int, float)) or value is None:
         return value
     if isinstance(value, dict):
-        return {key: _escape_html_value(item) for key, item in value.items()}
+        # The keys too: a template that prints the object whole
+        # ("{params}") prints its keys, and a key is the product's text
+        # as much as a value is. A path into it ("{params[name]}") names
+        # an identifier, which escaping leaves as it is.
+        return {
+            escape(key) if isinstance(key, str) else key: _escape_html_value(item)
+            for key, item in value.items()
+        }
     return escape(str(value))
 
 

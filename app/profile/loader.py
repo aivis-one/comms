@@ -179,7 +179,7 @@
 
 import re
 import string
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -315,7 +315,15 @@ _DEFAULT_RECIPIENT_SCHEDULE = RecipientSchedule.RESPECT.value
 # fractions, no compound forms ("1h30m"), no bare numbers -- a bare
 # number would leave the unit to be guessed.
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-_DURATION_RE = re.compile(r"^([1-9][0-9]*)([smhd])$")
+_DURATION_RE = re.compile(r"([1-9][0-9]*)([smhd])")
+# The longest duration a profile may declare: ten years, a term past
+# which "expires" and "keeps" both mean never. It fits what the durations
+# become -- llm_calls.answer_keep_seconds is an int32 (315 360 000 s of
+# 2 147 483 647), and an intake's now + expires_after stays a date --
+# whatever NOTIFICATION_RETENTION_DAYS is (0 is "keep forever", and then
+# answer_keep had no bound at all).
+_MAX_DURATION_DAYS = 3650
+_MAX_DURATION_SECONDS = _MAX_DURATION_DAYS * 86400
 
 
 # -----------------------------------------------------------------------------
@@ -648,13 +656,25 @@ def _check_answer_keep(value: Any) -> str | None:
 
 
 def _check_duration(value: Any) -> str | None:
-    if isinstance(value, str) and _DURATION_RE.match(value):
-        return None
-    return (
-        f"found {_describe(value)}; expected a duration literal: a "
-        f"positive integer and one unit of {', '.join(_DURATION_UNITS)} "
-        f"(e.g. \"15m\", \"24h\", \"7d\")"
-    )
+    """A duration literal -- the whole string, a trailing newline is not
+    one (fullmatch) -- of at most _MAX_DURATION_DAYS. The bound is held
+    by comparing the count with the unit's share of it, so a count of any
+    length is refused here, never multiplied into a timedelta that
+    overflows."""
+    match = _DURATION_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return (
+            f"found {_describe(value)}; expected a duration literal: a "
+            f"positive integer and one unit of {', '.join(_DURATION_UNITS)} "
+            f"(e.g. \"15m\", \"24h\", \"7d\")"
+        )
+    count, unit = int(match.group(1)), match.group(2)
+    if count > _MAX_DURATION_SECONDS // _DURATION_UNITS[unit]:
+        return (
+            f"found {value!r}; longer than {_MAX_DURATION_DAYS}d, the "
+            f"longest duration a profile may declare"
+        )
+    return None
 
 
 def _int_in_range(
@@ -697,7 +717,7 @@ def _backoff_base(value: Any) -> str | None:
 
 
 def _duration_value(literal: str) -> timedelta:
-    match = _DURATION_RE.match(literal)
+    match = _DURATION_RE.fullmatch(literal)
     assert match is not None  # checked by _check_duration first
     return timedelta(
         seconds=int(match.group(1)) * _DURATION_UNITS[match.group(2)],
@@ -894,14 +914,11 @@ def parse_profile(
         templates[locale] = _parse_template_tree(
             locale, doc, declared, violations,
         )
-        for type_key, channels in templates[locale].items():
-            problem = _telegram_markup_problem(channels.get("telegram"))
-            if problem is not None:
-                violations.append(Violation(
-                    f"{_TEMPLATES_SUBDIR}/{locale}.yaml", type_key,
-                    _TELEGRAM_TEXT,
-                    f"{type_key}.{_TELEGRAM_TEXT}: {problem}",
-                ))
+    for locale, type_key, problem in _telegram_markup_problems(templates):
+        violations.append(Violation(
+            f"{_TEMPLATES_SUBDIR}/{locale}.yaml", type_key, _TELEGRAM_TEXT,
+            f"{type_key}.{_TELEGRAM_TEXT} for a {locale} recipient: {problem}",
+        ))
 
     _raise_if_any(violations)
     return Profile(types=declared, templates=templates)
@@ -909,36 +926,77 @@ def parse_profile(
 
 # THE TELEGRAM TEXT IS CHECKED AS IT IS SENT (TPL-2): the title and the
 # body in one string, "\n\n" between, with ParseMode.HTML -- a tag may
-# open in the title and close in the body. A field without a template
-# stands as what the formatter puts there (the stored title in <b>, the
-# stored body), a template field as "1" (app/profile/telegram_html.py:
-# the values are escaped, so only the template's own text makes markup).
+# open in the title and close in the body. EACH FIELD COMES BY THE CHAIN
+# OF LOCALES THE SEND WALKS (the recipient's, then DEFAULT_LOCALE --
+# app/engine/template_engine.py _locale_chain), field by field: a ru
+# title over the en body is a letter a ru recipient gets, so it is checked
+# for every locale of the profile (a locale the profile has no texts in
+# gets DEFAULT_LOCALE's alone, checked as that locale). A field no locale
+# of the chain has stands as what the formatter puts there (the stored
+# title in <b>, the stored body); a template field as _FIELD_STANDS_AS.
 _TELEGRAM_TEXT = "telegram.title+body"
+# What a field stands as: a value the way it reaches the text -- escaped
+# ("&amp;") and with the characters of a link (":", "/"). Text and a
+# quoted attribute take it; an unquoted attribute does not, as it would
+# not take the link the letter carries (parse_html reads an unquoted
+# value as a name token: letters, digits, "." and "-").
+_FIELD_STANDS_AS = "x:/&amp;"
 
 
-def _telegram_markup_problem(fields: Mapping[str, Any] | None) -> str | None:
-    """Why Telegram refuses the text these telegram templates make, or
-    None (no title or body template, or markup it parses)."""
-    if not fields:
-        return None
-    title, body = fields.get("title"), fields.get("body")
-    if not isinstance(title, str) and not isinstance(body, str):
-        return None
-    text = (
-        (_fields_as_one(title) if isinstance(title, str) else "<b>1</b>")
-        + "\n\n"
-        + (_fields_as_one(body) if isinstance(body, str) else "1")
-    )
-    problem = telegram_html_problem(text)
-    if problem is None:
-        return None
-    return f"Telegram would not parse the HTML of every letter -- {problem}"
+def _telegram_markup_problems(
+    templates: Mapping[str, TemplateTree],
+) -> list[tuple[str, str, str]]:
+    """(locale, type, why) for every telegram text Telegram would refuse
+    to parse, the title and the body of each taken by the send's chain."""
+    default = settings.default_locale
+    problems: list[tuple[str, str, str]] = []
+    for locale in sorted(templates):
+        chain = [locale] if locale == default else [locale, default]
+        type_keys = sorted({
+            type_key for step in chain for type_key in templates.get(step, {})
+        })
+        for type_key in type_keys:
+            title, body = (
+                _first_text(templates, chain, type_key, field)
+                for field in ("title", "body")
+            )
+            if title is None and body is None:
+                continue
+            problem = telegram_html_problem(
+                (_fields_as_one(title) if title is not None else "<b>1</b>")
+                + "\n\n"
+                + (_fields_as_one(body) if body is not None else "1")
+            )
+            if problem is not None:
+                problems.append((
+                    locale, type_key,
+                    f"Telegram would not parse the HTML of every letter -- "
+                    f"{problem}",
+                ))
+    return problems
+
+
+def _first_text(
+    templates: Mapping[str, TemplateTree],
+    chain: Sequence[str],
+    type_key: str,
+    field: str,
+) -> str | None:
+    """The telegram text of `field` the send would take, or None."""
+    for step in chain:
+        value = (
+            templates.get(step, {}).get(type_key, {}).get("telegram", {})
+        ).get(field)
+        if isinstance(value, str):
+            return value
+    return None
 
 
 def _fields_as_one(template: str) -> str:
-    """The template with every field as "1" and "{{" "}}" as braces."""
+    """The template with every field as _FIELD_STANDS_AS and "{{" "}}" as
+    braces."""
     return "".join(
-        literal + ("" if name is None else "1")
+        literal + ("" if name is None else _FIELD_STANDS_AS)
         for literal, name, _, _ in string.Formatter().parse(template)
     )
 
@@ -1640,8 +1698,45 @@ def parse_overlay(raw: RawOverlay, base: Profile) -> dict[str, TemplateTree]:
         tree = _parse_overlay_file(locale, doc, base, variables, violations)
         if tree:
             result[locale] = tree
+    # The telegram text as it will be sent: the overlay's leaves over
+    # the base's, by the send's chain -- an en overlay reaches every
+    # locale that falls back to en. The base passed this check, so what
+    # is found here is the overlay's.
+    for locale, type_key, problem in _telegram_markup_problems(
+        _overlaid(base.templates, result),
+    ):
+        # Named by the overlay files of the chain -- the ones that made
+        # the text (an en overlay breaks a ru recipient's letter).
+        files = ", ".join(
+            f"{step}{_OVERLAY_SUFFIX}"
+            for step in dict.fromkeys((locale, settings.default_locale))
+            if step in result
+        )
+        violations.append(Violation(
+            _overlay_where(files), type_key, _TELEGRAM_TEXT,
+            f"{type_key}.{_TELEGRAM_TEXT} for a {locale} recipient: {problem}",
+        ))
     _raise_if_any(violations, _overlay_subject(raw.root))
     return result
+
+
+def _overlaid(
+    base: Mapping[str, TemplateTree], overlay: Mapping[str, TemplateTree],
+) -> dict[str, TemplateTree]:
+    """The base's templates with the overlay's leaves over them."""
+    merged: dict[str, TemplateTree] = {}
+    for locale, tree in base.items():
+        merged[locale] = {
+            type_key: {
+                channel: {
+                    **fields,
+                    **overlay.get(locale, {}).get(type_key, {}).get(channel, {}),
+                }
+                for channel, fields in channels.items()
+            }
+            for type_key, channels in tree.items()
+        }
+    return merged
 
 
 def _parse_overlay_file(
@@ -1751,18 +1846,6 @@ def _parse_overlay_file(
                 tree_channels[channel] = tree_fields
         if tree_channels:
             tree[type_key] = tree_channels
-            # The telegram text as it will be sent: the overlay's
-            # leaves over the base's (TPL-2).
-            replaced = tree_channels.get("telegram")
-            if replaced:
-                problem = _telegram_markup_problem(
-                    {**base_sheets.get("telegram", {}), **replaced},
-                )
-                if problem is not None:
-                    violations.append(Violation(
-                        where, type_key, _TELEGRAM_TEXT,
-                        f"{type_key}.{_TELEGRAM_TEXT}: {problem}",
-                    ))
     return tree
 
 

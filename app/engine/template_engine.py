@@ -126,21 +126,6 @@ class _LetterFormatter(Formatter):
         return str(super().format_field(value, format_spec))
 
 
-def _template_fields(template: str) -> list[str]:
-    """Every field path of a template, in the order format_map meets
-    them: a field, then the fields of its own format spec
-    ("{amount:{width}}" -> amount, width). The stdlib parser is the one
-    format_map uses (_string.formatter_parser)."""
-    fields: list[str] = []
-    for _, field_name, spec, _ in Formatter().parse(template):
-        if field_name is None:
-            continue
-        fields.append(field_name)
-        if spec:
-            fields.extend(_template_fields(spec))
-    return fields
-
-
 def _locale_chain(locale: str | None) -> tuple[str, ...]:
     """The locales a field is looked up in, in order: the requested
     one, then the deploy default. One copy for render, resolve_flag and
