@@ -69,7 +69,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DbSession, require_service_auth
+from app.api.deps import DbSession
 from app.api.paging import PAGE_LIMIT_DEFAULT, decode_cursor, page, page_limit
 from app.core.database import get_db_reader
 from app.engine.constants import DeliveryChannel
@@ -83,7 +83,6 @@ from app.engine.service import (
 router = APIRouter(
     prefix="/api/v1/recipients/{recipient_id}/inbox",
     tags=["inbox"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 

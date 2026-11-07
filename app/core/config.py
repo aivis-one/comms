@@ -423,7 +423,13 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # -- Application --
-    app_env: str = "development"
+    # CLOSED BY DEFAULT (REV-3): an absent APP_ENV is production -- the
+    # token is required to start, the schema endpoints are not mounted.
+    # Only an EXPLICIT APP_ENV=development runs without a token: a lost
+    # variable (an .env assembled by hand, a compose override) closes
+    # the API instead of opening it. Rejected: APP_ENV required with no
+    # default -- a box with an older .env would not start at all.
+    app_env: str = "production"
     log_level: str = "INFO"
 
     # -- Database (dedicated comms database inside the product Postgres) --
@@ -478,10 +484,10 @@ class Settings(BaseSettings):
     # -- Service-to-service authorization (Phase 3b item 1) --
     # The comms API is INTERNAL (arch decision 14): only the product
     # backend calls it, over the shared Docker network, presenting this
-    # shared secret as "Authorization: Bearer <token>". Verified by the
-    # FastAPI dependency in app/api/deps.py. NEVER logged (same
-    # principle as the formatter's secret sanitizer).
-    # Empty token: startup ERROR outside development (an
+    # shared secret as "Authorization: Bearer <token>". Verified before
+    # anything of the request is read (app/api/service_auth.py). NEVER
+    # logged (same principle as the formatter's secret sanitizer).
+    # Empty token: startup ERROR outside an explicit development (an
     # unauthenticated "internal" API is effectively open) -- the same
     # axis as DATABASE_URL. In development an empty token disables auth
     # with a loud startup warning (app/main.py).
@@ -714,7 +720,7 @@ class Settings(BaseSettings):
 
     @property
     def is_dev(self) -> bool:
-        """True when running in development mode."""
+        """True only under an explicit APP_ENV=development."""
         return self.app_env == "development"
 
     @property

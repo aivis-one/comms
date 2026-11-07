@@ -223,7 +223,9 @@ async def _case(verb: str, *, actor_holds: bool = False) -> _Case:
     """A section thread and an actor ON the roster who may run `verb`.
 
     `actor_holds` -- the actor is the thread's assignee (the branch of
-    can_operate that ignores the roster); claim has no such case.
+    can_operate that ignores the roster). Claim's own such case -- the
+    assignee's repeat, answered before the roster -- is held in
+    tests/test_answer_as_first.py.
     """
     actor, holder, colleague = [await _recipient() for _ in range(3)]
     section = await _section(actor, holder, colleague)

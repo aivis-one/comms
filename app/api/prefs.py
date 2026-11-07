@@ -28,10 +28,10 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DbSession, require_service_auth
+from app.api.deps import DbSession
 from app.audience.prefs import (
     RecipientPreferences,
     get_preferences,
@@ -45,7 +45,6 @@ from app.profile.registry import registry
 router = APIRouter(
     prefix="/api/v1/recipients/{recipient_id}/preferences",
     tags=["preferences"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 
@@ -173,7 +172,9 @@ class PreferencesPatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    categories: dict[str, bool] | None = None
+    # StrictBool (REV-3): lax mode read "off" or 0 as false -- a mute
+    # the product never sent.
+    categories: dict[str, StrictBool] | None = None
     # None is meaningful (clear the schedule) -- presence is checked
     # via model_fields_set, not via the value. A LIST, not an object:
     # a recipient has as many allowed periods as their week needs, and

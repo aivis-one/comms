@@ -17,8 +17,8 @@
 #                               -> TestWindow
 #   M5 counts added to the /health body
 #                               -> TestHealthUnchanged
-#   M6 require_service_auth dropped from the router
-#                               -> TestAuth
+#   M6 the service token not asked (app/api/service_auth.py taken out
+#      of the app)            -> TestAuth
 #   M7 a write on the read path
 #                               -> TestNothingStored
 #   M8 the index of migration 0018 dropped

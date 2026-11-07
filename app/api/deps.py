@@ -4,8 +4,10 @@
 #
 # Phase 3b item 1. The comms API is internal (arch decision 14): its
 # only caller is the product backend, which presents the shared secret
-# as "Authorization: Bearer <token>". This dependency guards every
-# /api/v1 router.
+# as "Authorization: Bearer <token>". require_service_auth is the check;
+# it is asked by the outermost middleware (app/api/service_auth.py,
+# REV-3) before anything of the request is read -- not as a dependency:
+# FastAPI parses a JSON body before it solves any dependency.
 #
 # THE TRUST MODEL -- the service token is the ONLY thing comms checks.
 # Every actor named in a request (participant, operator, sender,
@@ -24,8 +26,9 @@
 #   - an auth failure is logged WITHOUT the presented value.
 #
 # EMPTY TOKEN:
-#   - outside development -> unreachable here: startup validation in
-#     app/core/config.py refuses to boot without the token;
+#   - outside an explicit development (an absent APP_ENV is production)
+#     -> unreachable here: startup validation in app/core/config.py
+#     refuses to boot without the token;
 #   - development -> auth is DISABLED (local dev without the bearer
 #     ceremony); app/main.py logs a loud warning at startup so an open
 #     API is visible, not silent.
@@ -52,7 +55,7 @@ from collections import Counter
 from typing import Annotated, Any
 
 import structlog
-from fastapi import Depends, Header, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -83,16 +86,15 @@ def _unauthorized() -> HTTPException:
 _BEARER_SCHEME = "bearer"
 
 
-async def require_service_auth(
-    authorization: str | None = Header(default=None),
-) -> None:
-    """FastAPI dependency: verify the service-to-service bearer token.
+async def require_service_auth(authorization: str | None) -> None:
+    """Verify the service-to-service bearer token.
 
     Raises HTTP 401 when the Authorization header is missing, is not
     a Bearer scheme (in any case: `bearer`, `BEARER`), or carries a
     token that does not match COMMS_SERVICE_TOKEN. No-op when the token
-    is unset (development only -- any other APP_ENV refuses to start
-    without it).
+    is unset (an explicit development only -- any other APP_ENV, an
+    absent one included, refuses to start without it). Asked by
+    app/api/service_auth.py RequireServiceToken for every request.
     """
     expected = settings.comms_service_token
     if not expected:
@@ -160,8 +162,9 @@ async def refuse_unstorable_body(request: Request) -> None:
     One check for every route, as refuse_repeated_query is: a route
     added later is covered without being named. A body that is not JSON
     is left alone -- the framework refuses it (422, or 400 for one it
-    cannot decode). The body is read once by Starlette and cached; the
-    route's model reads the same bytes.
+    cannot decode); one nested past the parser's depth is a 422 here.
+    The body is read once by Starlette and cached; the route's model
+    reads the same bytes.
     """
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return
@@ -172,6 +175,13 @@ async def refuse_unstorable_body(request: Request) -> None:
         data: Any = json.loads(raw)
     except ValueError:
         return
+    except RecursionError:
+        # Nested past the parser's depth (REV-3): the caller's input, not
+        # comms' failure. Reached on a route with no body model -- on one
+        # with a model FastAPI has already failed to parse it (its 400).
+        raise ValidationError(
+            "the body is nested deeper than its JSON can be read"
+        ) from None
     if not isinstance(data, dict):
         if holds_unstorable(data):
             raise ValidationError(f"the body holds {UNSTORABLE}")

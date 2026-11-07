@@ -12,7 +12,9 @@
 # validation, naming the offending inputs. The mapping:
 #
 #   ValidationError, request validation  -> 422  validation
-#   the service token (app/api/deps.py)  -> 401  unauthorized
+#   the service token                     -> 401  unauthorized
+#     (app/api/service_auth.py: answered through error_response by the
+#     outermost middleware, before routing -- so before 404 / 405 too)
 #   AuthorizationError                   -> 403  forbidden
 #   NotFoundError, an unknown route      -> 404  not_found
 #   a known route, another method        -> 405  method_not_allowed
@@ -31,9 +33,9 @@
 #     (UnhandledErrorMiddleware: the class and the place to the log,
 #     nothing of the exception to the caller)
 #
-# Starlette's own HTTPException (401 from the token dependency, the
-# router's 404 / 405) is mapped here too, so no response leaves the
-# service in the framework's default {"detail": ...} shape.
+# Starlette's own HTTPException (the router's 404 / 405) is mapped here
+# too, so no response leaves the service in the framework's default
+# {"detail": ...} shape.
 #
 # The messages of the service exceptions are returned verbatim. That is
 # safe because of WHERE they are written: every one is raised by our own
@@ -198,7 +200,7 @@ def register_error_handlers(app: FastAPI) -> None:
     async def _http(
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
-        """The token dependency's 401, the router's 404 / 405 -- and any
+        """The router's 404 / 405 -- and any
         other client status the framework raises (a 400 for a body it
         cannot read): `bad_request`, never `internal`, which says the
         failure is ours (API-2)."""

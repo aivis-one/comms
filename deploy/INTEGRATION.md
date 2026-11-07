@@ -591,16 +591,16 @@ body, with a class a program can branch on:
 | status | class | when |
 |---|---|---|
 | 400 | `bad_request` | the request could not be read -- a body that is not UTF-8 JSON; any other client status this table does not list travels with this class too. Fix the request; repeating it changes nothing |
-| 401 | `unauthorized` | the service token is missing or wrong |
+| 401 | `unauthorized` | the service token is missing or wrong -- asked first, on every path but `/health` and `/ready`, before anything of the request is read: without it an unknown route, another method, a body of any size or shape is this 401 too |
 | 403 | `forbidden` | the actor has no role in this thread |
-| 404 | `not_found` | the entity or the route does not exist |
-| 405 | `method_not_allowed` | the route exists, the method does not |
+| 404 | `not_found` | the entity or the route does not exist (a route: with the token) |
+| 405 | `method_not_allowed` | the route exists, the method does not (with the token) |
 | 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator, or changed by another call while it was being assigned or released (section 14) |
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
-| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value |
+| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
@@ -645,14 +645,16 @@ never meaningful. Build the query from a mapping, one value per key.
 same key with the same request -- method, path with its query, body
 bytes -- answers with the SAME thread or message in its current state,
 and pings nobody again; the same key with another request is a 409
-`conflict`. Every other mutating call is safe to repeat by
+`conflict`. This holds when two requests with one key race as well: the
+one that loses the insert answers as the creating request (`created:
+true`, the same thread) or, with another body, the 409. Every other mutating call is safe to repeat by
 construction, so it takes no key:
 
 | call | why a repeat is safe |
 |---|---|
 | `PUT /recipients/{id}` | a versioned snapshot: the version is its key |
 | `DELETE /recipients/{id}` | forgetting twice is forgetting once |
-| `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
+| `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to -- even after the roster has dropped them since; a user thread is never claimed (403) --, 409 for anyone else |
 | `POST /threads/{id}/assign` | answers "whose is it now": a thread already with that assignee is returned as it is |
 | `POST /threads/{id}/release` | a thread already in the pool is returned as it is |
 | `DELETE /threads/{id}` | a thread that is not there -- never was, or already deleted -- is answered as one deleted: 204 |

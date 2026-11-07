@@ -121,7 +121,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DbSession, require_service_auth
+from app.api.deps import DbSession
 from app.api.idempotency import (
     IDEMPOTENCY_HEADER,
     request_fingerprint,
@@ -133,6 +133,7 @@ from app.api.paging import (
     encode_cursor,
     page,
     page_limit,
+    utc_instant,
 )
 from app.core.constants import MAX_IDEMPOTENCY_KEY_LEN, PAGE_LIMIT_MAX
 from app.core.database import (
@@ -204,7 +205,6 @@ from app.variants import reader_states, write_request, write_variant
 router = APIRouter(
     prefix="/api/v1/threads",
     tags=["messaging"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 # Sections get their OWN router rather than a path under /threads: a
@@ -217,7 +217,6 @@ router = APIRouter(
 sections_router = APIRouter(
     prefix="/api/v1/sections",
     tags=["messaging"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 # Participants get their own router for the same reason sections do: a
@@ -228,7 +227,6 @@ sections_router = APIRouter(
 participants_router = APIRouter(
     prefix="/api/v1/participants",
     tags=["messaging"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 
@@ -400,8 +398,10 @@ class ThreadCreateIn(BaseModel):
         default=None, max_length=MAX_SUBJECT_ID_LEN,
     )
     title: str | None = Field(default=None, max_length=MAX_THREAD_TITLE_LEN)
+    # Strict (REV-3): lax mode read "1" and `true` as priority 1.
     priority: int | None = Field(
         default=None, ge=MIN_THREAD_PRIORITY, le=MAX_THREAD_PRIORITY,
+        strict=True,
     )
 
 
@@ -598,6 +598,18 @@ class ReadIn(BaseModel):
     participant: UUID
     last_read_at: datetime | None = None
 
+    @field_validator("last_read_at")
+    @classmethod
+    def _in_utc_range(cls, value: datetime | None) -> datetime | None:
+        """A time without a zone is read as UTC (tolerated, as always);
+        one that leaves the range once moved to UTC is a 422 naming the
+        field (REV-3) -- it reached the driver's conversion as a 500."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return utc_instant(value)
+
 
 class UnreadCountsIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -698,8 +710,23 @@ async def create_thread(
             raise
         # A concurrent request with this key won the insert.
         winner = await _replay(session, Thread, key, fingerprint)
-        assert winner is not None
+        if winner is None:
+            # The winner was deleted (DELETE /threads/{id}) between the
+            # collision and this read: no row carries the key any more.
+            # A 500, as before -- the case has no answer of its own yet.
+            raise
         return {**_thread_out(winner), "created": True}
+    if not created and thread.idempotency_key == key:
+        # THE SAME KEY LOST THE RACE ON THE DEDUP INDEX (REV-3): Postgres
+        # may report the conversation's own unique index before the
+        # key's, and create_or_get_thread then answers "found" with the
+        # thread a concurrent request with THIS key inserted. That is the
+        # key's business, not the dedup's: the key's rule (_replay) --
+        # the same request is the creating request again (`created:
+        # true`), another request with the key is a 409.
+        replayed = await _replay(session, Thread, key, fingerprint)
+        if replayed is not None:
+            return {**_thread_out(replayed), "created": True}
     return {**_thread_out(thread), "created": created}
 
 
@@ -805,12 +832,18 @@ async def list_threads(
     "nothing unread here" and be indistinguishable from a thread the
     operator has fully read.
     """
-    if (operator is None) == (client is None):
+    # The reader is decided once, by construction: exactly one of the two
+    # (REV-3 -- was an assert further down, gone under `python -O`).
+    if client is not None and operator is None:
+        reader, of_client = client, True
+    elif operator is not None and client is None:
+        reader, of_client = operator, False
+    else:
         raise ValidationError(
             "exactly one of operator / client: the reader whose threads "
             "are listed"
         )
-    if client is not None and is_supervisor:
+    if of_client and is_supervisor:
         raise ValidationError(
             "is_supervisor widens an operator's read; a client's list has "
             "no such widening"
@@ -820,20 +853,17 @@ async def list_threads(
             "locale applies to the last message: send with_last_message=true"
         )
     _checked_locale(locale)
-    if client is not None:
-        reader = client
+    if of_client:
         threads, next_cursor = await list_client_threads(
             session,
-            client=client,
+            client=reader,
             limit=page_limit(limit),
             cursor=decode_cursor(cursor),
         )
     else:
-        assert operator is not None  # exactly one of the two, above
-        reader = operator
         threads, next_cursor = await list_visible_threads(
             session,
-            operator=operator,
+            operator=reader,
             is_supervisor=is_supervisor,
             limit=page_limit(limit),
             cursor=decode_cursor(cursor),
@@ -1126,9 +1156,7 @@ async def mark_thread_read(
     """
     await _require_thread(session, thread_id)
     now = datetime.now(UTC)
-    requested = payload.last_read_at
-    if requested is not None and requested.tzinfo is None:
-        requested = requested.replace(tzinfo=UTC)  # tolerate naive input
+    requested = payload.last_read_at  # zoned and in range (ReadIn)
     when = min(requested, now) if requested is not None else now
     await mark_read(
         session,
@@ -1171,15 +1199,25 @@ async def claim(
     The row is taken before WHO is decided, and WHO is decided on locked
     rows (API-1, app/messaging/membership.py THE RIGHT IS TAKEN): a
     removal from the roster cannot land between the check and the
-    claim."""
+    claim.
+
+    THE ASSIGNEE IS ANSWERED BEFORE THE ROSTER IS ASKED (REV-3): a claim
+    repeated after a lost answer is that claim again -- the thread is
+    the caller's, read on the taken row, so it is 200 `claimed` even if
+    the roster has dropped the operator since (the first answer was
+    200). The FORM is asked first all the same: a user thread is never
+    claimed, not even by its master -- no first claim of one was ever
+    answered 200."""
     thread = await take_thread(session, thread_id)
+    # Two refusals, one class (API-2): the form, or the roster.
+    if thread.operator_kind != OperatorKind.SECTION:
+        raise AuthorizationError(
+            "a user thread's operator is fixed by the form; only a "
+            "section thread is claimed"
+        )
+    if thread.assignee == payload.operator:
+        return {"claimed": True, "thread": _thread_out(thread)}
     if not await can_claim(session, thread, payload.operator):
-        # Two refusals, one class (API-2): the form, or the roster.
-        if thread.operator_kind != OperatorKind.SECTION:
-            raise AuthorizationError(
-                "a user thread's operator is fixed by the form; only a "
-                "section thread is claimed"
-            )
         raise AuthorizationError(
             "the operator does not serve the thread's section"
         )

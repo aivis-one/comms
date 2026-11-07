@@ -42,7 +42,6 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
 from app.api.paging import (
     PAGE_LIMIT_DEFAULT,
     decode_cursor,
@@ -71,7 +70,6 @@ from app.engine.service import (
 router = APIRouter(
     prefix="/api/v1/notifications/by-key",
     tags=["jobs"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 # -----------------------------------------------------------------------------

@@ -7,7 +7,8 @@
 # included, behind the service token; reading it changes nothing.
 #
 # MUTATIONS these tests were written against (each turns one red):
-#   M6  require_service_auth dropped from the router  -> TestAuth
+#   M6  the service token not asked (RequireServiceToken out of the
+#       app)                                          -> TestAuth
 #   M7  a write on the read path                      -> TestNothingChanges
 #   M9  an address in an item                         -> TestNoAddress
 #   M10 newest first        -> TestPaging.test_a_recipient_created_...

@@ -20,7 +20,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
 from app.api.jobs import read_only_snapshot
 from app.api.paging import (
     PAGE_LIMIT_DEFAULT,
@@ -34,7 +33,6 @@ from app.engine.changes import Position, list_changes
 router = APIRouter(
     prefix="/api/v1/notifications",
     tags=["jobs"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 # The closed field set of an item -- the table in INTEGRATION.md §9.

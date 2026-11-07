@@ -70,6 +70,7 @@ __all__ = [
     "page",
     "page_by_seq",
     "page_limit",
+    "utc_instant",
 ]
 
 _SEQ_PREFIX = "seq:"
@@ -103,16 +104,24 @@ def _bigint(text: str) -> int:
     return int(digits)
 
 
-def _instant(text: str) -> datetime:
-    """A time with its zone, convertible to UTC, or ValueError."""
-    when = datetime.fromisoformat(text)
-    if when.tzinfo is None:
-        raise ValueError("the time carries no zone")
+def utc_instant(when: datetime) -> datetime:
+    """`when`, a time with its zone, if it stays in range once moved to
+    UTC -- the driver's own conversion (9999-12-31 at -05:00 overflows)
+    -- or ValueError. The one rule for every time the API takes: the
+    cursors here, a read pointer (app/api/messaging.py ReadIn)."""
     try:
         when.astimezone(UTC)
     except OverflowError:
         raise ValueError("the time leaves the range once moved to UTC") from None
     return when
+
+
+def _instant(text: str) -> datetime:
+    """A time with its zone, convertible to UTC, or ValueError."""
+    when = datetime.fromisoformat(text)
+    if when.tzinfo is None:
+        raise ValueError("the time carries no zone")
+    return utc_instant(when)
 
 
 def page_limit(value: int) -> int:
