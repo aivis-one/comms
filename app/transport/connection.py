@@ -24,9 +24,12 @@
 # THE CONNECTION IS CHECKED (review 3.14.0, 2.3). redis-py 5 retries no
 # command by default, so a connection that died while idle fails the
 # first command sent on it -- an XACK after a commit among them.
-# health_check_interval: a connection idle longer than
-# REDIS_HEALTH_CHECK_SECONDS is PINGed before its next command, and a
-# dead one is dropped there and then (an error, which the caller's own
+# health_check_interval: a connection is PINGed before the FIRST command
+# it carries -- redis-py starts every connection with the check due, so
+# the PING comes ahead of the CLIENT SETINFO of its handshake -- and
+# before any command after an idle longer than REDIS_HEALTH_CHECK_SECONDS.
+# A PING not answered PONG drops the connection there and then (an
+# error, which the caller's own
 # retry meets on a fresh connection: the consumer's ack,
 # app/transport/consumer.py _ack_until_done; the relay's next tick).
 # 30 s: the consumer reads at least once per CONSUMER_BLOCK_MS (at most

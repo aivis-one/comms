@@ -177,7 +177,8 @@ CHANGES_SCAN_ROWS = 5000
 REDIS_TIMEOUT_MARGIN_SECONDS = 10.0
 
 # How long a redis connection may idle before it is PINGed ahead of its
-# next command (app/transport/connection.py, THE CONNECTION IS CHECKED).
+# next command; every connection is PINGed before its first command as
+# well (app/transport/connection.py, THE CONNECTION IS CHECKED).
 REDIS_HEALTH_CHECK_SECONDS = 30.0
 
 # The push relay (P3-1, app/transport/push_relay.py): how often it looks
