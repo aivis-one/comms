@@ -45,15 +45,26 @@ from typing import Any
 #   1. the Authorization header, scheme included -- before bearer, so
 #      "Authorization: Basic x" loses its credentials and not just the
 #      word "Basic";
-#   2. bearer on its own (a token with no header name in front);
-#   3. userinfo in a URL/DSN, EMPTY user allowed, and the password runs
-#      to the LAST @ of the authority (a raw @ in a password must not
-#      leave its tail behind);
-#   4. token-shaped values with no keyword next to them;
-#   5. key=value / key: value for credential keywords (SAN-1), in two
-#      passes -- a query parameter first, then every other form:
+#   2. key=value / key: value for credential keywords (SAN-1) -- BEFORE
+#      the shapes below (REV-4b): a shape that took the start of a value
+#      ("password=sk-...", "token=<48 hex>") left its tail behind, since
+#      the pair does not extend a value already [redacted]; the pair now
+#      takes the whole value first, so "password=sk-... more" is
+#      "password=[redacted]" -- up to the boundary, the pair's own rule;
+#   3. bearer on its own (a token with no header name in front);
+#   4. userinfo in a URL/DSN, EMPTY user allowed, the password running
+#      to the @ that ends the authority -- a raw @ or / in a password
+#      (base64 has /) leaves no tail. THE PRICE: an @ in the path after
+#      a port with no userinfo ("https://host:443/a@b") takes "443/a" --
+#      text cleaned that need not be, never a secret left;
+#   5. token-shaped values with no keyword next to them.
+#   Pattern 2 in detail, in two passes -- a query parameter first, then
+#   every other form:
 #      - THE KEY is a credential word (password, passwd, pwd, token,
-#        secret, api_key/api-key/apikey, authorization) with any
+#        secret, api_key/api-key/apikey, authorization, secret_key,
+#        private_key, credential/credentials -- REV-4b; never a bare
+#        "key": idempotency_key and correlation_key are on every line
+#        comms writes) with any
 #        prefix joined by _ or - (access_token, db_password,
 #        comms_service_token, x-api-key), quoted or not ("password":,
 #        'password':). A word that only CONTAINS one does not count:
@@ -71,7 +82,7 @@ from typing import Any
 #        is what keeps the text after a redacted header and makes the
 #        pass idempotent.
 #    The separator is kept as written (key: [redacted], key=[redacted]).
-#    THE PRICE of pattern 5, by design: a secret that itself contains
+#    THE PRICE of pattern 2, by design: a secret that itself contains
 #    , ; & ) ] } leaves the part after that character behind; the text
 #    after an unquoted value on the same line, up to that boundary, is
 #    eaten with it ("token=abc rest" -> "token=[redacted]"). The limit:
@@ -82,7 +93,9 @@ _AUTH_HEADER_RE = re.compile(
     r"(?i)\b(authorization)\b\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+"
 )
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
-_URL_USERINFO_RE = re.compile(r"(://[^/\s:@]*:)[^/\s]*(@)")
+_URL_USERINFO_RE = re.compile(
+    r"(://[^/\s:@]*:)\S*?(@)(?=[^\s@/?#]*(?:[/?#]|\s|$))"
+)
 _TELEGRAM_TOKEN_RE = re.compile(r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}")
 _MAILGUN_KEY_RE = re.compile(
     r"(?i)\b(?:key-[0-9a-f]{32}|[0-9a-f]{32}-[0-9a-f]{8}-[0-9a-f]{8})\b"
@@ -115,7 +128,8 @@ _LLM_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
 _LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{48,}\b")
 _KEY = (
     r"\b(?:[a-z0-9]+[_-])*"
-    r"(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|authorization)"
+    r"(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|authorization"
+    r"|secret[_-]?key|private[_-]?key|credentials?)"
 )
 _REDACTED = "[redacted]"
 _QUERY_KEYVAL_RE = re.compile(
@@ -135,7 +149,7 @@ _KEYVAL_RE = re.compile(
 
 
 def _keyval_redacted(match: re.Match[str]) -> str:
-    """Pattern 5's replacement: the key and separator as written, the
+    """Pattern 2's replacement: the key and separator as written, the
     value's quotes kept around [redacted]."""
     head, value = match.group(1), match.group(2)
     if value[0] in "\"'":
@@ -150,18 +164,29 @@ def sanitize_text(text: str) -> str:
     Idempotent: sanitize_text(sanitize_text(x)) == sanitize_text(x).
     Callers cut AFTER calling this, never before: a cut through the
     middle of a secret can leave a prefix no pattern recognises. The
-    gaps in coverage: the KNOWN CEILING on _LONG_HEX_RE, and pattern 5's
+    gaps in coverage: the KNOWN CEILING on _LONG_HEX_RE, and pattern 2's
     price and its camelCase limit (the list above).
     """
     text = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _QUERY_KEYVAL_RE.sub(rf"\1{_REDACTED}", text)
+    text = _KEYVAL_RE.sub(_keyval_redacted, text)
     text = _BEARER_RE.sub("bearer [redacted]", text)
     text = _URL_USERINFO_RE.sub(r"\1[redacted]\2", text)
     text = _TELEGRAM_TOKEN_RE.sub("[redacted]", text)
     text = _MAILGUN_KEY_RE.sub("[redacted]", text)
     text = _LLM_KEY_RE.sub("[redacted]", text)
-    text = _LONG_HEX_RE.sub("[redacted]", text)
-    text = _QUERY_KEYVAL_RE.sub(rf"\1{_REDACTED}", text)
-    return _KEYVAL_RE.sub(_keyval_redacted, text)
+    return _LONG_HEX_RE.sub("[redacted]", text)
+
+
+_SECRET_NAME_RE = re.compile(rf"(?i){_KEY}")
+
+
+def is_secret_name(name: str) -> bool:
+    """Whether a NAME -- a field of a log event, a key of a dict in one
+    -- is a credential's (REV-4b): the key of pattern 2, the whole name.
+    One rule with the text: "password", "x-api-key", "db_secret_key" are;
+    "passwords_match", "max_tokens", "idempotency_key" are not."""
+    return _SECRET_NAME_RE.fullmatch(name) is not None
 
 
 _APP_ROOT = Path(__file__).resolve().parents[1]

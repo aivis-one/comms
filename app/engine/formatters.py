@@ -1047,7 +1047,11 @@ class EmailFormatter:
                 f"provider rate limit (429){_reason_tail(reason, 200)}"
             )
 
-        if status in _EMAIL_CONFIG_STATUSES or (
+        # A redirect is the channel's too (REV-4b): httpx follows none,
+        # and a 3xx to a POST says EMAIL_API_BASE_URL is not the API's
+        # address -- every message would get the same, as the llm
+        # channel already reads it.
+        if status in _EMAIL_CONFIG_STATUSES or 300 <= status < 400 or (
             status in _EMAIL_SENDER_FAULT_STATUSES
             and _looks_like_sender_fault(message)
         ):
@@ -1059,8 +1063,8 @@ class EmailFormatter:
             )
 
         # Everything else -- a 400 on the recipient, a 400 or 404 whose
-        # body did not name the sender, any other 4xx and a 3xx -- is ONE
-        # message failing.
+        # body did not name the sender, any other 4xx -- is ONE message
+        # failing.
         # Deliberately conservative: mistaking a channel fault for a
         # single message costs one email, the opposite declares a live
         # channel dead on an unparsed reply. The body is logged so the
@@ -1179,7 +1183,8 @@ LLM_GATEWAY_ROUTING: dict[str, Any] = {
 _LLM_PATH = "/chat/completions"
 
 # HTTP statuses that mean the SET is wrong, not this request: the key
-# (401, 403), the credit on the key (402 -- spec §14.12 item 6: "a
+# (401, 403 -- unless a policy declined the request, _declined_by_policy),
+# the credit on the key (402 -- spec §14.12 item 6: "a
 # configuration failure, the channel is dead, fix the deploy"), the
 # model the set names (404). A redirect means the endpoint is wrong.
 _LLM_CONFIG_STATUSES = frozenset({401, 402, 403, 404})
@@ -1272,6 +1277,33 @@ def _error_text(status: int, error: Any) -> str:
     return "; ".join(parts)
 
 
+# A 403 that declines THIS request, not the key (REV-4b): OpenRouter's
+# documented shapes (openrouter.ai/docs/api_reference/errors-and-
+# debugging) -- a moderation flag (`metadata.reasons`), a guardrail's
+# content filter (`metadata.patterns`), a typed policy decline
+# (`metadata.error_type` content_policy_violation or refusal). Read by
+# the KEYS of the provider's metadata, never by its text: flagged_input
+# is the letter's, and comms does not read it. Every other 403 -- no
+# body, a spent budget (`metadata.limit_source`), permissions -- stays
+# the set's configuration.
+_POLICY_DECLINES = frozenset({"content_policy_violation", "refusal"})
+
+
+def _declined_by_policy(error: Any) -> bool:
+    """Whether a provider's 403 error object declines the request on a
+    policy (the letter's), rather than the key's rights or budget."""
+    if not isinstance(error, dict):
+        return False
+    metadata = error.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        "reasons" in metadata
+        or "patterns" in metadata
+        or metadata.get("error_type") in _POLICY_DECLINES
+    )
+
+
 def _error_code(error: Any) -> int | None:
     """The HTTP-like code a provider put in an error object (a gateway
     reports a failure inside a 200 so -- its documented error shape is
@@ -1318,6 +1350,8 @@ def interpret_llm_response(
             # the code the provider put there.
             code = _error_code(error)
             text = f"{_error_text(status, error)} (inside the answer)"
+            if code == 403 and _declined_by_policy(error):
+                return _SetFailure(set_name, _SetOutcome.REJECTED, text)
             if code in _LLM_CONFIG_STATUSES:
                 return _SetFailure(set_name, _SetOutcome.CONFIGURATION, text)
             if code == 429:
@@ -1346,6 +1380,8 @@ def interpret_llm_response(
         )
 
     text = _error_text(status, error)
+    if status == 403 and _declined_by_policy(error):
+        return _SetFailure(set_name, _SetOutcome.REJECTED, text)
     if status in _LLM_CONFIG_STATUSES or 300 <= status < 400:
         return _SetFailure(set_name, _SetOutcome.CONFIGURATION, text)
     if status == 429:
@@ -1791,13 +1827,15 @@ def _request_may_have_arrived(exc: Exception) -> bool:
     """True when the request could already be at the provider.
 
     A connect failure never produced a message; a read timeout may
-    have. The provider offers no idempotency on this endpoint, so the
-    distinction cannot PREVENT a duplicate -- it only makes it
-    attributable afterwards. Named by class rather than by an httpx
-    import: this module must stay importable on a deploy without email.
+    have. A pool timeout never got a connection to send on (REV-4b: it
+    was counted with the reads). The provider offers no idempotency on
+    this endpoint, so the distinction cannot PREVENT a duplicate -- it
+    only makes it attributable afterwards. Named by class rather than
+    by an httpx import: this module must stay importable on a deploy
+    without email.
     """
     name = type(exc).__name__
-    return "Read" in name or "Pool" in name or "Remote" in name
+    return "Read" in name or "Remote" in name
 
 
 def _escape_html_variables(variables: dict[str, Any]) -> dict[str, Any]:

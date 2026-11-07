@@ -36,7 +36,9 @@ from typing import Any
 import structlog
 
 from app.core.config import settings
-from app.core.sanitize import sanitize_text, sanitized_traceback
+from app.core.sanitize import is_secret_name, sanitize_text, sanitized_traceback
+
+_REDACTED = "[redacted]"
 
 # The fields of a log event NOT sanitized by value: the keys that join a
 # product's own logs to comms' (spec §6.6 -- "one thread through both
@@ -77,8 +79,17 @@ def _sanitized(value: Any, path: frozenset[int] = frozenset()) -> Any:
         return sanitize_text(repr(value))
     inner = path | {id(value)}
     if isinstance(value, dict):
-        return {key: _sanitized(item, inner) for key, item in value.items()}
+        return {key: _field(key, item, inner) for key, item in value.items()}
     return type(value)(_sanitized(item, inner) for item in value)
+
+
+def _field(name: Any, value: Any, path: frozenset[int] = frozenset()) -> Any:
+    """A named value -- a field of the event, a key of a dict in it: a
+    credential's name hides its value whole, whatever its type
+    (is_secret_name, REV-4b); any other is walked as above."""
+    if isinstance(name, str) and is_secret_name(name):
+        return _REDACTED
+    return _sanitized(value, path)
 
 
 def sanitize_event(
@@ -89,7 +100,7 @@ def sanitize_event(
     runs after format_exc_info. CORRELATION_FIELDS pass whole."""
     for key, value in event_dict.items():
         if key not in CORRELATION_FIELDS:
-            event_dict[key] = _sanitized(value)
+            event_dict[key] = _field(key, value)
     return event_dict
 
 

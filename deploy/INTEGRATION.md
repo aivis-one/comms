@@ -487,8 +487,9 @@ and a `400` or `404` whose JSON message names the sender -- a domain the
 provider does not have (`404`, "Domain not found"), one not verified, a
 sender outside it -- are the channel: `failed`, `configuration`, logged as
 above. `429` waits the provider's `Retry-After`, or is retried without
-one; `408` and `5xx` are retried. Every other answer -- a `400` on the
-recipient, a `404` that names no sender, a redirect -- is this email:
+one; `408` and `5xx` are retried. A redirect (`3xx`) is the channel too:
+`EMAIL_API_BASE_URL` is not the provider's API. Every other answer -- a
+`400` on the recipient, a `404` that names no sender -- is this email:
 `failed`, `message_rejected`.
 
 **What email reads from the profile.** Its own fields under its own
@@ -1677,7 +1678,10 @@ and to ask again with a new letter, under a new key.
 
 **A failure is the transport's only,** and only then is the NEXT set of
 the list asked, in the same call: the status of the response (401, 402,
-403, 404 -- the set is wrong; 429; 408, 409, 5xx), a failure the
+403, 404 -- the set is wrong, except a 403 that declines the request on
+a policy -- a moderation flag, a guardrail, a content filter, read from
+the provider's `error.metadata` -- which is this request's; 429; 408,
+409, 5xx), a failure the
 provider puts inside a 200 (an `error` object), an answer that is not a
 chat completion, an answer larger than 4194304 bytes (by its
 `Content-Length`, or counted while reading -- read no further), no
