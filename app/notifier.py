@@ -375,7 +375,7 @@ async def consume_close_notifications(
     Owns its own sessions; commits per batch.
 
     ONE THREAD AT A TIME (REV-2): each thread's clear and notice run in
-    a SAVEPOINT of the batch's transaction (_close_one). A thread whose
+    a SAVEPOINT of the batch's transaction. A thread whose
     notice fails -- a database error included, which aborts the
     transaction up to that savepoint only -- is rolled back alone and
     said once in the log (its id, the class and the place, never the
@@ -415,7 +415,31 @@ async def consume_close_notifications(
             ]
             for thread, thread_id, seen in walked:
                 assert seen is not None  # the WHERE of the read above
-                total += await _close_one(session, thread, thread_id, seen)
+                # ONE THREAD AT A TIME: its clear and its notice in a
+                # savepoint; a failure rolls back this thread only, the
+                # flag stays for the next pass.
+                try:
+                    async with session.begin_nested():
+                        cleared = await session.execute(
+                            update(Thread)
+                            .where(
+                                Thread.id == thread_id,
+                                Thread.close_notify_pending_at == seen,
+                            )
+                            .values(close_notify_pending_at=None)
+                            .execution_options(synchronize_session=False)
+                        )
+                        if cleared.rowcount != 1:  # type: ignore[attr-defined]
+                            continue
+                        await _emit_close_notification(session, thread, seen)
+                except Exception as exc:
+                    logger.error(
+                        "close_notification_error",
+                        thread_id=str(thread_id),
+                        error=pipeline_error_of(exc),
+                    )
+                    continue
+                total += 1
             await session.commit()
             _, last_id, last_seen = walked[-1]
             assert last_seen is not None
@@ -427,34 +451,3 @@ async def consume_close_notifications(
         logger.info("close_notify_pass", notified=total)
     return total
 
-
-async def _close_one(
-    session: AsyncSession, thread: Thread, thread_id: UUID, seen: datetime,
-) -> int:
-    """Clear one thread's flag `seen` and emit its notice, in a SAVEPOINT
-    (consume_close_notifications, ONE THREAD AT A TIME). Returns 1 when
-    the thread was notified, 0 when its flag was no longer `seen` or its
-    notice failed -- rolled back to the savepoint and logged, the flag
-    kept for the next pass."""
-    try:
-        async with session.begin_nested():
-            cleared = await session.execute(
-                update(Thread)
-                .where(
-                    Thread.id == thread_id,
-                    Thread.close_notify_pending_at == seen,
-                )
-                .values(close_notify_pending_at=None)
-                .execution_options(synchronize_session=False)
-            )
-            if cleared.rowcount != 1:  # type: ignore[attr-defined]
-                return 0
-            await _emit_close_notification(session, thread, seen)
-    except Exception as exc:
-        logger.error(
-            "close_notification_error",
-            thread_id=str(thread_id),
-            error=pipeline_error_of(exc),
-        )
-        return 0
-    return 1

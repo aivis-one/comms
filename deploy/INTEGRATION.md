@@ -1346,10 +1346,10 @@ One row per transition, in order.
 answers, such a failure -- a deadlock that keeps coming back, say -- is
 a failure like any other: an attempt is counted, its row in the path
 carries the step, the class and the place and `wait_until`, and at the
-ceiling of failures in a row the job gets its outcome. While the
-database does not answer, nothing can be written: the job keeps its
-state, no attempt is counted, and comms takes it again once the
-database is back.
+ceiling the job gets its outcome -- the ceiling of failures in a row
+(`attempts` above). While the database does not answer, nothing can be
+written: the job keeps its state, no attempt is counted, and comms
+takes it again once the database is back.
 
 ## 9. What changed since a cursor
 
