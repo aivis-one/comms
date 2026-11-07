@@ -74,6 +74,12 @@
 # names of everything dropped, the reason, the attempts and the source
 # entry id. The stream lives in the shared redis with no expiry; a
 # letter kept there would outlive every promise of the contract.
+# BOUNDED IN BYTES as well as in number (dlq_maxlen): a value of `data`
+# longer than _DLQ_VALUE_MAX, an event name or a dropped name longer
+# than _DLQ_NAME_MAX is not kept -- named in _dlq_dropped, or counted in
+# _dlq_dropped_more -- and _dlq_dropped lists the first
+# _DLQ_DROPPED_LISTED names. A dead letter is written whatever came in;
+# only what it holds is cut.
 #
 # KNOWN CEILING -- head-of-line blocking on the ordering retry (BL-4).
 # Mechanics: a group_changed that arrived before its user_upserted is
@@ -153,13 +159,19 @@ _IDLE_SLEEP_SECONDS = 0.05
 # the log. Said loudly on the first wait and every _WAIT_LOUD_EVERY-th.
 _WAIT_CEILING = 30.0
 _WAIT_LOUD_EVERY = 10
+# The doublings _wait_delay counts at most: 0.2 s * 2**32 is past any
+# ceiling a deploy could want, and an exponent kept this small never
+# overflows the float -- before, a wait of ~8.5 h (2**1024) raised
+# OverflowError out of the wait itself.
+_WAIT_DOUBLINGS = 32
 
 # THE PENDING LIST AGAIN, WHILE RUNNING (WK-3): every this many seconds
 # run() reads its own pending list once more (_drain_pending, its cursor
 # rule kept) between its reads of new entries. An entry left pending --
-# a dead letter or an ack that could not be written, an entry whose
-# handling raised -- is offered again in the running process, no longer
-# only at the next start. The cost, named: an entry pending for good is
+# a dead letter that could not be written, an entry whose handling
+# raised -- is offered again in the running process, no longer only at
+# the next start. An ack is never left pending: it is retried in place
+# (_ack_until_done). The cost, named: an entry pending for good is
 # handled again every interval, an ordering retry of it (BL-4) included.
 _PENDING_REDRAIN_SECONDS = 60.0
 
@@ -173,6 +185,7 @@ DLQ_FIELDS: tuple[str, ...] = (
     "_dlq_data_fingerprint",
     "_dlq_data_bytes",
     "_dlq_dropped",
+    "_dlq_dropped_more",
     "_dlq_error",
     "_dlq_attempts",
     "_dlq_source_entry_id",
@@ -186,6 +199,18 @@ DLQ_FIELDS: tuple[str, ...] = (
 # for as long as the object lives. The one place this exception is
 # written.
 _DLQ_WITHHELD_ENVELOPE_FIELDS = frozenset({"llm_audio"})
+
+# THE BYTES OF A DEAD LETTER (deploy/INTEGRATION.md, "How long comms
+# keeps things"). Measured on the form written to redis -- JSON with
+# ensure_ascii, so a character is a byte. A lawful value of every kept
+# field fits _DLQ_VALUE_MAX however it escapes (the longest: an email of
+# 320 Cyrillic characters, 1920); an event or a field name is short
+# (_DLQ_NAME_MAX); twenty sorted names show the pattern of a broken
+# producer, and the count says how broken. A letter is then ~19 KB at
+# most, ~190 MB at the default dlq_maxlen -- before, ~4 MB and ~40 GB.
+_DLQ_VALUE_MAX = 2048
+_DLQ_NAME_MAX = 128
+_DLQ_DROPPED_LISTED = 20
 
 
 class StreamConsumer:
@@ -335,9 +360,10 @@ class StreamConsumer:
         self, entry_id: str | bytes, fields: dict[Any, Any]
     ) -> None:
         """Parse -> handle -> ack. Never raises for a bad EVENT
-        (poison-pill rule), and never for a dead letter or an ack that
-        cannot be written either (FIX review 3.13.0): those leave the
-        entry pending (_dead_letter_or_hold, _ack_or_hold).
+        (poison-pill rule), and never for a dead letter that cannot be
+        written either (FIX review 3.13.0): that leaves the entry pending
+        (_dead_letter_or_hold). An ack that fails is retried in place
+        until it is written (_ack_until_done): the next entry waits.
 
         RETRIES:
           - NotFoundError (the address book has not caught up) and a
@@ -398,7 +424,7 @@ class StreamConsumer:
                     refusal_class=conflict_class(exc),
                     reason=exception_text(exc),
                 )
-                await self._ack_or_hold(entry_id)
+                await self._ack_until_done(entry_id)
                 return
             except ValidationError as exc:
                 await self._dead_letter_or_hold(
@@ -427,7 +453,7 @@ class StreamConsumer:
                 if is_transient_db_error(exc) and not await self._database_answers():
                     attempt -= 1  # the database's moment, not the event's
                     waited += 1
-                    delay = min(_WAIT_CEILING, _BACKOFF_DELAYS[0] * 2 ** (waited - 1))
+                    delay = _wait_delay(waited)
                     if waited == 1 or waited % _WAIT_LOUD_EVERY == 0:
                         logger.warning(
                             "event_waiting_for_database",
@@ -481,22 +507,71 @@ class StreamConsumer:
                     attempt=attempt,
                 )
             # Acknowledged OUTSIDE the try (FIX review 3.13.0): an XACK
-            # that fails is no failure of the event to dead-letter; the
-            # entry stays pending, and its replay is a duplicate.
-            await self._ack_or_hold(entry_id)
+            # that fails is no failure of the event to dead-letter. It is
+            # retried here, the session already closed -- no connection to
+            # the database and no row lock held while it waits.
+            await self._ack_until_done(entry_id)
             return
 
-    async def _ack_or_hold(self, entry_id: str | bytes) -> None:
-        """Acknowledge; if Redis refuses, the entry stays pending (said
-        loudly) -- never an exception out of an entry's handling."""
-        try:
-            await self._ack(entry_id)
-        except Exception as exc:
-            logger.error(
-                "event_ack_failed",
-                entry_id=_id_str(entry_id),
-                error=pipeline_error_of(exc),
-            )
+    # KNOWN CEILING -- the process stopped while an ack is retried.
+    # Mechanics: an event is committed, its XACK keeps failing, and the
+    # process stops in the retry (SIGTERM, a crash, the OOM killer): the
+    # entry is still pending, and the next start's _drain_pending handles
+    # it again FIRST -- before any new entry, which is read only after
+    # the drain -- so the stream's order is kept, but the event is
+    # applied a second time. A sync event re-applied with nothing newer
+    # between is the same state; a notification_request is collapsed by
+    # its key.
+    # Status: acknowledged by design.
+    # Task: none -- the closure is the ordering of membership events,
+    # v4.0's, and no task of this repository carries it.
+    # Unfreeze trigger: a writer of memberships outside the stream (a
+    # REST route), OR a handler whose second application is not the same
+    # state, OR event_ack_failed in the log followed by a restart before
+    # event_acked_after_retry.
+    # Agreed fix shape: an order for membership events -- the stream
+    # entry id kept on the membership row, or a version from the product
+    # -- and a replay older than the row refused.
+    # Rejected: the ack before the commit (spec §5.4 -- the job lost on a
+    # crash between them); the retry in a task of its own (the next
+    # entry taken before the ack, and a replay of this one applied over
+    # it -- the window this closes); retrying only a lost connection (a
+    # refusal such as NOGROUP would end the process, and ensure_group,
+    # creating the group from id "0", would replay the whole stream).
+    async def _ack_until_done(self, entry_id: str | bytes) -> None:
+        """Acknowledge, retrying IN PLACE until redis takes it: the event
+        is committed, a replay of it would apply it again, and the next
+        entry is not taken meanwhile -- a group_changed true replayed over
+        the false behind it would put the person back (review 3.14.0,
+        2.3). Any failure is retried, the delay doubling to
+        _WAIT_CEILING (_wait_delay); said on the first and every
+        _WAIT_LOUD_EVERY-th failure, and once more when the ack is
+        written. A cancellation is not caught: the stop stays a stop
+        (the KNOWN CEILING above)."""
+        failures = 0
+        while True:
+            try:
+                await self._ack(entry_id)
+            except Exception as exc:
+                failures += 1
+                delay = _wait_delay(failures)
+                if failures == 1 or failures % _WAIT_LOUD_EVERY == 0:
+                    logger.error(
+                        "event_ack_failed",
+                        entry_id=_id_str(entry_id),
+                        attempts=failures,
+                        delay=delay,
+                        error=pipeline_error_of(exc),
+                    )
+                await asyncio.sleep(delay)
+                continue
+            if failures:
+                logger.warning(
+                    "event_acked_after_retry",
+                    entry_id=_id_str(entry_id),
+                    attempts=failures + 1,
+                )
+            return
 
     async def _dead_letter_or_hold(
         self,
@@ -507,25 +582,28 @@ class StreamConsumer:
         attempts: int,
     ) -> None:
         """THE ONE WAY an entry goes to the dead letter (FIX review
-        3.13.0): written, then acknowledged. If the writing or the ack
-        fails -- Redis down, a dead letter that cannot be built -- the
-        entry STAYS PENDING: not lost, seen in XPENDING and in this log
-        line, offered again at the next pass over the pending list
-        (_drain_pending, its cursor past it: every
-        _PENDING_REDRAIN_SECONDS and at the next start, WK-3). Never an
-        exception out of an except clause: before, a TypeError of the
-        dead letter's own JSON left
-        _process_entry from inside one and took the consumer down, again
-        at every restart."""
+        3.13.0): written, then acknowledged. If the writing fails --
+        Redis down, a dead letter that cannot be built -- the entry STAYS
+        PENDING: not lost, seen in XPENDING and in this log line, offered
+        again at the next pass over the pending list (_drain_pending, its
+        cursor past it: every _PENDING_REDRAIN_SECONDS and at the next
+        start, WK-3). Never an exception out of an except clause: before,
+        a TypeError of the dead letter's own JSON left _process_entry
+        from inside one and took the consumer down, again at every
+        restart. A letter WRITTEN is acknowledged like an applied event
+        (_ack_until_done): left pending, it would be written again at
+        every pass -- or the event applied late, over newer ones, once
+        its cause had gone."""
         try:
             await self._to_dlq(entry_id, fields, reason=reason, attempts=attempts)
-            await self._ack(entry_id)
         except Exception as exc:
             logger.error(
                 "dead_letter_write_failed",
                 entry_id=_id_str(entry_id),
                 error=pipeline_error_of(exc),
             )
+            return
+        await self._ack_until_done(entry_id)
 
     async def _ack(self, entry_id: str | bytes) -> None:
         await self._redis.xack(self._stream, self._group, entry_id)
@@ -578,6 +656,15 @@ def _retryable(exc: BaseException) -> bool:
     return isinstance(exc, NotFoundError) or is_transient_db_error(exc)
 
 
+def _wait_delay(n: int) -> float:
+    """The n-th delay (n >= 1) of a wait that doubles from
+    _BACKOFF_DELAYS[0] to _WAIT_CEILING: the database's absence and an
+    ack's retry alike. The exponent is bounded (_WAIT_DOUBLINGS), so a
+    wait of any length is a number, never an OverflowError."""
+    doublings = min(n - 1, _WAIT_DOUBLINGS)
+    return float(min(_WAIT_CEILING, _BACKOFF_DELAYS[0] * 2 ** doublings))
+
+
 def dlq_kept_data_fields(event: str | None) -> frozenset[str] | None:
     """The keys of `data` a dead letter keeps for this event; None when
     it keeps none.
@@ -604,12 +691,14 @@ def dead_letter_fields(
     """The dead letter of one stream entry (DEAD LETTERS, module header).
 
     Values are written only where they are kept: `event` (when it is
-    UTF-8) and the allowed keys of `data` (when it is a UTF-8 JSON
-    object). Everything else is dropped by NAME -- a field of the entry
-    under its own name (entry_field_name: a byte that is not UTF-8 as a
-    backslash escape), a key of `data` as `data.<key>`, the whole of
-    `data` as `data` -- and the names are listed in _dlq_dropped, so the
-    reader sees what was there without seeing it. The fingerprint is of the
+    UTF-8 and within _DLQ_NAME_MAX) and the allowed keys of `data` (when
+    it is a UTF-8 JSON object), each within _DLQ_VALUE_MAX. Everything
+    else is dropped by NAME -- a field of the entry under its own name
+    (entry_field_name: a byte that is not UTF-8 as a backslash escape), a
+    key of `data` as `data.<key>`, the whole of `data` as `data` -- and the
+    first _DLQ_DROPPED_LISTED names within _DLQ_NAME_MAX are listed in
+    _dlq_dropped, sorted; _dlq_dropped_more counts the others. The reader
+    sees what was there without seeing it. The fingerprint is of the
     `data` bytes as the stream delivered them, the digest a refusal at
     intake records (stream_fingerprint).
     """
@@ -622,7 +711,8 @@ def dead_letter_fields(
         raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
         if name == ENVELOPE_EVENT_FIELD:
             event = _utf8_or_none(raw)
-            if event is None:
+            if event is None or len(raw) > _DLQ_NAME_MAX:
+                event = None
                 dropped.append(name)
         elif name == ENVELOPE_DATA_FIELD:
             raw_data = raw
@@ -642,13 +732,17 @@ def dead_letter_fields(
         else:
             # ensure_ascii: a lone surrogate (a JSON escape the producer
             # may send) is not encodable as UTF-8 on the way to redis.
-            dead["_dlq_data"] = json.dumps(
-                {k: v for k, v in data.items() if k in kept}, sort_keys=True,
-            )
-            dropped += [
-                f"{ENVELOPE_DATA_FIELD}.{k}" for k in data if k not in kept
-            ]
-    dead["_dlq_dropped"] = json.dumps(sorted(dropped))
+            # A value is kept only when its written form fits.
+            short = {
+                k: v for k, v in data.items()
+                if k in kept and len(json.dumps(v, sort_keys=True)) <= _DLQ_VALUE_MAX
+            }
+            dead["_dlq_data"] = json.dumps(short, sort_keys=True)
+            dropped += [f"{ENVELOPE_DATA_FIELD}.{k}" for k in data if k not in short]
+    listable = sorted(n for n in dropped if len(json.dumps(n)) <= _DLQ_NAME_MAX)
+    listed = listable[:_DLQ_DROPPED_LISTED]
+    dead["_dlq_dropped"] = json.dumps(listed)
+    dead["_dlq_dropped_more"] = str(len(dropped) - len(listed))
     dead["_dlq_error"] = reason
     dead["_dlq_attempts"] = str(attempts)
     dead["_dlq_source_entry_id"] = entry_id

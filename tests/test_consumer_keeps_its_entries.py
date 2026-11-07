@@ -184,9 +184,18 @@ class TestHeld:
         async def both() -> bool:
             return await _recipient(first) and await _recipient(second)
 
+        async def both_acked() -> bool:
+            return await both() and await _pending(fake_redis, a_stream) == 0
+
         with capture_logs() as logs:
-            await _run_until(StreamConsumer(fake_redis), both)
-        assert await _pending(fake_redis, a_stream) == 1
+            await _run_until(StreamConsumer(fake_redis), both_acked)
+        # Until review 3.14.0 (2.3) the entry stayed pending here -- right
+        # then: the ack was tried once, and the replay of it was the
+        # duplicate. That replay re-applies a membership event over a newer
+        # one; the ack is now retried in place (_ack_until_done), so
+        # nothing is left pending. The property this test holds (M7) is the
+        # same: a failed ack is no failure of the event -- no dead letter.
+        assert calls[0] == 3  # the failed one, its retry, the second's
         assert await _dlq(fake_redis) == []  # applied, not a failure
         assert "event_ack_failed" in [e["event"] for e in logs]
 

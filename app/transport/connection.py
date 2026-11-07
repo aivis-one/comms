@@ -20,6 +20,20 @@
 # below the block would turn every empty wait into an error; derived,
 # it is longer than the block by construction. The connect timeout
 # follows the socket timeout (redis-py's default when none is given).
+#
+# THE CONNECTION IS CHECKED (review 3.14.0, 2.3). redis-py 5 retries no
+# command by default, so a connection that died while idle fails the
+# first command sent on it -- an XACK after a commit among them.
+# health_check_interval: a connection idle longer than
+# REDIS_HEALTH_CHECK_SECONDS is PINGed before its next command, and a
+# dead one is dropped there and then (an error, which the caller's own
+# retry meets on a fresh connection: the consumer's ack,
+# app/transport/consumer.py _ack_until_done; the relay's next tick).
+# 30 s: the consumer reads at least once per CONSUMER_BLOCK_MS (at most
+# a minute), so its PING is at most one per read; the relay's connection
+# idles while nothing is owed, and that is the one it catches.
+# socket_keepalive: the kernel finds a peer that vanished without a
+# word on a connection nobody uses.
 # =============================================================================
 
 from redis.asyncio import Redis
@@ -35,8 +49,12 @@ def redis_socket_timeout() -> float:
 
 
 def redis_client() -> Redis:
-    """A redis client on REDIS_URL with the socket timeout."""
+    """A redis client on REDIS_URL with the socket timeout, its idle
+    connections checked and kept alive (the header)."""
     client: Redis = Redis.from_url(
-        settings.redis_url, socket_timeout=redis_socket_timeout(),
+        settings.redis_url,
+        socket_timeout=redis_socket_timeout(),
+        health_check_interval=constants.REDIS_HEALTH_CHECK_SECONDS,
+        socket_keepalive=True,
     )
     return client

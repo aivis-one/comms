@@ -542,10 +542,12 @@ class TestDurableIntake:
 
         Until FIX review 3.13.0 a failed XACK left run() and took the
         process down -- the old assertion (`run()` raises) was right then.
-        That fix acknowledges outside the handling, and an ack that fails
-        leaves the entry pending with the process alive (_ack_or_hold):
-        the property is the same -- nothing lost, nothing twice -- and
-        every wait here has a deadline, never a bare `await run()`."""
+        That fix acknowledges outside the handling, with the process alive.
+        Since review 3.14.0 (2.3) an ack that fails is retried in place
+        (_ack_until_done): the process is held in that retry, the entry
+        pending, until it is stopped -- the crash this test stages. The
+        property is the same -- nothing lost, nothing twice -- and every
+        wait here has a deadline, never a bare `await run()`."""
         redis = fakeaioredis.FakeRedis()
         stream = f"comms:test:{uuid4().hex[:8]}"
         monkeypatch.setattr(settings, "comms_events_stream", stream)
@@ -572,7 +574,7 @@ class TestDurableIntake:
                     assert asyncio.get_event_loop().time() < deadline
                     assert not task.done(), "the consumer went down"
                     await asyncio.sleep(0.02)
-                assert not task.done()  # alive, past the failed ack
+                assert not task.done()  # alive, held in the ack's retry
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)

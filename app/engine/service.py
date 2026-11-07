@@ -2121,10 +2121,11 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     )
     # THE ONE EDIT OF THE JOURNAL, and why it is allowed: forgetting
     # outweighs append-only. Append-only is a property of the design;
-    # forgetting is an obligation to a person (spec §10.4). A provider's
-    # words may quote the address being forgotten -- the reason
-    # error_message is cleared just above -- and the journal keeps the
-    # same words for the same recipient. Only that column, only this
+    # forgetting is an obligation to a person (spec §10.4), within what
+    # app/forgetting.py WHAT STAYS names -- the dead letters among it.
+    # A provider's words may quote the address being forgotten -- the
+    # reason error_message is cleared just above -- and the journal keeps
+    # the same words for the same recipient. Only that column, only this
     # recipient; every other field of the row stays, and so does the
     # path. The fence test names this function as the single exception.
     await session.execute(

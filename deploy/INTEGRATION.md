@@ -2236,13 +2236,24 @@ retain its own copy: comms is the delivery service, not the archive.
 says so; every other field of the entry, and every other key of its
 `data`, is dropped and only its NAME is listed.
 
+A dead letter is bounded in bytes as well, and is written whatever came
+in: only what it holds is cut. Lengths are of the form written -- JSON
+with every non-ASCII character escaped, so a character is a byte. A
+value of `data` longer than **2048** is not kept, its key is dropped by
+name; an `event` longer than **128** bytes is not kept, `event` is
+dropped by name; `_dlq_dropped` lists the first **20** names in sorted
+order, each at most **128** long as JSON, and `_dlq_dropped_more` counts
+the names it does not list. Every value a valid event sends fits, but
+a `reminder_cancel` `types` list of many keys.
+
 | field | what it holds |
 |---|---|
-| `event` | the entry's event name as sent; absent when the entry had none, or it was not UTF-8 |
-| `_dlq_data` | a JSON object of the keys of `data` the event's own field set names (section 7): for `notification_request` the frame and the envelope without `llm_audio` -- the signed link to a person's voice (section 11); for the other events their fields. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
+| `event` | the entry's event name as sent; absent when the entry had none, or it was not UTF-8, or longer than 128 bytes |
+| `_dlq_data` | a JSON object of the keys of `data` the event's own field set names (section 7): for `notification_request` the frame and the envelope without `llm_audio` -- the signed link to a person's voice (section 11); for the other events their fields; a key whose value is longer than 2048 as JSON is left out. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
 | `_dlq_data_fingerprint` | the SHA-256 of the `data` bytes as sent -- the digest a rejection at intake records; absent without `data` |
 | `_dlq_data_bytes` | the length of those bytes; absent without `data` |
-| `_dlq_dropped` | a JSON list of the names of everything not kept: a field of the entry by its name, a key of `data` as `data.<key>`, the whole of `data` as `data`; `[]` when nothing was |
+| `_dlq_dropped` | a JSON list of the names of everything not kept: a field of the entry by its name, a key of `data` as `data.<key>`, the whole of `data` as `data`; sorted, the first 20 of those at most 128 long as JSON; `[]` when nothing was |
+| `_dlq_dropped_more` | how many names of what was not kept the list leaves out -- past the first 20, or longer than 128; `0` when it lists them all |
 | `_dlq_error` | why: comms' own refusal (it names fields and the address, never the letter), or the class and the place of the failure -- never an exception's text |
 | `_dlq_attempts` | the attempts made; `0` -- refused as it was read |
 | `_dlq_source_entry_id` | the entry's id in the stream it came from |

@@ -834,7 +834,9 @@ class TestTheContract:
         start = section.index("**What a dead letter holds.**")
         documented = re.findall(r"^\| `([a-z_]+)` \|", section[start:], re.M)
         assert documented == list(DLQ_FIELDS)
-        assert len(documented) == 8
+        # 9 since review 3.14.0 (5): _dlq_dropped_more counts the names
+        # _dlq_dropped no longer lists; 8 was right before it.
+        assert len(documented) == 9
 
     def test_the_withheld_link_is_named(self) -> None:
         section = _section("## How long comms keeps things")
