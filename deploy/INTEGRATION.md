@@ -459,8 +459,10 @@ sender address -- and all three must be set together or left empty
 together. The sender has no default because it is a product fact; a
 default would make an incomplete set look complete. It accepts either a
 bare address or the display form `Name <address>`, since a signed
-sender delivers better, and a value carrying a line break is refused at
-startup.
+sender delivers better -- in the env file the display form only in
+quotes (`EMAIL_FROM_ADDRESS="Comms <noreply@example.com>"`): the file is
+read by `source`, and an unquoted `<` is a redirection there. A value
+carrying a line break is refused at startup.
 
 The provider region is different in kind: it has a default, so
 "unset" and "set to the default" cannot be told apart, and it therefore
@@ -591,7 +593,7 @@ body, with a class a program can branch on:
 
 | status | class | when |
 |---|---|---|
-| 400 | `bad_request` | the request could not be read -- a body that is not UTF-8 JSON; any other client status this table does not list travels with this class too. Fix the request; repeating it changes nothing |
+| 400 | `bad_request` | the request could not be read -- a body that is not UTF-8 JSON, or one nested deeper than its JSON can be read on a route that takes a body model; any other client status this table does not list travels with this class too. Fix the request; repeating it changes nothing |
 | 401 | `unauthorized` | the service token is missing or wrong -- asked first, on every path but `/health` and `/ready`, before anything of the request is read: without it an unknown route, another method, a body of any size or shape is this 401 too |
 | 403 | `forbidden` | the actor has no role in this thread |
 | 404 | `not_found` | the entity or the route does not exist (a route: with the token) |
@@ -601,7 +603,7 @@ body, with a class a program can branch on:
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
-| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read |
+| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read on a route that takes no body model -- on one that does, the framework answers `400` `bad_request` (above) |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
