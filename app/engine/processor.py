@@ -1196,20 +1196,24 @@ async def cleanup_terminal_notifications() -> int:
     the observable value of the BL-3 promotion trigger.
 
     KNOWN CEILING (acknowledged by design -- dispatch plan BL-3):
-      1. Mechanics: the batch select filters on status and on
-         greatest(created_at, scheduled_at) (REV-2), with an anti-join
-         on push_outbox, and no index serves the filter -> each pass
-         seq-scans the notifications table as it grows (REV-2 measured
-         it at 200k rows: its report).
+      1. Mechanics: the batch select filters on status and on the
+         retention age -- created_at for a cancelled job, else
+         greatest(created_at, scheduled_at) (REV-2, REV-8;
+         app/engine/service.py _retention_age) -- with an anti-join on
+         push_outbox, and no index serves the filter -> each pass
+         seq-scans the notifications table as it grows (REV-2 and REV-8
+         measured it at 200k rows: their reports).
       2. Status: acknowledged by design.
       3. Backlog ref: BL-3 (dispatch plan §6a).
       4. Promotion trigger (observable, via the retention_pass log):
          a pass stably longer than ~1 second OR terminal rows on the
          order of a million.
       5. Agreed fix: ONE migration -- a partial index on the expression
-         greatest(created_at, scheduled_at) with a predicate over the
-         terminal statuses (an index on created_at alone no longer
-         serves the filter since REV-2).
+         of _retention_age (CASE WHEN status = 'cancelled' THEN
+         created_at ELSE greatest(created_at, scheduled_at) END) with a
+         predicate over the terminal statuses (an index on created_at
+         alone no longer serves the filter since REV-2, nor one on
+         greatest() since REV-8).
       6. Rejected: an index NOW (write amplification on a hot table
          for a query that is cheap at current scale and rare by
          cadence); an unbounded DELETE (one long transaction + its FK

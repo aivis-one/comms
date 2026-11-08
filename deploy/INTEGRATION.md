@@ -965,7 +965,7 @@ never interprets.
 | `type` | required | envelope | declared by the profile; the profile routes it to its channels |
 | `target_type` | by type | envelope | `user` \| `group` \| `all` -- required for a type delivered to people, refused for an llm type (section 11) |
 | `target_value` | by type | envelope | a recipient uuid, a group key, or `*`, matching `target_type`; with `target_type` or not at all |
-| `scheduled_at` | optional | envelope | ISO 8601 with a zone -- "not before" |
+| `scheduled_at` | optional | envelope | ISO 8601 with a zone -- "not before"; at most 3650 days ahead of the intake, refused under the key past that |
 | `expiry_at` | optional | envelope | ISO 8601 with a zone; in the future and after `scheduled_at`; wins over the profile's `expires_after` |
 | `correlation` | optional | envelope | string, 1..200 -- the product's own reference, stored untouched (see below) |
 | `title` | by type | letter | 1..500 -- the stored fallback; templates override it at delivery. Required for a type delivered to people, refused for an llm type |
@@ -2219,10 +2219,11 @@ too. A model's answer is kept by its type.
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is
   removed by the worker's retention pass after that many days, counted
-  from the later of its creation and its `scheduled_at`: a job sent
-  late lives its days from when it was due, and one cancelled or
-  expired before a `scheduled_at` in the future is kept until that
-  moment plus the period. Nothing is removed while a delivery is still
+  from the later of its creation and its `scheduled_at` -- a job sent
+  late lives its days from when it was due -- except a `cancelled` one,
+  counted from its creation: a cancel is the one outcome a job can
+  reach before it is due, and a reminder cancelled years ahead is not
+  kept for those years. Nothing is removed while a delivery is still
   pending, nor while a push of the job (section 10) is still owed --
   it goes once comms has published it.
 - **A model's answer** (section 11): the type's `answer_keep`, default

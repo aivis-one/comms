@@ -18,6 +18,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -820,3 +821,77 @@ class TestConsumerRedactsItsFailures:
             assert "INSERT INTO recipients" not in entry["error"]
             assert entry["error"].startswith("sqlalchemy.exc.OperationalError at ")
 
+
+# -----------------------------------------------------------------------------
+# REV-8 item 1 -- scheduled_at has a ceiling: a refusal under the key
+# -----------------------------------------------------------------------------
+#
+# MUTATIONS these tests were written against (each turns one red):
+#   S1 no ceiling on scheduled_at -> 9999 is an OverflowError and a dead
+#      letter, now + 3651d is accepted
+#   S2 the ceiling checked after the profile's expiry is added -> 9999
+#      with expires_after is still an OverflowError
+# Not built: `>` against `>=` at the border -- now is taken inside the
+# intake, so the equality to the microsecond cannot be sent from here.
+
+
+def _ahead(days: int, minutes: int = 0) -> str:
+    return (
+        datetime.now(UTC) + timedelta(days=days, minutes=minutes)
+    ).isoformat()
+
+
+class TestTheScheduleCeiling:
+    @pytest.mark.parametrize("scheduled_at", [
+        "9999-12-31T23:00:00+00:00",
+        "far",  # now + 3651 days
+    ])
+    async def test_past_the_ceiling_is_a_refusal_under_the_key(
+        self, redis: fakeaioredis.FakeRedis, stream: str,
+        db_session: AsyncSession, scheduled_at: str,
+    ) -> None:
+        """A type with expires_after (unit_expiring, 1h): the expiry is
+        scheduled_at + 1h, which for the year 9999 was an OverflowError
+        and the event a dead letter `unexpected`. Now: refused under its
+        key, the field and the ceiling named, no dead letter, no job."""
+        value = _ahead(3651) if scheduled_at == "far" else scheduled_at
+        data = _request_data(type="unit_expiring", scheduled_at=value)
+        key = data["idempotency_key"]
+        await _xadd(redis, stream, "notification_request", data)
+
+        async def refused() -> bool:
+            return bool(await intake_outcomes_for(db_session, key))
+
+        await _run_until(StreamConsumer(redis), refused)
+        (outcome,) = await intake_outcomes_for(db_session, key)
+        assert outcome.outcome == IntakeOutcomeClass.REJECTED_AT_INTAKE
+        reason = str(outcome.reason)
+        assert "scheduled_at" in reason
+        assert "3650 days ahead" in reason
+        assert await redis.exists(settings.dlq_stream) == 0
+        assert await _notification_count(db_session, key) == 0
+
+    @pytest.mark.parametrize("days", [3650, 30])
+    async def test_inside_the_ceiling_is_accepted(
+        self, redis: fakeaioredis.FakeRedis, stream: str,
+        db_session: AsyncSession, days: int,
+    ) -> None:
+        """The pair: now + 3650 days (a minute inside, for the clock the
+        intake reads after this one) and now + 30 days -- accepted, the
+        expiry counted from scheduled_at."""
+        value = _ahead(days, minutes=-1)
+        data = _request_data(type="unit_expiring", scheduled_at=value)
+        key = data["idempotency_key"]
+        await _xadd(redis, stream, "notification_request", data)
+
+        async def accepted() -> bool:
+            db_session.expire_all()
+            return await _notification_count(db_session, key) == 1
+
+        await _run_until(StreamConsumer(redis), accepted)
+        job = (await db_session.execute(
+            select(Notification).where(Notification.idempotency_key == key)
+        )).scalar_one()
+        assert job.scheduled_at == datetime.fromisoformat(value)
+        assert job.expiry_at == job.scheduled_at + timedelta(hours=1)
+        assert await redis.exists(settings.dlq_stream) == 0

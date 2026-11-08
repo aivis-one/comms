@@ -319,11 +319,14 @@ _DURATION_RE = re.compile(r"([1-9][0-9]*)([smhd])")
 # The longest duration a profile may declare: ten years, a term past
 # which "expires" and "keeps" both mean never. It fits what the durations
 # become -- llm_calls.answer_keep_seconds is an int32 (315 360 000 s of
-# 2 147 483 647), and an intake's now + expires_after stays a date --
-# whatever NOTIFICATION_RETENTION_DAYS is (0 is "keep forever", and then
-# answer_keep had no bound at all).
-_MAX_DURATION_DAYS = 3650
-_MAX_DURATION_SECONDS = _MAX_DURATION_DAYS * 86400
+# 2 147 483 647), and an intake's scheduled_at + expires_after stays a
+# date: scheduled_at is held to the same ceiling ahead of now at intake
+# (app/engine/service.py create_notification, REV-8), so the sum is at
+# most now + 2 x MAX_DURATION_DAYS -- whatever NOTIFICATION_RETENTION_DAYS
+# is (0 is "keep forever", and then answer_keep had no bound at all).
+# The one copy: the intake reads it from here.
+MAX_DURATION_DAYS = 3650
+_MAX_DURATION_SECONDS = MAX_DURATION_DAYS * 86400
 
 
 # -----------------------------------------------------------------------------
@@ -657,7 +660,7 @@ def _check_answer_keep(value: Any) -> str | None:
 
 def _check_duration(value: Any) -> str | None:
     """A duration literal -- the whole string, a trailing newline is not
-    one (fullmatch) -- of at most _MAX_DURATION_DAYS. The bound is held
+    one (fullmatch) -- of at most MAX_DURATION_DAYS. The bound is held
     by comparing the count with the unit's share of it, so a count of any
     length is refused here, never multiplied into a timedelta that
     overflows."""
@@ -677,7 +680,7 @@ def _check_duration(value: Any) -> str | None:
         or int(digits) > _MAX_DURATION_SECONDS // _DURATION_UNITS[unit]
     ):
         return (
-            f"found {value!r}; longer than {_MAX_DURATION_DAYS}d, the "
+            f"found {value!r}; longer than {MAX_DURATION_DAYS}d, the "
             f"longest duration a profile may declare"
         )
     return None

@@ -149,10 +149,12 @@ async def list_changes(
     KNOWN CEILING (acknowledged by design -- P2-3, retention under a
     live cursor):
       1. Mechanics: retention deletes a terminal job by the later of
-         its created_at and scheduled_at (app/engine/service.py
+         its created_at and scheduled_at, a cancelled one by its
+         created_at (app/engine/service.py
          delete_terminal_notifications_batch; REV-2 -- a job sent late
-         lives its period from when it was due), its journal rows with
-         it (ON DELETE CASCADE). A job due longer ago than the retention
+         lives its period from when it was due; REV-8 -- a cancel can
+         come before the job is due), its journal rows with it (ON
+         DELETE CASCADE). A job due longer ago than the retention
          period whose last change came after the product's position can
          be deleted before the product reads that change: the feed never
          shows it, although the cursor is not expired.

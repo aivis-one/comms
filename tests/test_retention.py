@@ -323,6 +323,68 @@ class TestRetentionMeasuresFromTheDueTime:
         assert await _remaining_ids() == set()
 
 
+class TestACancelledJobAgesFromCreation:
+    """REV-8 item 2: a cancelled job ages from created_at -- the one
+    outcome a job can reach before its scheduled_at (a cancel of a job
+    still pending; every other outcome comes of an attempt, and only a
+    due job is attempted -- app/engine/processor.py ready_now). Every
+    other outcome ages from the later of created_at and scheduled_at,
+    as REV-2 set.
+
+    MUTATIONS these tests were written against (each turns one red):
+      A1 greatest() for every status
+         -> test_a_cancelled_reminder_goes_by_its_creation
+      A2 created_at for every status
+         -> test_every_other_outcome_keeps_its_due_time (each status)
+    """
+
+    async def test_a_cancelled_reminder_goes_by_its_creation(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Created 100 days ago, due in two years, cancelled: deleted --
+        it does not keep its title and body for two years more. A1."""
+        now = datetime.now(UTC)
+        job = await _make_notification(
+            db_session, status=NotificationStatus.CANCELLED, age_days=100,
+            scheduled_at=now + timedelta(days=730),
+        )
+        await db_session.commit()
+
+        assert await cleanup_terminal_notifications() == 1
+        assert job.id not in await _remaining_ids()
+
+    @pytest.mark.parametrize("status", [
+        NotificationStatus.SENT,
+        NotificationStatus.PARTIAL_SENT,
+        NotificationStatus.FAILED,
+        NotificationStatus.EXPIRED,
+        NotificationStatus.SUPPRESSED,
+        NotificationStatus.NO_RECIPIENTS,
+    ])
+    async def test_every_other_outcome_keeps_its_due_time(
+        self, db_session: AsyncSession, status: NotificationStatus,
+    ) -> None:
+        """Created 100 days ago, due -- and decided -- yesterday: kept, its
+        outcome readable by its key for the period from when it was due.
+        The pair in the same pass: a cancelled job of the same dates goes,
+        so the pass did run and select. A2."""
+        now = datetime.now(UTC)
+        kept = await _make_notification(
+            db_session, status=status, age_days=100,
+            scheduled_at=now - timedelta(days=1),
+        )
+        gone = await _make_notification(
+            db_session, status=NotificationStatus.CANCELLED, age_days=100,
+            scheduled_at=now - timedelta(days=1),
+        )
+        await db_session.commit()
+
+        assert await cleanup_terminal_notifications() == 1
+        remaining = await _remaining_ids()
+        assert kept.id in remaining
+        assert gone.id not in remaining
+
+
 class TestWorkerMaintenanceCadence:
     """Phase 4b edit 3: app/worker.py runs BOTH maintenance passes on
     their own per-process cadences (retention + auto-close), each with

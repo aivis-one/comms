@@ -58,6 +58,7 @@ from sqlalchemy import (
     ColumnElement,
     Select,
     any_,
+    case,
     delete,
     exists,
     func,
@@ -117,7 +118,7 @@ from app.engine.models import (
 )
 from app.engine.resolver import resolve_targets
 from app.engine.wake import signal_lane
-from app.profile.loader import is_llm_route
+from app.profile.loader import MAX_DURATION_DAYS, is_llm_route
 from app.profile.registry import Decided, Layer, RecipientSchedule, registry
 
 logger = structlog.get_logger()
@@ -726,7 +727,7 @@ async def create_notification(
             type only; its host must be in LLM_BODY_HOSTS. Kept with the
             letter, cleared with it.
         scheduled_at: "Not before" -- when the job becomes deliverable.
-            Defaults to now.
+            Defaults to now; at most MAX_DURATION_DAYS ahead.
         expiry_at: The envelope's expiry. Wins over the profile's
             expires_after, which counts from scheduled_at.
         correlation: The product's own reference, stored untouched.
@@ -737,8 +738,8 @@ async def create_notification(
     Raises:
         ValidationError: The request cannot be accepted -- undeclared
             type, a body longer than the type's max_body_chars, invalid
-            target_type, an expiry already passed or not after
-            scheduled_at.
+            target_type, a scheduled_at past its ceiling, an expiry
+            already passed or not after scheduled_at.
     """
     # -- The profile record IS the registration (every installed type
     # has one; a type without a record is not declared). --
@@ -800,6 +801,18 @@ async def create_notification(
     now = datetime.now(UTC)
     if scheduled_at is None:
         scheduled_at = now
+
+    # -- A schedule has a ceiling (REV-8): at most MAX_DURATION_DAYS
+    # ahead, the ceiling of the profile's durations. Checked first, before
+    # either expiry: the profile's expiry is scheduled_at + expires_after,
+    # and at the year 9999 that sum was an OverflowError -- the event a
+    # dead letter instead of a refusal under its key. --
+    if scheduled_at > now + timedelta(days=MAX_DURATION_DAYS):
+        raise ValidationError(
+            f"scheduled_at {scheduled_at.isoformat()} is more than "
+            f"{MAX_DURATION_DAYS} days ahead (now {now.isoformat()}): a job "
+            f"is scheduled at most {MAX_DURATION_DAYS} days ahead"
+        )
 
     # -- Expiry: the envelope over the profile, the layer kept. --
     if expiry_at is not None:
@@ -2282,6 +2295,25 @@ _RETENTION_TERMINAL_STATUSES = (
 )
 
 
+# The outcomes retention ages from created_at, not from the later of
+# created_at and scheduled_at (REV-8): the one a job can reach before it
+# is due. See delete_terminal_notifications_batch.
+_RETENTION_FROM_CREATION_STATUSES = (NotificationStatus.CANCELLED,)
+
+
+def _retention_age() -> ColumnElement[datetime]:
+    """The instant a terminal job's retention counts from -- ONE
+    expression, the one KNOWN CEILING BL-3's index would be built on
+    (app/engine/processor.py cleanup_terminal_notifications)."""
+    return case(
+        (
+            Notification.status.in_(_RETENTION_FROM_CREATION_STATUSES),
+            Notification.created_at,
+        ),
+        else_=func.greatest(Notification.created_at, Notification.scheduled_at),
+    )
+
+
 async def delete_terminal_notifications_batch(
     session: AsyncSession,
     *,
@@ -2305,9 +2337,16 @@ async def delete_terminal_notifications_batch(
     not deleted before it has lived its retention from the moment it
     was due. Measured on created_at alone, a reminder scheduled past
     the horizon was deleted within the hour of its send -- gone from
-    the inbox, 404 by its key. The model carries no updated_at; what a
-    job does after it was due is still bounded by created_at only
-    (app/engine/changes.py KNOWN CEILING P2-3).
+    the inbox, 404 by its key. EXCEPT A CANCELLED JOB (REV-8), which
+    ages from created_at (_RETENTION_FROM_CREATION_STATUSES): the one
+    outcome a job can reach before it is due -- a cancel of a job still
+    pending; every other outcome comes of an attempt, and only a due job
+    is attempted (app/engine/processor.py ready_now), or of an expiry,
+    which is after scheduled_at. Measured from scheduled_at, a reminder
+    cancelled two years ahead kept its title and body two years and the
+    period. The model carries no updated_at; what a job does after it
+    was due is still bounded by created_at only (app/engine/changes.py
+    KNOWN CEILING P2-3).
 
     NOT WHILE A PUSH IS OWED (REV-2, as the expiry cleanup since H7):
     a job with a row in push_outbox is skipped -- the cascade would
@@ -2344,8 +2383,7 @@ async def delete_terminal_notifications_batch(
         select(Notification.id)
         .where(
             Notification.status.in_(_RETENTION_TERMINAL_STATUSES),
-            func.greatest(Notification.created_at, Notification.scheduled_at)
-            < cutoff,
+            _retention_age() < cutoff,
             ~exists().where(PushOutbox.notification_id == Notification.id),
         )
         .order_by(Notification.created_at)

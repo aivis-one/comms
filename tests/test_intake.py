@@ -343,9 +343,11 @@ class TestRejectedAtIntake:
         ({"priority": 1}, "unknown field(s) 'priority'"),
         ({"expiry_at": "2020-01-01T00:00:00+00:00"}, "has already passed"),
         (
+            # Inside the ceiling of scheduled_at (REV-8: 3650 days ahead);
+            # 2090 was past it and is now refused by the ceiling first.
             {
-                "scheduled_at": "2090-01-02T00:00:00+00:00",
-                "expiry_at": "2090-01-01T00:00:00+00:00",
+                "scheduled_at": "2030-01-02T00:00:00+00:00",
+                "expiry_at": "2030-01-01T00:00:00+00:00",
             },
             "is not after scheduled_at",
         ),
