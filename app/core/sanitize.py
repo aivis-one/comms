@@ -53,16 +53,20 @@ from typing import Any
 #      "password=[redacted]" -- up to the boundary, the pair's own rule;
 #   3. bearer on its own (a token with no header name in front);
 #   4. userinfo in a URL/DSN, EMPTY user allowed, the password running
-#      to the @ that ends the authority -- a raw @ or / in a password
-#      (base64 has /) leaves no tail. THE PRICE: an @ in the path after
-#      a port with no userinfo ("https://host:443/a@b") takes "443/a" --
-#      text cleaned that need not be, never a secret left;
+#      to the LAST @ before any ? or # -- a raw @ or / in a password
+#      (base64 has /), or both ("p@ss/w"), leaves no tail (REV-6; REV-4b
+#      stopped at the first @ followed by a host, and "p@ss/w@db" kept
+#      "ss/w"). THE PRICE: an @ in the PATH takes the authority with it
+#      -- "https://u:p@host/a@b" -> "p@host/a", "https://host:443/a@b"
+#      -> "443/a" -- text cleaned that need not be, never a secret left;
 #   5. token-shaped values with no keyword next to them.
 #   Pattern 2 in detail, in two passes -- a query parameter first, then
 #   every other form:
 #      - THE KEY is a credential word (password, passwd, pwd, token,
 #        secret, api_key/api-key/apikey, authorization, secret_key,
-#        private_key, credential/credentials -- REV-4b; never a bare
+#        private_key, credential/credentials -- REV-4b; cookie,
+#        session_id/sessionid, passphrase, pgpassword,
+#        secret_access_key -- REV-6; never a bare
 #        "key": idempotency_key and correlation_key are on every line
 #        comms writes) with any
 #        prefix joined by _ or - (access_token, db_password,
@@ -94,7 +98,7 @@ _AUTH_HEADER_RE = re.compile(
 )
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
 _URL_USERINFO_RE = re.compile(
-    r"(://[^/\s:@]*:)\S*?(@)(?=[^\s@/?#]*(?:[/?#]|\s|$))"
+    r"(://[^/\s:@]*:)[^\s?#]*(@)(?=[^\s@/?#]*(?:[/?#]|\s|$))"
 )
 _TELEGRAM_TOKEN_RE = re.compile(r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}")
 _MAILGUN_KEY_RE = re.compile(
@@ -126,10 +130,18 @@ _LLM_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
 #      demand of a provider credential, and a red start on a valid
 #      configuration).
 _LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{48,}\b")
+# The key: a credential word with any prefix joined by _ or -. LINEAR on
+# any text (REV-6): the prefix starts only where no letter, digit, _ or -
+# stands before it, and every repetition ends in a separator its letters
+# cannot take -- one way to split a run, so no start inside a run is
+# tried and nothing is tried twice. The prefix SAN-1 wrote,
+# \b(?:[a-z0-9]+[_-])*, tried every start of a run like "a-a-a-...":
+# quadratic, 22 s on 80 000 characters.
 _KEY = (
-    r"\b(?:[a-z0-9]+[_-])*"
+    r"(?<![a-z0-9_-])(?:[a-z0-9]*[_-])*"
     r"(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|authorization"
-    r"|secret[_-]?key|private[_-]?key|credentials?)"
+    r"|secret[_-]?key|private[_-]?key|credentials?"
+    r"|cookie|session[_-]?id|passphrase|pgpassword|secret[_-]?access[_-]?key)"
 )
 _REDACTED = "[redacted]"
 _QUERY_KEYVAL_RE = re.compile(
@@ -307,7 +319,20 @@ def exception_text(exc: BaseException) -> str:
     summary = db_error_summary(exc)
     if summary is not None:
         return summary
-    return sanitize_text(str(exc))[:2000]
+    try:
+        text = str(exc)
+    except Exception:
+        # Never a failure of its own (REV-6): an exception whose __str__
+        # raises is named by its type, as unreadable_value does.
+        return unreadable_value(exc)
+    return sanitize_text(text)[:2000]
+
+
+def unreadable_value(value: object) -> str:
+    """What stands in a log or a record for a value that cannot be read
+    -- its str or repr raises, it is nested past the walk: its type,
+    never a part of it (REV-6)."""
+    return f"<unreadable {type(value).__name__}>"
 
 
 def sanitized_traceback(exc: BaseException) -> str:

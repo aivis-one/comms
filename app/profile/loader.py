@@ -668,8 +668,14 @@ def _check_duration(value: Any) -> str | None:
             f"positive integer and one unit of {', '.join(_DURATION_UNITS)} "
             f"(e.g. \"15m\", \"24h\", \"7d\")"
         )
-    count, unit = int(match.group(1)), match.group(2)
-    if count > _MAX_DURATION_SECONDS // _DURATION_UNITS[unit]:
+    digits, unit = match.group(1), match.group(2)
+    # The length first (REV-6): int() refuses a string of more than 4300
+    # digits with a bare ValueError, and a count longer than the ceiling
+    # in digits is above it anyway.
+    if (
+        len(digits) > len(str(_MAX_DURATION_SECONDS))
+        or int(digits) > _MAX_DURATION_SECONDS // _DURATION_UNITS[unit]
+    ):
         return (
             f"found {value!r}; longer than {_MAX_DURATION_DAYS}d, the "
             f"longest duration a profile may declare"
@@ -992,11 +998,24 @@ def _first_text(
     return None
 
 
+# What `params` printed WHOLE stands as (REV-6): the one object the
+# intake lets into action_data prints as its str() -- keys and values
+# escaped, the quotes of the repr raw ("'"), unlike any scalar, whose
+# "'" html.escape writes as &#x27;. In a single-quoted attribute those
+# raw quotes end it early, as they would on the send.
+_PARAMS_STANDS_AS = str({_FIELD_STANDS_AS: _FIELD_STANDS_AS})
+
+
 def _fields_as_one(template: str) -> str:
-    """The template with every field as _FIELD_STANDS_AS and "{{" "}}" as
-    braces."""
+    """The template with every field as what it stands as -- `params`
+    whole as _PARAMS_STANDS_AS, any other as _FIELD_STANDS_AS -- and
+    "{{" "}}" as braces."""
     return "".join(
-        literal + ("" if name is None else _FIELD_STANDS_AS)
+        literal + (
+            "" if name is None
+            else _PARAMS_STANDS_AS if name == "params"
+            else _FIELD_STANDS_AS
+        )
         for literal, name, _, _ in string.Formatter().parse(template)
     )
 

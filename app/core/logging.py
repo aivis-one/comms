@@ -26,7 +26,9 @@
 # logs and comms' (spec §6.6) are left whole: CORRELATION_FIELDS.
 # =============================================================================
 
+import copy
 import logging
+import re
 import sys
 import threading
 from collections.abc import MutableMapping
@@ -36,7 +38,12 @@ from typing import Any
 import structlog
 
 from app.core.config import settings
-from app.core.sanitize import is_secret_name, sanitize_text, sanitized_traceback
+from app.core.sanitize import (
+    is_secret_name,
+    sanitize_text,
+    sanitized_traceback,
+    unreadable_value,
+)
 
 _REDACTED = "[redacted]"
 
@@ -63,33 +70,62 @@ _WALKED = (list, tuple, set, frozenset)
 _SCALARS = (bool, int, float)
 
 
-def _sanitized(value: Any, path: frozenset[int] = frozenset()) -> Any:
+# How deep _sanitized walks (REV-6): a value nested deeper is named, not
+# walked -- the walk is recursion, and 2000 levels raised RecursionError
+# out of the chain. The order of MAX_JSON_DEPTH (64), far from Python's
+# own limit.
+_MAX_LOG_DEPTH = 64
+
+
+def _sanitized(
+    value: Any, path: frozenset[int] = frozenset(), depth: int = 0,
+) -> Any:
     """A value of a log event with every string in it through the one
     sanitizer. Never raises: what it cannot walk -- an object, a
     container it does not rebuild, a container that holds itself (`path`
     is the ids above this one; the same object twice side by side is
     walked twice, it is not a cycle) -- becomes sanitize_text(repr(v)),
-    which is what the JSON renderer's fallback would print anyway."""
+    which is what the JSON renderer's fallback would print anyway; a
+    value whose repr raises, or one nested past _MAX_LOG_DEPTH, becomes
+    unreadable_value -- its type, nothing of it (REV-6). A pair -- a
+    tuple or list of two whose first is a credential's name,
+    ("x-api-key", "...") as headers come -- keeps the name and hides the
+    value, as a field does (REV-6)."""
     if isinstance(value, str):
         return sanitize_text(value)
     if value is None or isinstance(value, _SCALARS):
         return value
     walked = isinstance(value, dict) or type(value) in _WALKED
     if not walked or id(value) in path:
-        return sanitize_text(repr(value))
+        try:
+            return sanitize_text(repr(value))
+        except Exception:
+            return unreadable_value(value)
+    if depth >= _MAX_LOG_DEPTH:
+        return unreadable_value(value)
     inner = path | {id(value)}
     if isinstance(value, dict):
-        return {key: _field(key, item, inner) for key, item in value.items()}
-    return type(value)(_sanitized(item, inner) for item in value)
+        return {
+            key: _field(key, item, inner, depth + 1)
+            for key, item in value.items()
+        }
+    if (
+        type(value) in (tuple, list) and len(value) == 2
+        and isinstance(value[0], str) and is_secret_name(value[0])
+    ):
+        return type(value)((sanitize_text(value[0]), _REDACTED))
+    return type(value)(_sanitized(item, inner, depth + 1) for item in value)
 
 
-def _field(name: Any, value: Any, path: frozenset[int] = frozenset()) -> Any:
+def _field(
+    name: Any, value: Any, path: frozenset[int] = frozenset(), depth: int = 0,
+) -> Any:
     """A named value -- a field of the event, a key of a dict in it: a
     credential's name hides its value whole, whatever its type
     (is_secret_name, REV-4b); any other is walked as above."""
     if isinstance(name, str) and is_secret_name(name):
         return _REDACTED
-    return _sanitized(value, path)
+    return _sanitized(value, path, depth)
 
 
 def sanitize_event(
@@ -155,7 +191,35 @@ class SanitizingFormatter(logging.Formatter):
         # summary -- before the line is sanitized.
         if record.exc_info and record.exc_info[1] is not None:
             record.exc_text = sanitized_traceback(record.exc_info[1])
-        return sanitize_text(self.inner.format(record))
+        # REV-6: the message and its arguments are DATA -- a provider's
+        # text, a path a client sent -- and a line break or an escape
+        # sequence in them would forge a line or repaint the terminal.
+        # Escaped on a copy, before the inner formatter lays the line out
+        # (uvicorn's access formatter unpacks record.args by position,
+        # and the strings keep their places); the traceback it appends
+        # (exc_text) is not data and stays as many lines as it is.
+        shown = copy.copy(record)
+        shown.msg = _escaped(record.msg)
+        if isinstance(record.args, tuple):
+            shown.args = tuple(_escaped(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            shown.args = {key: _escaped(arg) for key, arg in record.args.items()}
+        return sanitize_text(self.inner.format(shown))
+
+
+# The characters a log line must not carry as they are: C0 controls but
+# the tab, DEL, NEL and the Unicode line and paragraph separators.
+_CONTROLS_RE = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+
+
+def _escaped(value: Any) -> Any:
+    """A string with every control _CONTROLS_RE names written as its
+    escape (\\n, \\x1b, \\u2028); anything else as it is."""
+    if not isinstance(value, str):
+        return value
+    return _CONTROLS_RE.sub(
+        lambda m: m.group(0).encode("unicode_escape").decode("ascii"), value,
+    )
 
 
 def _sanitize_handlers() -> None:
