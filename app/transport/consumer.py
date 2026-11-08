@@ -64,6 +64,18 @@
 #              whole stream (poison-pill rule) -- the DLQ keeps what
 #              the investigation needs (DEAD LETTERS below).
 #
+# REDIS ITSELF, on the XACK and on the dead letter's XADD (review 3.14.0,
+# 2.3, N0, N3). Both are retried IN PLACE (_until_done), the next entry
+# not taken meanwhile: an entry left pending would be handled again
+# later, over the newer entries behind it. A lost connection, a timeout,
+# a redis loading its data, an OOM and an error of any other kind are
+# retried for as long as they last, said loudly. A REFUSAL -- a
+# ResponseError but OOM, an authentication or authorization error
+# (_is_refusal) -- that comes _REDIS_REFUSALS_BEFORE_EXIT times ends
+# run() with RedisRefusedError: the connection that keeps meeting a replica
+# after a failover is mended by the restart, not by a retry on it, and
+# the entry, still pending, is handled first at the next start.
+#
 # DEAD LETTERS -- for the investigation, never a replay. Nothing reads
 # the DLQ back into the stream: the product resends from its outbox, the
 # source of the request (deploy/INTEGRATION.md, "How long comms keeps
@@ -104,7 +116,12 @@ from typing import Any
 
 import structlog
 from redis.asyncio import Redis
-from redis.exceptions import ResponseError
+from redis.exceptions import (
+    AuthenticationError,
+    AuthorizationError,
+    OutOfMemoryError,
+    ResponseError,
+)
 from redis.typing import EncodableT, FieldT
 
 from app.core.config import settings
@@ -165,14 +182,23 @@ _WAIT_LOUD_EVERY = 10
 # OverflowError out of the wait itself.
 _WAIT_DOUBLINGS = 32
 
+# A REFUSAL OF REDIS (REDIS ITSELF, the header): this many of them on one
+# operation of one entry end run(). With the doubling wait (0.2 s to the
+# ceiling) the process holds ~25 s before it goes: time for a failover to
+# promote the very replica the connection meets, which mends READONLY in
+# place; past that a retry on the same connection mends nothing, and the
+# restart costs seconds and one entry replayed in the stream's order.
+_REDIS_REFUSALS_BEFORE_EXIT = 8
+
 # THE PENDING LIST AGAIN, WHILE RUNNING (WK-3): every this many seconds
 # run() reads its own pending list once more (_drain_pending, its cursor
 # rule kept) between its reads of new entries. An entry left pending --
-# a dead letter that could not be written, an entry whose handling
+# a dead letter that could not be built, an entry whose handling
 # raised -- is offered again in the running process, no longer only at
-# the next start. An ack is never left pending: it is retried in place
-# (_ack_until_done). The cost, named: an entry pending for good is
-# handled again every interval, an ordering retry of it (BL-4) included.
+# the next start. An ack and a dead letter's write are never left
+# pending: they are retried in place (_until_done). The cost, named: an
+# entry pending for good is handled again every interval, an ordering
+# retry of it (BL-4) included.
 _PENDING_REDRAIN_SECONDS = 60.0
 
 # The fields of a dead letter -- the contract's list
@@ -206,11 +232,16 @@ _DLQ_WITHHELD_ENVELOPE_FIELDS = frozenset({"llm_audio"})
 # field fits _DLQ_VALUE_MAX however it escapes (the longest: an email of
 # 320 Cyrillic characters, 1920); an event or a field name is short
 # (_DLQ_NAME_MAX); twenty sorted names show the pattern of a broken
-# producer, and the count says how broken. A letter is then ~19 KB at
-# most, ~190 MB at the default dlq_maxlen -- before, ~4 MB and ~40 GB.
+# producer, and the count says how broken. _dlq_error is cut at
+# _DLQ_ERROR_MAX characters once it is redacted (_dead_letter_of), and
+# is written as UTF-8: up to 4 bytes a character. A letter is then
+# ~25 KB at most -- 7 kept values, 20 names, the event, the error, the
+# rest small -- ~250 MB at the default dlq_maxlen; before REV-1, ~4 MB
+# and ~40 GB.
 _DLQ_VALUE_MAX = 2048
 _DLQ_NAME_MAX = 128
 _DLQ_DROPPED_LISTED = 20
+_DLQ_ERROR_MAX = 2000
 
 
 class StreamConsumer:
@@ -316,9 +347,14 @@ class StreamConsumer:
         the pending list (WK-3: every _PENDING_REDRAIN_SECONDS, and at
         the next start). A failure of the loop's own read (Redis down)
         is outside this and still ends run(): the restart policy
-        reconnects."""
+        reconnects. So does RedisRefusedError, let through here: a refusal of
+        redis on the entry's XACK or dead letter (REDIS ITSELF, the
+        module header) -- caught, it would leave the entry pending and
+        take the next, the window _until_done closes."""
         try:
             await self._process_entry(entry_id, fields)
+        except RedisRefusedError:
+            raise  # the process's, not the entry's (REDIS ITSELF, header)
         except Exception as exc:
             logger.error(
                 "event_left_pending",
@@ -334,7 +370,7 @@ class StreamConsumer:
         the start and every _PENDING_REDRAIN_SECONDS (run, WK-3)."""
         drained = 0
         # A CURSOR, not "0" every time (FIX review 3.13.0): an entry left
-        # pending on purpose (a dead letter that could not be written)
+        # pending on purpose (a dead letter that could not be built)
         # stays in the pending list, and reading from "0" again would meet
         # it forever -- no new event would ever be read. Each read starts
         # after the last entry seen: a held entry is met once per pass.
@@ -514,50 +550,97 @@ class StreamConsumer:
             return
 
     # KNOWN CEILING -- the process stopped while an ack is retried.
-    # Mechanics: an event is committed, its XACK keeps failing, and the
-    # process stops in the retry (SIGTERM, a crash, the OOM killer): the
-    # entry is still pending, and the next start's _drain_pending handles
-    # it again FIRST -- before any new entry, which is read only after
-    # the drain -- so the stream's order is kept, but the event is
-    # applied a second time. A sync event re-applied with nothing newer
-    # between is the same state; a notification_request is collapsed by
-    # its key.
+    # Mechanics: an event is committed and its XACK keeps failing; the
+    # process stops in the retry (SIGTERM, a crash, the OOM killer) or
+    # ends it on purpose -- a refusal of redis _REDIS_REFUSALS_BEFORE_EXIT
+    # times (RedisRefusedError). The entry is still pending, and the next
+    # start's _drain_pending handles it again FIRST -- before any new
+    # entry, which is read only after the drain -- so the stream's order
+    # is kept, but the event is applied a second time. A sync event
+    # re-applied with nothing newer between is the same state; a
+    # notification_request is collapsed by its key. The same for a dead
+    # letter's write: the entry is handled again from the start.
+    # Left as it is, v4.0's: an entry left pending after an exception in
+    # its handling (event_left_pending) is read again by the next pass
+    # over the pending list (WK-3), after the newer entries behind it --
+    # held in place instead, one poisoned entry would stop the stream for
+    # good.
     # Status: acknowledged by design.
     # Task: none -- the closure is the ordering of membership events,
     # v4.0's, and no task of this repository carries it.
     # Unfreeze trigger: a writer of memberships outside the stream (a
     # REST route), OR a handler whose second application is not the same
-    # state, OR event_ack_failed in the log followed by a restart before
-    # event_acked_after_retry.
+    # state, OR event_ack_failed or redis_refused in the log followed by
+    # a restart before event_acked_after_retry, OR event_left_pending of
+    # a group_changed or section_membership_changed.
     # Agreed fix shape: an order for membership events -- the stream
     # entry id kept on the membership row, or a version from the product
     # -- and a replay older than the row refused.
     # Rejected: the ack before the commit (spec §5.4 -- the job lost on a
     # crash between them); the retry in a task of its own (the next
     # entry taken before the ack, and a replay of this one applied over
-    # it -- the window this closes); retrying only a lost connection (a
-    # refusal such as NOGROUP would end the process, and ensure_group,
-    # creating the group from id "0", would replay the whole stream).
+    # it -- the window this closes); a refusal retried for as long as it
+    # lasts (review 3.14.0, N3: READONLY from a replica after a failover,
+    # the stream standing, the healthcheck green, and the restart that
+    # would reconnect never coming); every failure of redis ending the
+    # process (a lost connection mends in place, and a restart per blip
+    # replays an entry each time).
     async def _ack_until_done(self, entry_id: str | bytes) -> None:
         """Acknowledge, retrying IN PLACE until redis takes it: the event
         is committed, a replay of it would apply it again, and the next
         entry is not taken meanwhile -- a group_changed true replayed over
         the false behind it would put the person back (review 3.14.0,
-        2.3). Any failure is retried, the delay doubling to
-        _WAIT_CEILING (_wait_delay); said on the first and every
-        _WAIT_LOUD_EVERY-th failure, and once more when the ack is
-        written. A cancellation is not caught: the stop stays a stop
-        (the KNOWN CEILING above)."""
+        2.3). _until_done; the KNOWN CEILING above."""
+        await self._until_done(
+            entry_id,
+            lambda: self._ack(entry_id),
+            failed="event_ack_failed",
+            done_after_retry="event_acked_after_retry",
+        )
+
+    async def _until_done(
+        self,
+        entry_id: str | bytes,
+        call: Callable[[], Awaitable[None]],
+        *,
+        failed: str,
+        done_after_retry: str,
+    ) -> None:
+        """One operation of redis on one entry, retried IN PLACE until it
+        is done (REDIS ITSELF, the module header): the delay doubling to
+        _WAIT_CEILING (_wait_delay); `failed` said on the first and every
+        _WAIT_LOUD_EVERY-th failure, `done_after_retry` once when it is
+        done. A refusal (_is_refusal) counts; at
+        _REDIS_REFUSALS_BEFORE_EXIT of them RedisRefusedError leaves run(),
+        the entry pending. Nothing else counts -- a lost connection between
+        refusals neither adds to them nor clears them. A cancellation is
+        not caught: the stop stays a stop."""
         failures = 0
+        refusals = 0
         while True:
             try:
-                await self._ack(entry_id)
+                await call()
             except Exception as exc:
                 failures += 1
+                if _is_refusal(exc):
+                    refusals += 1
+                    if refusals >= _REDIS_REFUSALS_BEFORE_EXIT:
+                        logger.error(
+                            "redis_refused",
+                            entry_id=_id_str(entry_id),
+                            operation=failed,
+                            refusals=refusals,
+                            attempts=failures,
+                            error=pipeline_error_of(exc),
+                        )
+                        raise RedisRefusedError(
+                            f"redis refused {failed} of {_id_str(entry_id)} "
+                            f"{refusals} times",
+                        ) from exc
                 delay = _wait_delay(failures)
                 if failures == 1 or failures % _WAIT_LOUD_EVERY == 0:
                     logger.error(
-                        "event_ack_failed",
+                        failed,
                         entry_id=_id_str(entry_id),
                         attempts=failures,
                         delay=delay,
@@ -567,7 +650,7 @@ class StreamConsumer:
                 continue
             if failures:
                 logger.warning(
-                    "event_acked_after_retry",
+                    done_after_retry,
                     entry_id=_id_str(entry_id),
                     attempts=failures + 1,
                 )
@@ -582,70 +665,88 @@ class StreamConsumer:
         attempts: int,
     ) -> None:
         """THE ONE WAY an entry goes to the dead letter (FIX review
-        3.13.0): written, then acknowledged. If the writing fails --
-        Redis down, a dead letter that cannot be built -- the entry STAYS
-        PENDING: not lost, seen in XPENDING and in this log line, offered
-        again at the next pass over the pending list (_drain_pending, its
-        cursor past it: every _PENDING_REDRAIN_SECONDS and at the next
-        start, WK-3). Never an exception out of an except clause: before,
-        a TypeError of the dead letter's own JSON left _process_entry
-        from inside one and took the consumer down, again at every
-        restart. A letter WRITTEN is acknowledged like an applied event
-        (_ack_until_done): left pending, it would be written again at
-        every pass -- or the event applied late, over newer ones, once
-        its cause had gone."""
+        3.13.0): built, written, then acknowledged.
+
+        A letter that cannot be BUILT (a defect of comms', not the
+        weather of redis) leaves the entry PENDING: not lost, seen in
+        XPENDING and in this log line, offered again at the next pass over
+        the pending list (_drain_pending, its cursor past it: every
+        _PENDING_REDRAIN_SECONDS and at the next start, WK-3). Never an
+        exception out of an except clause: before, a TypeError of the dead
+        letter's own JSON left _process_entry from inside one and took the
+        consumer down, again at every restart.
+
+        The WRITE and the ack are retried in place (_until_done, review
+        3.14.0 N0): left pending, the entry would be handled again at the
+        next pass -- written twice, or, its cause gone, applied late over
+        the newer entries behind it (a group_changed true that waited for
+        its person, over the false that followed)."""
         try:
-            await self._to_dlq(entry_id, fields, reason=reason, attempts=attempts)
+            letter = self._dead_letter_of(
+                entry_id, fields, reason=reason, attempts=attempts,
+            )
         except Exception as exc:
             logger.error(
-                "dead_letter_write_failed",
+                "dead_letter_build_failed",
                 entry_id=_id_str(entry_id),
                 error=pipeline_error_of(exc),
             )
             return
+        await self._until_done(
+            entry_id,
+            lambda: self._write_dead_letter(letter),
+            failed="dead_letter_write_failed",
+            done_after_retry="dead_letter_written_after_retry",
+        )
+        logger.warning(
+            "event_dead_lettered",
+            entry_id=_id_str(entry_id),
+            dlq=self._dlq,
+            reason=letter["_dlq_error"],
+            attempts=attempts,
+        )
         await self._ack_until_done(entry_id)
 
     async def _ack(self, entry_id: str | bytes) -> None:
         await self._redis.xack(self._stream, self._group, entry_id)
 
-    async def _to_dlq(
+    def _dead_letter_of(
         self,
         entry_id: str | bytes,
         fields: dict[Any, Any],
         *,
         reason: str,
         attempts: int,
-    ) -> None:
-        """Dead-letter the entry's address with diagnostics attached --
-        DEAD LETTERS in the module header; the fields are
-        dead_letter_fields'.
+    ) -> dict[str, str]:
+        """The dead letter of the entry, its address with diagnostics
+        attached -- DEAD LETTERS in the module header; the fields are
+        dead_letter_fields'. No redis: what fails here is comms'.
 
         The reason is redacted HERE, the one point every dead-letter
-        path passes. It is a refusal of comms' own (a ValidationError:
+        path passes, and cut to _DLQ_ERROR_MAX after it (a redaction may
+        lengthen it). It is a refusal of comms' own (a ValidationError:
         field names and the address, never the letter) or the class and
         place of an exception (pipeline_error_of), never an exception's
-        text. The stream is capped (approximate MAXLEN) so a
-        misbehaving producer cannot grow it without bound.
+        text.
         """
-        reason = sanitize_text(reason)
-        payload = dead_letter_fields(
-            fields, reason=reason, attempts=attempts, entry_id=_id_str(entry_id),
+        return dead_letter_fields(
+            fields,
+            reason=sanitize_text(reason)[:_DLQ_ERROR_MAX],
+            attempts=attempts,
+            entry_id=_id_str(entry_id),
         )
+
+    async def _write_dead_letter(self, letter: dict[str, str]) -> None:
+        """XADD the letter. The stream is capped (approximate MAXLEN) so a
+        misbehaving producer cannot grow it without bound."""
         # redis-py's FieldT alias is invariant in dict params, so a
         # plain dict[str, str] does not satisfy it; alias it exactly.
-        entry: dict[FieldT, EncodableT] = dict(payload.items())
+        entry: dict[FieldT, EncodableT] = dict(letter.items())
         await self._redis.xadd(
             self._dlq,
             entry,
             maxlen=settings.dlq_maxlen,
             approximate=True,
-        )
-        logger.warning(
-            "event_dead_lettered",
-            entry_id=_id_str(entry_id),
-            dlq=self._dlq,
-            reason=reason,
-            attempts=attempts,
         )
 
 
@@ -654,6 +755,26 @@ def _retryable(exc: BaseException) -> bool:
     NotFoundError -- the address book has not caught up) or a transient
     failure of the database, by the one rule (TX-1)."""
     return isinstance(exc, NotFoundError) or is_transient_db_error(exc)
+
+
+class RedisRefusedError(RuntimeError):
+    """Redis refused one operation of one entry _REDIS_REFUSALS_BEFORE_EXIT
+    times (REDIS ITSELF, the module header): out of run() and out of the
+    process, the restart policy bringing it back. Its cause is the last
+    refusal."""
+
+
+def _is_refusal(exc: BaseException) -> bool:
+    """A refusal of redis that a retry on the same connection does not
+    mend: an authentication or authorization error (redis-py raises them
+    as ConnectionError, so they are asked first), any ResponseError --
+    READONLY, NOPERM, WRONGTYPE and the codes without a class of their
+    own -- but OOM, which a restart does not mend either: memory is freed
+    by redis, not by a reconnect. Everything else -- a lost connection, a
+    timeout, LOADING, an error that is not redis' -- is retried."""
+    if isinstance(exc, (AuthenticationError, AuthorizationError)):
+        return True
+    return isinstance(exc, ResponseError) and not isinstance(exc, OutOfMemoryError)
 
 
 def _wait_delay(n: int) -> float:

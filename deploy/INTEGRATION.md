@@ -459,10 +459,8 @@ sender address -- and all three must be set together or left empty
 together. The sender has no default because it is a product fact; a
 default would make an incomplete set look complete. It accepts either a
 bare address or the display form `Name <address>`, since a signed
-sender delivers better -- in the env file the display form only in
-quotes (`EMAIL_FROM_ADDRESS="Comms <noreply@example.com>"`): the file is
-read by `source`, and an unquoted `<` is a redirection there. A value
-carrying a line break is refused at startup.
+sender delivers better, and a value carrying a line break is refused at
+startup.
 
 The provider region is different in kind: it has a default, so
 "unset" and "set to the default" cannot be told apart, and it therefore
@@ -593,7 +591,7 @@ body, with a class a program can branch on:
 
 | status | class | when |
 |---|---|---|
-| 400 | `bad_request` | the request could not be read -- a body that is not UTF-8 JSON, or one nested deeper than its JSON can be read on a route that takes a body model; any other client status this table does not list travels with this class too. Fix the request; repeating it changes nothing |
+| 400 | `bad_request` | the request could not be read -- a body that is not UTF-8 JSON; any other client status this table does not list travels with this class too. Fix the request; repeating it changes nothing |
 | 401 | `unauthorized` | the service token is missing or wrong -- asked first, on every path but `/health` and `/ready`, before anything of the request is read: without it an unknown route, another method, a body of any size or shape is this 401 too |
 | 403 | `forbidden` | the actor has no role in this thread |
 | 404 | `not_found` | the entity or the route does not exist (a route: with the token) |
@@ -603,7 +601,7 @@ body, with a class a program can branch on:
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
 | 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
-| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read on a route that takes no body model -- on one that does, the framework answers `400` `bad_request` (above) |
+| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
@@ -706,7 +704,12 @@ they were part of stay: a conversation belongs to both sides, and what
 happens to message bodies -- and to their variants (section 12) -- is
 the product's decision. That decision is a thread at a time: deleting a
 thread (section 14) removes every message in it, whoever wrote it. A deletion is
-final -- a person who returns gets a new id in the product. A
+final -- a person who returns gets a new id in the product. One copy is
+not forgotten: the fields of the address book kept in a dead letter
+(`<COMMS_EVENTS_STREAM>:dlq`, "How long comms keeps things") stay there
+-- the products hide a person rather than erase them and comms follows
+them, and that stream is for an investigation by hand, capped by
+`DLQ_MAXLEN` and trimmed. A
 recipient deactivated or deleted after a job was resolved is not sent
 to either: their delivery ends `recipient_inactive`, which is neither a
 failure nor a mute.
@@ -1001,11 +1004,15 @@ writers emit them), a literal past the float range (`1e309`), an
 integer of more than 4300 digits -- is rejected naming the field; so
 is `data` nested deeper than 64 levels (the `data` object itself the
 first), and a `scheduled_at` or `expiry_at` that lies, in UTC, before
-the year 1 or after 9999 (the year 1 at `+01:00`, say). A request is
-rejected under its key whenever the key can be read. Data that cannot
-be read at all -- broken JSON, a nesting past what the reader can
-follow -- leaves no key, and the request goes to the dead-letter
-stream.
+the year 1 or after 9999 (the year 1 at `+01:00`, say). A request
+refused for what it holds is rejected under its key whenever the key
+can be read. Data that cannot be read at all -- broken JSON, a nesting
+past what the reader can follow -- leaves no key, and the request goes
+to the dead-letter stream. So does a request whose key can be read but
+whose handling failed -- transient failures past the retries while the
+database answers, or an error no retry mends: this version of comms
+gives it no outcome under its key, and the product sees that absence (a
+read by the key finds no job).
 
 **The size of an entry.** An entry whose `data` is larger than 4194304
 bytes (4 MiB) is refused for its size before any of it is read, and goes
@@ -2257,8 +2264,10 @@ value of `data` longer than **2048** is not kept, its key is dropped by
 name; an `event` longer than **128** bytes is not kept, `event` is
 dropped by name; `_dlq_dropped` lists the first **20** names in sorted
 order, each at most **128** long as JSON, and `_dlq_dropped_more` counts
-the names it does not list. Every value a valid event sends fits, but
-a `reminder_cancel` `types` list of many keys.
+the names it does not list. `_dlq_error` is at most 2000 characters --
+up to 8000 bytes in UTF-8. Every value a valid event sends fits, but a
+`reminder_cancel` `types` list of many keys. A dead letter is then
+about 25 KB at most, about 250 MB at the default `DLQ_MAXLEN`.
 
 | field | what it holds |
 |---|---|

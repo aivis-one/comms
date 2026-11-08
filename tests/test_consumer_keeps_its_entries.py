@@ -2,7 +2,7 @@
 # FIX review 3.13.0 -- the consumer keeps its entries and itself
 # =============================================================================
 #
-#   1 a dead letter that cannot be built or written never takes the
+#   1 a dead letter that cannot be built never takes the
 #     process down: the entry stays PENDING (_dead_letter_or_hold), the
 #     next entry is processed; the review's own entry (a key with a NUL,
 #     then 1e999) is dead-lettered without its data;
@@ -126,18 +126,25 @@ class TestTheReviewsEntry:
 
 
 def _failing_dead_letters(monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
-    """The dead letter's writing fails `times` times (a Redis XADD to the
-    dead-letter stream refused), then works."""
-    real = StreamConsumer._to_dlq
+    """The dead letter cannot be BUILT `times` times (a defect of comms'
+    -- dead_letter_fields raises), then it can.
+
+    Until review 3.14.0 (N0) this failed the WRITE (a ConnectionError of
+    the XADD) -- right then: a write that failed left the entry pending.
+    The write is retried in place now (_until_done,
+    tests/test_consumer_refusal_and_dlq_write.py); a letter that cannot
+    be built is what still leaves the entry pending, and what these tests
+    hold."""
+    real = consumer_module.dead_letter_fields
     calls = [0]
 
-    async def to_dlq(self: StreamConsumer, *args: Any, **kwargs: Any) -> None:
+    def building(*args: Any, **kwargs: Any) -> dict[str, str]:
         calls[0] += 1
         if calls[0] <= times:
-            raise ConnectionError("the dead-letter stream is unreachable")
-        await real(self, *args, **kwargs)
+            raise TypeError("the dead letter cannot be built")
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(StreamConsumer, "_to_dlq", to_dlq)
+    monkeypatch.setattr(consumer_module, "dead_letter_fields", building)
     return calls
 
 
@@ -161,7 +168,7 @@ class TestHeld:
             await _run_until(StreamConsumer(fake_redis), next_one)
         assert await _pending(fake_redis, a_stream) == 1  # the held one
         assert await _dlq(fake_redis) == []
-        assert "dead_letter_write_failed" in [e["event"] for e in logs]
+        assert "dead_letter_build_failed" in [e["event"] for e in logs]
 
     async def test_an_ack_that_fails(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
@@ -244,7 +251,7 @@ class TestTheCursor:
             await _run_until(StreamConsumer(fake_redis), later_done)
         assert len(met) == 1
         assert await _pending(fake_redis, a_stream) == 1
-        assert "dead_letter_write_failed" in [e["event"] for e in logs]
+        assert "dead_letter_build_failed" in [e["event"] for e in logs]
 
     async def test_a_held_entry_goes_out_when_it_can(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
