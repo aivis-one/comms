@@ -184,8 +184,48 @@ from app.core.lanes import Lane
 # (the entry stays pending), waits for its database while it does not
 # answer, and dead-letters an event only when the database answers;
 # update stops comms before the datastores; a hanging test is red.
+#
+# 3.14.0 is a MINOR: most of its changes are refusals of a product's own
+# wrong input, but four change what a product sees on right input -- a
+# section whose operators were all taken out serves no one (migration
+# 0039); a variable the job does not carry is printed as its
+# placeholder and marked in the journal (0040); without APP_ENV the API
+# is production, closed, not open; a scheduled letter is kept until its
+# scheduled_at plus the retention, not from its creation. The refusals:
+# the API asks the service token before it reads anything of a request;
+# a string the database cannot store, a malformed cursor, query
+# parameter, schedule time or read pointer, a bool or int sent as
+# another type are a 422, a body past 1 MiB a 413, an event past 4 MiB
+# a dead letter, action data past 64 KiB refused at intake, a
+# preference write for a forgotten recipient a 409; a repeated claim
+# and the loser of a creation race under the same key answer as the
+# first call; scheduled_at past 3650 days ahead is refused under the
+# key; a profile with a blank text, Telegram markup Telegram refuses or
+# a duration past 3650 days does not load. No value from the database
+# reaches a log; the sanitizer runs in linear time, never fails on a
+# value, and hides a credential named by its field or key whole. An
+# operator acts only while the roster gives the right, taken under
+# lock. The worker takes a job only while it is still ready; a
+# transient failure of the database counts while the database answers
+# and the uncounted wait is gone (0038); the pipeline budget counts
+# failures in a row; a stop writes the channel's answer through; the
+# expiry sweep goes in portions and close notifications thread by
+# thread; the database probe is bounded as a whole. Telegram's final
+# refusals are final; email's unknown sender domain is the channel's,
+# any 2xx accepted, a 408 retried; an LLM's policy decline refuses the
+# letter, its answer read as a stream under a ceiling. The consumer
+# retries its ack and its dead letter in place, goes down to be
+# restarted on a lasting refusal of Redis, reads its own pending list
+# again while running, and bounds the dead letters in bytes.
+# Retention ages a cancelled job from its creation and keeps a job a
+# push is owed for. The reminder cancel finds its jobs by an index on
+# correlation (0041, built concurrently); the translations feed reads
+# the latest request. Across autumn's change of the clocks the
+# schedule neither defers into the past nor skips the second pass. CI
+# runs the fast checks first, the suite in three parts, and installs
+# nothing without a hash.
 # The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.13.0"
+APP_VERSION = "3.14.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
