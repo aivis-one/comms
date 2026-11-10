@@ -45,6 +45,7 @@ from app.api.messaging import participants_router, sections_router
 from app.api.messaging import router as messaging_router
 from app.api.prefs import router as prefs_router
 from app.api.recipients import router as recipients_router
+from app.api.request_id import RequestId
 from app.api.service_auth import RequireServiceToken
 from app.core.config import APP_VERSION, settings
 from app.core.database import (
@@ -153,8 +154,12 @@ register_error_handlers(app)
 app.add_middleware(LimitRequestBody)
 # The service token, asked before routing and before the body is read,
 # counted, parsed or checked; /health and /ready alone are open
-# (app/api/service_auth.py, REV-3). Added last, the outermost.
+# (app/api/service_auth.py, REV-3). Outside the body limit.
 app.add_middleware(RequireServiceToken)
+# The request id (protocol 9.6), before anything else of comms looks at
+# the request: the 401 and the 413 carry it too (app/api/request_id.py).
+# Added last, the outermost.
+app.add_middleware(RequestId)
 app.include_router(inbox_router)
 app.include_router(jobs_router)
 app.include_router(changes_router)

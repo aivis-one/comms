@@ -15,9 +15,11 @@
 # get_request_handler) -- a tokenless body was answered 422 (malformed,
 # or a NUL), 400 (nested too deep) or even 500 before the token was
 # looked at. A middleware runs before routing, so before all of that.
-# It is added last in app/main.py, the outermost; against the body
-# limit (app/api/body_limit.py) the order is a choice, not a guard: that
-# one refuses only while a body is read, and this never reads it.
+# It is added in app/main.py outside every other layer of comms but the
+# request id's (app/api/request_id.py), which only names the request;
+# against the body limit (app/api/body_limit.py) the order is a choice,
+# not a guard: that one refuses only while a body is read, and this never
+# reads it.
 #
 # THE ANSWER IS BUILT HERE: a user middleware sits outside Starlette's
 # ExceptionMiddleware, so an HTTPException raised here would reach no

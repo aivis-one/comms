@@ -62,6 +62,11 @@ jobs:
       APP_ENV: ci
       DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+      # The release every log line names (W3-2, protocol 9.4): what the
+      # image carries from the machine's build argument (job `image`),
+      # here from the run -- a process of comms without it refuses to
+      # start (app/core/logging.py release_from_environment).
+      PRIMER_RELEASE: ${{ github.ref_name }}
       # The package from the checkout, as the image has it from /app
       # (Dockerfile, PYTHONPATH) -- not installed (REV-5, see below).
       PYTHONPATH: ${{ github.workspace }}
@@ -219,6 +224,8 @@ jobs:
       # value -- the suite replaces it anyway (tests/conftest.py).
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
       PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
+      # The release every log line names, as in `checks` (W3-2).
+      PRIMER_RELEASE: ${{ github.ref_name }}
       # The package from the checkout, as in `checks` (REV-5).
       PYTHONPATH: ${{ github.workspace }}
 

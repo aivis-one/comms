@@ -136,6 +136,7 @@ from app.core.exceptions import (
     ValidationError,
     conflict_class,
 )
+from app.core.logging import request_id_of, serving
 from app.core.sanitize import (
     exception_text,
     pipeline_error_of,
@@ -147,6 +148,7 @@ from app.transport.connection import redis_client
 from app.transport.events import (
     ENVELOPE_DATA_FIELD,
     ENVELOPE_EVENT_FIELD,
+    ENVELOPE_REQUEST_ID_FIELD,
     EVENT_FIELDS,
     EVENT_NOTIFICATION_REQUEST,
     NOTIFICATION_REQUEST_ENVELOPE_FIELDS,
@@ -350,17 +352,24 @@ class StreamConsumer:
         reconnects. So does RedisRefusedError, let through here: a refusal of
         redis on the entry's XACK or dead letter (REDIS ITSELF, the
         module header) -- caught, it would leave the entry pending and
-        take the next, the window _until_done closes."""
-        try:
-            await self._process_entry(entry_id, fields)
-        except RedisRefusedError:
-            raise  # the process's, not the entry's (REDIS ITSELF, header)
-        except Exception as exc:
-            logger.error(
-                "event_left_pending",
-                entry_id=_id_str(entry_id),
-                error=pipeline_error_of(exc),
-            )
+        take the next, the window _until_done closes.
+
+        THE ENTRY'S REQUEST ID (W3-2, protocol 9.6): every line written
+        for the entry -- its parse, its handling, its dead letter, this
+        last line -- carries the id of its envelope (entry_request_id),
+        or one of comms' own; the next entry starts from its own, and a
+        line after the entry from none."""
+        with serving(entry_request_id(fields)):
+            try:
+                await self._process_entry(entry_id, fields)
+            except RedisRefusedError:
+                raise  # the process's, not the entry's (REDIS ITSELF, header)
+            except Exception as exc:
+                logger.error(
+                    "event_left_pending",
+                    entry_id=_id_str(entry_id),
+                    error=pipeline_error_of(exc),
+                )
 
     async def _drain_pending(self) -> int:
         """Replay entries delivered to THIS consumer but never acked
@@ -875,6 +884,18 @@ def _utf8_or_none(raw: bytes) -> str | None:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def entry_request_id(fields: dict[Any, Any]) -> str:
+    """The id an entry's lines are written under: its envelope's
+    request_id when that is of the form (app/core/logging.py
+    request_id_of), else a fresh one -- absent, empty, too long, not
+    ASCII or not UTF-8 alike. Never a refusal of the event (9.6): this is
+    the address of the lines, not a part of the event."""
+    for key, value in fields.items():
+        if entry_field_name(key) == ENVELOPE_REQUEST_ID_FIELD:
+            return request_id_of(value)
+    return request_id_of(None)
 
 
 def _id_str(entry_id: str | bytes) -> str:

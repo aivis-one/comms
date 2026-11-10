@@ -609,6 +609,17 @@ body, with a class a program can branch on:
 
 The message is for a human; the class is the contract.
 
+**The request id.** Pass the `X-Request-ID` of your own request into
+every call of comms, `/health` and `/ready` included (protocol 9.6).
+comms keeps it when it is of the form `[A-Za-z0-9._-]{1,128}`; any
+other -- absent, empty, longer, with a space or a line break -- is
+replaced by an id comms mints. Of several `X-Request-ID` headers the
+last is taken and judged alone: a malformed last one is replaced, never
+an earlier one used. Every response carries the id the request was
+served under in its own `X-Request-ID` -- the `401` of the token, the
+`413` of the body and a `500` too -- and every log line comms writes
+for the request names it in `request_id`.
+
 **A write is answered after its commit.** Every route that writes
 answers only once what it wrote is committed: a 2xx means the row is
 there. A commit that fails is the answer -- a 503 or a 500 -- never a
@@ -940,9 +951,18 @@ contract; the schema comments in `app/transport/events.py` follow it.
 
 ### The frame
 
-One stream entry is `{event, data}`: `event` names the kind, `data` is
-a UTF-8 JSON document. The frame never changes; everything evolves
-inside `data`, which always carries an integer `v` (supported: `1`).
+One stream entry is `{event, data}` and, optionally, `request_id`:
+`event` names the kind, `data` is a UTF-8 JSON document. The event
+never changes; everything evolves inside `data`, which always carries
+an integer `v` (supported: `1`).
+
+`request_id` is the `X-Request-ID` of the request that wrote the event
+(section 5, protocol 9.6), of the form `[A-Za-z0-9._-]{1,128}`. Every
+log line comms writes while it processes the entry names it; one that
+is absent or of another form -- not UTF-8 either -- is replaced by an id
+comms mints, and the event is processed as it would be without the
+field: an event is never refused, and never dead-lettered, because of
+its `request_id`.
 The field set of every event is **closed** -- `notification_request`,
 `reminder_cancel`, `user_upserted`, `user_deleted`, `group_changed` and
 `section_membership_changed`: an unknown field refuses the event, naming

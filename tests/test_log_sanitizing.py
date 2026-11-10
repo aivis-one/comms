@@ -192,15 +192,17 @@ class TestThePiecesInProcess:
         assert line["exception"].startswith("Traceback")
         assert line["nested"] == {"dsn": [_DSN.replace(_PASSWORD, "[redacted]")]}
 
-    def test_the_formatter_keeps_the_inner_shape(self) -> None:
-        inner = logging.Formatter("<%(levelname)s> %(message)s")
-        formatter = SanitizingFormatter(inner)
+    def test_the_formatter_writes_the_machine_line(self) -> None:
+        """Until W3-2 the formatter wrapped the one a handler had and
+        kept its shape (`<WARNING> dsn ...`); the machine's line
+        (protocol 9.4) replaced that shape -- the level is a field, the
+        sanitized text is the line's msg."""
         record = logging.LogRecord(
             "x", logging.WARNING, __file__, 1, "dsn %s", (_DSN,), None,
         )
-        assert formatter.format(record) == (
-            f"<WARNING> dsn {_DSN.replace(_PASSWORD, '[redacted]')}"
-        )
+        line = json.loads(SanitizingFormatter().format(record))
+        assert (line["level"], line["event"]) == ("warning", "x")
+        assert line["msg"] == f"dsn {_DSN.replace(_PASSWORD, '[redacted]')}"
 
 
 class TestCorrelationFields:

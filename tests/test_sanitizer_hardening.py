@@ -18,8 +18,10 @@
 #     with both "@" and "/" -- each with its pair that is no secret.
 #   - STDLIB: a line break or an escape in the message or its arguments
 #     is written as its escape; the traceback stays as many lines as it
-#     is; uvicorn's access formatter, which unpacks record.args by
-#     position, still lays its line out.
+#     is; uvicorn's access record, whose format unpacks record.args by
+#     position, still lays its message out. Read in the line's `msg`:
+#     since W3-2 the formatter writes the machine's line (protocol 9.4),
+#     and the text it wrote before is the message inside it.
 #   - PROFILE: a duration of 5000 digits is a ProfileError;
 #     <a href='{params}'> is refused, as Telegram refuses the repr's
 #     raw quotes; <a href="{params}"> and <a href='{url}'> load.
@@ -68,7 +70,6 @@ from typing import Any
 import pytest
 import structlog
 import yaml
-from uvicorn.logging import AccessFormatter
 
 import app.core.sanitize as sanitize_module
 from app.core.exceptions import ProfileError
@@ -188,6 +189,13 @@ class TestForms:
         assert sanitize_text(cleaned) == cleaned
 
 
+def _msg(line: str) -> str:
+    """The message of a line SanitizingFormatter wrote (W3-2: a JSON
+    object of protocol 9.4; its `msg` is the text the line was before)."""
+    message: str = json.loads(line)["msg"]
+    return message
+
+
 def _record(
     msg: str, args: Any = None, exc: BaseException | None = None,
 ) -> logging.LogRecord:
@@ -202,7 +210,7 @@ class TestStdlibLine:
         line = SanitizingFormatter().format(_record(
             "provider said %s\nINFO forged line", ("a\x1b[31mb\u2028c",)))
         assert "\n" not in line and "\x1b" not in line and "\u2028" not in line
-        assert line == (
+        assert _msg(line) == (
             "provider said a\\x1b[31mb\\u2028c\\nINFO forged line"
         )
 
@@ -211,18 +219,20 @@ class TestStdlibLine:
             raise ValueError("boom")
         except ValueError as exc:
             line = SanitizingFormatter().format(_record("failed\nx", exc=exc))
-        first, *rest = line.split("\n")
+        first, *rest = _msg(line).split("\n")
         assert first == "failed\\nx"
         assert rest and rest[0].startswith("Traceback")
 
     def test_uvicorn_s_access_line(self) -> None:
-        """AccessFormatter unpacks record.args by position."""
-        inner = AccessFormatter('%(client_addr)s "%(request_line)s" %(status_code)s',
-                                use_colors=False)
-        line = SanitizingFormatter(inner).format(_record(
+        """uvicorn's access record is laid out by its own format, which
+        unpacks record.args by position. Until W3-2 this went through
+        uvicorn's AccessFormatter, kept inside SanitizingFormatter, and
+        the line read '... 200 OK'; the machine's line replaced that
+        formatter -- the message is the record's own, the escape kept."""
+        line = SanitizingFormatter().format(_record(
             '%s - "%s %s HTTP/%s" %d',
             ("1.2.3.4:5", "GET", "/x?a=1\nFAKE", "1.1", 200)))
-        assert line == '1.2.3.4:5 "GET /x?a=1\\nFAKE HTTP/1.1" 200 OK'
+        assert _msg(line) == '1.2.3.4:5 - "GET /x?a=1\\nFAKE HTTP/1.1" 200'
 
     def test_the_original_record_is_left_alone(self) -> None:
         record = _record("a\n%s", ("c\nd",))
@@ -407,7 +417,7 @@ class TestNotAString:
     _FORGED = _ForgedError("bad\nINFO forged \x1b[31m")
 
     def _line(self, msg: Any, args: Any = None) -> str:
-        return SanitizingFormatter().format(_record(msg, args))
+        return _msg(SanitizingFormatter().format(_record(msg, args)))
 
     def test_an_exception_argument(self) -> None:
         assert self._line("failed: %s", (self._FORGED,)) == (
@@ -431,15 +441,16 @@ class TestNotAString:
             "3 2.5 1.5 True")
 
     def test_the_pair_uvicorn_and_the_traceback(self) -> None:
-        inner = AccessFormatter(
-            '%(client_addr)s "%(request_line)s" %(status_code)s', use_colors=False)
-        line = SanitizingFormatter(inner).format(_record(
-            '%s - "%s %s HTTP/%s" %d', ("1.2.3.4:5", "GET", "/x", "1.1", 404)))
-        assert line == '1.2.3.4:5 "GET /x HTTP/1.1" 404 Not Found'
+        """uvicorn's status stays a number for %d (W3-2: laid out by the
+        record's own format, no longer by uvicorn's AccessFormatter --
+        see TestStdlibLine.test_uvicorn_s_access_line)."""
+        line = self._line(
+            '%s - "%s %s HTTP/%s" %d', ("1.2.3.4:5", "GET", "/x", "1.1", 404))
+        assert line == '1.2.3.4:5 - "GET /x HTTP/1.1" 404'
         try:
             raise ValueError("boom")
         except ValueError as exc:
-            out = SanitizingFormatter().format(_record("failed: %s", (exc,), exc))
+            out = _msg(SanitizingFormatter().format(_record("failed: %s", (exc,), exc)))
         first, *rest = out.split("\n")
         assert first == "failed: boom" and rest[0].startswith("Traceback")
 

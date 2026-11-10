@@ -10,12 +10,17 @@
 # allowed set in EVENT_FIELDS, both ways (D1 / R5). Not repeated here: a
 # second full copy is the copy the next change forgets.
 #
-# THE FRAME: one Redis Stream entry is {event, data}; `event` names the
-# kind (KNOWN_EVENTS), `data` is a UTF-8 JSON document.
+# THE FRAME: one Redis Stream entry is {event, data} and, optionally,
+# request_id (protocol 9.6, W3-2); `event` names the kind (KNOWN_EVENTS),
+# `data` is a UTF-8 JSON document. request_id is the address of the lines
+# the entry's processing writes, not a part of the event: the consumer
+# reads it from the raw entry (app/transport/consumer.py), and this
+# parser never sees it (_decode_entry) -- whatever it holds, it refuses
+# nothing.
 #
-# VERSIONING (frozen decision, review 3c part B): the ENVELOPE
-# {event, data} is frozen FOREVER -- all evolution happens INSIDE
-# data, gated by its required integer field "v". The consumer
+# VERSIONING (frozen decision, review 3c part B): the EVENT -- {event,
+# data} -- does not change: all evolution happens INSIDE data, gated by
+# its required integer field "v". The consumer
 # validates "v" on every event (review 3c amendment A): a missing or
 # unsupported version is a TERMINAL error -> DLQ, never a silent parse
 # under old semantics. Currently supported: v=1.
@@ -87,6 +92,9 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
 # Envelope field names (frozen).
 ENVELOPE_EVENT_FIELD = "event"
 ENVELOPE_DATA_FIELD = "data"
+# The request id beside them (protocol 9.6): optional, read by the
+# consumer, never by the parser (THE FRAME, above).
+ENVELOPE_REQUEST_ID_FIELD = "request_id"
 
 EVENT_NOTIFICATION_REQUEST = "notification_request"
 EVENT_USER_UPSERTED = "user_upserted"
@@ -848,7 +856,8 @@ def entry_field_name(name: str | bytes) -> str:
 
 
 def _decode_entry(fields: dict[Any, Any]) -> dict[str, str]:
-    """Every field name and value of the entry as UTF-8 text.
+    """Every field name and value of the entry as UTF-8 text -- but the
+    request id's.
 
     The frame is UTF-8 (section 7); a byte that is not refuses the
     ENTRY here, naming the field, so that it is dead-lettered like any
@@ -856,10 +865,17 @@ def _decode_entry(fields: dict[Any, Any]) -> dict[str, str]:
     consumer's process -- and the restart would replay the same entry
     from the pending list, forever (the poison-pill rule in
     app/transport/consumer.py).
+
+    THE REQUEST ID IS LEFT OUT (W3-2): protocol 9.6 -- an event is never
+    refused because of its request_id. Not UTF-8, it would have refused
+    the entry here; the consumer reads it from the raw entry, and one not
+    of its form is replaced by comms' own.
     """
     decoded: dict[str, str] = {}
     for key, value in fields.items():
         name = entry_field_name(key)
+        if name == ENVELOPE_REQUEST_ID_FIELD:
+            continue
         if not _is_utf8(key):
             raise ValidationError(f"envelope: field name {name!r} is not UTF-8")
         if not _is_utf8(value):
