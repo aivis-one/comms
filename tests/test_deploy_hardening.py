@@ -25,6 +25,9 @@
 #   M11 a checkout without persist-credentials: false -> TestCi (REV-5)
 #   M12 a pip install the lock's hashes do not cover (`-e .`, a bare
 #       pin) -> TestCi (REV-5)
+#   M13 the suite run with the checkout mounted again -> TestImageRuns
+#   M14 tests/ back in .dockerignore      -> TestImage (W1-1)
+#   M15 .env out of .dockerignore         -> TestImage (W1-1)
 # =============================================================================
 
 import asyncio
@@ -430,12 +433,12 @@ def _pip_installs(data: dict[str, Any]) -> list[str]:
     ]
 
 
-# What a hash-checked install looks like: the lock itself (every line of
-# it carries its hashes -- tests/test_delivery_contract.py), or a file
-# installed under --require-hashes (a stanza of the lock).
-_HASHED = re.compile(
-    r"(python3? -m )?pip install (-r requirements\.lock|--require-hashes -r \S+)"
-)
+# What a hash-checked install looks like: a file installed under
+# --require-hashes, written out -- a lock, or a stanza of one. Until W1-1
+# `pip install -r requirements.lock` passed as well, pip switching into
+# hash-checking mode by itself while the file carries hashes; the flag
+# is now required, so a lock that lost its hashes fails the install.
+_HASHED = re.compile(r"(python3? -m )?pip install --require-hashes -r \S+")
 
 
 def _unhashed(installs: list[str]) -> list[str]:
@@ -504,11 +507,12 @@ class TestCi:
 
     def test_the_guard_sees_an_unhashed_install(self) -> None:
         installs = [
-            "pip install -r requirements.lock",
+            "pip install --require-hashes -r requirements-dev.lock",
             'pip install --require-hashes -r "$RUNNER_TEMP/pyyaml.txt"',
+            "pip install -r requirements.lock",
             "pip install -e . --no-deps",
             "pip install pyyaml==6.0.3",
-            "python -m pip install -r requirements.lock somepackage",
+            "python -m pip install --require-hashes -r requirements.lock somepackage",
         ]
         assert _unhashed(installs) == installs[2:]
 
@@ -527,10 +531,7 @@ class TestImage:
         assert not any("--upgrade pip" in line for line in code)
 
     def test_the_context_keeps_what_the_build_copies(self) -> None:
-        ignored = [line.strip() for line in
-                   (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
-                   if line.strip() and not line.startswith("#")]
-        assert "tests/" in ignored
+        ignored = _ignored()
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         sources = []
         for line in dockerfile.splitlines():
@@ -543,22 +544,101 @@ class TestImage:
             assert not any(pattern.rstrip("/") == top for pattern in ignored), source
 
 
+    def test_the_context_holds_the_tree_but_secrets_and_history(self) -> None:
+        """W1-1: the test stage copies the context entire and the suite
+        reads the whole tree, so no file of it is ignored -- M14; and
+        what must never reach an image stays out: the history and every
+        .env -- M15. TX-4 kept tests/ and the rest out of the context;
+        the runtime stage's white list of COPY lines does that now."""
+        ignored = _ignored()
+        tree = _tree_files(ROOT)
+        # The pair: the walk sees what the suite reads.
+        assert {"tests/conftest.py", "deploy/INTEGRATION.md",
+                ".github/workflows/ci.yml", "scripts/check_domain_literals.py",
+                ".gitignore", ".dockerignore", "Dockerfile",
+                "requirements-dev.lock"} <= tree
+        assert [path for path in sorted(tree) if _in(path, ignored)] == []
+        for path in (".git/config", ".env", ".env.local", "deploy/.env",
+                     "app/.env"):
+            assert _in(path, ignored), path
+
+    def test_the_guard_sees_an_ignored_file(self) -> None:
+        assert _in("tests/conftest.py", ["tests/"])
+        assert _in("deploy/.env", ["**/.env"])
+        assert not _in("deploy/.env.example", ["**/.env", ".env.*"])
+        assert _in("deploy/INTEGRATION.md", ["*.md"]) is False
+        assert _in("README.md", ["*.md"])
+
+
+def _ignored() -> list[str]:
+    """.dockerignore's patterns; the file has no negation, and one would
+    be refused here rather than misread."""
+    patterns = [line.strip() for line in
+                (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.startswith("#")]
+    assert not any(p.startswith("!") for p in patterns), patterns
+    return patterns
+
+
+def _in(path: str, patterns: list[str]) -> bool:
+    """Whether .dockerignore's `patterns` keep `path` (relative, posix)
+    out of the context: a pattern is anchored at the root, matches the
+    path or a directory above it, and `**/` matches at any depth."""
+    from fnmatch import fnmatchcase
+
+    parts = path.split("/")
+    prefixes = ["/".join(parts[:n]) for n in range(1, len(parts) + 1)]
+    for pattern in patterns:
+        pattern = pattern.rstrip("/")
+        if pattern.startswith("**/"):
+            tail = pattern[3:]
+            if any(fnmatchcase(part, tail) for part in parts):
+                return True
+        elif any(
+            fnmatchcase(prefix, pattern) and prefix.count("/") == pattern.count("/")
+            for prefix in prefixes
+        ):
+            return True
+    return False
+
+
+def _tree_files(root: Path) -> set[str]:
+    """Every file of the tree, relative: not .git, not the caches, not a
+    .env (what the context leaves out on purpose -- asserted on its own
+    in the test above)."""
+    skipped = {".git", "__pycache__", ".pytest_cache", ".mypy_cache",
+               ".ruff_cache"}
+    found = set()
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if skipped & set(relative.parts) or not path.is_file():
+            continue
+        if relative.suffix == ".pyc" or relative.name == ".env" or (
+            len(relative.parts) == 1 and relative.name.startswith(".env.")
+        ):
+            continue
+        found.add(relative.as_posix())
+    return found
+
+
 # ---------------------------------------------------------------------------
 # every run of the image reads only what the image has, or a mount
 # (TX-4 FIX)
 # ---------------------------------------------------------------------------
 
 
-def _image_paths() -> set[str]:
-    """What the image carries: the TARGETS of the runtime stage's COPY
-    lines (a white list), resolved against its WORKDIR -- the Dockerfile
-    parsed, one copy. .dockerignore is a black list of the build
-    context and says nothing of what the image holds."""
+def _image_paths(stage: str = "runtime") -> set[str]:
+    """What a stage carries: the TARGETS of its COPY lines (a white list),
+    resolved against its WORKDIR -- the Dockerfile parsed, one copy.
+    .dockerignore is a black list of the build context and says nothing
+    of what the image holds. The stage by its NAME (W1-1): until then
+    the last FROM was read, which was the runtime of two stages."""
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    runtime = dockerfile.rsplit("\nFROM ", 1)[1]
+    blocks = re.split(r"^FROM\s+\S+\s+AS\s+(\S+)\s*$", dockerfile, flags=re.M)
+    named = dict(zip(blocks[1::2], blocks[2::2], strict=True))
     workdir = "/"
     found = set()
-    for line in runtime.splitlines():
+    for line in named[stage].splitlines():
         line = line.strip()
         if line.startswith("WORKDIR "):
             # the directory exists, empty: a path IN it is the COPYs'
@@ -569,21 +649,30 @@ def _image_paths() -> set[str]:
             base = target if target.startswith("/") else f"{workdir}/{target}"
             base = re.sub(r"/\./|/\.$", "/", base).replace("//", "/")
             for source in sources:
-                if base.endswith("/") and not source.endswith("/"):
+                if source == ".":
+                    # the whole context, into the target directory
+                    found.add(base.rstrip("/") or "/")
+                elif base.endswith("/") and not source.endswith("/"):
                     found.add(base + source.rsplit("/", 1)[-1])
                 else:
                     found.add(base.rstrip("/"))
     return found
 
 
-def _image_runs(text_: str) -> list[str]:
+# The image tag CI gives each stage it builds (W1-1).
+_TAGS = {"comms:ci": "runtime", "comms:test": "test"}
+
+
+def _image_runs(text_: str) -> list[tuple[str, str]]:
     """Every `docker run` of comms' image in a workflow, one string each,
-    from `docker run` to the image name and the rest of its line."""
+    from `docker run` to the image name and the rest of its line -- with
+    the stage its tag names."""
     runs = []
     for step in re.findall(r"run: \|\n((?:\s{10,}.*\n)+)", text_):
         joined = re.sub(r"\\\n\s*", " ", step)
-        runs += [m.group(0) for m in
-                 re.finditer(r"docker run [^\n]*?comms:ci[^\n]*", joined)]
+        runs += [(_TAGS[m.group(1)], m.group(0)) for m in
+                 re.finditer(r"docker run [^\n]*?(comms:(?:ci|test))\b[^\n]*",
+                             joined)]
     return runs
 
 
@@ -613,10 +702,23 @@ class TestImageRuns:
         image = _image_paths()
         assert {"/app/app", "/app/migrations", "/app/alembic.ini"} <= image
         assert not any(p.startswith("/app/tests") for p in image)
+        assert "/app" in _image_paths("test")  # the whole tree (W1-1)
         runs = _image_runs(_CI)
-        assert len(runs) == 2  # the start, and the suite
-        for run in runs:
-            assert _unreachable(run, image) == [], run
+        # Until W1-1 two runs, both of the runtime: the start and the
+        # suite. Now each stage three: what it carries (pip list), the
+        # machine's arguments, and the start (runtime) or the suite (test).
+        assert sorted(stage for stage, _ in runs) == ["runtime"] * 3 + ["test"] * 3
+        for stage, run in runs:
+            assert _unreachable(run, _image_paths(stage)) == [], run
+
+    def test_the_suite_runs_in_the_test_stage_unmounted(self) -> None:
+        """W1-1, M13: the suite runs in the stage the machine runs it in,
+        on that stage's own copy of the tree -- a checkout mounted over
+        /app would prove the checkout, not the stage."""
+        (stage, suite), = [(s, r) for s, r in _image_runs(_CI) if "pytest" in r]
+        assert stage == "test"
+        assert not re.search(r"-v\s", suite), suite
+        assert "comms:test sh -c" in suite
 
     def test_the_guard_sees_a_path_the_image_lacks(self) -> None:
         run = ("docker run -d --name x -e TEMPLATES_DIR=/app/tests/fixtures/"
@@ -627,7 +729,7 @@ class TestImageRuns:
         assert _unreachable(mounted, _image_paths()) == []
 
     def test_the_start_reads_the_profile_where_a_box_does(self) -> None:
-        (start,) = [r for r in _image_runs(_CI) if "TEMPLATES_DIR" in r]
+        (start,) = [r for _, r in _image_runs(_CI) if "TEMPLATES_DIR" in r]
         ci_dir = re.search(r"-e TEMPLATES_DIR=(\S+)", start)
         assert ci_dir is not None
         services = _compose()["services"]
@@ -678,12 +780,16 @@ class TestMigrationLockTimeout:
 # ---------------------------------------------------------------------------
 
 _PYPROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-_LOCK = (ROOT / "requirements.lock").read_text(encoding="utf-8")
+# Both locks (W1-1): the runtime's and the dev one.
+_LOCKS = {
+    name: (ROOT / name).read_text(encoding="utf-8")
+    for name in ("requirements.lock", "requirements-dev.lock")
+}
 
 
-def _locked() -> dict[str, Version]:
+def _locked(lock: str = "requirements-dev.lock") -> dict[str, Version]:
     found = {}
-    for line in _LOCK.splitlines():
+    for line in _LOCKS[lock].splitlines():
         match = re.match(r"^([A-Za-z0-9_.\-]+)==([^\s\\;]+)", line.strip())
         if match:
             found[match.group(1).lower().replace("_", "-")] = Version(match.group(2))
@@ -711,8 +817,14 @@ class TestTheLockSatisfies:
     it is closed by hand. This keeps it from being merged: the version
     the lock pins must lie in every range pyproject declares."""
 
-    def test_every_locked_version_is_in_its_range(self) -> None:
-        assert _unsatisfied(_declared(), _locked()) == []
+    @pytest.mark.parametrize("lock", list(_LOCKS))
+    def test_every_locked_version_is_in_its_range(self, lock: str) -> None:
+        """Each lock against every range it pins -- the runtime lock
+        carries `dependencies` only, so the dev lock is what holds the
+        ranges of `dev` (W1-1)."""
+        locked = _locked(lock)
+        assert locked  # the pair: the file reads as pins
+        assert _unsatisfied(_declared(), locked) == []
 
     def test_the_guard_sees_a_drift(self) -> None:
         drifted = [Requirement("fastapi>=999.0")]
@@ -726,11 +838,17 @@ class TestTheLockSatisfies:
 
 class TestAHangIsRed:
     def test_the_image_gets_the_timeout_from_the_lock(self) -> None:
-        """The suite on a box (comms-deploy.sh test) and CI's image job run
-        on the image's venv: pytest-timeout reaches it through the lock."""
+        """The suite runs in the test stage (CI's image job, the deploy
+        machine): pytest-timeout reaches it through the dev lock that
+        stage installs. Until W1-1 the runtime image ran the suite and
+        took it from the one lock; the runtime carries no test tool now
+        (tests/test_image_stages.py)."""
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        assert re.search(r"pip install [^\n]*-r requirements\.lock", dockerfile)
-        assert re.search(r"^pytest-timeout==", _LOCK, re.M)
+        assert re.search(
+            r"pip install [^\n]*--require-hashes -r requirements-dev\.lock",
+            dockerfile,
+        )
+        assert re.search(r"^pytest-timeout==", _LOCKS["requirements-dev.lock"], re.M)
         options = _PYPROJECT["tool"]["pytest"]["ini_options"]
         assert options["timeout"] == 300
         assert options["timeout_method"] == "signal"

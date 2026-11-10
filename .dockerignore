@@ -1,24 +1,21 @@
 # =============================================================================
-# The build context (TX-4): only what the Dockerfile COPYs --
-# pyproject.toml, requirements.lock, app/, alembic.ini, migrations/.
-# Everything else stays out: it is not needed, and a context that ships
-# .git, the tests or a stray .env into the builder is how secrets and
-# weight end up in an image. tests/test_deploy_hardening.py holds both
-# lists against each other.
+# The build context (W1-1): the whole tree, but what must never be in an
+# image. The test stage copies the context entire -- the suite reads tests/,
+# deploy/, scripts/, .github/, the *.md files, this file and .gitignore --
+# and the runtime stage copies a white list of it (Dockerfile), so weight
+# and stray files stay out of the image the service runs by its COPY lines,
+# not by this file. TX-4's rule (the context is only what the Dockerfile
+# copies) is lifted for that reason; what it guarded against stays out here:
+# the repository's history, any .env (a secret in the context is a secret in
+# the test stage), and caches. tests/test_deploy_hardening.py holds this
+# list against the Dockerfile and against what the suite reads.
 # =============================================================================
 .git
-.github
-.dockerignore
 .env
 .env.*
 **/.env
-tests/
-deploy/
-scripts/
-docs/
 **/__pycache__
 **/*.pyc
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
-*.md

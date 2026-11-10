@@ -2,8 +2,8 @@
 # H10 -- every container image comms names is pinned by digest
 # =============================================================================
 #
-# Where comms names an image: the Dockerfile's FROM (both stages), the
-# compose file's `image:` (comms-postgres, comms-redis). CI names none of
+# Where comms names an image: the Dockerfile's FROM (all three stages,
+# W1-1), the compose file's `image:` (comms-postgres, comms-redis). CI names none of
 # its own: it reads Postgres from the compose file. Each pin is
 # `name:tag@sha256:<64 hex>` -- the tag for the reader and for Dependabot,
 # the digest deciding. The digests' VALUES are not held here: Dependabot
@@ -64,14 +64,18 @@ class TestThePins:
             *(f"Dockerfile: {ref}" for ref in _dockerfile_images()),
             *(f"compose {name}: {ref}" for name, ref in _compose_images().items()),
         ]
-        # The pair: the walk finds them -- two stages, two services.
-        assert len(named) == 4, named
+        # The pair: the walk finds them -- three stages, two services. Two
+        # stages until W1-1, which put the test stage between them.
+        assert len(named) == 5, named
         unpinned = [entry for entry in named if not _PIN.match(entry.split(": ", 1)[1])]
         assert unpinned == []
 
-    def test_both_stages_build_on_one_image(self) -> None:
+    def test_every_stage_builds_on_one_image(self) -> None:
+        """builder, test and runtime on one base (W1-1; two stages before):
+        the suite in the test stage runs on the Python and Debian the
+        runtime has."""
         images = _dockerfile_images()
-        assert len(images) == 2
+        assert len(images) == 3
         assert len(set(images)) == 1, images
 
     def test_the_lines_the_boxes_stay_on(self) -> None:

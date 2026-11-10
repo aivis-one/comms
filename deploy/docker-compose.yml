@@ -187,7 +187,7 @@ services:
     # docker-compose), which brings a new digest as a pull request into
     # `test`. CI runs this same image (.github/workflows/ci.yml reads it
     # from here). tests/test_image_pins.py holds the pins.
-    image: postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    image: postgres:16@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
     container_name: comms-postgres
     # ITS OWN VARIABLES ONLY (TX-4), not the whole .env: the database
     # has no business holding the channel tokens and LLM keys. Compose
@@ -221,7 +221,7 @@ services:
 
   comms-redis:
     # Pinned by digest -- see comms-postgres above.
-    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    image: redis:7-alpine@sha256:7b1753b4c5ad8458906c272a8132b8c15f5557b000379eb115fb239706a384b7
     container_name: comms-redis
     # Its own variable only (TX-4), as comms-postgres.
     environment:

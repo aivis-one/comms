@@ -42,6 +42,35 @@ dependencies = [
     "tzdata>=2024.1",
 ]
 
+# THE TWO LOCKS (W1-1). The ranges above and below are resolved once, into
+# two files, and every install of comms -- the image's stages, CI -- is from
+# one of them, hash-checked (--require-hashes, written out, not left to pip
+# noticing the hashes):
+#   requirements.lock      `dependencies` only -- what the runtime image
+#                          carries (Dockerfile, stage `builder`);
+#   requirements-dev.lock  `dependencies` + `dev` -- what the `test` stage
+#                          and CI's jobs add on top.
+# WHY A LOCK: a range resolves to different versions of every transitive
+# package on different days; the lock is the resolution itself. WHY HASHES:
+# a version says which release, a hash says which artifact -- a substituted
+# wheel is what a version pin cannot catch; the hashes cover every
+# platform's wheel, so an image built on another architecture resolves.
+#
+# REGENERATE, whenever a dependency here changes, in the same commit -- one
+# command, both files, in this order:
+#
+#     uv pip compile pyproject.toml --extra dev --python-version 3.12 \
+#         --generate-hashes -o requirements-dev.lock && \
+#     uv pip compile pyproject.toml --python-version 3.12 \
+#         --generate-hashes -c requirements-dev.lock -o requirements.lock
+#
+# The second resolution is constrained by the first, so a package both
+# files carry has one version and one set of hashes in both. uv keeps the
+# pins already in an output file, so a regeneration moves only what the
+# ranges force. Each file is the command's output, whole: uv writes its own
+# first lines (the command that made it), and anything added by hand would
+# be erased by the next run. tests/test_delivery_contract.py holds all of
+# it: the hashes, the coverage, one version per package, the command.
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0,<9.0",

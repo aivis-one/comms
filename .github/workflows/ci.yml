@@ -14,9 +14,12 @@
 #          via `alembic upgrade head`; the slowest nodes and the time of
 #          every file printed (--durations, the junit report).
 #   image  the comms image built from the Dockerfile -- its base pinned
-#          by digest -- and the suite run INSIDE it, as the `test` verb of
-#          deploy/comms-deploy.sh does on a box: the Python and Debian the
-#          boxes run, not the runner's.
+#          by digest -- in both of its stages that run something: the
+#          suite runs INSIDE the `test` stage, as the deploy machine runs
+#          it (W1-1: the stage carries the tree, nothing is mounted), on
+#          the Python and Debian the boxes run, not the runner's; the
+#          `runtime` stage starts and answers, and carries exactly the
+#          runtime lock.
 # Postgres is the image deploy/docker-compose.yml pins for comms-postgres,
 # read from there (H10): one pin, kept by Dependabot's docker-compose
 # ecosystem, and CI on the database the boxes run. A `services:` image
@@ -76,12 +79,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Every package from the lock, hash-checked; the project itself is
+      # Every package from the dev lock (the runtime's and the tools'),
+      # hash-checked -- the flag written out (W1-1); the project itself is
       # not installed (REV-5): `pip install -e .` built it with whatever
       # setuptools the index served, no pin and no hash. PYTHONPATH
       # (above) finds it, as the image does.
       - name: Install dependencies (pinned)
-        run: pip install -r requirements.lock
+        run: pip install --require-hashes -r requirements-dev.lock
 
       - name: Lint (ruff)
         run: ruff check .
@@ -231,11 +235,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      # From the lock, so CI tests the package set the image ships; the
-      # project itself is not installed -- PYTHONPATH (above), as the
-      # image (REV-5).
+      # From the dev lock, so CI tests the package set the test stage
+      # carries (W1-1), hash-checked; the project itself is not installed
+      # -- PYTHONPATH (above), as the image (REV-5).
       - name: Install dependencies (pinned)
-        run: pip install -r requirements.lock
+        run: pip install --require-hashes -r requirements-dev.lock
 
       # The pinned image, from deploy/docker-compose.yml. Ready is asked
       # over TCP: during initdb the image's temporary server listens on
@@ -305,6 +309,10 @@ jobs:
 
     env:
       PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
+      # The deploy machine's two build arguments (W1-1, Dockerfile header):
+      # what was built and from which commit, as the machine passes them.
+      PRIMER_RELEASE: ${{ github.ref_name }}
+      PRIMER_COMMIT: ${{ github.sha }}
 
     steps:
       - name: Check out
@@ -320,8 +328,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      # PyYAML's own stanza of the lock -- its version and its hashes, one
-      # source -- installed hash-checked (REV-5; was a bare pin).
+      # PyYAML's own stanza of the runtime lock -- its version and its
+      # hashes, one source -- installed hash-checked (REV-5; was a bare
+      # pin).
       - name: Read the compose file's pins
         run: |
           awk '/^pyyaml==/{on=1} on && /^[a-z]/ && !/^pyyaml==/{exit} on && !/^ *#/{print}' requirements.lock > "$RUNNER_TEMP/pyyaml.txt"
@@ -357,8 +366,50 @@ jobs:
           docker logs comms-postgres
           exit 1
 
+      # Both stages that run something, with the machine's arguments
+      # (W1-1): `test` by its name, the runtime by building without
+      # --target (the last stage, as compose and the machine build it).
+      # The builder is built once: the second build takes it from the
+      # first's cache.
       - name: Build the comms image (the Dockerfile's pinned base)
-        run: docker build -t comms:ci .
+        run: |
+          docker build --target test -t comms:test \
+            --build-arg PRIMER_RELEASE="$PRIMER_RELEASE" \
+            --build-arg PRIMER_COMMIT="$PRIMER_COMMIT" .
+          docker build -t comms:ci \
+            --build-arg PRIMER_RELEASE="$PRIMER_RELEASE" \
+            --build-arg PRIMER_COMMIT="$PRIMER_COMMIT" .
+
+      # WHAT EACH STAGE CARRIES, read from the built images (W1-1): the
+      # runtime's venv is the runtime lock exactly -- not a dev package,
+      # not a package of no lock -- and the test stage's holds the whole
+      # dev lock. pip itself is the base image's (Dockerfile). Once per
+      # build is enough: part 1 only (CI-2).
+      - name: The runtime carries the runtime lock, the test stage the dev lock
+        if: matrix.part == 1
+        run: |
+          docker run --rm comms:ci python -m pip list --format=freeze > "$RUNNER_TEMP/runtime.txt"
+          docker run --rm comms:test python -m pip list --format=freeze > "$RUNNER_TEMP/test.txt"
+          python -c "import re, sys
+          def pins(path):
+              found = re.findall(r'^([A-Za-z0-9_.-]+)==(\S+)', open(path).read(), re.M)
+              return {(n.lower().replace('_', '-'), v) for n, v in found if n.lower() != 'pip'}
+          runtime, test = pins(sys.argv[1]), pins(sys.argv[2])
+          prod, dev = pins('requirements.lock'), pins('requirements-dev.lock')
+          assert prod and dev, 'the pair: the locks read as pins'
+          assert runtime == prod, ('runtime', sorted(runtime ^ prod))
+          assert dev <= test, ('test', sorted(dev - test))
+          print(f'runtime: {len(runtime)} = the runtime lock; test: {len(test)} >= the dev lock ({len(dev)})')" "$RUNNER_TEMP/runtime.txt" "$RUNNER_TEMP/test.txt"
+
+      # The machine's two arguments reach the process of each stage, as
+      # built above -- the value, not only the name (W1-1).
+      - name: Both stages hand the machine's arguments to the process
+        if: matrix.part == 1
+        run: |
+          check='test "$PRIMER_RELEASE" = "$1" && test "$PRIMER_COMMIT" = "$2"'
+          docker run --rm comms:ci sh -c "$check" _ "$PRIMER_RELEASE" "$PRIMER_COMMIT"
+          docker run --rm comms:test sh -c "$check" _ "$PRIMER_RELEASE" "$PRIMER_COMMIT"
+          echo "both stages: PRIMER_RELEASE=$PRIMER_RELEASE PRIMER_COMMIT=$PRIMER_COMMIT"
 
       # The image's own command, as comms-app runs it: it starts and
       # answers readiness (200 only with the database reached). The test
@@ -400,16 +451,14 @@ jobs:
           docker logs comms-app
           exit 1
 
-      # On the image's Python, Debian and installed packages. The checkout
-      # is mounted over /app, read-only: the suite also reads files the
-      # image does not ship (deploy/, scripts/, .github/) --
-      # the code is the same, the interpreter and the packages are the
-      # image's (/opt/venv).
+      # In the test stage, as the deploy machine runs it (W1-1): its
+      # Python, Debian and packages, and its own copy of the tree --
+      # nothing is mounted, so what is proved is the stage the machine
+      # runs, not this checkout.
       - name: The suite inside the image
         run: |
           docker run --rm --network host \
-            -v "$PWD:/app:ro" \
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
-            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50 $PART_ARGS"
+            comms:test sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50 $PART_ARGS"

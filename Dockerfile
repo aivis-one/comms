@@ -2,12 +2,22 @@
 # COMMS Service -- Dockerfile
 # =============================================================================
 #
-# MULTI-STAGE BUILD (cbshome/velo pattern, trimmed -- no cairo/pdf deps):
-#   Stage 1 ("builder"): installs ALL dependencies (prod + dev) into a venv.
-#   Stage 2 ("runtime"): copies venv + app code + tests + migrations.
-#
-# Dev dependencies (pytest, ruff, mypy, httpx) are ALWAYS installed
-# because tests run inside this container on the VPS.
+# THREE STAGES (W1-1), named so because the deploy machine builds them by
+# name:
+#   builder  installs the RUNTIME dependencies (requirements.lock) into a
+#            venv; nothing else.
+#   test     the builder's venv plus the dev dependencies
+#            (requirements-dev.lock), and the whole tree: the suite is run
+#            from here -- by CI's `image` job and by the machine, which
+#            builds `--target test` from the same release and runs the
+#            suite in a one-off container. It carries everything the suite
+#            reads (tests/, deploy/, scripts/, .github/, the *.md files),
+#            so nothing is mounted over it.
+#   runtime  the builder's venv, the service's code and its migrations;
+#            the LAST stage, so a build without --target (compose, the
+#            machine's service build) gives it. No test tool is in it:
+#            pytest, ruff, mypy and fakeredis are the test stage's only
+#            (tests/test_image_stages.py holds both sides).
 #
 # ONE IMAGE, THREE PROCESSES (handoff item 1; deploy/ Phase 5):
 #   API:      default CMD (uvicorn on :8000)
@@ -19,56 +29,92 @@
 #
 # PYTHONPATH=/app ensures `from app.core.config import settings` works
 # everywhere: uvicorn, alembic, pytest -- without `pip install -e .`.
+#
+# THE MACHINE'S TWO ARGUMENTS (W1-1): PRIMER_RELEASE (a tag or a branch)
+# and PRIMER_COMMIT (a sha) are build arguments the machine passes to every
+# build; each stage that runs a process of comms -- runtime and test -- takes
+# them as ARG and hands them to the process as ENV. No default and no
+# refusal here: a build without them carries them empty, and the process
+# that reads them refuses an empty value at its start. CI passes them too
+# (.github/workflows/ci.yml, job `image`).
 # =============================================================================
 
-# THE BASE IMAGE IS PINNED BY DIGEST (H10), the tag kept for the reader
-# and for Dependabot (.github/dependabot.yml, ecosystem docker): a tag
-# moves -- python:3.12-slim moved to Debian 13 under every build that
-# pulled it -- and only the digest says which image a build gets. Both
-# stages name the same one (tests/test_image_pins.py holds that). A new
-# digest arrives as a Dependabot pull request into `test`, never quietly.
+# THE BASE IMAGE IS PINNED BY DIGEST (H10), the tag kept for the reader:
+# a tag moves -- python:3.12-slim moved to Debian 13 under every build that
+# pulled it -- and only the digest says which image a build gets. All three
+# stages name the same one (tests/test_image_pins.py holds that).
 
 # ---------------------------------------------------------------------------
-# Stage 1: Builder -- install all dependencies
+# Stage 1: builder -- the runtime dependencies
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS builder
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
 
 WORKDIR /build
 
-COPY pyproject.toml requirements.lock ./
+COPY requirements.lock ./
 
 # Install DEPENDENCIES ONLY -- the project itself is never pip-installed
-# (runtime imports the `app` package via PYTHONPATH, see below; that is
-# this file's own stated design). The previous form -- `pip install
-# ".[dev]"`, copied from the velo donor -- installs the PROJECT, which
-# needs the `app/` sources that are deliberately absent from this stage:
-# it died with "package directory 'app' does not exist" on the first real
-# build (2026-07-27). The donor survives the same pattern only by
-# accident: velo's pyproject has no [tool.setuptools] packages
-# declaration, so setuptools silently builds an EMPTY distribution from a
-# bare pyproject; comms declares `packages = ["app"]`, which turns that
-# accident into a hard error. Extracting the dependency list keeps this
-# layer keyed on pyproject.toml alone -- source changes do not reinstall
-# dependencies, which is the whole point of the two-stage split.
+# (the stages import the `app` package via PYTHONPATH, see below). The
+# form `pip install ".[dev]"`, copied from the velo donor, installed the
+# PROJECT, which needs the `app/` sources deliberately absent from this
+# stage: it died with "package directory 'app' does not exist" on the
+# first real build (2026-07-27). This layer is keyed on the lock alone --
+# source changes do not reinstall dependencies.
 #
-# FROM THE LOCK, NOT FROM THE RANGES. pyproject states ranges, so
-# extracting its dependency list here -- which is what this layer used
-# to do -- resolved them afresh on every build: the image built today
-# and the image built next month carried different versions of every
-# transitive package, and nothing recorded which. requirements.lock is
-# the resolution itself, regenerated deliberately (see its header) in
-# the same commit as any dependency change.
+# FROM THE LOCK, NOT FROM THE RANGES: requirements.lock is the resolution
+# itself (how it is made: pyproject.toml, above [project.optional-
+# dependencies]). --require-hashes is written out: every artifact is
+# checked against the lock's hashes, and a lock that lost them fails here
+# instead of installing unchecked.
 #
 # NO `pip install --upgrade pip` (TX-4): it fetched whatever pip was
 # newest on the day of the build -- the one unpinned download of the
 # image. The venv's pip is the base image's, pinned by its digest above.
 RUN python -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir -r requirements.lock
+    /opt/venv/bin/pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # ---------------------------------------------------------------------------
-# Stage 2: Runtime
+# Stage 2: test -- the runtime's venv, the dev dependencies, the whole tree
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS runtime
+# Built FROM the base, not from runtime (runtime is the last stage), so it
+# repeats what runtime sets -- user, WORKDIR, the four ENV, the machine's
+# two arguments -- and the suite runs in the environment the service runs
+# in (tests/test_image_stages.py holds the two alike). It sets no CMD and
+# no EXPOSE: the machine gives the suite's command, CI its own.
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS test
+
+WORKDIR /app
+
+RUN groupadd --gid 1000 comms && \
+    useradd --uid 1000 --gid comms --shell /bin/sh comms
+
+# The runtime's packages, the very files, then the dev ones on top: what
+# both locks pin is already installed at the same version and is kept.
+COPY --from=builder /opt/venv /opt/venv
+COPY requirements-dev.lock ./
+RUN /opt/venv/bin/pip install --no-cache-dir --require-hashes -r requirements-dev.lock
+
+# The whole build context: .dockerignore keeps out only .git, the .env
+# files and caches (its header says why).
+COPY . ./
+
+ARG PRIMER_RELEASE
+ARG PRIMER_COMMIT
+ENV PRIMER_RELEASE=${PRIMER_RELEASE}
+ENV PRIMER_COMMIT=${PRIMER_COMMIT}
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH="/app"
+
+# Not root, as runtime: the tree belongs to root and is read, not written
+# (the pytest cache and --junitxml go to /tmp).
+USER comms
+
+# ---------------------------------------------------------------------------
+# Stage 3: runtime -- the service
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS runtime
 
 WORKDIR /app
 
@@ -78,22 +124,22 @@ RUN groupadd --gid 1000 comms && \
 
 COPY --from=builder /opt/venv /opt/venv
 
-# Copy everything the service needs.
+# Copy everything the service needs -- a white list: the build context
+# holds the whole tree for the test stage, and nothing else of it comes
+# here. NO tests/ (TX-4): the suite runs from the test stage.
 COPY app/ ./app/
-# NO tests/ (TX-4): nothing in the image runs them from here. Both who
-# run the suite on this image -- `comms-deploy.sh test` and CI's `image`
-# job -- mount the checkout over /app, so the tests come from the
-# checkout; the image gives the interpreter and the packages, pytest,
-# ruff and mypy included (/opt/venv) -- they stay. .dockerignore keeps
-# tests/ and the rest out of the build context too.
 COPY pyproject.toml ./
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
 
+ARG PRIMER_RELEASE
+ARG PRIMER_COMMIT
+ENV PRIMER_RELEASE=${PRIMER_RELEASE}
+ENV PRIMER_COMMIT=${PRIMER_COMMIT}
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-# CRITICAL: alembic, pytest, and CLI tools must find the `app` package.
+# CRITICAL: alembic and CLI tools must find the `app` package.
 ENV PYTHONPATH="/app"
 
 USER comms
