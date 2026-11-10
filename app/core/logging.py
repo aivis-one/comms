@@ -28,10 +28,11 @@
 
 import copy
 import logging
+import numbers
 import re
 import sys
 import threading
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from types import TracebackType
 from typing import Any
 
@@ -198,18 +199,62 @@ class SanitizingFormatter(logging.Formatter):
         # (uvicorn's access formatter unpacks record.args by position,
         # and the strings keep their places); the traceback it appends
         # (exc_text) is not data and stays as many lines as it is.
+        # A message or an argument that is not a string (an exception, an
+        # object) becomes text inside the inner formatter, by its str or
+        # repr -- escaped there too (REV-9): the message as getMessage
+        # would read it, an argument wrapped so %s and %r print exactly
+        # what they would, its controls escaped. A number stays a number:
+        # %d and %f want one, and uvicorn reads its status as an int.
         shown = copy.copy(record)
-        shown.msg = _escaped(record.msg)
+        shown.msg = _escaped(
+            record.msg if isinstance(record.msg, str)
+            else _readable(str, record.msg)
+        )
         if isinstance(record.args, tuple):
-            shown.args = tuple(_escaped(arg) for arg in record.args)
+            shown.args = tuple(_argument(arg) for arg in record.args)
         elif isinstance(record.args, dict):
-            shown.args = {key: _escaped(arg) for key, arg in record.args.items()}
+            shown.args = {key: _argument(arg) for key, arg in record.args.items()}
         return sanitize_text(self.inner.format(shown))
 
 
 # The characters a log line must not carry as they are: C0 controls but
 # the tab, DEL, NEL and the Unicode line and paragraph separators.
 _CONTROLS_RE = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+
+
+def _readable(read: Callable[[Any], str], value: Any) -> str:
+    """read(value) -- str or repr -- or, when that raises, the value's
+    type (unreadable_value): a log line never fails on its argument."""
+    try:
+        return read(value)
+    except Exception:
+        return unreadable_value(value)
+
+
+class _Escaped:
+    """An argument of a stdlib record that is not a string or a number:
+    %s and %r print its str and repr, escaped (REV-9)."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    def __str__(self) -> str:
+        return str(_escaped(_readable(str, self._value)))
+
+    def __repr__(self) -> str:
+        return str(_escaped(_readable(repr, self._value)))
+
+
+def _argument(value: Any) -> Any:
+    """A record's argument as the inner formatter should see it: a string
+    escaped, a number as it is, anything else wrapped in _Escaped."""
+    if isinstance(value, str):
+        return _escaped(value)
+    if isinstance(value, numbers.Number):
+        return value
+    return _Escaped(value)
 
 
 def _escaped(value: Any) -> Any:

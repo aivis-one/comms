@@ -35,11 +35,24 @@
 #   H9  the traceback escaped too                   -> TestStdlibLine
 #   H10 int() before the length                     -> TestProfile
 #   H11 params standing as any field                -> TestProfile
+# REV-9 -- every pattern linear on its own form; a Cookie header whole; a
+# record's message or argument that is not a string escaped by its text:
+#   N1  _URL_USERINFO_RE as REV-6 wrote it          -> TestEveryPattern
+#   N2  the first "@" instead of the last           -> TestEveryPattern
+#   N3  no Cookie header pass                       -> TestCookieHeader
+#   N4  the Cookie header to its first ";"          -> TestCookieHeader
+#   N5  an object argument not wrapped              -> TestNotAString
+#   N6  numbers wrapped too                         -> TestNotAString
+#   N7  a message that is not a string not escaped  -> TestNotAString
+#   N8  a pattern with no inputs                    -> TestEveryPattern
 # =============================================================================
 
+import decimal
 import io
 import json
 import logging
+import numbers
+import re
 import shutil
 import statistics
 import sys
@@ -53,6 +66,7 @@ import structlog
 import yaml
 from uvicorn.logging import AccessFormatter
 
+import app.core.sanitize as sanitize_module
 from app.core.exceptions import ProfileError
 from app.core.logging import SanitizingFormatter, processors
 from app.core.sanitize import exception_text, is_secret_name, sanitize_text
@@ -270,3 +284,169 @@ class TestProfile:
     ])
     def test_the_pair_loads(self, tmp_path: Path, body: str) -> None:
         load_profile(FileProfileSource(_profile(tmp_path, body=body)))
+
+
+# =============================================================================
+# REV-9
+# =============================================================================
+
+# The inputs that break each pattern's own form: its leading characters
+# repeated, and its neighbours. Keyed by the pattern's name in
+# app/core/sanitize.py; test_every_pattern_has_inputs holds the keys equal
+# to the patterns the module compiles, so a new pattern without inputs
+# turns it red.
+_UNITS: dict[str, list[str]] = {
+    "_AUTH_HEADER_RE": ["authorization: ", "authorization ", "Authorization:="],
+    "_BEARER_RE": ["Bearer ", "bearer", "bearer\t"],
+    "_COOKIE_HEADER_RE": ["cookie: ", "set-cookie:", "Cookie:a=b; "],
+    "_KEYVAL_RE": ["a-", "token-", "token=", "token: ", 'password="', "a_b-"],
+    "_LLM_KEY_RE": ["sk-", "sk-a!"],
+    "_LONG_HEX_RE": ["a" * 47 + "-", "a"],
+    "_MAILGUN_KEY_RE": ["key-", "a" * 32 + "-"],
+    "_QUERY_KEYVAL_RE": ["?token=", "&a=", "?a-"],
+    "_SECRET_NAME_RE": ["a-", "token-", "a_b-"],
+    "_TELEGRAM_TOKEN_RE": ["bot1234567:", "1234567:"],
+    "_URL_USERINFO_RE": ["://a:", "://", ":@", "://a:@b", "://a:x@"],
+}
+_PATTERNS = {
+    name: value for name, value in vars(sanitize_module).items()
+    if isinstance(value, re.Pattern)
+}
+_MIXED = "".join(unit for units in _UNITS.values() for unit in units)
+
+
+def _fastest(work: Callable[[], object], repeats: int = 1) -> float:
+    """The least of 5 runs, each `repeats` calls: the run the machine
+    least disturbed."""
+    runs = []
+    for _ in range(5):
+        started = time.perf_counter()
+        for _ in range(repeats):
+            work()
+        runs.append(time.perf_counter() - started)
+    return min(runs)
+
+
+def _assert_linear(work: Callable[[str], object], unit: str) -> None:
+    """Each doubling of the input, 10 000 to 80 000 characters, at most
+    triples the time -- judged as it comes. A call too quick to time
+    alone (under 5 ms at 10 000) is timed as so many calls at every size
+    that the first run takes 5 ms: a ratio of two microsecond figures is
+    the clock's, not the pattern's."""
+    first = unit * (10_000 // len(unit) + 1)
+    repeats = max(1, int(0.005 / max(_fastest(lambda: work(first)), 1e-7)) + 1)
+    earlier = None
+    for n in (10_000, 20_000, 40_000, 80_000):
+        text = unit * (n // len(unit) + 1)
+        took = _fastest(lambda text=text: work(text), repeats)
+        if earlier is not None:
+            assert took / max(earlier, 1e-6) <= 3, (unit[:12], n, earlier, took)
+        earlier = took
+
+
+class TestEveryPattern:
+    """Item 1: every pattern the module compiles, on the inputs that
+    break its own form, through the pattern alone and through the whole
+    sanitizer. N1, N2, N8."""
+
+    def test_every_pattern_has_inputs(self) -> None:
+        assert set(_UNITS) == set(_PATTERNS)
+
+    @pytest.mark.parametrize(("name", "unit"), [
+        (name, unit) for name, units in sorted(_UNITS.items()) for unit in units
+    ] + [("_mixed", _MIXED)])
+    def test_linear(self, name: str, unit: str) -> None:
+        if name in _PATTERNS:
+            pattern = _PATTERNS[name]
+            _assert_linear(lambda text: pattern.sub("", text), unit)
+        _assert_linear(sanitize_text, unit)
+
+    @pytest.mark.parametrize("unit", ["://a:", "://"])
+    def test_the_reviewer_s_inputs_under_a_second(self, unit: str) -> None:
+        text = unit * (100_000 // len(unit))
+        assert _fastest(lambda: sanitize_text(text)) < 1
+
+    @pytest.mark.parametrize(("text", "cleaned"), [
+        (f"postgresql://comms:p@{_SECRET}/w@db/comms",
+         "postgresql://comms:[redacted]@db/comms"),
+        (f"https://u:{_SECRET}@host/path?e=a@b.c",
+         "https://u:[redacted]@host/path?e=a@b.c"),
+        ("redis://:@h:6379/0 down", "redis://:[redacted]@h:6379/0 down"),
+        ("https://host:443/path", "https://host:443/path"),
+    ])
+    def test_the_last_at_as_before(self, text: str, cleaned: str) -> None:
+        assert sanitize_text(text) == cleaned
+        assert sanitize_text(cleaned) == cleaned
+
+
+class TestCookieHeader:
+    """Item 2: a Cookie header's every cookie. N3, N4."""
+
+    @pytest.mark.parametrize(("text", "cleaned"), [
+        (f"Cookie: a={_SECRET}; c={_SECRET}", "Cookie: [redacted]"),
+        (f"Set-Cookie: s={_SECRET}; Path=/; HttpOnly\nnext",
+         "Set-Cookie: [redacted]\nnext"),
+        (f"cookie:a={_SECRET};b={_SECRET}", "cookie:[redacted]"),
+    ])
+    def test_the_whole_value(self, text: str, cleaned: str) -> None:
+        assert sanitize_text(text) == cleaned
+        assert sanitize_text(cleaned) == cleaned
+
+    @pytest.mark.parametrize(("text", "cleaned"), [
+        (f"cookie={_SECRET}; b=c", "cookie=[redacted]; b=c"),
+        ("cookie_policy: strict", "cookie_policy: strict"),
+        ("cookies_enabled: true", "cookies_enabled: true"),
+        ("no cookie here", "no cookie here"),
+        ("Cookie:   ", "Cookie:   "),
+    ])
+    def test_the_pair_left_by_its_own_rule(self, text: str, cleaned: str) -> None:
+        assert sanitize_text(text) == cleaned
+
+
+class _ForgedError(Exception):
+    pass
+
+
+class TestNotAString:
+    """Item 3: what becomes text inside the formatter is escaped by that
+    text. N5-N7."""
+
+    _FORGED = _ForgedError("bad\nINFO forged \x1b[31m")
+
+    def _line(self, msg: Any, args: Any = None) -> str:
+        return SanitizingFormatter().format(_record(msg, args))
+
+    def test_an_exception_argument(self) -> None:
+        assert self._line("failed: %s", (self._FORGED,)) == (
+            "failed: bad\\nINFO forged \\x1b[31m")
+
+    def test_its_repr(self) -> None:
+        line = self._line("failed: %r", (self._FORGED,))
+        assert "\n" not in line and "\x1b" not in line
+        assert line.startswith("failed: _ForgedError(")
+
+    def test_a_message_that_is_not_a_string(self) -> None:
+        assert self._line(self._FORGED) == "bad\\nINFO forged \\x1b[31m"
+
+    def test_an_argument_whose_str_raises(self) -> None:
+        assert self._line("x %s", (_BadRepr(),)) == "x <unreadable _BadRepr>"
+        assert self._line("x %s", (_BadStrError(),)) == "x <unreadable _BadStrError>"
+
+    def test_the_pair_numbers_stay_numbers(self) -> None:
+        assert isinstance(decimal.Decimal("1.5"), numbers.Number)  # the instrument
+        assert self._line("%d %.1f %s %s", (3, 2.5, decimal.Decimal("1.5"), True)) == (
+            "3 2.5 1.5 True")
+
+    def test_the_pair_uvicorn_and_the_traceback(self) -> None:
+        inner = AccessFormatter(
+            '%(client_addr)s "%(request_line)s" %(status_code)s', use_colors=False)
+        line = SanitizingFormatter(inner).format(_record(
+            '%s - "%s %s HTTP/%s" %d', ("1.2.3.4:5", "GET", "/x", "1.1", 404)))
+        assert line == '1.2.3.4:5 "GET /x HTTP/1.1" 404 Not Found'
+        try:
+            raise ValueError("boom")
+        except ValueError as exc:
+            out = SanitizingFormatter().format(_record("failed: %s", (exc,), exc))
+        first, *rest = out.split("\n")
+        assert first == "failed: boom" and rest[0].startswith("Traceback")
+

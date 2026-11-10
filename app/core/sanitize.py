@@ -44,7 +44,8 @@ from typing import Any
 # record, so every text goes through this twice:
 #   1. the Authorization header, scheme included -- before bearer, so
 #      "Authorization: Basic x" loses its credentials and not just the
-#      word "Basic";
+#      word "Basic"; then a Cookie or Set-Cookie header, to the end of
+#      its line (REV-9);
 #   2. key=value / key: value for credential keywords (SAN-1) -- BEFORE
 #      the shapes below (REV-4b): a shape that took the start of a value
 #      ("password=sk-...", "token=<48 hex>") left its tail behind, since
@@ -97,8 +98,22 @@ _AUTH_HEADER_RE = re.compile(
     r"(?i)\b(authorization)\b\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+"
 )
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
-_URL_USERINFO_RE = re.compile(
-    r"(://[^/\s:@]*:)[^\s?#]*(@)(?=[^\s@/?#]*(?:[/?#]|\s|$))"
+# The userinfo: "://", a user, ":", and the rest of the URL up to a
+# space, "?" or "#" -- the password is that rest up to its LAST "@",
+# found by _userinfo_redacted, not by the expression: REV-6 wrote the
+# "@" and a look-ahead into it, and "://a:" repeated made it try every
+# "@" from every start -- quadratic, 91 s on 200 000 characters (REV-9).
+# The same "@": past the last one there is no other before the space,
+# "?" or "#", which is all the look-ahead asked.
+_URL_USERINFO_RE = re.compile(r"(://[^/\s:@]*:)([^\s?#]*)")
+# A Cookie or Set-Cookie HEADER: its value is every cookie up to the end
+# of the line, not the first pair (REV-9) -- "Cookie: a=b; c=d" kept
+# "c=d" under the pair's boundary. The header form only, the colon; a
+# pair "cookie=..." stays the pair's. The spaces after the colon are
+# taken whole (possessive), so the guard sees what follows them and a
+# second pass leaves "Cookie: [redacted]" as it is.
+_COOKIE_HEADER_RE = re.compile(
+    r"(?i)(?<![a-z0-9_-])((?:set-)?cookie)(\s*:[ \t]*+)(?!\[redacted\])[^\r\n]+"
 )
 _TELEGRAM_TOKEN_RE = re.compile(r"\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}")
 _MAILGUN_KEY_RE = re.compile(
@@ -180,14 +195,25 @@ def sanitize_text(text: str) -> str:
     price and its camelCase limit (the list above).
     """
     text = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _COOKIE_HEADER_RE.sub(r"\1\2[redacted]", text)
     text = _QUERY_KEYVAL_RE.sub(rf"\1{_REDACTED}", text)
     text = _KEYVAL_RE.sub(_keyval_redacted, text)
     text = _BEARER_RE.sub("bearer [redacted]", text)
-    text = _URL_USERINFO_RE.sub(r"\1[redacted]\2", text)
+    text = _URL_USERINFO_RE.sub(_userinfo_redacted, text)
     text = _TELEGRAM_TOKEN_RE.sub("[redacted]", text)
     text = _MAILGUN_KEY_RE.sub("[redacted]", text)
     text = _LLM_KEY_RE.sub("[redacted]", text)
     return _LONG_HEX_RE.sub("[redacted]", text)
+
+
+def _userinfo_redacted(match: re.Match[str]) -> str:
+    """Pattern 4's replacement: the password up to the LAST "@" of the
+    rest; no "@" -- no userinfo, the text as it is."""
+    head, rest = match.group(1), match.group(2)
+    at = rest.rfind("@")
+    if at < 0:
+        return match.group(0)
+    return f"{head}{_REDACTED}{rest[at:]}"
 
 
 _SECRET_NAME_RE = re.compile(rf"(?i){_KEY}")

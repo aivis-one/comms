@@ -191,7 +191,8 @@ from app.core.lanes import Lane
 # 0039); a variable the job does not carry is printed as its
 # placeholder and marked in the journal (0040); without APP_ENV the API
 # is production, closed, not open; a scheduled letter is kept until its
-# scheduled_at plus the retention, not from its creation. The refusals:
+# scheduled_at plus the retention, not from its creation -- a cancelled
+# one from its creation. The refusals:
 # the API asks the service token before it reads anything of a request;
 # a string the database cannot store, a malformed cursor, query
 # parameter, schedule time or read pointer, a bool or int sent as

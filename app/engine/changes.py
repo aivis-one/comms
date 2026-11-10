@@ -161,10 +161,11 @@ async def list_changes(
       2. Status: acknowledged by design.
       3. Backlog ref: none -- it takes a job that went on changing
          longer than the retention period (90 days by default) after it
-         was due.
+         was due (a cancelled one: after it was created).
       4. Promotion trigger (observable): a key the product holds as
          unfinished that the read by key answers 404, under a cursor
-         that is not expired.
+         that is not expired -- for a cancelled job, counted from its
+         creation, not from when it was due.
       5. Agreed fix: none agreed; the candidate is retention measuring
          a terminal job's age by its last transition.
       6. Rejected: a stored "deletion horizon" written by retention (a
