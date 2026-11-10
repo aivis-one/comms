@@ -4,12 +4,13 @@
 # control character of its data; the profile refuses what the send would
 # =============================================================================
 #
-#   - TIME: the median of 5 runs, for sanitize_text and is_secret_name,
-#     on runs that made the key's prefix quadratic ("a-"*n -- 22 s on
-#     80 000 characters before REV-6) and their neighbours; each doubling
-#     of n from 10 000 to 80 000 at most triples the time (linear ~2,
-#     quadratic ~4). A ratio, not a number of seconds: the machine does
-#     not decide the test.
+#   - TIME: sanitize_text and is_secret_name on runs that made the
+#     key's prefix quadratic ("a-"*n -- 22 s on 80 000 characters before
+#     REV-6) and their neighbours; each doubling of n from 10 000 to
+#     80 000 at most triples the time (linear ~2, quadratic ~4). Timed by
+#     _assert_linear, the one measure of the file: the least of 5 runs,
+#     each of so many calls that a run takes 20 ms at 10 000. A ratio,
+#     not a number of seconds: the machine does not decide the test.
 #   - NEVER FAILS: a repr or a str that raises, a value nested 2000 deep
 #     -> a line with <unreadable TYPE>, nothing of the value.
 #   - FORMS: the roots cookie, session_id, passphrase, pgpassword,
@@ -23,8 +24,10 @@
 #     <a href='{params}'> is refused, as Telegram refuses the repr's
 #     raw quotes; <a href="{params}"> and <a href='{url}'> load.
 #
-# MUTATIONS these tests were written against (each turns one red):
-#   H1  the prefix as SAN-1 wrote it                -> TestLinearTime
+# MUTATIONS these tests were written against (each turns the test
+# named red):
+#   H1  the prefix as SAN-1 wrote it                -> TestLinearTime,
+#                                                      TestEveryPattern
 #   H2  no stand-in when repr raises                -> TestNeverFails
 #   H3  no depth limit                              -> TestNeverFails
 #   H4  exception_text without its try              -> TestNeverFails
@@ -45,6 +48,8 @@
 #   N6  numbers wrapped too                         -> TestNotAString
 #   N7  a message that is not a string not escaped  -> TestNotAString
 #   N8  a pattern with no inputs                    -> TestEveryPattern
+# TEST-1 -- one measure of time in the file:
+#   T1  an O(n^2) step in is_secret_name alone      -> TestLinearTime
 # =============================================================================
 
 import decimal
@@ -54,7 +59,6 @@ import logging
 import numbers
 import re
 import shutil
-import statistics
 import sys
 import time
 from collections.abc import Callable
@@ -76,17 +80,11 @@ _SECRET = "zq" + "REV6" + "s9"
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "profile"
 
 
-def _median_seconds(work: Callable[[], object]) -> float:
-    runs = []
-    for _ in range(5):
-        started = time.perf_counter()
-        work()
-        runs.append(time.perf_counter() - started)
-    return statistics.median(runs)
-
-
 class TestLinearTime:
-    """Item 1. H1."""
+    """Item 1: the sanitizer on the key's own runs, and is_secret_name --
+    its fullmatch starts at position 0 alone and must reach the end, not
+    the path of _SECRET_NAME_RE.sub that TestEveryPattern times (H1 is
+    quadratic in that sub and linear in this fullmatch). H1, T1."""
 
     @pytest.mark.parametrize("unit", [
         "a-", "-", "a", "token-", "a_b-", "x" * 50 + "-", "a- b_", "password=x ",
@@ -95,14 +93,7 @@ class TestLinearTime:
     def test_each_doubling_at_most_triples(
         self, unit: str, function: Callable[[str], object],
     ) -> None:
-        # Each doubling is judged as it comes: a quadratic run fails on
-        # the first, before the next sizes cost minutes.
-        earlier = None
-        for n in (10_000, 20_000, 40_000, 80_000):
-            took = _median_seconds(lambda n=n: function(unit * (n // len(unit))))
-            if earlier is not None:
-                assert took / max(earlier, 1e-6) <= 3, (unit, n, earlier, took)
-            earlier = took
+        _assert_linear(function, unit)
 
 
 def _logged(**fields: Any) -> dict[str, Any]:
@@ -329,12 +320,14 @@ def _fastest(work: Callable[[], object], repeats: int = 1) -> float:
 
 def _assert_linear(work: Callable[[str], object], unit: str) -> None:
     """Each doubling of the input, 10 000 to 80 000 characters, at most
-    triples the time -- judged as it comes. A call too quick to time
-    alone (under 5 ms at 10 000) is timed as so many calls at every size
-    that the first run takes 5 ms: a ratio of two microsecond figures is
-    the clock's, not the pattern's."""
+    triples the time -- judged as it comes, so a quadratic run fails on
+    the first doubling, before the next sizes cost minutes. A call too
+    quick to time alone (under 20 ms at 10 000) is timed as so many
+    calls at every size that the first run takes 20 ms: a ratio of two
+    figures of a few milliseconds is the machine's, not the pattern's
+    (TEST-1: 2.4 ms -> 9.7 ms on a slow CI, no defect)."""
     first = unit * (10_000 // len(unit) + 1)
-    repeats = max(1, int(0.005 / max(_fastest(lambda: work(first)), 1e-7)) + 1)
+    repeats = max(1, int(0.02 / max(_fastest(lambda: work(first)), 1e-7)) + 1)
     earlier = None
     for n in (10_000, 20_000, 40_000, 80_000):
         text = unit * (n // len(unit) + 1)
