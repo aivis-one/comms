@@ -26,6 +26,7 @@
 # =============================================================================
 
 from collections.abc import Awaitable, Callable
+from typing import Any
 from uuid import UUID
 
 import structlog
@@ -61,7 +62,7 @@ async def resolve_targets(
         logger.warning(
             "unknown_target_type",
             target_type=target_type,
-            target_value=target_value,
+            **_target_shape(target_value),
         )
         return []
 
@@ -70,7 +71,7 @@ async def resolve_targets(
     logger.info(
         "targets_resolved",
         target_type=target_type,
-        target_value=target_value,
+        **_target_shape(target_value),
         count=len(recipient_ids),
     )
     return recipient_ids
@@ -81,6 +82,16 @@ async def resolve_targets(
 # ---------------------------------------------------------------------------
 
 
+def _target_shape(target_value: str) -> dict[str, Any]:
+    """What a log may hold of a target (DB-1): its length -- never the
+    value, nor anything derived from it (a hash of a phone or an email
+    from a known list is reversed by trying the list). The kind is the
+    event's name; the job's id and its idempotency key come with the
+    logging context of the attempt (structlog contextvars) -- by them the
+    product finds the job on its side."""
+    return {"target_length": len(target_value)}
+
+
 async def _resolve_user(
     session: AsyncSession,
     target_value: str,
@@ -89,7 +100,9 @@ async def _resolve_user(
     try:
         recipient_id = UUID(target_value)
     except ValueError:
-        logger.warning("invalid_user_target", target_value=target_value)
+        logger.warning(
+            "invalid_user_target", **_target_shape(target_value),
+        )
         return []
 
     stmt = select(Recipient.id).where(
@@ -107,7 +120,9 @@ async def _resolve_group(
 ) -> list[UUID]:
     """Resolve a group_key -> all active members of the group."""
     if not target_value:
-        logger.warning("invalid_group_target", target_value=target_value)
+        logger.warning(
+            "invalid_group_target", **_target_shape(target_value),
+        )
         return []
 
     stmt = (

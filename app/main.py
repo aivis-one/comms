@@ -29,9 +29,14 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from app.api.body_limit import LimitRequestBody
 from app.api.changes import router as changes_router
 from app.api.channels import router as channels_router
-from app.api.deps import refuse_repeated_query
+from app.api.deps import (
+    refuse_repeated_query,
+    refuse_unstorable_body,
+    refuse_unstorable_query,
+)
 from app.api.errors import register_error_handlers
 from app.api.inbox import router as inbox_router
 from app.api.jobs import router as jobs_router
@@ -40,6 +45,7 @@ from app.api.messaging import participants_router, sections_router
 from app.api.messaging import router as messaging_router
 from app.api.prefs import router as prefs_router
 from app.api.recipients import router as recipients_router
+from app.api.service_auth import RequireServiceToken
 from app.core.config import APP_VERSION, settings
 from app.core.database import (
     ProcessRole,
@@ -48,6 +54,7 @@ from app.core.database import (
     set_process_role,
 )
 from app.core.logging import setup_logging
+from app.core.sanitize import db_error_summary, pipeline_error_of
 from app.engine.formatters import channel_map, close_formatters, llm_set_map
 from app.profile.loader import install_profile_from_settings
 
@@ -94,16 +101,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 # THE INTERACTIVE SCHEMA IS A DEVELOPMENT TOOL, NOT A PRODUCT SURFACE.
-# FastAPI serves /docs, /redoc and /openapi.json with no authentication
-# of their own -- require_service_auth guards the routers, not these --
-# and what they publish is every route's docstring. Those docstrings
+# FastAPI serves /docs, /redoc and /openapi.json as routes of their own
+# (behind the service token like every path, when one is set), and what
+# they publish is every route's docstring. Those docstrings
 # are written for us: they carry KNOWN CEILING blocks, release markers
 # and, on one route, the sentence describing a read-authz bypass --
 # text for the next developer, published to anyone who asks.
 #
 # An integrator does not need them: deploy/INTEGRATION.md is the
-# contract, and it is written for that reader. So outside development
-# the three endpoints do not exist at all -- openapi_url=None also
+# contract, and it is written for that reader. So outside an explicit
+# development (an absent APP_ENV is production) the three endpoints do
+# not exist at all -- openapi_url=None also
 # removes /docs and /redoc, and the explicit Nones say so to the next
 # reader rather than leaving it to be discovered.
 def docs_urls(is_dev: bool) -> dict[str, str | None]:
@@ -131,10 +139,22 @@ app = FastAPI(
     docs_url=_DOCS["docs_url"],
     redoc_url=_DOCS["redoc_url"],
     # Before every route: a key given twice is refused, not read as its
-    # last value (app/api/deps.py).
-    dependencies=[Depends(refuse_repeated_query)],
+    # last value; a query or body string the database cannot store is a
+    # 422, not the driver's 500 (app/api/deps.py).
+    dependencies=[
+        Depends(refuse_repeated_query),
+        Depends(refuse_unstorable_query),
+        Depends(refuse_unstorable_body),
+    ],
 )
 register_error_handlers(app)
+# Every request's body bounded at MAX_REQUEST_BODY_BYTES, refused 413
+# before a byte past it is read or parsed (app/api/body_limit.py, PERF-3).
+app.add_middleware(LimitRequestBody)
+# The service token, asked before routing and before the body is read,
+# counted, parsed or checked; /health and /ready alone are open
+# (app/api/service_auth.py, REV-3). Added last, the outermost.
+app.add_middleware(RequireServiceToken)
 app.include_router(inbox_router)
 app.include_router(jobs_router)
 app.include_router(changes_router)
@@ -147,15 +167,21 @@ app.include_router(channels_router)
 app.include_router(lanes_router)
 
 
-async def _db_ok() -> bool:
-    """Probe database connectivity via an ORM expression."""
+async def _db_failure() -> Exception | None:
+    """Probe database connectivity via an ORM expression: None when it
+    answers, else what it raised -- for the caller to log or not."""
     try:
         engine = get_engine()
         async with engine.connect() as conn:
             await conn.execute(select(1))
-    except Exception:
-        return False
-    return True
+    except Exception as exc:
+        return exc
+    return None
+
+
+async def _db_ok() -> bool:
+    """Probe database connectivity; the failure itself is not kept."""
+    return await _db_failure() is None
 
 
 @app.get("/health")
@@ -189,8 +215,23 @@ async def health() -> JSONResponse:
 
 @app.get("/ready")
 async def ready() -> JSONResponse:
-    """Readiness probe -- 503 if the database is unreachable."""
-    db_ok = await _db_ok()
+    """Readiness probe -- 503 if the database is unreachable.
+
+    A 503 SAYS WHY, IN THE LOG (API-2): the class and the place of the
+    failure as DB-1 writes them -- a database error as its summary
+    (db_error_summary: class, place, SQLSTATE), anything else (a refused
+    connection is an OSError) as its class and place alone. Never a text:
+    the database's words and an OS error's (it quotes the address) stay
+    out. The answer is unchanged; /health stays silent (its form is
+    v4.0's).
+    """
+    failure = await _db_failure()
+    db_ok = failure is None
+    if failure is not None:
+        logger.warning(
+            "ready_db_unreachable",
+            error=db_error_summary(failure) or pipeline_error_of(failure),
+        )
     return JSONResponse(
         status_code=200 if db_ok else 503,
         content={

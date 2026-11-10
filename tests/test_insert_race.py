@@ -4,9 +4,11 @@
 #
 # THE RULE IS WIDER THAN A NEW ID: any write that reads, finds nothing
 # and inserts a key two writers can reach is a race -- a recipient id
-# (apply_snapshot, tombstone), a membership pair (group_changed), a
-# category mute (set_category_muted, D1-3). Every such insert goes
-# through app/core/database.py once_more_on_insert_race.
+# (apply_snapshot, tombstone), a membership pair (group_changed). Every
+# such insert goes through app/core/database.py once_more_on_insert_race.
+# A category mute (set_category_muted) was one (D1-3) until API-2: its
+# writers now queue on the recipient's row, so two never reach the key
+# together -- TestTheCategoryMuteRace holds that order instead.
 #
 # Two real sessions, no mocks: session A runs the write and holds its
 # INSERT uncommitted; session B, in a task, reads (finds nothing, A has
@@ -24,8 +26,8 @@
 #   M12 the helper without its SAVEPOINT -> every race test (the retry
 #       runs inside an aborted transaction)
 #   M13 the PUT route keeps its own begin_nested -> test_put_has_no_copy
-#   M23 the helper without its SAVEPOINT -> TestTheCategoryMuteRace too
-#   M24 the mute inserting past the helper -> TestTheCategoryMuteRace
+#   M25 the mute without the recipient's row taken (API-2) ->
+#       TestTheCategoryMuteRace (B does not wait; its INSERT meets A's key)
 # =============================================================================
 
 import ast
@@ -37,7 +39,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -182,12 +184,19 @@ def test_put_has_no_copy_of_the_mechanism() -> None:
 
 
 class TestTheCategoryMuteRace:
-    """D1-3 done-when (1). Before: the loser of two concurrent mutes of
-    one category got an IntegrityError on category_mutes_pkey -- a 500,
-    and its transaction rolled back WITH every other toggle of the same
-    PATCH. Both PATCHes run the route function exactly as a request
-    does: get_db_session commits after the handler returns
-    (app/core/database.py), and here each session commits in its turn."""
+    """Two PATCHes muting one category of one recipient: the second WAITS
+    for the first, and both toggles are kept, one row per category.
+
+    D1-3 held the opposite race and was right then: the two read "not
+    muted" side by side, the loser's INSERT met the key and the
+    insert-race rule ran it once more (its log line proved the race).
+    API-2 takes the recipient's row FOR NO KEY UPDATE before any
+    preference write (app/audience/prefs.py THE ORDER OF ROW LOCKS), so
+    the second write cannot read before the first commits: there is no
+    insert race left to win, and the retry was removed. The wait is
+    observed through pg_blocking_pids, never by timing. Both PATCHes run
+    the route function exactly as a request does, each session
+    committing in its turn."""
 
     async def test_two_patches_both_succeed_and_no_toggle_is_lost(self) -> None:
         rid = uuid4()
@@ -198,26 +207,53 @@ class TestTheCategoryMuteRace:
         b = PreferencesPatch(
             categories={"unit_updates": False, "unit_reminder": False},
         )
-        with capture_logs() as logs:
-            form_b = await _race(
-                lambda s: patch_preferences_form(
-                    recipient_id=rid, patch=a, session=s,
-                ),
-                lambda s: patch_preferences_form(
-                    recipient_id=rid, patch=b, session=s,
-                ),
-            )
+        factory = get_session_factory()
+        async with factory() as first, factory() as second:
+            await patch_preferences_form(recipient_id=rid, patch=a, session=first)
+            holder = await first.scalar(text("SELECT pg_backend_pid()"))
+
+            async def run_b() -> dict[str, Any]:
+                form = await patch_preferences_form(
+                    recipient_id=rid, patch=b, session=second,
+                )
+                await second.commit()
+                return form
+
+            task = asyncio.create_task(run_b())
+            await _until_waiting_on(holder, task)
+            await first.commit()
+            form_b = await asyncio.wait_for(task, 10.0)
         # B answered with the form (a 200), not an exception (a 500) ...
         assert form_b["categories"]["unit_updates"] is False
         assert form_b["categories"]["unit_reminder"] is False
         # ... one row for the contested category, and B's other toggle
-        # survived the race.
+        # survived.
         assert await _count(
             CategoryMute, recipient_id=rid, category="unit_updates",
         ) == 1
         assert await _count(
             CategoryMute, recipient_id=rid, category="unit_reminder",
         ) == 1
-        # The race happened -- proven by the retry's log line, not timing.
-        assert [log for log in logs if log["event"] == "category_mute_raced"]
+
+
+async def _until_waiting_on(holder: Any, task: asyncio.Task[Any]) -> None:
+    """Until a backend of this database waits on `holder` -- by
+    pg_blocking_pids, never by a sleep; B ending first fails the test."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10.0
+    while True:
+        async with get_session_factory()() as s:
+            waiting = await s.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "AND CAST(:holder AS integer) = ANY(pg_blocking_pids(pid))"
+                ),
+                {"holder": holder},
+            )
+        if waiting:
+            return
+        assert not task.done(), f"B ended without waiting: {task.result()!r}"
+        assert loop.time() < deadline, "B never waited"
+        await asyncio.sleep(0.02)
 

@@ -24,7 +24,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.engine.processor as processor_module
@@ -36,7 +36,7 @@ from app.engine.constants import (
     NotificationStatus,
     TargetType,
 )
-from app.engine.models import Notification, NotificationDelivery
+from app.engine.models import Notification, NotificationDelivery, PushOutbox
 from app.engine.processor import cleanup_terminal_notifications
 from app.worker import (
     reset_auto_close_gate,
@@ -60,8 +60,14 @@ async def _make_notification(
     """Persist a notification with an explicit age.
 
     created_at is set explicitly in the constructor -- SQLAlchemy
-    sends the value, overriding the column's server_default.
+    sends the value, overriding the column's server_default -- and
+    scheduled_at with it, unless given: what intake writes for a job
+    sent without one (app/engine/service.py create_notification). Left
+    to its server default it was the insert's own now(), a job created
+    long ago and due today -- unreachable, and since REV-2 retention
+    measures the later of the two.
     """
+    created_at = datetime.now(UTC) - timedelta(days=age_days)
     defaults: dict[str, Any] = {
         "type": "unit_event",
         "title": "T",
@@ -69,7 +75,8 @@ async def _make_notification(
         "target_type": TargetType.USER,
         "target_value": "*",
         "status": status,
-        "created_at": datetime.now(UTC) - timedelta(days=age_days),
+        "created_at": created_at,
+        "scheduled_at": created_at,
         **notification_row_fields(),
     }
     defaults.update(overrides)
@@ -236,6 +243,146 @@ class TestRetentionPass:
 
         assert await cleanup_terminal_notifications() == 0
         assert await _remaining_ids() == {ancient.id}
+
+
+class TestRetentionMeasuresFromTheDueTime:
+    """REV-2 item 2: the age is the later of created_at and scheduled_at,
+    and a job whose push is still owed is not deleted.
+
+    MUTATIONS these tests were written against (each turns one red):
+      T1 the age on created_at alone       -> test_a_late_reminder_...
+      T2 the age on scheduled_at alone     -> test_a_past_scheduled_at_...
+      T3 the push_outbox anti-join dropped -> test_an_owed_push_keeps_...
+    """
+
+    async def test_a_late_reminder_is_not_deleted_on_its_send(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Created 100 days ago, due -- and sent -- yesterday: it lives its
+        retention from yesterday. The pair: created 100 days ago, due 95
+        days ago, sent then -- deleted. T1."""
+        now = datetime.now(UTC)
+        late = await _make_notification(
+            db_session, status=NotificationStatus.SENT, age_days=100,
+            scheduled_at=now - timedelta(days=1),
+        )
+        old = await _make_notification(
+            db_session, status=NotificationStatus.SENT, age_days=100,
+            scheduled_at=now - timedelta(days=95),
+        )
+        await db_session.commit()
+
+        assert await cleanup_terminal_notifications() == 1
+        remaining = await _remaining_ids()
+        assert late.id in remaining
+        assert old.id not in remaining
+
+    async def test_a_past_scheduled_at_counts_from_creation(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """A product may send a scheduled_at in the past: created
+        yesterday, due 100 days ago -- the later is yesterday, kept. T2."""
+        now = datetime.now(UTC)
+        job = await _make_notification(
+            db_session, status=NotificationStatus.SENT, age_days=1,
+            scheduled_at=now - timedelta(days=100),
+        )
+        await db_session.commit()
+
+        assert await cleanup_terminal_notifications() == 0
+        assert await _remaining_ids() == {job.id}
+
+    async def test_an_owed_push_keeps_the_job(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Two jobs past the horizon; one still owes the product a push.
+        That one stays, with its push; the other goes. Once the relay
+        has published (its row deleted), the next pass deletes it. T3."""
+        owing = await _make_notification(
+            db_session, status=NotificationStatus.SENT, age_days=100,
+        )
+        await _make_notification(  # free: owes nothing
+            db_session, status=NotificationStatus.SENT, age_days=100,
+        )
+        db_session.add(PushOutbox(notification_id=owing.id))
+        await db_session.commit()
+
+        assert await cleanup_terminal_notifications() == 1
+        assert await _remaining_ids() == {owing.id}  # free went
+        async with get_session_factory()() as session:
+            assert (await session.execute(
+                select(func.count()).select_from(PushOutbox)
+                .where(PushOutbox.notification_id == owing.id)
+            )).scalar_one() == 1
+            await session.execute(
+                delete(PushOutbox).where(PushOutbox.notification_id == owing.id),
+            )
+            await session.commit()
+
+        assert await cleanup_terminal_notifications() == 1
+        assert await _remaining_ids() == set()
+
+
+class TestACancelledJobAgesFromCreation:
+    """REV-8 item 2: a cancelled job ages from created_at -- the one
+    outcome a job can reach before its scheduled_at (a cancel of a job
+    still pending; every other outcome comes of an attempt, and only a
+    due job is attempted -- app/engine/processor.py ready_now). Every
+    other outcome ages from the later of created_at and scheduled_at,
+    as REV-2 set.
+
+    MUTATIONS these tests were written against (each turns one red):
+      A1 greatest() for every status
+         -> test_a_cancelled_reminder_goes_by_its_creation
+      A2 created_at for every status
+         -> test_every_other_outcome_keeps_its_due_time (each status)
+    """
+
+    async def test_a_cancelled_reminder_goes_by_its_creation(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """Created 100 days ago, due in two years, cancelled: deleted --
+        it does not keep its title and body for two years more. A1."""
+        now = datetime.now(UTC)
+        job = await _make_notification(
+            db_session, status=NotificationStatus.CANCELLED, age_days=100,
+            scheduled_at=now + timedelta(days=730),
+        )
+        await db_session.commit()
+
+        assert await cleanup_terminal_notifications() == 1
+        assert job.id not in await _remaining_ids()
+
+    @pytest.mark.parametrize("status", [
+        NotificationStatus.SENT,
+        NotificationStatus.PARTIAL_SENT,
+        NotificationStatus.FAILED,
+        NotificationStatus.EXPIRED,
+        NotificationStatus.SUPPRESSED,
+        NotificationStatus.NO_RECIPIENTS,
+    ])
+    async def test_every_other_outcome_keeps_its_due_time(
+        self, db_session: AsyncSession, status: NotificationStatus,
+    ) -> None:
+        """Created 100 days ago, due -- and decided -- yesterday: kept, its
+        outcome readable by its key for the period from when it was due.
+        The pair in the same pass: a cancelled job of the same dates goes,
+        so the pass did run and select. A2."""
+        now = datetime.now(UTC)
+        kept = await _make_notification(
+            db_session, status=status, age_days=100,
+            scheduled_at=now - timedelta(days=1),
+        )
+        gone = await _make_notification(
+            db_session, status=NotificationStatus.CANCELLED, age_days=100,
+            scheduled_at=now - timedelta(days=1),
+        )
+        await db_session.commit()
+
+        assert await cleanup_terminal_notifications() == 1
+        remaining = await _remaining_ids()
+        assert kept.id in remaining
+        assert gone.id not in remaining
 
 
 class TestWorkerMaintenanceCadence:

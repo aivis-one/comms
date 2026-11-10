@@ -148,19 +148,24 @@ async def list_changes(
 
     KNOWN CEILING (acknowledged by design -- P2-3, retention under a
     live cursor):
-      1. Mechanics: retention deletes a terminal job by its created_at
-         (app/engine/service.py delete_terminal_notifications_batch),
-         its journal rows with it (ON DELETE CASCADE). A job created
-         longer ago than the retention period whose last change came
-         after the product's position can be deleted before the product
-         reads that change: the feed never shows it, although the
-         cursor is not expired.
+      1. Mechanics: retention deletes a terminal job by the later of
+         its created_at and scheduled_at, a cancelled one by its
+         created_at (app/engine/service.py
+         delete_terminal_notifications_batch; REV-2 -- a job sent late
+         lives its period from when it was due; REV-8 -- a cancel can
+         come before the job is due), its journal rows with it (ON
+         DELETE CASCADE). A job due longer ago than the retention
+         period whose last change came after the product's position can
+         be deleted before the product reads that change: the feed never
+         shows it, although the cursor is not expired.
       2. Status: acknowledged by design.
-      3. Backlog ref: none -- it takes a job that lived longer than the
-         retention period (90 days by default).
+      3. Backlog ref: none -- it takes a job that went on changing
+         longer than the retention period (90 days by default) after it
+         was due (a cancelled one: after it was created).
       4. Promotion trigger (observable): a key the product holds as
          unfinished that the read by key answers 404, under a cursor
-         that is not expired.
+         that is not expired -- for a cancelled job, counted from its
+         creation, not from when it was due.
       5. Agreed fix: none agreed; the candidate is retention measuring
          a terminal job's age by its last transition.
       6. Rejected: a stored "deletion horizon" written by retention (a

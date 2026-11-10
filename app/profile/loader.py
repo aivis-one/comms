@@ -179,7 +179,7 @@
 
 import re
 import string
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -206,6 +206,7 @@ from app.core.constants import (
 )
 from app.core.exceptions import ProfileError
 from app.core.lanes import Lane
+from app.core.sanitize import exception_text
 from app.profile.registry import (
     Decided,
     Layer,
@@ -217,6 +218,8 @@ from app.profile.registry import (
     TypeRecord,
     registry,
 )
+from app.profile.telegram_html import telegram_html_problem
+from app.profile.template_fields import field_problem
 
 logger = structlog.get_logger()
 
@@ -312,7 +315,18 @@ _DEFAULT_RECIPIENT_SCHEDULE = RecipientSchedule.RESPECT.value
 # fractions, no compound forms ("1h30m"), no bare numbers -- a bare
 # number would leave the unit to be guessed.
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-_DURATION_RE = re.compile(r"^([1-9][0-9]*)([smhd])$")
+_DURATION_RE = re.compile(r"([1-9][0-9]*)([smhd])")
+# The longest duration a profile may declare: ten years, a term past
+# which "expires" and "keeps" both mean never. It fits what the durations
+# become -- llm_calls.answer_keep_seconds is an int32 (315 360 000 s of
+# 2 147 483 647), and an intake's scheduled_at + expires_after stays a
+# date: scheduled_at is held to the same ceiling ahead of now at intake
+# (app/engine/service.py create_notification, REV-8), so the sum is at
+# most now + 2 x MAX_DURATION_DAYS -- whatever NOTIFICATION_RETENTION_DAYS
+# is (0 is "keep forever", and then answer_keep had no bound at all).
+# The one copy: the intake reads it from here.
+MAX_DURATION_DAYS = 3650
+_MAX_DURATION_SECONDS = MAX_DURATION_DAYS * 86400
 
 
 # -----------------------------------------------------------------------------
@@ -442,11 +456,45 @@ class FileProfileSource:
 
         templates_by_locale: dict[str, Any] = {}
         templates_dir = root / _TEMPLATES_SUBDIR
+        # No templates/ at all is a profile whose letters come as the
+        # product wrote them -- lawful, said nothing about (TPL-2). What
+        # IS in it is read whole: an entry that is not a <locale>.yaml
+        # file (en.yml, a directory, any other file) was skipped
+        # silently, its texts with it -- a typo that took a locale's
+        # templates away. Refused.
+        # A hidden entry (.gitkeep, .DS_Store) is a tool's, not the
+        # profile's: skipped, said nothing about -- a service file must
+        # not keep comms from starting.
         if templates_dir.is_dir():
-            for path in sorted(templates_dir.glob("*.yaml")):
-                locale = path.stem
-                templates_by_locale[locale] = self._read_yaml(
-                    path, f"{_TEMPLATES_SUBDIR}/{path.name}", violations,
+            for path in sorted(templates_dir.iterdir()):
+                if path.name.startswith("."):
+                    continue
+                where = f"{_TEMPLATES_SUBDIR}/{path.name}"
+                if not (path.is_file() and path.suffix == ".yaml"):
+                    violations.append(Violation(
+                        where, "", "",
+                        f"is not a templates file: {_TEMPLATES_SUBDIR}/ holds "
+                        f"<locale>.yaml files only, and anything else in it "
+                        f"would be skipped with its texts",
+                    ))
+                    continue
+                templates_by_locale[path.stem] = self._read_yaml(
+                    path, where, violations,
+                )
+        # A directory beside types.yaml and templates/ is no part of the
+        # profile -- `template/` may be templates/ mistyped. Said, not
+        # refused: in v3 a refused profile is a comms that does not start,
+        # and a product may keep its own directory there (TPL-2). A file
+        # (a README) is not a directory, a hidden one (.git, .idea) is a
+        # tool's: neither is said.
+        for path in sorted(root.iterdir()):
+            if (
+                path.is_dir() and path.name != _TEMPLATES_SUBDIR
+                and not path.name.startswith(".")
+            ):
+                logger.warning(
+                    "profile_unknown_directory", directory=path.name,
+                    templates=_TEMPLATES_SUBDIR,
                 )
 
         _raise_if_any(violations)
@@ -468,9 +516,11 @@ class FileProfileSource:
                 finally:
                     loader.dispose()
         except yaml.YAMLError as exc:
-            raise ProfileError(f"Invalid YAML in {path}: {exc}") from exc
+            raise ProfileError(
+            f"Invalid YAML in {path}: {exception_text(exc)}"
+        ) from exc
         except OSError as exc:
-            raise ProfileError(f"Cannot read {path}: {exc}") from exc
+            raise ProfileError(f"Cannot read {path}: {exception_text(exc)}") from exc
         for key, line, first in loader.duplicates:
             violations.append(Violation(
                 where, "", f"line {line:06d}",
@@ -609,13 +659,31 @@ def _check_answer_keep(value: Any) -> str | None:
 
 
 def _check_duration(value: Any) -> str | None:
-    if isinstance(value, str) and _DURATION_RE.match(value):
-        return None
-    return (
-        f"found {_describe(value)}; expected a duration literal: a "
-        f"positive integer and one unit of {', '.join(_DURATION_UNITS)} "
-        f"(e.g. \"15m\", \"24h\", \"7d\")"
-    )
+    """A duration literal -- the whole string, a trailing newline is not
+    one (fullmatch) -- of at most MAX_DURATION_DAYS. The bound is held
+    by comparing the count with the unit's share of it, so a count of any
+    length is refused here, never multiplied into a timedelta that
+    overflows."""
+    match = _DURATION_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return (
+            f"found {_describe(value)}; expected a duration literal: a "
+            f"positive integer and one unit of {', '.join(_DURATION_UNITS)} "
+            f"(e.g. \"15m\", \"24h\", \"7d\")"
+        )
+    digits, unit = match.group(1), match.group(2)
+    # The length first (REV-6): int() refuses a string of more than 4300
+    # digits with a bare ValueError, and a count longer than the ceiling
+    # in digits is above it anyway.
+    if (
+        len(digits) > len(str(_MAX_DURATION_SECONDS))
+        or int(digits) > _MAX_DURATION_SECONDS // _DURATION_UNITS[unit]
+    ):
+        return (
+            f"found {value!r}; longer than {MAX_DURATION_DAYS}d, the "
+            f"longest duration a profile may declare"
+        )
+    return None
 
 
 def _int_in_range(
@@ -658,7 +726,7 @@ def _backoff_base(value: Any) -> str | None:
 
 
 def _duration_value(literal: str) -> timedelta:
-    match = _DURATION_RE.match(literal)
+    match = _DURATION_RE.fullmatch(literal)
     assert match is not None  # checked by _check_duration first
     return timedelta(
         seconds=int(match.group(1)) * _DURATION_UNITS[match.group(2)],
@@ -855,9 +923,104 @@ def parse_profile(
         templates[locale] = _parse_template_tree(
             locale, doc, declared, violations,
         )
+    for locale, type_key, problem in _telegram_markup_problems(templates):
+        violations.append(Violation(
+            f"{_TEMPLATES_SUBDIR}/{locale}.yaml", type_key, _TELEGRAM_TEXT,
+            f"{type_key}.{_TELEGRAM_TEXT} for a {locale} recipient: {problem}",
+        ))
 
     _raise_if_any(violations)
     return Profile(types=declared, templates=templates)
+
+
+# THE TELEGRAM TEXT IS CHECKED AS IT IS SENT (TPL-2): the title and the
+# body in one string, "\n\n" between, with ParseMode.HTML -- a tag may
+# open in the title and close in the body. EACH FIELD COMES BY THE CHAIN
+# OF LOCALES THE SEND WALKS (the recipient's, then DEFAULT_LOCALE --
+# app/engine/template_engine.py _locale_chain), field by field: a ru
+# title over the en body is a letter a ru recipient gets, so it is checked
+# for every locale of the profile (a locale the profile has no texts in
+# gets DEFAULT_LOCALE's alone, checked as that locale). A field no locale
+# of the chain has stands as what the formatter puts there (the stored
+# title in <b>, the stored body); a template field as _FIELD_STANDS_AS.
+_TELEGRAM_TEXT = "telegram.title+body"
+# What a field stands as: a value the way it reaches the text -- escaped
+# ("&amp;") and with the characters of a link (":", "/"). Text and a
+# quoted attribute take it; an unquoted attribute does not, as it would
+# not take the link the letter carries (parse_html reads an unquoted
+# value as a name token: letters, digits, "." and "-").
+_FIELD_STANDS_AS = "x:/&amp;"
+
+
+def _telegram_markup_problems(
+    templates: Mapping[str, TemplateTree],
+) -> list[tuple[str, str, str]]:
+    """(locale, type, why) for every telegram text Telegram would refuse
+    to parse, the title and the body of each taken by the send's chain."""
+    default = settings.default_locale
+    problems: list[tuple[str, str, str]] = []
+    for locale in sorted(templates):
+        chain = [locale] if locale == default else [locale, default]
+        type_keys = sorted({
+            type_key for step in chain for type_key in templates.get(step, {})
+        })
+        for type_key in type_keys:
+            title, body = (
+                _first_text(templates, chain, type_key, field)
+                for field in ("title", "body")
+            )
+            if title is None and body is None:
+                continue
+            problem = telegram_html_problem(
+                (_fields_as_one(title) if title is not None else "<b>1</b>")
+                + "\n\n"
+                + (_fields_as_one(body) if body is not None else "1")
+            )
+            if problem is not None:
+                problems.append((
+                    locale, type_key,
+                    f"Telegram would not parse the HTML of every letter -- "
+                    f"{problem}",
+                ))
+    return problems
+
+
+def _first_text(
+    templates: Mapping[str, TemplateTree],
+    chain: Sequence[str],
+    type_key: str,
+    field: str,
+) -> str | None:
+    """The telegram text of `field` the send would take, or None."""
+    for step in chain:
+        value = (
+            templates.get(step, {}).get(type_key, {}).get("telegram", {})
+        ).get(field)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+# What `params` printed WHOLE stands as (REV-6): the one object the
+# intake lets into action_data prints as its str() -- keys and values
+# escaped, the quotes of the repr raw ("'"), unlike any scalar, whose
+# "'" html.escape writes as &#x27;. In a single-quoted attribute those
+# raw quotes end it early, as they would on the send.
+_PARAMS_STANDS_AS = str({_FIELD_STANDS_AS: _FIELD_STANDS_AS})
+
+
+def _fields_as_one(template: str) -> str:
+    """The template with every field as what it stands as -- `params`
+    whole as _PARAMS_STANDS_AS, any other as _FIELD_STANDS_AS -- and
+    "{{" "}}" as braces."""
+    return "".join(
+        literal + (
+            "" if name is None
+            else _PARAMS_STANDS_AS if name == "params"
+            else _FIELD_STANDS_AS
+        )
+        for literal, name, _, _ in string.Formatter().parse(template)
+    )
 
 
 def _versioned_body(doc: Any) -> dict[Any, Any]:
@@ -1294,6 +1457,18 @@ def _parse_template_tree(
                     ))
                     continue
                 complaint = _leaf_complaint(fname, template)
+                if (
+                    complaint is None and isinstance(template, str)
+                    and not template.strip()
+                ):
+                    # TPL-2: a blank base text renders blank on every
+                    # letter of the type -- refused here, never at the send.
+                    complaint = (
+                        "is blank: every letter of the type would carry "
+                        "nothing there -- write the text, or leave the field "
+                        "out for the product's own title and body (the "
+                        "default label for a button)"
+                    )
                 if complaint is None and isinstance(template, str):
                     domain = _domain_literal(template)
                     if domain is not None:
@@ -1325,9 +1500,11 @@ class _FormatProbe:
     pre-formatted strings (same principle as pre-rendered digests).
 
     Item access returns another probe ({user[name]} works on the JSON
-    dicts that actually arrive). Attribute access is deliberately NOT
-    provided: getattr on a dict fails at runtime, so {user.name} must
-    die at validation, not on the delivery path.
+    dicts that actually arrive). Attribute access is not what refuses
+    {user.name}: the probe has the attributes every object has
+    (__class__, __doc__ ...), so the dry run alone let {x.__class__}
+    through -- the path is refused before the probe is asked
+    (app/profile/template_fields.py, TPL-1).
     """
 
     def __format__(self, spec: str) -> str:
@@ -1392,20 +1569,29 @@ def _leaf_complaint(fname: str, template: Any) -> str | None:
     if not isinstance(template, str):
         return f"must be a string, got {type(template).__name__}"
     try:
+        # The fields themselves first (TPL-1, app/profile/template_fields.py):
+        # an attribute anywhere in a path, a field inside a format spec,
+        # a width or precision wider than a letter. BEFORE the dry run --
+        # a width of 10**8 would make the dry run itself build the string.
+        # A template the parser refuses is the dry run's to name.
+        problem = field_problem(template)
+    except ValueError:
+        problem = None
+    if problem is not None:
+        return problem
+    try:
         # Dry run against probes: parser errors (unbalanced braces,
         # bad conversions) and specs no JSON scalar accepts surface
         # here -- exactly what must kill startup instead of the
         # delivery path. Specs valid for SOME runtime value pass.
+        # Attribute access no longer reaches it: field_problem above
+        # refuses every attribute by the path, which the probe could not
+        # (every object has __class__).
         template.format_map(_ProbeDict())
-    except AttributeError as exc:
-        return (
-            f"uses attribute access on a template variable ({exc}). "
-            f"Variables are JSON values, so `{{user.name}}` fails at "
-            f"runtime -- use item access (`{{user[name]}}`)."
-        )
     except (ValueError, TypeError, IndexError, KeyError) as exc:
         return (
-            f"has a broken format spec or field path: {exc}. Template "
+            f"has a broken format spec or field path: "
+            f"{exception_text(exc)}. Template "
             f"language is str.format_map -- check braces and format specs."
         )
     return None
@@ -1495,17 +1681,15 @@ def _overlay_subject(root: Path | str) -> str:
 def _variable_roots(template: str) -> set[str]:
     """The variable names a template reads, by their root.
 
-    {user[name]} reads `user`; a nested spec ({amount:{width}}) reads
-    `width` too. Only called on a template that passed the dry run, so
-    parsing cannot fail here and positional fields never get this far.
+    {user[name]} reads `user`. Only called on a template that passed
+    the leaf check, so parsing cannot fail here, positional fields never
+    get this far, and no format spec holds a field (TPL-1 refuses one --
+    the walk into a spec this did is gone with it, TPL-2).
     """
     roots: set[str] = set()
-    for _, name, spec, _ in string.Formatter().parse(template):
-        if name is None:
-            continue
-        roots.add(re.split(r"[.\[]", name, maxsplit=1)[0])
-        if spec:
-            roots |= _variable_roots(spec)
+    for _, name, _, _ in string.Formatter().parse(template):
+        if name is not None:
+            roots.add(re.split(r"[.\[]", name, maxsplit=1)[0])
     return roots
 
 
@@ -1536,8 +1720,45 @@ def parse_overlay(raw: RawOverlay, base: Profile) -> dict[str, TemplateTree]:
         tree = _parse_overlay_file(locale, doc, base, variables, violations)
         if tree:
             result[locale] = tree
+    # The telegram text as it will be sent: the overlay's leaves over
+    # the base's, by the send's chain -- an en overlay reaches every
+    # locale that falls back to en. The base passed this check, so what
+    # is found here is the overlay's.
+    for locale, type_key, problem in _telegram_markup_problems(
+        _overlaid(base.templates, result),
+    ):
+        # Named by the overlay files of the chain -- the ones that made
+        # the text (an en overlay breaks a ru recipient's letter).
+        files = ", ".join(
+            f"{step}{_OVERLAY_SUFFIX}"
+            for step in dict.fromkeys((locale, settings.default_locale))
+            if step in result
+        )
+        violations.append(Violation(
+            _overlay_where(files), type_key, _TELEGRAM_TEXT,
+            f"{type_key}.{_TELEGRAM_TEXT} for a {locale} recipient: {problem}",
+        ))
     _raise_if_any(violations, _overlay_subject(raw.root))
     return result
+
+
+def _overlaid(
+    base: Mapping[str, TemplateTree], overlay: Mapping[str, TemplateTree],
+) -> dict[str, TemplateTree]:
+    """The base's templates with the overlay's leaves over them."""
+    merged: dict[str, TemplateTree] = {}
+    for locale, tree in base.items():
+        merged[locale] = {
+            type_key: {
+                channel: {
+                    **fields,
+                    **overlay.get(locale, {}).get(type_key, {}).get(channel, {}),
+                }
+                for channel, fields in channels.items()
+            }
+            for type_key, channels in tree.items()
+        }
+    return merged
 
 
 def _parse_overlay_file(

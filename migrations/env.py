@@ -98,6 +98,13 @@ def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
         connection=connection,
         target_metadata=target_metadata,
         include_object=include_object,
+        # What `alembic check` compares, said here rather than left to
+        # alembic's defaults (REV-5): a column's type (the default since
+        # alembic 1.12) and its SERVER DEFAULT (off by default) -- a
+        # model whose default drifted from the database's is a red check,
+        # not a silent difference.
+        compare_type=True,
+        compare_server_default=True,
     )
 
     with context.begin_transaction():
@@ -117,6 +124,8 @@ async def run_async_migrations() -> None:
     # connect), not in a transaction it could leave with.
     connectable = create_async_engine(
         settings.database_url,
+        # DB-1: no bound value in an error's text ([parameters]).
+        hide_parameters=True,
         connect_args={"server_settings": {"lock_timeout": "10s"}},
     )
 

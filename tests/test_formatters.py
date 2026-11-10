@@ -34,12 +34,13 @@ from aiogram.exceptions import (
     TelegramAPIError,
     TelegramNetworkError,
     TelegramRetryAfter,
+    TelegramUnauthorizedError,
 )
 from structlog.testing import capture_logs
 
 from app.audience.models import Recipient
 from app.core.config import Settings
-from app.core.sanitize import sanitize_error, sanitize_text, sanitized_traceback
+from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine.constants import DeliveryChannel, FailureClass
 from app.engine.formatters import (
     ChannelRegistry,
@@ -245,6 +246,30 @@ class TestFormatDeepLink:
         with pytest.raises(PermanentDeliveryError, match=r"^deep link:"):
             fmt.format_deep_link({"action": "open practice"})
 
+    def test_a_null_param_is_no_param(self) -> None:
+        """null means absent (TPL-1): the link is the bare action, as for
+        an action without params -- not `open_thread__None`. The pair is
+        test_single_param: a value is still carried."""
+        fmt = TelegramFormatter(bot=_FakeBot(), bot_url=BOT_URL)
+        link = fmt.format_deep_link({
+            "action": "open_thread", "params": {"thread_id": None},
+        })
+        assert link == f"{BOT_URL}?startapp=open_thread"
+
+    def test_null_params_are_dropped_before_they_are_counted(self) -> None:
+        """A null beside a value leaves ONE parameter: the link carries
+        the value, it is not refused as two; nulls alone leave none."""
+        fmt = TelegramFormatter(bot=_FakeBot(), bot_url=BOT_URL)
+        link = fmt.format_deep_link({
+            "action": "open_practice",
+            "params": {"slot_id": None, "practice_id": "p1"},
+        })
+        assert link == f"{BOT_URL}?startapp=open_practice__p1"
+        bare = fmt.format_deep_link({
+            "action": "dashboard", "params": {"a": None, "b": None},
+        })
+        assert bare == f"{BOT_URL}?startapp=dashboard"
+
 
 class TestTelegramDeliver:
     """Send path merged from velo (message building) + cbshome contract."""
@@ -255,14 +280,11 @@ class TestTelegramDeliver:
         markup. Flags fall to channel defaults (no sheet flags for
         unit_event).
 
-        The job now carries `extra`, the one variable of the sheet's
-        body that is not a core field. It used to be left out, and the
-        test expected the body as "World [{extra}]": right while the
-        engine printed a missing variable back as "{extra}" (SafeDict).
-        G5 removed that -- a missing variable makes the field fall back
-        to the stored text (tests/test_template_missing_variable.py) --
-        so without `extra` the body would no longer come from the sheet
-        and this test would not be about the template path at all."""
+        The job carries `extra`, the one variable of the sheet's body
+        that is not a core field: this test is about a sheet with every
+        variable present. Without it the body prints "{extra}" -- its
+        placeholder (TPL-1, tests/test_template_missing_variable.py);
+        under G5 it fell back to the stored text."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
         recipient = _recipient()
@@ -558,26 +580,26 @@ class TestSanitizeError:
     """Review 1.1: sanitizer covers DSNs, key=value and bearer shapes."""
 
     def test_dsn_userinfo_redacted(self) -> None:
-        msg = sanitize_error(
+        msg = exception_text(
             Exception("connect postgresql+asyncpg://comms:s3cret@db/comms")
         )
         assert "s3cret" not in msg
         assert "://comms:[redacted]@db/comms" in msg
 
     def test_key_value_redacted(self) -> None:
-        msg = sanitize_error(Exception("failed: token=abc123 rest"))
+        msg = exception_text(Exception("failed: token=abc123 rest"))
         assert "abc123" not in msg
         assert "token=[redacted]" in msg
 
     def test_bearer_before_keyword_redacted(self) -> None:
         """Secret precedes the keyword -- the Phase 1 gap (review §4)."""
-        msg = sanitize_error(
+        msg = exception_text(
             Exception("invalid Authorization: Bearer eyJhbGci.payload x")
         )
         assert "eyJhbGci" not in msg
 
     def test_plain_message_untouched(self) -> None:
-        assert sanitize_error(Exception("plain failure")) == "plain failure"
+        assert exception_text(Exception("plain failure")) == "plain failure"
 
 
 
@@ -750,11 +772,12 @@ class TestSanitizeForms:
         assert sanitize_text("") == ""
 
     def test_the_record_cut_never_splits_a_secret(self) -> None:
-        """sanitize_error cuts at 2000 AFTER redacting: a secret that
+        """exception_text (sanitize_error until DB-1, which folded it into the
+        one rule for an exception's text) cuts at 2000 AFTER redacting: a secret that
         straddles the cut would otherwise leave its prefix behind,
         which no pattern recognises once the @ is gone."""
         text = "x" * 1985 + f" redis://:{_REDIS_PASS}@comms-redis:6379/0"
-        cleaned = sanitize_error(Exception(text))
+        cleaned = exception_text(Exception(text))
         assert len(cleaned) == 2000
         assert _REDIS_PASS[:8] not in cleaned
 
@@ -785,11 +808,10 @@ class TestComposition:
         """Template path: no injected markup at all -- the sheet's own
         markup (here: none) is the whole story.
 
-        The job carries `extra` now. Without it the body was
-        "World [{extra}]" from the sheet while a missing variable was
-        printed back literally (SafeDict); since G5 it makes the body
-        fall back to the stored text, which would turn this "both from
-        the template" case into a mixed one."""
+        The job carries `extra`: both fields from the template, every
+        variable present. Without it the body still comes from the
+        sheet, with the placeholder "{extra}" (TPL-1); under G5 it fell
+        back to the stored text, which made this case a mixed one."""
         bot = _FakeBot()
         fmt = TelegramFormatter(bot=bot, bot_url=BOT_URL)
 
@@ -1045,6 +1067,21 @@ class TestTelegramFailuresReachTheLogRedacted:
             e for e in logs if e["event"] == "delivery_permanent_failure"
         ]
         assert "bot was blocked by the user" in entry["error"]
+
+    async def test_a_rejected_token_keeps_telegram_words(self) -> None:
+        """SAN-1: the text is not "bot token: <words>" -- the sanitizer's
+        key=value pattern would take Telegram's words for the token's
+        value and redact them to the end of the line."""
+        error = TelegramUnauthorizedError(
+            method=SimpleNamespace(),  # type: ignore[arg-type]
+            message="Unauthorized",
+        )
+        outcome, _ = await _tg_outcome(error)
+        assert outcome.failure_class is FailureClass.CONFIGURATION
+        assert outcome.error == (
+            "Telegram rejected the bot token -- "
+            "Telegram server says - Unauthorized"
+        )
 
     async def test_rate_limit_carries_telegram_words(self) -> None:
         error = TelegramRetryAfter(

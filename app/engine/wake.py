@@ -99,6 +99,8 @@ def wake_engine() -> AsyncEngine:
     """The listener's own engine: the service's database, no pool."""
     return create_async_engine(
         settings.database_url,
+        # DB-1: no bound value in an error's text ([parameters]).
+        hide_parameters=True,
         poolclass=NullPool,
         connect_args={
             "server_settings": {"application_name": WAKE_APPLICATION_NAME},

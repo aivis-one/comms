@@ -141,10 +141,10 @@ async def test_health_reports_the_same_map_on_every_call(
 class TestTheSchemaIsNotPublic:
     """The interactive schema is a development tool (R-4).
 
-    FastAPI serves /docs, /redoc and /openapi.json with no
-    authentication of their own -- require_service_auth guards the
-    routers, not these -- and what they publish is every route's
-    docstring. Ours are written for us: KNOWN CEILING blocks, release
+    FastAPI serves /docs, /redoc and /openapi.json as routes of their
+    own -- behind the service token like every path when one is set,
+    open in a development without one -- and what they publish is every
+    route's docstring. Ours are written for us: KNOWN CEILING blocks, release
     markers, and on one route the sentence describing a read-authz
     bypass. Five of twenty-one operations carried such text.
     """

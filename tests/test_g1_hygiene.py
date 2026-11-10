@@ -116,6 +116,8 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         _NOT_A_JOB + "the product's event, its address in the log",
     ("app/api/idempotency.py", "request_fingerprint", "body"):
         _NOT_A_JOB + "Request.body(), the request digested whole",
+    ("app/api/deps.py", "refuse_unstorable_body", "body"):
+        _NOT_A_JOB + "Request.body(), the raw request checked for storability",
     ("app/api/jobs.py", "_answer", "body"):
         _NOT_A_JOB + "LLMAnswer.body, the model's answer for the product",
     ("app/engine/service.py", "_answer_row", "body"):
@@ -539,6 +541,10 @@ class TestTheInsertRace:
         async with factory() as session:
             operator = await create_recipient(session)
             section = await get_or_create_section(session, key="sec-m", label="M")
+            # A declared roster (API-1): the race is two inserts of one
+            # member row. On an undeclared section the first event's
+            # declaration would serialize the two before either inserts.
+            section.roster_declared = True
             await session.commit()
         async with factory() as first:
             first.add(SectionMember(section_id=section.id, operator_id=operator.id))

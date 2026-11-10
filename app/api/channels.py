@@ -20,7 +20,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
 from app.core.constants import HEALTH_WINDOW_DEFAULT_MINUTES
 from app.core.database import get_db_reader
 from app.engine.health import channel_health, health_window
@@ -28,7 +27,6 @@ from app.engine.health import channel_health, health_window
 router = APIRouter(
     prefix="/api/v1/channels",
     tags=["channels"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 

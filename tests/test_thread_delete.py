@@ -82,6 +82,7 @@ from app.variants import write_request
 from tests.helpers import (
     create_recipient,
     create_section,
+    declare_member,
     intake_fields,
     next_tk2_telegram_id,
 )
@@ -111,7 +112,7 @@ async def _section(*members: UUID) -> UUID:
     async with get_session_factory()() as s:
         section = await create_section(s, key=f"tk2-{uuid4().hex[:8]}")
         for member in members:
-            s.add(SectionMember(section_id=section.id, operator_id=member))
+            await declare_member(s, section, member)
         await s.commit()
         return section.id
 

@@ -15,12 +15,20 @@
 #     code and a miss was a programming error.
 #
 # WHAT STAYED:
-#   - str.format_map rendering (identical in both donors) -- but NOT the
-#     donors' SafeDict, which printed a missing variable back as its own
-#     "{name}": a typo in a template, or a variable the product did not
-#     send, reached the person as braces (G5). A variable the job does
-#     not carry now makes the field fall back like a broken format spec
-#     does (render below; deploy/INTEGRATION.md section 3).
+#   - str.format rendering (identical in both donors), through
+#     _LetterFormatter -- the same parser and the same lookups as
+#     str.format_map (string.Formatter, _string).
+#
+# A VARIABLE THE JOB DOES NOT CARRY IS PRINTED AS ITS PLACEHOLDER (TPL-1,
+# the owner's decision of 4 November 2026; G5's fallback is withdrawn):
+# "{paid_amount}", "{user[name]}" stands in the letter where the field
+# did not resolve -- a key the product did not send, a path into one
+# that does not go through, a JSON null. Louder is better than quieter:
+# the person sees that something is missing, and the job's journal names
+# it (template_unresolved on the channel's `accepted` row,
+# app/engine/journal.py). Every other field renders as usual. A TYPE
+# WITHOUT A TEMPLATE for the field still takes the stored title/body
+# (render -> None): that is the product's own text, not a hole in one.
 #   - {type}.{channel}.{field} addressing granularity (cbshome base --
 #     richer than velo's per-type title/body, supports email subject).
 #   - Locale fallback chain: requested -> deploy default locale.
@@ -32,6 +40,8 @@
 # where the difference is visible, walking the SAME chain as render().
 # =============================================================================
 
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from string import Formatter
 from typing import Any
 
@@ -39,52 +49,81 @@ import structlog
 
 from app.core.config import settings
 from app.profile.registry import TextDecided, registry
+from app.profile.template_fields import path_has_attribute, spec_too_wide
 
 logger = structlog.get_logger()
 
 
-# What a field path that does not resolve raises inside format_map --
-# and what a broken format spec raises: one family, one fallback.
+# What a broken format spec raises over a value that is there, and an
+# attribute in a path -- the field then renders as if it had no template
+# (render_field -> None).
 _RENDER_ERRORS = (KeyError, ValueError, TypeError, IndexError, AttributeError)
+# A path that does not resolve: the key or index is not there, or the
+# value on the way is not a mapping or a list.
+_LOOKUP_ERRORS = (KeyError, IndexError, TypeError)
 
 
-def _template_fields(template: str) -> list[str]:
-    """Every field path of a template, in the order format_map meets
-    them: a field, then the fields of its own format spec
-    ("{amount:{width}}" -> amount, width). The stdlib parser is the one
-    format_map uses (_string.formatter_parser)."""
-    fields: list[str] = []
-    for _, field_name, spec, _ in Formatter().parse(template):
-        if field_name is None:
-            continue
-        fields.append(field_name)
-        if spec:
-            fields.extend(_template_fields(spec))
-    return fields
+class _AttributeInPathError(AttributeError):
+    """A field path that takes an attribute: refused at startup
+    (app/profile/template_fields.py); here it is not looked up at all --
+    the field renders as if it had no template."""
 
 
-def _unresolved_field(
-    template: str, variables: dict[str, Any],
-) -> str | None:
-    """The first field path of the template that does not resolve
-    against the variables -- "titel", "user[name]" -- or None.
+@dataclass(frozen=True)
+class _Unresolved:
+    """The stand-in for a field that did not resolve: its path."""
 
-    The name is the TEMPLATE's text (the profile's), never a value of
-    the letter (H8): the resolved value is looked up and dropped. It
-    names the first path that fails, whichever failure format_map met
-    first; a broken format spec over variables that all resolve has no
-    name, as before.
-    """
-    try:
-        fields = _template_fields(template)
-    except ValueError:
-        return None
-    for field_name in fields:
+    path: str
+
+
+@dataclass(frozen=True)
+class RenderedField:
+    """A template field as rendered, and the paths that did not resolve
+    in it -- the template's text, never a value of the letter."""
+
+    text: str
+    unresolved: tuple[str, ...]
+
+
+class _LetterFormatter(Formatter):
+    """str.format with the letter's variables, where a field that does
+    not resolve -- or resolves to null -- prints its placeholder
+    "{path}" (escaped by `escape` for the channel's markup) instead of
+    raising, and is noted. A width or precision above
+    MAX_TEMPLATE_SPEC_WIDTH, from the template or from the letter
+    ({a:{w}}), is a broken format spec."""
+
+    def __init__(self, escape: Callable[[str], str]) -> None:
+        super().__init__()
+        self._escape = escape
+        self.unresolved: list[str] = []
+
+    def get_field(
+        self, field_name: str, args: Sequence[Any], kwargs: Mapping[str, Any],
+    ) -> Any:
+        if path_has_attribute(field_name):
+            raise _AttributeInPathError(field_name)
         try:
-            Formatter().get_field(field_name, (), variables)
-        except _RENDER_ERRORS:
-            return field_name
-    return None
+            obj, first = super().get_field(field_name, args, kwargs)
+        except _LOOKUP_ERRORS:
+            obj, first = None, field_name
+        if obj is None:
+            if field_name not in self.unresolved:
+                self.unresolved.append(field_name)
+            return _Unresolved(field_name), first
+        return obj, first
+
+    def convert_field(self, value: Any, conversion: str | None) -> Any:
+        if isinstance(value, _Unresolved):
+            return value
+        return super().convert_field(value, conversion)
+
+    def format_field(self, value: Any, format_spec: str) -> str:
+        if isinstance(value, _Unresolved):
+            return self._escape("{" + value.path + "}")
+        if spec_too_wide(format_spec):
+            raise ValueError("a width or precision above the template limit")
+        return str(super().format_field(value, format_spec))
 
 
 def _locale_chain(locale: str | None) -> tuple[str, ...]:
@@ -98,35 +137,39 @@ def _locale_chain(locale: str | None) -> tuple[str, ...]:
     return (requested, settings.default_locale)
 
 
-def render(
+def render_field(
     notification_type: str,
     channel: str,
     field: str,
     locale: str | None = None,
     variables: dict[str, Any] | None = None,
-) -> str | None:
-    """Render a notification template with variable substitution.
+    *,
+    escape: Callable[[str], str] = str,
+) -> RenderedField | None:
+    """Render a notification template field with variable substitution.
 
     Lookup order:
       1. Requested locale
       2. Fallback to the deploy default locale
       3. None -- caller falls back to the stored title/body
 
-    A broken format spec in the template (e.g. "{amount:,.2f}" against
-    a string variable) also returns None with a warning, as does
-    attribute access on a JSON variable ("{user.name}") -- a template
-    config error must not burn delivery retries (review 1.1); the
-    caller's stored-value fallback covers it. Second line of defense:
-    the profile validator (app/profile/loader.py) rejects these at
-    startup, this guard covers templates registered past it.
+    A FIELD THAT DOES NOT RESOLVE PRINTS ITS PLACEHOLDER (TPL-1):
+    "{titel}", a key the product did not send, a path into one
+    ("{user[name]}" with no `user`, or a `user` without `name`, or a
+    `user` that is not an object), a JSON null anywhere on the path. The
+    placeholder is the path as the template writes it, in braces, passed
+    through `escape` (the telegram text is HTML; the button and the email
+    are plain text) -- and the path is in `unresolved`, in the order the
+    template meets it, once. The rest of the field renders as usual.
 
-    So does a variable the job does not carry (G5): "{titel}", a key
-    the product did not send, a path into one ("{user[name]}" with no
-    `user`, or a `user` without `name`, or a `user` that is not an
-    object). The field is not printed with braces in it; it falls back
-    exactly as when no template exists. The warning names the first
-    field path that does not resolve (`variable`) -- the template's
-    text, never a value of the letter.
+    A broken format spec over a value that is there ("{amount:,.2f}"
+    against a string), a width or precision above the template limit,
+    and an attribute in a path return None with a warning, as before --
+    the caller's stored-value fallback covers them; the profile
+    validator (app/profile/loader.py) refuses all three at startup, this
+    covers templates registered past it. The warning names the class,
+    never the text (H8): a nested spec puts a value of the letter in the
+    exception's text.
 
     Args:
         notification_type: Registered type key (e.g. "unit_event").
@@ -134,10 +177,11 @@ def render(
         field: Template field (e.g. "body", "title", "subject").
         locale: Recipient locale; None means deploy default.
         variables: Dict of variables for substitution.
+        escape: What a placeholder goes through for the channel's markup.
 
     Returns:
-        Rendered template string, or None when no template is
-        registered or it does not render with these variables.
+        The rendered field and its unresolved paths, or None when no
+        template is registered or it does not render.
     """
     requested = locale or settings.default_locale
 
@@ -159,18 +203,15 @@ def render(
         )
         return None
 
-    values = variables or {}
+    formatter = _LetterFormatter(escape)
     try:
-        return template_str.format_map(values)
+        text = formatter.vformat(template_str, (), variables or {})
     except _RENDER_ERRORS as exc:
         # The exception's CLASS, never its text (H8): a nested spec
         # ({amount:{width}}) puts a value of the letter into the text
         # ("Invalid format specifier '<value>' ..."). Its place is the
-        # coordinates below -- str.format_map raises from C, so the
-        # traceback's place would be this line for every template.
-        # KeyError is a variable the job does not carry (G5): the same
-        # configuration error, the same fallback, named by its path.
-        unresolved = _unresolved_field(template_str, values)
+        # coordinates below -- the traceback's place would be this line
+        # for every template.
         logger.warning(
             "template_render_error",
             type=notification_type,
@@ -178,9 +219,37 @@ def render(
             field=field,
             locale=requested,
             error_class=type(exc).__name__,
-            **({} if unresolved is None else {"variable": unresolved}),
+            **(
+                {"variable": formatter.unresolved[0]}
+                if formatter.unresolved else {}
+            ),
         )
         return None
+    if formatter.unresolved:
+        logger.warning(
+            "template_field_unresolved",
+            type=notification_type,
+            channel=channel,
+            field=field,
+            locale=requested,
+            variables=list(formatter.unresolved),
+        )
+    return RenderedField(text=text, unresolved=tuple(formatter.unresolved))
+
+
+def render(
+    notification_type: str,
+    channel: str,
+    field: str,
+    locale: str | None = None,
+    variables: dict[str, Any] | None = None,
+) -> str | None:
+    """render_field's text alone, placeholders unescaped -- for a reader
+    that needs no unresolved paths (see render_field)."""
+    rendered = render_field(
+        notification_type, channel, field, locale=locale, variables=variables,
+    )
+    return None if rendered is None else rendered.text
 
 
 def resolve_flag(

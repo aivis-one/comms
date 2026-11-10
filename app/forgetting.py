@@ -23,7 +23,12 @@
 # conversation or fail), threads and messages (a shared conversation --
 # what happens to message BODIES is the product's decision, spec §10.6),
 # and finished delivery rows (the delivery history; they carry the
-# product's id, no way to reach anyone).
+# product's id, no way to reach anyone). And the dead letters: the copies
+# of a person's address-book fields in <COMMS_EVENTS_STREAM>:dlq are not
+# cleared -- the owner's decision at the 3.13.0 review: the products hide
+# a person rather than erase them and comms follows them, and the stream
+# is for an investigation by hand, capped by DLQ_MAXLEN and trimmed
+# (deploy/INTEGRATION.md, "How long comms keeps things").
 #
 # WHAT HOLDS THE WINDOW against an attempt in flight (G1 item 1, tests/
 # test_g1_forgetting_in_flight.py). An attempt resolves, delivers and
@@ -89,6 +94,10 @@ async def forget_recipient(
     )
     if not forgotten:
         return False
+    # The recipient row is held FOR UPDATE by the tombstone from here on:
+    # a preference write takes the same row first, so it is ordered
+    # against these deletions, never between them (app/audience/prefs.py
+    # THE ORDER OF ROW LOCKS).
     for statement in (
         delete(GroupMembership).where(GroupMembership.recipient_id == recipient_id),
         delete(CategoryMute).where(CategoryMute.recipient_id == recipient_id),

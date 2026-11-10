@@ -20,6 +20,11 @@
 #                      -> test_an_empty_blocking_wait_...
 #   M4  _main without its consumer_loop_failed line
 #                      -> TestTheProcess
+#   M5  the client without its health check (review 3.14.0)
+#                      -> test_an_empty_blocking_wait_... (no PING seen)
+#   M6  the live server answering PING with OK, as before 3.14.0
+#                      -> test_an_empty_blocking_wait_... (the check
+#                         drops the connection)
 # =============================================================================
 
 import asyncio
@@ -95,7 +100,14 @@ async def _command(reader: asyncio.StreamReader) -> list[str] | None:
 @asynccontextmanager
 async def _live(seen: list[list[str]]) -> AsyncIterator[int]:
     """Answer like redis does for an empty stream: XREADGROUP with BLOCK
-    replies nil only after the block; everything else at once."""
+    replies nil only after the block; PING replies PONG, as the client's
+    health check requires (app/transport/connection.py, THE CONNECTION IS
+    CHECKED -- before the first command of every connection); everything
+    else OK at once.
+
+    Until review 3.14.0 every command but XREADGROUP got OK, a PING
+    among them -- right while the client sent none; since it checks its
+    connections, an OK to the PING is a broken connection to it."""
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -110,6 +122,8 @@ async def _live(seen: list[list[str]]) -> AsyncIterator[int]:
                         block_ms = int(command[upper.index("BLOCK") + 1])
                         await asyncio.sleep(block_ms / 1000)
                     writer.write(b"*-1\r\n")
+                elif name == "PING":
+                    writer.write(b"+PONG\r\n")
                 else:
                     writer.write(b"+OK\r\n")
                 await writer.drain()
@@ -298,6 +312,8 @@ class TestTheConsumer:
         blocking = [c for c in seen if "BLOCK" in [p.upper() for p in c]]
         assert len(blocking) >= 3
         assert str(_BLOCK_MS) in blocking[0]
+        # The pair: the connection was checked on the wire (health check).
+        assert ["PING"] in seen
 
 
 class TestTheProcess:

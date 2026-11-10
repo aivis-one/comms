@@ -3,6 +3,14 @@
 # no 40P01, both sides reach the end, no outbox row is lost
 # =============================================================================
 #
+# Since H7 (the expiry cleanup) and REV-2 (retention) neither deleter
+# takes a job whose push is still owed, so neither cascade reaches an
+# outbox row: the crossing described below (as it stood until REV-2)
+# can no longer be built, and
+# the tests hold that the deleters never meet the relay
+# (TestTheRetentionNeverMeetsTheRelay, TestTheExpiryCleanup). The relay's
+# SKIP LOCKED stays, held against a second relay (TestTwoRelays).
+#
 # Real sessions on real connections; the order is built with locks and
 # observed in pg_stat_activity, never with sleeps.
 #
@@ -12,16 +20,19 @@
 #      the statement cleanup_terminal_notifications commits batch by
 #      batch), one job per batch: Y, the older, first.
 #
-# The crossing: T has deleted Y, so its cascade holds b; R deletes [a, b]
+# The crossing, until REV-2: T has deleted Y, so its cascade held b; R deletes [a, b]
 # -- it locks a, and then b is T's; T deletes X, and its cascade needs
 # a. A relay that WAITS for b closes the cycle: both wait on Lock, and
 # Postgres kills one with 40P01. With FOR UPDATE SKIP LOCKED R never
 # waits: it deletes a, skips b, and T goes on once R commits.
 #
 # MUTATIONS these tests were written against:
-#   M5  the relay's delete without SKIP LOCKED -> TestTheCrossing sees
-#       both sessions waiting on Lock, then 40P01
-#   M6  NOWAIT instead of SKIP LOCKED -> R fails 55P03, a not deleted
+#   M5  the relay's delete without SKIP LOCKED -> TestTwoRelays: the
+#       second relay waits for the first
+#   M6  NOWAIT instead of SKIP LOCKED -> TestTwoRelays: the second
+#       relay fails 55P03
+#   T3  retention without the push_outbox anti-join (REV-2)
+#       -> TestTheRetentionNeverMeetsTheRelay: retention waits for R
 # =============================================================================
 
 import asyncio
@@ -31,13 +42,10 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from fakeredis import aioredis as fakeaioredis
 from sqlalchemy import func, select, text, update
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.transport.push_relay as relay
-from app.core.config import settings
 from app.core.database import get_session_factory
 from app.engine.constants import NotificationStatus, TargetType
 from app.engine.models import Notification, PushOutbox
@@ -122,19 +130,6 @@ async def _done_or_waiting(task: asyncio.Task[Any], pid: int) -> bool:
     raise AssertionError("neither done nor waiting within the bound")
 
 
-async def _both_waiting(first: int, second: int) -> bool:
-    for _ in range(int(_BOUND / _POLL)):
-        if await _waiting(first) and await _waiting(second):
-            return True
-        await asyncio.sleep(_POLL)
-    return False
-
-
-def _sqlstate(exc: BaseException | None) -> str | None:
-    orig = getattr(exc, "orig", None)
-    return getattr(orig, "sqlstate", None) or getattr(
-        getattr(orig, "__cause__", None), "sqlstate", None,
-    )
 
 
 async def _count(model: Any, *where: Any) -> int:
@@ -144,110 +139,73 @@ async def _count(model: Any, *where: Any) -> int:
         )).scalar_one())
 
 
-async def _outcome(task: asyncio.Task[Any]) -> tuple[Any, BaseException | None]:
-    try:
-        return await task, None
-    except DBAPIError as exc:
-        return None, exc
-
 
 def _later(work: Awaitable[Any]) -> asyncio.Task[Any]:
     return asyncio.ensure_future(work)
 
 
 # -----------------------------------------------------------------------------
-# The crossing
+# Retention against the relay
 # -----------------------------------------------------------------------------
 
 
-class TestTheCrossing:
-    async def _cross(self, *, t_commits: bool) -> dict[str, Any]:
-        """Build the crossing; return what each side did."""
-        x, y, a, b = await _jobs()
-        cutoff = datetime.now(UTC)
+class TestTheRetentionNeverMeetsTheRelay:
+    """Retention against the relay's delete.
+
+    Until REV-2 retention deleted X and Y whatever they owed, its cascade
+    took b while the relay deleted [a, b], and the crossing was held
+    here: the relay never waits (SKIP LOCKED), retention waits for the
+    relay's a, both finish, no row lost -- true then. REV-2 made
+    retention skip a job whose push is still owed
+    (delete_terminal_notifications_batch, an anti-join on push_outbox),
+    as H7 made the expiry cleanup (TestTheExpiryCleanup below): its
+    cascade never reaches an outbox row, so it never meets the relay --
+    and with no lock of each other's held, no cycle of the two can be
+    built at all. Held now, more precisely: with R open (a deleted,
+    uncommitted) retention deletes nothing and does not wait; R
+    committed, the next pass deletes X (its push published) and keeps Y
+    (b still owed); R rolled back, both stay, rows and all. The relay's
+    SKIP LOCKED is held by TestTwoRelays."""
+
+    @pytest.mark.parametrize("r_commits", [True, False])
+    async def test_retention_skips_what_is_owed_and_never_waits(
+        self, r_commits: bool,
+    ) -> None:
+        x, y, a, _b = await _jobs()
+        cutoff = datetime.now(UTC) + timedelta(seconds=1)
         factory = get_session_factory()
-        seen: dict[str, Any] = {"x": x, "y": y, "a": a, "b": b}
-        async with factory() as t, factory() as r:
-            t_pid, r_pid = await _pid(t), await _pid(r)
-            # Long enough for the observer to see a cycle before the
-            # detector breaks it; the cycle itself is built by locks.
-            for session in (t, r):
-                await session.execute(text("SET LOCAL deadlock_timeout = '3s'"))
-            # Precondition of the crossing: R meets a before b.
-            order = (await t.execute(
-                text("SELECT id FROM push_outbox ORDER BY ctid"),
-            )).scalars().all()
-            assert list(order) == [a, b]
-            # T: retention's first batch -- Y; its cascade holds b.
-            assert await delete_terminal_notifications_batch(
-                t, cutoff=cutoff, limit=1,
-            ) == 1
-            # R: the relay's delete of both published rows.
-            r_task = _later(relay.delete_published(r, [a, b]))
-            seen["r_waited"] = await _done_or_waiting(r_task, r_pid)
-            # T: retention's second batch -- X; its cascade needs a.
+        async with factory() as r, factory() as t:
+            assert await relay.delete_published(r, [a]) == 1
+            t_pid = await _pid(t)
             t_task = _later(delete_terminal_notifications_batch(
-                t, cutoff=cutoff, limit=1,
+                t, cutoff=cutoff, limit=100,
             ))
-            seen["both_waited"] = (
-                seen["r_waited"] and await _both_waiting(t_pid, r_pid)
-            )
-            if not seen["r_waited"]:
-                seen["t_waited_on_r"] = await _done_or_waiting(t_task, t_pid)
-            seen["r_deleted"], seen["r_error"] = await _outcome(r_task)
-            if seen["r_error"] is None:
+            # Observed, not timed: retention finished, it did not wait
+            # for the relay's lock on a.
+            waited = await _done_or_waiting(t_task, t_pid)
+            if waited:
+                # Let retention go, so a regression fails this test
+                # instead of hanging it on the relay's open transaction.
+                await r.rollback()
+                await t_task
+                await t.rollback()
+            assert waited is False
+            assert await t_task == 0
+            await t.commit()
+            if r_commits:
                 await r.commit()
             else:
                 await r.rollback()
-            seen["t_deleted"], seen["t_error"] = await _outcome(t_task)
-            if seen["t_error"] is None and t_commits:
-                await t.commit()
-            else:
-                await t.rollback()
-        return seen
-
-    async def test_the_relay_never_waits_and_both_sides_finish(self) -> None:
-        seen = await self._cross(t_commits=True)
-        assert _sqlstate(seen["r_error"]) is None, seen["r_error"]
-        assert _sqlstate(seen["t_error"]) is None, seen["t_error"]
-        assert seen["r_waited"] is False
-        assert seen["both_waited"] is False
-        # R deleted a and skipped b, which T's cascade held.
-        assert seen["r_deleted"] == 1
-        # T waited for R's a -- a wait with nobody waiting back.
-        assert seen["t_waited_on_r"] is True
-        assert seen["t_deleted"] == 1
-        # Nothing is left and nothing is lost: a was published and
-        # deleted by R; b went with Y; both jobs are gone.
-        assert await _count(PushOutbox) == 0
-        assert await _count(
-            Notification, Notification.id.in_([seen["x"], seen["y"]]),
-        ) == 0
-
-    async def test_a_cascade_that_rolls_back_leaves_the_skipped_row_owed(
-        self,
-    ) -> None:
-        """T rolls back: Y and X are back, b -- skipped by R -- is still
-        owed, and the next tick publishes Y's key again (a duplicate,
-        harmless). a, published and deleted by R, stays deleted."""
-        seen = await self._cross(t_commits=False)
-        assert seen["r_deleted"] == 1
-        remaining = await _count(PushOutbox)
-        assert remaining == 1
-        assert await _count(PushOutbox, PushOutbox.id == seen["b"]) == 1
-        redis = fakeaioredis.FakeRedis()
-        try:
-            assert await relay.relay_once(redis) == 1
-            entries = await redis.xrange(settings.changes_stream)
-        finally:
-            await redis.aclose()
-        async with get_session_factory()() as session:
-            job = await session.get(Notification, seen["y"])
-            assert job is not None
-        assert [e[b"idempotency_key"].decode() for _, e in entries] == [
-            job.idempotency_key,
-        ]
-        assert await _count(PushOutbox) == 0
+        async with factory() as t:
+            assert await delete_terminal_notifications_batch(
+                t, cutoff=cutoff, limit=100,
+            ) == (1 if r_commits else 0)
+            await t.commit()
+        assert await _count(Notification, Notification.id == x) == (
+            0 if r_commits else 1
+        )
+        assert await _count(Notification, Notification.id == y) == 1
+        assert await _count(PushOutbox) == (1 if r_commits else 2)
 
 
 class TestTwoRelays:

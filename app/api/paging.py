@@ -31,18 +31,32 @@
 #       (writing transaction, identity) and the moment it was read.
 # Each decoder refuses the others' cursors (422): a cursor carried from
 # one listing to another is malformed, not silently reinterpreted.
+#
+# MALFORMED IS DECIDED HERE, NOT IN THE DATABASE (TIME-1). comms writes
+# every cursor itself, so what it would never write is the caller's
+# error and a 422 -- never a 500 from the driver, never a silent reading:
+#   - a time without a zone: the driver would take it as the server's
+#     local time and page from an instant nobody sent;
+#   - a time that leaves the range once moved to UTC (9999-12-31 at
+#     -05:00): the driver's own conversion overflows;
+#   - an integer the bigint column cannot hold (the journal's identity
+#     behind "seq:" and the changes id). The changes feed's xact needs
+#     no such bound here: list_changes refuses every xact at or past the
+#     snapshot's xmax as "from the future" before it reaches a query.
+# A refusal names the cursor and never quotes it.
 # =============================================================================
 
 import base64
 import binascii
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 from app.core.constants import PAGE_LIMIT_DEFAULT, PAGE_LIMIT_MAX
 from app.core.exceptions import ValidationError
+from app.core.sanitize import exception_text
 
 __all__ = [
     "PAGE_LIMIT_DEFAULT",
@@ -56,10 +70,58 @@ __all__ = [
     "page",
     "page_by_seq",
     "page_limit",
+    "utc_instant",
 ]
 
 _SEQ_PREFIX = "seq:"
 _CHANGES_PREFIX = "chg:"
+
+# The ceiling of a bigint column: the journal's identity, which "seq:"
+# and the changes id are compared with. Its decimal form has 19 digits.
+_BIGINT_MAX = 2**63 - 1
+_BIGINT_DIGITS = len(str(_BIGINT_MAX))
+
+
+def _digits(text: str) -> str:
+    """Decimal ASCII digits, nothing else (no sign), or ValueError."""
+    if not (text.isascii() and text.isdigit()):
+        raise ValueError("not a non-negative integer")
+    return text
+
+
+def _counter(text: str) -> int:
+    """A non-negative decimal integer, or ValueError."""
+    return int(_digits(text))
+
+
+def _bigint(text: str) -> int:
+    """A non-negative integer a bigint column can hold, or ValueError.
+    The length is checked before int() reads the digits, so a string of
+    any size costs no conversion."""
+    digits = _digits(text)
+    if len(digits) > _BIGINT_DIGITS or int(digits) > _BIGINT_MAX:
+        raise ValueError("an integer beyond the 64-bit column's range")
+    return int(digits)
+
+
+def utc_instant(when: datetime) -> datetime:
+    """`when`, a time with its zone, if it stays in range once moved to
+    UTC -- the driver's own conversion (9999-12-31 at -05:00 overflows)
+    -- or ValueError. The one rule for every time the API takes: the
+    cursors here, a read pointer (app/api/messaging.py ReadIn)."""
+    try:
+        when.astimezone(UTC)
+    except OverflowError:
+        raise ValueError("the time leaves the range once moved to UTC") from None
+    return when
+
+
+def _instant(text: str) -> datetime:
+    """A time with its zone, convertible to UTC, or ValueError."""
+    when = datetime.fromisoformat(text)
+    if when.tzinfo is None:
+        raise ValueError("the time carries no zone")
+    return utc_instant(when)
 
 
 def page_limit(value: int) -> int:
@@ -86,9 +148,9 @@ def decode_cursor(value: str | None) -> tuple[datetime, UUID] | None:
         when_text, _, id_text = raw.partition("|")
         if not id_text:
             raise ValueError("missing separator")
-        return datetime.fromisoformat(when_text), UUID(id_text)
+        return _instant(when_text), UUID(id_text)
     except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed cursor: {exc}") from exc
+        raise ValidationError(f"Malformed cursor: {exception_text(exc)}") from exc
 
 
 def page[T](
@@ -117,12 +179,9 @@ def decode_seq_cursor(value: str | None) -> int | None:
         raw = base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
         if not raw.startswith(_SEQ_PREFIX):
             raise ValueError("not a sequence cursor")
-        digits = raw.removeprefix(_SEQ_PREFIX)
-        if not (digits.isascii() and digits.isdigit()):
-            raise ValueError("not a non-negative integer")
-        return int(digits)
+        return _bigint(raw.removeprefix(_SEQ_PREFIX))
     except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed cursor: {exc}") from exc
+        raise ValidationError(f"Malformed cursor: {exception_text(exc)}") from exc
 
 
 def page_by_seq[T](
@@ -175,12 +234,8 @@ def decode_changes_cursor(value: str | None) -> ChangesCursor | None:
         xact_text, ident_text, read_text = raw.removeprefix(
             _CHANGES_PREFIX,
         ).split(":", 2)
-        for digits in (xact_text, ident_text):
-            if not (digits.isascii() and digits.isdigit()):
-                raise ValueError("not a non-negative integer")
-        read_at = datetime.fromisoformat(read_text)
-        if read_at.tzinfo is None:
-            raise ValueError("the read time carries no zone")
-        return ChangesCursor(int(xact_text), int(ident_text), read_at)
+        return ChangesCursor(
+            _counter(xact_text), _bigint(ident_text), _instant(read_text),
+        )
     except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise ValidationError(f"Malformed cursor: {exc}") from exc
+        raise ValidationError(f"Malformed cursor: {exception_text(exc)}") from exc

@@ -12,13 +12,18 @@
 # validation, naming the offending inputs. The mapping:
 #
 #   ValidationError, request validation  -> 422  validation
-#   the service token (app/api/deps.py)  -> 401  unauthorized
+#   the service token                     -> 401  unauthorized
+#     (app/api/service_auth.py: answered through error_response by the
+#     outermost middleware, before routing -- so before 404 / 405 too)
 #   AuthorizationError                   -> 403  forbidden
 #   NotFoundError, an unknown route      -> 404  not_found
 #   a known route, another method        -> 405  method_not_allowed
 #   ConflictError (by subclass)          -> 409  conflict | stale_snapshot
 #                                                | recipient_deleted
 #   CursorExpiredError                   -> 410  cursor_expired
+#   any other 4xx of the framework       -> its status, bad_request
+#     (today a 400: a body it cannot read as JSON) -- the caller's
+#     request, never `internal` (API-2)
 #   DBAPIError                           -> 500  internal
 #   a TRANSIENT failure of the database  -> 503  unavailable
 #     (is_transient_db_error: a deadlock, a lost or refused connection,
@@ -28,9 +33,9 @@
 #     (UnhandledErrorMiddleware: the class and the place to the log,
 #     nothing of the exception to the caller)
 #
-# Starlette's own HTTPException (401 from the token dependency, the
-# router's 404 / 405) is mapped here too, so no response leaves the
-# service in the framework's default {"detail": ...} shape.
+# Starlette's own HTTPException (the router's 404 / 405) is mapped here
+# too, so no response leaves the service in the framework's default
+# {"detail": ...} shape.
 #
 # The messages of the service exceptions are returned verbatim. That is
 # safe because of WHERE they are written: every one is raised by our own
@@ -64,8 +69,7 @@ from app.core.exceptions import (
     ValidationError,
     conflict_class,
 )
-from app.core.sanitize import sanitized_traceback
-from app.engine.journal import pipeline_error_of
+from app.core.sanitize import pipeline_error_of, sanitized_traceback
 
 logger = structlog.get_logger()
 
@@ -97,6 +101,9 @@ class ErrorClass(StrEnum):
     INTERNAL = "internal"
     # A transient failure of the database (TX-1): repeat the request.
     UNAVAILABLE = "unavailable"
+    # A 4xx the framework raised that no class above names (API-2): the
+    # request could not be read; fix it, do not repeat it.
+    BAD_REQUEST = "bad_request"
 
 
 # What the caller is told on a TRANSIENT database failure (TX-1). Fixed
@@ -193,8 +200,17 @@ def register_error_handlers(app: FastAPI) -> None:
     async def _http(
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
-        """The token dependency's 401 and the router's 404 / 405."""
-        error_class = _HTTP_CLASSES.get(exc.status_code, ErrorClass.INTERNAL)
+        """The router's 404 / 405 -- and any
+        other client status the framework raises (a 400 for a body it
+        cannot read): `bad_request`, never `internal`, which says the
+        failure is ours (API-2)."""
+        error_class = _HTTP_CLASSES.get(exc.status_code)
+        if error_class is None:
+            error_class = (
+                ErrorClass.BAD_REQUEST
+                if 400 <= exc.status_code < 500
+                else ErrorClass.INTERNAL
+            )
         return error_response(
             exc.status_code, error_class, str(exc.detail),
             headers=getattr(exc, "headers", None),

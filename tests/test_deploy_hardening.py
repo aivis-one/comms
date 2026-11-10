@@ -22,6 +22,9 @@
 #   M8  no lock_timeout in migrations/env.py -> TestMigrationLockTimeout
 #   M9  update's app recreate without --no-deps -> TestUpdate
 #   M10 the lock's version out of pyproject's range -> TestTheLockSatisfies
+#   M11 a checkout without persist-credentials: false -> TestCi (REV-5)
+#   M12 a pip install the lock's hashes do not cover (`-e .`, a bare
+#       pin) -> TestCi (REV-5)
 # =============================================================================
 
 import asyncio
@@ -410,6 +413,35 @@ def _uses_lines(text_: str) -> list[str]:
             if re.match(r"\s*(-\s+)?uses:", line)]
 
 
+def _checkouts(data: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        step for job in data["jobs"].values() for step in job["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+
+
+def _pip_installs(data: dict[str, Any]) -> list[str]:
+    """Every `pip install` command line of every step's `run`."""
+    return [
+        line.strip()
+        for job in data["jobs"].values() for step in job["steps"]
+        for line in str(step.get("run", "")).splitlines()
+        if re.match(r"\s*(python3? -m )?pip install\b", line)
+    ]
+
+
+# What a hash-checked install looks like: the lock itself (every line of
+# it carries its hashes -- tests/test_delivery_contract.py), or a file
+# installed under --require-hashes (a stanza of the lock).
+_HASHED = re.compile(
+    r"(python3? -m )?pip install (-r requirements\.lock|--require-hashes -r \S+)"
+)
+
+
+def _unhashed(installs: list[str]) -> list[str]:
+    return [line for line in installs if not _HASHED.fullmatch(line)]
+
+
 def _jobs_without_a_limit(data: dict[str, Any]) -> list[str]:
     return [
         name for name, job in data["jobs"].items()
@@ -448,6 +480,37 @@ class TestCi:
     def test_the_guard_sees_a_tag(self) -> None:
         line = _uses_lines("      - uses: actions/checkout@v7\n")[0]
         assert not re.search(r"@[0-9a-f]{40}\s+#\s*v\d", line)
+
+    @pytest.mark.parametrize("workflow", _WORKFLOWS, ids=lambda p: p.name)
+    def test_no_checkout_keeps_the_token(self, workflow: Path) -> None:
+        """REV-5: actions/checkout writes the job's token into
+        .git/config unless told not to, and the checkout is mounted into
+        the containers the suite runs in."""
+        data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        checkouts = _checkouts(data)
+        assert checkouts, "the pair: there are checkouts to read"
+        for step in checkouts:
+            assert (step.get("with") or {}).get("persist-credentials") is False
+
+    @pytest.mark.parametrize("workflow", _WORKFLOWS, ids=lambda p: p.name)
+    def test_every_install_is_hash_checked(self, workflow: Path) -> None:
+        """REV-5: no package reaches CI that the lock's hashes do not
+        name -- not the project built by `pip install -e .` (its
+        setuptools came unpinned), not a bare `pyyaml==` pin."""
+        data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        installs = _pip_installs(data)
+        assert installs, "the pair: there are installs to read"
+        assert _unhashed(installs) == []
+
+    def test_the_guard_sees_an_unhashed_install(self) -> None:
+        installs = [
+            "pip install -r requirements.lock",
+            'pip install --require-hashes -r "$RUNNER_TEMP/pyyaml.txt"',
+            "pip install -e . --no-deps",
+            "pip install pyyaml==6.0.3",
+            "python -m pip install -r requirements.lock somepackage",
+        ]
+        assert _unhashed(installs) == installs[2:]
 
 
 # ---------------------------------------------------------------------------

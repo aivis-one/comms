@@ -18,6 +18,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -744,12 +745,20 @@ class TestConsumerRedactsItsFailures:
     ) -> None:
         """The pair of the OperationalError rows, on a REAL failure: a
         40001 from Postgres whose bound parameter carries the secret.
-        Retried (TX-1), each retry line redacted and naming the failure;
-        then the dead letter, "retries exhausted", class and place."""
+        Retried (TX-1), each retry line naming the failure without it;
+        then the dead letter, "retries exhausted", class and place.
+
+        Until DB-1 the secret stood in the error's text ([parameters]) and
+        the retry line carried that text redacted -- the SQL in it named the
+        failure, and this asserted both. DB-1 hides the parameters on the
+        engine and writes a database error into a log as its summary: the
+        line names the failure by class, place and SQLSTATE, and holds
+        neither the secret nor the SQL."""
         real = await real_serialization_failure(
             label=f"redis://:{_REDIS_PASS}@comms-redis:6379/0",
         )
-        assert _REDIS_PASS in str(real)  # the secret IS in its text
+        assert _REDIS_PASS not in str(real)  # hidden on the engine (DB-1)
+        assert "[SQL parameters hidden" in str(real)
 
         async def failing(*_args: Any, **_kwargs: Any) -> Any:
             raise real
@@ -768,7 +777,9 @@ class TestConsumerRedactsItsFailures:
         assert len(retries) == 4
         for entry in retries:
             assert _REDIS_PASS not in entry["error"]
-            assert "UPDATE sections" in entry["error"]
+            assert "UPDATE sections" not in entry["error"]
+            assert entry["error"].startswith("sqlalchemy.exc.DBAPIError at ")
+            assert "SQLSTATE 40001" in entry["error"]
         entries = await redis.xrange(settings.dlq_stream)
         fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
         assert fields["_dlq_error"].startswith(
@@ -787,7 +798,9 @@ class TestConsumerRedactsItsFailures:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The same secret on every attempt: each of the four retry
-        lines is redacted, and each still names the failure."""
+        lines is without it, and each still names the failure -- by its
+        summary since DB-1 (until then by its redacted text, the SQL
+        included)."""
         async def failing(*_args: Any, **_kwargs: Any) -> Any:
             raise _operational_error()
 
@@ -805,5 +818,80 @@ class TestConsumerRedactsItsFailures:
         assert len(retries) == 4
         for entry in retries:
             assert _REDIS_PASS not in entry["error"]
-            assert "INSERT INTO recipients" in entry["error"]
+            assert "INSERT INTO recipients" not in entry["error"]
+            assert entry["error"].startswith("sqlalchemy.exc.OperationalError at ")
 
+
+# -----------------------------------------------------------------------------
+# REV-8 item 1 -- scheduled_at has a ceiling: a refusal under the key
+# -----------------------------------------------------------------------------
+#
+# MUTATIONS these tests were written against (each turns one red):
+#   S1 no ceiling on scheduled_at -> 9999 is an OverflowError and a dead
+#      letter, now + 3651d is accepted
+#   S2 the ceiling checked after the profile's expiry is added -> 9999
+#      with expires_after is still an OverflowError
+# Not built: `>` against `>=` at the border -- now is taken inside the
+# intake, so the equality to the microsecond cannot be sent from here.
+
+
+def _ahead(days: int, minutes: int = 0) -> str:
+    return (
+        datetime.now(UTC) + timedelta(days=days, minutes=minutes)
+    ).isoformat()
+
+
+class TestTheScheduleCeiling:
+    @pytest.mark.parametrize("scheduled_at", [
+        "9999-12-31T23:00:00+00:00",
+        "far",  # now + 3651 days
+    ])
+    async def test_past_the_ceiling_is_a_refusal_under_the_key(
+        self, redis: fakeaioredis.FakeRedis, stream: str,
+        db_session: AsyncSession, scheduled_at: str,
+    ) -> None:
+        """A type with expires_after (unit_expiring, 1h): the expiry is
+        scheduled_at + 1h, which for the year 9999 was an OverflowError
+        and the event a dead letter `unexpected`. Now: refused under its
+        key, the field and the ceiling named, no dead letter, no job."""
+        value = _ahead(3651) if scheduled_at == "far" else scheduled_at
+        data = _request_data(type="unit_expiring", scheduled_at=value)
+        key = data["idempotency_key"]
+        await _xadd(redis, stream, "notification_request", data)
+
+        async def refused() -> bool:
+            return bool(await intake_outcomes_for(db_session, key))
+
+        await _run_until(StreamConsumer(redis), refused)
+        (outcome,) = await intake_outcomes_for(db_session, key)
+        assert outcome.outcome == IntakeOutcomeClass.REJECTED_AT_INTAKE
+        reason = str(outcome.reason)
+        assert "scheduled_at" in reason
+        assert "3650 days ahead" in reason
+        assert await redis.exists(settings.dlq_stream) == 0
+        assert await _notification_count(db_session, key) == 0
+
+    @pytest.mark.parametrize("days", [3650, 30])
+    async def test_inside_the_ceiling_is_accepted(
+        self, redis: fakeaioredis.FakeRedis, stream: str,
+        db_session: AsyncSession, days: int,
+    ) -> None:
+        """The pair: now + 3650 days (a minute inside, for the clock the
+        intake reads after this one) and now + 30 days -- accepted, the
+        expiry counted from scheduled_at."""
+        value = _ahead(days, minutes=-1)
+        data = _request_data(type="unit_expiring", scheduled_at=value)
+        key = data["idempotency_key"]
+        await _xadd(redis, stream, "notification_request", data)
+
+        async def accepted() -> bool:
+            db_session.expire_all()
+            return await _notification_count(db_session, key) == 1
+
+        await _run_until(StreamConsumer(redis), accepted)
+        job = (await db_session.execute(
+            select(Notification).where(Notification.idempotency_key == key)
+        )).scalar_one()
+        assert job.scheduled_at == datetime.fromisoformat(value)
+        assert job.expiry_at == job.scheduled_at + timedelta(hours=1)
+        assert await redis.exists(settings.dlq_stream) == 0

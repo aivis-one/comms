@@ -482,7 +482,12 @@ class TestEveryPath:
         letter: retried, then dead-lettered -- the class and the place,
         never the letter."""
         real = await real_serialization_failure(label=f"title {_S}")
-        assert _S in str(real)
+        # Until DB-1 the letter stood in the error's text ([parameters]) and
+        # this instrument asserted it there; the engine now hides bound
+        # parameters, and what remains to hold is that nothing of it
+        # reaches the dead letter or the log either way.
+        assert _S not in str(real)
+        assert "[SQL parameters hidden" in str(real)
 
         async def failing(*_args: Any, **_kwargs: Any) -> Any:
             raise real
@@ -829,7 +834,9 @@ class TestTheContract:
         start = section.index("**What a dead letter holds.**")
         documented = re.findall(r"^\| `([a-z_]+)` \|", section[start:], re.M)
         assert documented == list(DLQ_FIELDS)
-        assert len(documented) == 8
+        # 9 since review 3.14.0 (5): _dlq_dropped_more counts the names
+        # _dlq_dropped no longer lists; 8 was right before it.
+        assert len(documented) == 9
 
     def test_the_withheld_link_is_named(self) -> None:
         section = _section("## How long comms keeps things")

@@ -39,7 +39,7 @@ from datetime import datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import literal, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
@@ -48,6 +48,7 @@ from app.core.constants import (
     MSG_TYPE_THREAD_CLOSED,
 )
 from app.core.database import get_session_factory
+from app.core.sanitize import pipeline_error_of
 from app.engine.constants import TargetType
 from app.engine.models import Notification
 from app.engine.service import Intake, accept_notification, canonical_fingerprint
@@ -373,41 +374,80 @@ async def consume_close_notifications(
     both cleared. user/DM threads are never flagged -> never notified.
     Owns its own sessions; commits per batch.
 
+    ONE THREAD AT A TIME (REV-2): each thread's clear and notice run in
+    a SAVEPOINT of the batch's transaction. A thread whose
+    notice fails -- a database error included, which aborts the
+    transaction up to that savepoint only -- is rolled back alone and
+    said once in the log (its id, the class and the place, never the
+    error's text); it keeps its flag and is tried again on the next
+    pass. The others of the batch are cleared, notified and committed.
+    Before, one such thread rolled the whole batch back on every pass,
+    and nobody behind it was ever told. The pass goes on AFTER the last
+    thread of each batch (a keyset on the same order), so a batch of
+    threads that keep failing is walked past, not selected again and
+    again; the order of row locks is the same walk.
+
     Returns the number of threads notified this pass.
     """
     factory = get_session_factory()
     total = 0
+    after: tuple[datetime, UUID] | None = None
     while True:
         async with factory() as session:
+            query = select(Thread).where(Thread.close_notify_pending_at.is_not(None))
+            if after is not None:
+                query = query.where(
+                    tuple_(Thread.close_notify_pending_at, Thread.id)
+                    > tuple_(literal(after[0]), literal(after[1])),
+                )
             threads = (
                 await session.scalars(
-                    select(Thread)
-                    .where(Thread.close_notify_pending_at.is_not(None))
+                    query
                     .order_by(Thread.close_notify_pending_at, Thread.id)
                     .limit(limit)
                 )
             ).all()
             if not threads:
                 break
-            for thread in threads:
-                seen = thread.close_notify_pending_at
+            walked = [
+                (thread, thread.id, thread.close_notify_pending_at)
+                for thread in threads
+            ]
+            for thread, thread_id, seen in walked:
                 assert seen is not None  # the WHERE of the read above
-                cleared = await session.execute(
-                    update(Thread)
-                    .where(
-                        Thread.id == thread.id,
-                        Thread.close_notify_pending_at == seen,
+                # ONE THREAD AT A TIME: its clear and its notice in a
+                # savepoint; a failure rolls back this thread only, the
+                # flag stays for the next pass.
+                try:
+                    async with session.begin_nested():
+                        cleared = await session.execute(
+                            update(Thread)
+                            .where(
+                                Thread.id == thread_id,
+                                Thread.close_notify_pending_at == seen,
+                            )
+                            .values(close_notify_pending_at=None)
+                            .execution_options(synchronize_session=False)
+                        )
+                        if cleared.rowcount != 1:  # type: ignore[attr-defined]
+                            continue
+                        await _emit_close_notification(session, thread, seen)
+                except Exception as exc:
+                    logger.error(
+                        "close_notification_error",
+                        thread_id=str(thread_id),
+                        error=pipeline_error_of(exc),
                     )
-                    .values(close_notify_pending_at=None)
-                    .execution_options(synchronize_session=False)
-                )
-                if cleared.rowcount == 1:  # type: ignore[attr-defined]
-                    await _emit_close_notification(session, thread, seen)
-                    total += 1
+                    continue
+                total += 1
             await session.commit()
+            _, last_id, last_seen = walked[-1]
+            assert last_seen is not None
+            after = (last_seen, last_id)
             if len(threads) < limit:
                 break
 
     if total:
         logger.info("close_notify_pass", notified=total)
     return total
+

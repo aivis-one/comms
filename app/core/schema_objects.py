@@ -177,6 +177,17 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "ON public.notifications USING btree (lane, status, scheduled_at)"
         ),
     ),
+    # The reminder cancel's select by correlation (PERF-2, migration
+    # 0041): app/engine/reminders.py cancel_reminders. Partial -- a job
+    # without a correlation is never looked up by it.
+    "ix_notifications_correlation": IndexShape(
+        unique=False,
+        definition=(
+            "CREATE INDEX ix_notifications_correlation "
+            "ON public.notifications USING btree (correlation) "
+            "WHERE (correlation IS NOT NULL)"
+        ),
+    ),
     # The expiry cleanup's batch select, in expiry order, over the rows
     # it may delete (H5, migration 0023). The status list is
     # app/engine/service.py _EXPIRED_DELETABLE_STATUSES.
@@ -401,6 +412,9 @@ MIGRATION_OWNED_CHECKS = frozenset({
     "ck_transitions_provider_text",
     "ck_transitions_error_not_blank",
     "ck_transitions_attempt_not_negative",
+    # The template's unresolved paths only on a channel's `accepted`
+    # row, and never an empty array (TPL-1, migration 0040).
+    "ck_transitions_template_unresolved",
     # What a job pushes is one of the three PushOn values, never NULL
     # (P3-1, migration 0020).
     "ck_notifications_push_on",
@@ -448,12 +462,6 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # or an object of subject, text and an optional html, none blank.
     "ck_notifications_email_not_json_null",
     "ck_notifications_email_form",
-    # A transient wait's fields go together (TX-3, migration 0037)...
-    "ck_notifications_transient_wait_whole",
-    # ...it is a gated state...
-    "ck_notifications_transient_wait_gated",
-    # ...and a state of a job not closed yet: no close leaves it behind.
-    "ck_notifications_transient_wait_open",
 })
 
 

@@ -42,7 +42,6 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
 from app.api.paging import (
     PAGE_LIMIT_DEFAULT,
     decode_cursor,
@@ -71,7 +70,6 @@ from app.engine.service import (
 router = APIRouter(
     prefix="/api/v1/notifications/by-key",
     tags=["jobs"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 # -----------------------------------------------------------------------------
@@ -103,7 +101,7 @@ DELIVERY_ITEM_FIELDS = (
 PATH_ITEM_FIELDS = (
     "at", "subject", "step", "outcome", "recipient_id", "channel",
     "attempt", "wait_reason", "wait_until", "failure_class", "category",
-    "error", "provider_text",
+    "error", "provider_text", "template_unresolved",
 )
 
 FORMS: dict[str, tuple[str, ...]] = {
@@ -248,6 +246,12 @@ def _path_item(row: NotificationTransition) -> dict[str, Any]:
         "category": row.category,
         "error": row.error,
         "provider_text": row.provider_text,
+        # TPL-1: the template's paths that did not resolve in the letter
+        # the channel took -- a list, or null.
+        "template_unresolved": (
+            None if row.template_unresolved is None
+            else list(row.template_unresolved)
+        ),
     })
 
 

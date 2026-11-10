@@ -19,6 +19,7 @@
 #   get_db_session() commits automatically after yield.
 # =============================================================================
 
+import asyncio
 import errno
 import socket
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -42,6 +43,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 
@@ -111,6 +113,9 @@ class Pool:
 #   api 10 + 10, per uvicorn worker -- one session per request.
 #   consumer 5 + 5 -- one event at a time in one session, and the push
 #       relay beside it, one session at a time (app/transport): two.
+#   The worker and the consumer each hold one more, outside their pools,
+#   while they ask whether the database answers (database_answers,
+#   PROBE_CONNECTIONS): one probe in flight per process at a time.
 POOLS: dict[ProcessRole, Pool] = {
     ProcessRole.API: Pool(size=10, overflow=10),
     ProcessRole.WORKER: Pool(size=10, overflow=25),
@@ -123,6 +128,11 @@ POOLS: dict[ProcessRole, Pool] = {
 # (comms-deploy.sh db, backup, restore), and the deploy script's own
 # asyncpg probe (comms-deploy.sh drain).
 RESERVED_CONNECTIONS = 3
+
+# The probe's own connection (database_answers), outside the pool, in
+# each process that asks: the worker and the consumer. One per process:
+# the probe is single-flight.
+PROBE_CONNECTIONS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +163,8 @@ def get_engine() -> AsyncEngine:
         pool = POOLS[_role]
         _engine = create_async_engine(
             settings.database_url,
+            # DB-1: no bound value in an error's text ([parameters]).
+            hide_parameters=True,
             echo=False,
             pool_size=pool.size,
             max_overflow=pool.overflow,
@@ -169,6 +181,73 @@ async def dispose_engine() -> None:
         await _engine.dispose()
         _engine = None
     _session_factory = None
+
+
+# DOES THE DATABASE ANSWER (WK-2). ONE PROBE, ONE RULE for the worker and
+# the consumer (spec 16.3, decided 1 November 2026): a transient failure
+# of the database is waited for, uncounted, only while the database does
+# not answer; while it answers, the failure is counted like any other.
+# How long "does the database answer" may take to say no -- the WHOLE of
+# it: the connection, the statement and the close.
+PROBE_TIMEOUT_SECONDS = 5.0
+
+# How the probe's connection names itself in pg_stat_activity.
+PROBE_APPLICATION_NAME = "comms-db-probe"
+
+_probe_in_flight: asyncio.Task[bool] | None = None
+
+
+async def database_answers() -> bool:
+    """Whether the database answers a SELECT 1 within PROBE_TIMEOUT_SECONDS,
+    on a connection of the probe's own, OUTSIDE the process's pool --
+    whatever the failure that made the caller ask.
+
+    OUTSIDE THE POOL: a pool every connection of which is held -- the
+    worker's lanes at their places, an event's session -- would make a
+    probe from it wait for a connection and say "no" of a database that
+    answers; that is a wait without a count, where the owner's rule
+    wants the count. Its own connection depends on the database alone.
+
+    BOUNDED AS A WHOLE: the timeout covers the connection's opening (TCP,
+    the startup, the authentication), the statement and the close; a
+    server that takes the connection and never speaks is a "no" in
+    PROBE_TIMEOUT_SECONDS.
+
+    SINGLE-FLIGHT: a caller that finds a probe in flight in this process
+    (on this event loop) waits for its answer instead of opening a
+    connection of its own -- a burst of failures across a lane's places
+    asks the database once, and the process holds at most
+    PROBE_CONNECTIONS outside its pool (the connection budget above).
+    """
+    global _probe_in_flight
+    loop = asyncio.get_running_loop()
+    probe = _probe_in_flight
+    if probe is None or probe.done() or probe.get_loop() is not loop:
+        probe = loop.create_task(_probe_once())
+        _probe_in_flight = probe
+    return await asyncio.shield(probe)
+
+
+async def _probe_once() -> bool:
+    """One probe: its own engine with no pool, used once, disposed."""
+    engine = create_async_engine(
+        settings.database_url,
+        # DB-1: no bound value in an error's text ([parameters]).
+        hide_parameters=True,
+        poolclass=NullPool,
+        connect_args={
+            "server_settings": {"application_name": PROBE_APPLICATION_NAME},
+        },
+    )
+    try:
+        async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
+            async with engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+    finally:
+        await engine.dispose()
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:

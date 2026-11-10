@@ -45,6 +45,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
+    ARRAY,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -300,8 +301,13 @@ class Notification(UUIDMixin, Base):
     )
 
     # -- The pipeline's own failures (T12, migration 0015) --
-    # How many attempts of the pipeline ended in an exception of comms'
-    # own (not a channel answer -- those are the deliveries' business).
+    # How many attempts of the pipeline IN A ROW ended in an exception
+    # of comms' own (not a channel answer -- those are the deliveries'
+    # business); an attempt that commits sets it back to 0, with the
+    # step and the error (REV-2, app/engine/processor.py _attempt_job),
+    # and every failure stays in the journal. A transient failure of
+    # the database counts while the database answers, and is not
+    # written while it does not (WK-2).
     # At settings.notification_max_pipeline_attempts the job gets its
     # outcome (app/engine/processor.py, _record_pipeline_failure).
     pipeline_attempts: Mapped[int] = mapped_column(
@@ -314,28 +320,6 @@ class Notification(UUIDMixin, Base):
     # neither starves the healthy ones nor is starved by them.
     pipeline_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
-        nullable=True,
-    )
-    # THE JOB'S OPEN WAIT on a TRANSIENT failure of the database (TX-3,
-    # migration 0037): when it began, the step it waits on, the failure's
-    # class and place. Its own fields -- pipeline_attempts / _step /
-    # _error stay the COUNTED failures and the last of them. Set together
-    # by the first transient failure of a wait (step and error refreshed
-    # when they change within it), cleared together by a step that
-    # succeeds, an ordinary failure and the job's close
-    # (service.end_transient_wait). The journal's row of a wait is
-    # written when it begins, not on every retry. Internal: no answer of
-    # the API carries them.
-    pipeline_transient_since: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-    pipeline_transient_step: Mapped[str | None] = mapped_column(
-        String(10),
-        nullable=True,
-    )
-    pipeline_transient_error: Mapped[str | None] = mapped_column(
-        String(300),
         nullable=True,
     )
     # Where it tore: a PipelineStep value.
@@ -642,6 +626,14 @@ class NotificationTransition(Base):
     # The provider's answer, sanitized before it is cut.
     provider_text: Mapped[str | None] = mapped_column(
         String(2000), nullable=True,
+    )
+    # TPL-1: on a channel row whose outcome is `accepted`, the paths of
+    # the template that did not resolve in the letter the channel took --
+    # the template's text, never the letter's. NULL when every field
+    # resolved; never an empty array (ck_transitions_template_unresolved,
+    # migration 0040).
+    template_unresolved: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True,
     )
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -18,14 +18,12 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_service_auth
 from app.api.jobs import read_only_snapshot
 from app.engine.depth import lane_depth
 
 router = APIRouter(
     prefix="/api/v1/lanes",
     tags=["lanes"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 

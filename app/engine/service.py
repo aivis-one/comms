@@ -58,6 +58,7 @@ from sqlalchemy import (
     ColumnElement,
     Select,
     any_,
+    case,
     delete,
     exists,
     func,
@@ -79,7 +80,7 @@ from app.core.constants import MAX_LLM_LETTER_CHARS
 from app.core.database import is_unique_violation_of
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.lanes import Lane
-from app.core.sanitize import sanitize_text, sanitized_traceback
+from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine import journal
 from app.engine.constants import (
     ACTIVE_STATUSES,
@@ -102,6 +103,7 @@ from app.engine.formatters import (
     NoAddressError,
     PermanentDeliveryError,
     RateLimitedError,
+    Sent,
     get_formatter,
     get_model_channel,
 )
@@ -116,7 +118,7 @@ from app.engine.models import (
 )
 from app.engine.resolver import resolve_targets
 from app.engine.wake import signal_lane
-from app.profile.loader import is_llm_route
+from app.profile.loader import MAX_DURATION_DAYS, is_llm_route
 from app.profile.registry import Decided, Layer, RecipientSchedule, registry
 
 logger = structlog.get_logger()
@@ -725,7 +727,7 @@ async def create_notification(
             type only; its host must be in LLM_BODY_HOSTS. Kept with the
             letter, cleared with it.
         scheduled_at: "Not before" -- when the job becomes deliverable.
-            Defaults to now.
+            Defaults to now; at most MAX_DURATION_DAYS ahead.
         expiry_at: The envelope's expiry. Wins over the profile's
             expires_after, which counts from scheduled_at.
         correlation: The product's own reference, stored untouched.
@@ -736,8 +738,8 @@ async def create_notification(
     Raises:
         ValidationError: The request cannot be accepted -- undeclared
             type, a body longer than the type's max_body_chars, invalid
-            target_type, an expiry already passed or not after
-            scheduled_at.
+            target_type, a scheduled_at past its ceiling, an expiry
+            already passed or not after scheduled_at.
     """
     # -- The profile record IS the registration (every installed type
     # has one; a type without a record is not declared). --
@@ -799,6 +801,18 @@ async def create_notification(
     now = datetime.now(UTC)
     if scheduled_at is None:
         scheduled_at = now
+
+    # -- A schedule has a ceiling (REV-8): at most MAX_DURATION_DAYS
+    # ahead, the ceiling of the profile's durations. Checked first, before
+    # either expiry: the profile's expiry is scheduled_at + expires_after,
+    # and at the year 9999 that sum was an OverflowError -- the event a
+    # dead letter instead of a refusal under its key. --
+    if scheduled_at > now + timedelta(days=MAX_DURATION_DAYS):
+        raise ValidationError(
+            f"scheduled_at {scheduled_at.isoformat()} is more than "
+            f"{MAX_DURATION_DAYS} days ahead (now {now.isoformat()}): a job "
+            f"is scheduled at most {MAX_DURATION_DAYS} days ahead"
+        )
 
     # -- Expiry: the envelope over the profile, the layer kept. --
     if expiry_at is not None:
@@ -974,17 +988,23 @@ async def resolve_notification(
     # A job for people has its address (ck_notifications_letter_by_kind).
     assert notification.target_type is not None
     assert notification.target_value is not None
-    recipient_ids = await resolve_targets(
-        session,
-        notification.target_type,
-        notification.target_value,
-    )
+    # The job's id and its key go with every line the resolver writes
+    # (DB-1): the target's value never does, and by these two the product
+    # finds the job on its side.
+    with structlog.contextvars.bound_contextvars(
+        notification_id=str(notification.id),
+        idempotency_key=notification.idempotency_key,
+    ):
+        recipient_ids = await resolve_targets(
+            session,
+            notification.target_type,
+            notification.target_value,
+        )
 
     if not recipient_ids:
         # Nobody to deliver to: the product's sync, not comms, is what
         # to look at -- and not the recipients' choice either.
         notification.status = NotificationStatus.NO_RECIPIENTS
-        end_transient_wait(notification)
         journal.record_job(session, notification, JournalStep.RESOLVE)
         logger.warning(
             "notification_no_targets",
@@ -1022,7 +1042,6 @@ async def resolve_notification(
         if not recipient_ids:
             # Every recipient muted it: their decision, not a failure.
             notification.status = NotificationStatus.SUPPRESSED
-            end_transient_wait(notification)
             journal.record_job(session, notification, JournalStep.RESOLVE)
             logger.info(
                 "notification_all_muted",
@@ -1662,7 +1681,7 @@ async def _deliver_single(
                 delivery_id=str(delivery.id),
                 channel=delivery.channel,
                 failure_class=failure_class.value,
-                error=sanitize_text(str(exc))[:200],
+                error=exception_text(exc)[:200],
             )
             answer = journal.answer_of(exc, failure_class)
             outcome = _DeliveryOutcome(
@@ -1708,9 +1727,13 @@ async def _deliver_single(
                 error=journal.answer_text(answer, exc),
             )
         else:
-            outcome = _DeliveryOutcome(success=success)
+            outcome = _DeliveryOutcome(success=bool(success))
+            # A letter rendered with fields that did not resolve (TPL-1):
+            # their paths go with the channel's answer, into the journal.
             answer = (
-                journal.ACCEPTED
+                journal.accepted(
+                    success.unresolved if isinstance(success, Sent) else ()
+                )
                 if success
                 else journal.Answer(outcome=ChannelAnswer.TRANSIENT)
             )
@@ -1884,22 +1907,6 @@ def first_waiting_delivery(
     )
 
 
-def end_transient_wait(notification: Notification) -> None:
-    """End the job's open wait on a transient failure of the database
-    (TX-3): a step that succeeded, an ordinary failure, or the job's
-    close. Every such place calls this -- the field never outlives
-    them (ck_notifications_transient_wait_open holds it in the database).
-    The wait's own three fields, and -- with no attempt counted -- the
-    gate too: such a gate had no other ground than the wait
-    (ck_notifications_pipeline_gate). The counted failures' trace
-    (pipeline_attempts / _step / _error) and their gate stay."""
-    notification.pipeline_transient_since = None
-    notification.pipeline_transient_step = None
-    notification.pipeline_transient_error = None
-    if not notification.pipeline_attempts:
-        notification.pipeline_retry_at = None
-
-
 async def rollup_notification(
     session: AsyncSession,
     notification: Notification,
@@ -1943,7 +1950,6 @@ async def rollup_notification(
     if verdict is None:
         return
     notification.status = verdict
-    end_transient_wait(notification)
     journal.record_job(session, notification, step)
     await forget_llm_letter(session, notification)
     await session.flush()
@@ -2055,6 +2061,35 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     journal row of theirs loses its provider_text, for the same reason.
 
     Returns the number of deliveries closed.
+
+    # KNOWN CEILING (forgetting is one transaction over every job of the
+    # person; acknowledged by design):
+    #   1. Mechanics: the select below takes FOR UPDATE on EVERY job that
+    #      has a delivery of this recipient -- finished ones too, until
+    #      retention deletes them -- and holds them all until the
+    #      caller's one transaction (forget_recipient: the tombstone, the
+    #      deletions, this) commits. A person in many jobs holds that
+    #      many job rows at once, and the attempts and sweeps of those
+    #      jobs wait behind it. The expiry sweep takes its jobs in
+    #      portions (app/engine/processor.py _EXPIRY_PORTION, PERF-1);
+    #      this does not.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: none -- no product forgets a recipient today (no
+    #      user_deleted, no DELETE /api/v1/recipients/{id} in aivis or
+    #      velo, PERF-1), so the width has no consumer.
+    #   4. Promotion trigger: a product starts sending user_deleted or
+    #      DELETE /api/v1/recipients/{id}; OR a recipient has more jobs
+    #      than one portion of the expiry sweep (_EXPIRY_PORTION).
+    #   5. Agreed fix: the caller commits the tombstone, the deletions and
+    #      a first portion of jobs, then withdraws the rest in portions,
+    #      one commit each, in id order; a repeated forgetting no longer
+    #      returns early on a tombstone but withdraws again, so a failure
+    #      in the middle is finished by the repeat the consumer or the
+    #      product already makes.
+    #   6. Rejected: a deferred worker pass over the tombstones -- the
+    #      DELETE would be answered before the deliveries are withdrawn;
+    #      portions inside the one transaction -- a row lock is held to
+    #      the commit, so they would hold exactly as many rows.
     """
     touched = (
         await session.execute(
@@ -2099,10 +2134,11 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     )
     # THE ONE EDIT OF THE JOURNAL, and why it is allowed: forgetting
     # outweighs append-only. Append-only is a property of the design;
-    # forgetting is an obligation to a person (spec §10.4). A provider's
-    # words may quote the address being forgotten -- the reason
-    # error_message is cleared just above -- and the journal keeps the
-    # same words for the same recipient. Only that column, only this
+    # forgetting is an obligation to a person (spec §10.4), within what
+    # app/forgetting.py WHAT STAYS names -- the dead letters among it.
+    # A provider's words may quote the address being forgotten -- the
+    # reason error_message is cleared just above -- and the journal keeps
+    # the same words for the same recipient. Only that column, only this
     # recipient; every other field of the row stays, and so does the
     # path. The fence test names this function as the single exception.
     await session.execute(
@@ -2123,8 +2159,14 @@ async def close_notifications(
     session: AsyncSession,
     condition: Any,
     outcome: NotificationStatus,
+    *,
+    limit: int | None = None,
 ) -> int:
-    """Expire or cancel every ACTIVE job matching `condition`.
+    """Expire or cancel every ACTIVE job matching `condition` -- or, with
+    `limit`, the first `limit` of them in id order: ONE PORTION, for a
+    caller that commits between portions (the expiry sweep, PERF-1). The
+    order and the lock are the same either way, so portions keep THE
+    ORDER OF ROW LOCKS; a portion shorter than `limit` is the last one.
 
     The waiting deliveries take the outcome (one the channel already
     accepted is closed SENT -- close_waiting_deliveries) and the job is
@@ -2139,18 +2181,20 @@ async def close_notifications(
     """
     delivery_outcome = _CLOSING[outcome]
     step = _CLOSING_STEP[outcome]
-    rows = await session.execute(
+    stmt = (
         select(Notification)
         .where(condition, Notification.status.in_(_ACTIVE_STATUSES))
         .order_by(Notification.id)
         .with_for_update()
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    rows = await session.execute(stmt)
     notifications = list(rows.scalars().all())
     for notification in notifications:
         if notification.status == NotificationStatus.PENDING:
             # Not resolved: no deliveries exist to carry the outcome.
             notification.status = outcome
-            end_transient_wait(notification)
             journal.record_job(session, notification, step)
             await forget_llm_letter(session, notification)
             continue
@@ -2251,6 +2295,25 @@ _RETENTION_TERMINAL_STATUSES = (
 )
 
 
+# The outcomes retention ages from created_at, not from the later of
+# created_at and scheduled_at (REV-8): the one a job can reach before it
+# is due. See delete_terminal_notifications_batch.
+_RETENTION_FROM_CREATION_STATUSES = (NotificationStatus.CANCELLED,)
+
+
+def _retention_age() -> ColumnElement[datetime]:
+    """The instant a terminal job's retention counts from -- ONE
+    expression, the one KNOWN CEILING BL-3's index would be built on
+    (app/engine/processor.py cleanup_terminal_notifications)."""
+    return case(
+        (
+            Notification.status.in_(_RETENTION_FROM_CREATION_STATUSES),
+            Notification.created_at,
+        ),
+        else_=func.greatest(Notification.created_at, Notification.scheduled_at),
+    )
+
+
 async def delete_terminal_notifications_batch(
     session: AsyncSession,
     *,
@@ -2270,14 +2333,58 @@ async def delete_terminal_notifications_batch(
     cascade -- an unbounded DELETE over a 90-day backlog was rejected
     in the handoff (one long transaction + cascade).
 
-    Age is measured on created_at: terminal rows are immutable and the
-    model carries no updated_at.
+    AGE FROM THE LATER OF created_at AND scheduled_at (REV-2): a job is
+    not deleted before it has lived its retention from the moment it
+    was due. Measured on created_at alone, a reminder scheduled past
+    the horizon was deleted within the hour of its send -- gone from
+    the inbox, 404 by its key. EXCEPT A CANCELLED JOB (REV-8), which
+    ages from created_at (_RETENTION_FROM_CREATION_STATUSES): the one
+    outcome a job can reach before it is due -- a cancel of a job still
+    pending; every other outcome comes of an attempt, and only a due job
+    is attempted (app/engine/processor.py ready_now), or of an expiry,
+    which is after scheduled_at. Measured from scheduled_at, a reminder
+    cancelled two years ahead kept its title and body two years and the
+    period. The model carries no updated_at; what a job does after it
+    was due is still bounded by created_at only (app/engine/changes.py
+    KNOWN CEILING P2-3).
+
+    NOT WHILE A PUSH IS OWED (REV-2, as the expiry cleanup since H7):
+    a job with a row in push_outbox is skipped -- the cascade would
+    take the push with the job before the product got it. The relay
+    deletes the row once it has published; the next pass deletes the
+    job. An anti-join on push_outbox (measured at 200k jobs: a hash
+    anti-join over the outbox, beside BL-3's scan). A push row is
+    written only in the transaction of a job's transition, and a job's
+    outcome row with it: a job this select sees terminal has every
+    push row it will ever have committed, and visible here.
+
+    KNOWN CEILING (acknowledged by design -- REV-2, a push never
+    published):
+      1. Mechanics: a job whose push the relay never publishes (redis
+         away for good, the consumer process not running) is never
+         deleted -- retention is no longer the one bound on how long a
+         job is kept.
+      2. Status: acknowledged by design.
+      3. Backlog ref: none -- the relay down that long is an incident
+         of its own, said in its log (push_relay_error).
+      4. Promotion trigger (observable): a push_outbox row whose job
+         is older than the retention period.
+      5. Agreed fix: none needed -- mend the relay; its next ticks
+         publish the backlog and the next retention pass deletes.
+      6. Rejected: deleting the job past a deadline whatever it owes
+         (the product loses a result it was promised -- the reason for
+         the skip); a second horizon for owed pushes (a new setting for
+         a failure that is an incident).
+
+    BY SCAN: the select has no index of its own -- KNOWN CEILING BL-3
+    on app/engine/processor.py cleanup_terminal_notifications.
     """
     batch_ids = (
         select(Notification.id)
         .where(
             Notification.status.in_(_RETENTION_TERMINAL_STATUSES),
-            Notification.created_at < cutoff,
+            _retention_age() < cutoff,
+            ~exists().where(PushOutbox.notification_id == Notification.id),
         )
         .order_by(Notification.created_at)
         .limit(limit)
@@ -2354,12 +2461,12 @@ async def delete_expired_notifications_batch(
     product, told nothing and finding nothing by its key, would lose
     the result itself (deploy/INTEGRATION.md section 10: a push may be
     lost, the result may not). The relay deletes the row once it has
-    published; the next pass deletes the job. No deadline of its own:
-    a push still owed when general retention reaches the job
-    (delete_terminal_notifications_batch, by created_at) goes with it
-    -- retention is the one bound on how long anything is kept. The
-    check is an anti-join on ix_push_outbox_notification, beside the
-    partial index, not instead of it (tests/test_push_survives_cleanup.py).
+    published; the next pass deletes the job. No deadline of its own,
+    and none in general retention either since REV-2: it skips such a
+    job the same way (delete_terminal_notifications_batch, its KNOWN
+    CEILING for a push never published). The check is an anti-join on
+    ix_push_outbox_notification, beside the partial index, not instead
+    of it (tests/test_push_survives_cleanup.py).
 
     NOT WHILE AN ANSWER IS KEPT (P5-1): a job whose model answer still
     has its body is skipped the same way -- an anti-join on the primary

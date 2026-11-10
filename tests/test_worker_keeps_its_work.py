@@ -3,20 +3,27 @@
 # =============================================================================
 #
 # What is held here:
+#   0 the attempt takes a job only while it is still ready by the
+#     selection's condition (WK-2): a gate, an expiry, the ceiling or no
+#     delivery due, met between the selection and the lock on real
+#     sessions -- nothing written, the gate kept;
 #   1 a step of the pipeline failing with a REAL transient failure of the
 #     database (tests/helpers.py real_serialization_failure, real_deadlock,
-#     real_own_backend_terminated) more times than the ceiling: the job is
-#     not closed, no attempt is spent; once the failure passes, it is
-#     delivered. The pair: an ordinary failure as many times -> closed at
-#     the ceiling, as before. A provider's network error (a real
-#     aiohttp ClientConnectorError, a real httpx ConnectError) never
-#     reaches the rule: it stays the delivery's outcome;
-#   2 the journal: a transient wait is one row -- written when the wait
-#     begins (pipeline_transient_since empty), again on a change of step
-#     or class; a successful step and an ordinary failure end the wait;
+#     real_own_backend_terminated) -- the consumer's rule (WK-2): counted
+#     while the database answers, up to the ceiling and the job's
+#     outcome; while it does not answer (the REAL probe asking port 1),
+#     nothing written, the job rests uncounted, delivered once it
+#     answers. The pair: an ordinary failure, the probe not asked. A
+#     provider's network error (a real aiohttp ClientConnectorError, a
+#     real httpx ConnectError) never reaches the rule: it stays the
+#     delivery's outcome. The database refuses a gate with no counted
+#     failure (0015's CHECK, back since 0038);
 #   3 a rollback on a dead connection and a failure record that cannot be
 #     written do not take the lane down; the job rests in the process and
-#     is taken again after;
+#     is taken again after; a record failing transiently is counted in
+#     the process while the database answers, a rest while it does not;
+#     a close at the ceiling failing transiently is STUCK while it
+#     answers, nothing written while it does not;
 #   4 the maintenance passes, each on its own; the cadence marks move
 #     after success only;
 #   5 a job's deliveries all end before its attempt rolls back; a stop is
@@ -26,8 +33,7 @@
 #   7 the contract.
 #
 # MUTATIONS these tests were written against (each turns one red):
-#   M1  the step not asking the rule -> TestTransientOnAStep (closed at the
-#       ceiling)
+#   M1  the lock without ready_now -> TestTheAttemptKeepsTheGate (WK-2)
 #   M2  the step's rollback unguarded -> TestTheLaneLives
 #       test_a_rollback_on_a_dead_connection (no gate recorded)
 #   M3  the failure record's rollback unguarded -> the same class, the
@@ -38,13 +44,18 @@
 #   M7  the retention mark before the pass -> TestMaintenance
 #   M8  gather without return_exceptions -> TestDeliveries
 #   M9  the idle condition only in the subquery -> TestAutoClose
-#   M10 the episode compared with the job's last step and error -> (b)
-#   M11 an ordinary failure not ending the wait -> (d)
+#   M10 a transient failure never counted (the probe not asked, the
+#       database taken as silent) -> test_a_live_database_counts_it (WK-2)
+#   M11 a transient failure always counted (the probe not asked, the
+#       database taken as answering) -> test_a_silent_database_writes_nothing
+#   M12 the close's transient failure a rest while the database answers ->
+#       test_a_transient_failure_of_the_close_while_it_answers_is_stuck
+#   M13 _kind_of without the probe -> test_a_record_failing_transiently_...
 # =============================================================================
 
 import asyncio
-import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -53,7 +64,8 @@ from uuid import UUID, uuid4
 import aiohttp
 import httpx
 import pytest
-from sqlalchemy import and_, select, text, update
+from sqlalchemy import and_, func, select, text, update
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -62,9 +74,14 @@ from app import worker
 from app.core.config import settings
 from app.core.database import get_engine, get_session_factory, is_transient_db_error
 from app.core.lanes import Lane
+from app.core.sanitize import pipeline_error_of
 from app.engine import processor, service
 from app.engine.constants import ACTIVE_STATUSES, NotificationStatus, TargetType
-from app.engine.models import Notification, NotificationTransition
+from app.engine.models import (
+    Notification,
+    NotificationDelivery,
+    NotificationTransition,
+)
 from app.messaging.constants import OperatorKind, ThreadKind
 from app.messaging.models import Thread
 from app.messaging.status import auto_close_idle_threads_batch
@@ -167,7 +184,189 @@ async def real_lock_not_available() -> Exception:
 
 
 # ---------------------------------------------------------------------------
-# 1 -- a transient failure on a step spends no attempt
+# 0 -- the attempt takes a job only while it is still ready (WK-2)
+# ---------------------------------------------------------------------------
+
+
+async def _deliveries(job_id: UUID) -> int:
+    async with get_session_factory()() as s:
+        return int(await s.scalar(
+            select(func.count()).select_from(NotificationDelivery)
+            .where(NotificationDelivery.notification_id == job_id)
+        ) or 0)
+
+
+async def _write(job_id: UUID, **values: Any) -> None:
+    async with get_session_factory()() as s:
+        await s.execute(update(Notification)
+                        .where(Notification.id == job_id).values(**values))
+        await s.commit()
+
+
+async def _gated_by_another(job_id: UUID) -> None:
+    """Another worker's failure record, committed between this pass's
+    selection and its attempt's lock: one counted failure, a gate an
+    hour ahead."""
+    await _write(
+        job_id, pipeline_attempts=1, pipeline_step="deliver",
+        pipeline_error="builtins.RuntimeError at app/engine/processor.py:1",
+        pipeline_retry_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+
+async def _stuck_by_another(job_id: UUID) -> None:
+    """Another worker's _record_stuck: at the ceiling, not closed."""
+    await _write(
+        job_id, pipeline_attempts=settings.notification_max_pipeline_attempts,
+        pipeline_step="rollup",
+        pipeline_error="builtins.RuntimeError at app/engine/processor.py:1",
+    )
+
+
+async def _expired_meanwhile(job_id: UUID) -> None:
+    """Its expiry passed between the selection and the lock (time moved
+    on; the sweep has not reached it)."""
+    await _write(job_id, expiry_at=datetime.now(UTC) - timedelta(seconds=1))
+
+
+async def _deliveries_put_behind_a_wait(job_id: UUID) -> None:
+    """Another attempt delivered its portion and put every waiting
+    delivery behind a wait: the job is PROCESSING with none due."""
+    async with get_session_factory()() as s:
+        await s.execute(update(NotificationDelivery)
+                        .where(NotificationDelivery.notification_id == job_id)
+                        .values(next_retry_at=datetime.now(UTC) + timedelta(hours=1),
+                                wait_reason="transient_backoff"))
+        await s.commit()
+
+
+class TestTheAttemptKeepsTheGate:
+    """done-when 1. Before WK-2 the attempt locked the row, checked its
+    status only and wiped pipeline_retry_at: a gate another worker set
+    between the selection and the lock was erased and the job went ahead
+    of its backoff (reproduced before the fix: the gated job went SENT,
+    its gate None). Now the lock carries ready_now itself.
+
+    The race on REAL sessions and the REAL pass: process_lane selects the
+    job; the attempt's task, before the real _attempt_job, lets another
+    session commit its write -- the row as the lock then finds it. The
+    twin "scheduled_at in the future" is not built: scheduled_at is
+    written only at intake, so a selected job cannot become not yet
+    scheduled (unreachable)."""
+
+    async def _race(
+        self, monkeypatch: pytest.MonkeyPatch, job_id: UUID,
+        meanwhile: Callable[[UUID], Awaitable[None]],
+    ) -> tuple[Notification, Notification, list[tuple[bool, bool]]]:
+        before = await _row(job_id)
+        real = processor._attempt_job
+        results: list[tuple[bool, bool]] = []
+
+        async def after_another(notif_id: UUID, *args: Any, **kwargs: Any) -> Any:
+            assert notif_id == job_id  # the pass did select it
+            await meanwhile(notif_id)
+            result = await real(notif_id, *args, **kwargs)
+            results.append(result)
+            return result
+
+        monkeypatch.setattr(processor, "_attempt_job", after_another)
+        await processor.process_lane(Lane(before.lane))
+        return before, await _row(job_id), results
+
+    async def test_a_gate_set_meanwhile_is_kept(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        job_id = await _job()
+        _, after, results = await self._race(monkeypatch, job_id, _gated_by_another)
+        assert results == [(False, False)]  # selected, not attempted
+        assert after.pipeline_retry_at is not None
+        assert after.pipeline_retry_at > datetime.now(UTC)
+        assert after.pipeline_attempts == 1
+        assert after.status == NotificationStatus.PENDING
+        assert await _deliveries(job_id) == 0
+
+    async def test_the_pair_a_job_still_ready_is_attempted(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The pair: the same race with a write that leaves the job ready
+        -- an old gate, already past -- and the attempt goes and wipes it."""
+        job_id = await _job()
+
+        async def past_gate(notif_id: UUID) -> None:
+            await _write(
+                notif_id, pipeline_attempts=1, pipeline_step="deliver",
+                pipeline_error="builtins.RuntimeError at app/engine/processor.py:1",
+                pipeline_retry_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+
+        _, after, results = await self._race(monkeypatch, job_id, past_gate)
+        assert results == [(True, False)]
+        assert after.status == NotificationStatus.SENT
+        assert after.pipeline_retry_at is None
+        assert await _deliveries(job_id) == 1
+
+    async def test_expired_meanwhile(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        job_id = await _job()
+        before, after, results = await self._race(
+            monkeypatch, job_id, _expired_meanwhile,
+        )
+        assert results == [(False, False)]
+        assert after.status == NotificationStatus.PENDING
+        assert (after.pipeline_attempts, after.pipeline_retry_at) == (
+            before.pipeline_attempts, before.pipeline_retry_at,
+        )
+        assert await _deliveries(job_id) == 0
+
+    async def test_stuck_meanwhile(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        job_id = await _job()
+        _, after, results = await self._race(monkeypatch, job_id, _stuck_by_another)
+        assert results == [(False, False)]
+        assert after.status == NotificationStatus.PENDING
+        assert after.pipeline_attempts == settings.notification_max_pipeline_attempts
+        assert after.pipeline_retry_at is None
+        assert await _deliveries(job_id) == 0
+
+    async def test_no_delivery_due_meanwhile(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PROCESSING, its deliveries committed by a first attempt whose
+        channel did not take the letter yet; the second pass selects it,
+        and before its lock every waiting delivery is put behind a wait:
+        not attempted, the channel not called again."""
+        calls = 0
+
+        async def not_now(*_args: Any, **_kwargs: Any) -> bool:
+            nonlocal calls
+            calls += 1
+            return False
+
+        monkeypatch.setattr(service.get_formatter("in_app"), "deliver", not_now)
+        job_id = await _job()
+        await _attempt(job_id)
+        first = await _row(job_id)
+        assert first.status == NotificationStatus.PROCESSING
+        assert calls == 1
+        await _write_deliveries_due(job_id)
+        _, after, results = await self._race(
+            monkeypatch, job_id, _deliveries_put_behind_a_wait,
+        )
+        assert results == [(False, False)]
+        assert calls == 1
+        assert after.status == NotificationStatus.PROCESSING
+        assert after.pipeline_attempts == 0
+
+
+async def _write_deliveries_due(job_id: UUID) -> None:
+    """The job's waiting deliveries due now (their wait run out)."""
+    async with get_session_factory()() as s:
+        await s.execute(update(NotificationDelivery)
+                        .where(NotificationDelivery.notification_id == job_id)
+                        .values(next_retry_at=None, wait_reason=None))
+        await s.commit()
+
+
+# ---------------------------------------------------------------------------
+# 1 -- a transient failure on a step: the consumer's rule (WK-2)
 # ---------------------------------------------------------------------------
 
 _TRANSIENT = {
@@ -177,47 +376,164 @@ _TRANSIENT = {
 }
 
 
+def _silence_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The REAL probe (app/core/database.py database_answers), asking a
+    database that does not answer: nothing listens on port 1. The
+    probe reads the URL when it asks; the attempt's own engine is
+    already built and is not touched."""
+    silent = make_url(settings.database_url).set(port=1)
+    monkeypatch.setattr(settings, "database_url",
+                        silent.render_as_string(hide_password=False))
+
+
+def _asked(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Every answer of the probe, as the worker gets it."""
+    answers: list[bool] = []
+    real = processor.database_answers
+
+    async def asking() -> bool:
+        answer = await real()
+        answers.append(answer)
+        return answer
+
+    monkeypatch.setattr(processor, "database_answers", asking)
+    return answers
+
+
+async def _open_gate(job_id: UUID) -> None:
+    """The backoff run out: the job's gate in the past -- time passing,
+    as a lane meets it on its next pass after the gate."""
+    async with get_session_factory()() as s:
+        await s.execute(
+            update(Notification)
+            .where(Notification.id == job_id,
+                   Notification.pipeline_retry_at.is_not(None))
+            .values(pipeline_retry_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await s.commit()
+
+
+async def _columns(job_id: UUID) -> dict[str, Any]:
+    """Every column of the job's row, as the database holds it."""
+    async with get_session_factory()() as s:
+        row = (await s.execute(
+            text("SELECT * FROM notifications WHERE id = :id"), {"id": job_id},
+        )).mappings().one()
+        return dict(row)
+
+
 class TestTransientOnAStep:
+    """done-when 2. Before WK-2 a transient failure gated the job without
+    a count whether the database answered or not: a job whose rollup
+    met a REAL deadlock every time went on until its expiry (reproduced
+    before the fix: ceiling + 1 attempts, attempts 0, PENDING). The rule
+    is the consumer's now: counted while the database answers, nothing
+    written while it does not."""
+
     @pytest.mark.parametrize("kind", sorted(_TRANSIENT))
-    async def test_more_than_the_ceiling_then_delivered(
+    async def test_a_live_database_counts_it(
         self, monkeypatch: pytest.MonkeyPatch, kind: str,
     ) -> None:
         failure = await _TRANSIENT[kind]()
         assert is_transient_db_error(failure)
         job_id = await _job()
+        answers = _asked(monkeypatch)
+        _failing(monkeypatch, "rollup_notification", failure)
+        await _attempt(job_id)
+        assert answers == [True]  # asked, and the database answered
+        job = await _row(job_id)
+        assert job.pipeline_attempts == 1
+        assert job.pipeline_step == "rollup"
+        assert job.pipeline_error is not None
+        assert job.pipeline_error.split(" at ", 1)[0] == pipeline_error_of(
+            failure).split(" at ", 1)[0]
+        assert job.pipeline_retry_at is not None
+        assert job.pipeline_retry_at > datetime.now(UTC)
+        assert job.status in ACTIVE_STATUSES
+        (row,) = await _rows_with_error(job_id)  # the path's row of it
+        assert row[0] == "rollup"
+
+    async def test_a_deadlock_every_time_closes_at_the_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ceiling by the ordinary path: one row per counted failure,
+        under the step that tore, then the job's outcome. Deliver, not
+        rollup: the close goes through the fold."""
+        failure = await real_deadlock()
+        job_id = await _job()
+        _failing(monkeypatch, "deliver_notification", failure)
+        ceiling = settings.notification_max_pipeline_attempts
+        for _ in range(ceiling):
+            await _open_gate(job_id)
+            await _attempt(job_id)
+        job = await _row(job_id)
+        assert job.pipeline_attempts == ceiling
+        assert job.status not in ACTIVE_STATUSES
+        assert [r[0] for r in await _rows_with_error(job_id)] == ["deliver"] * ceiling
+
+    @pytest.mark.parametrize("kind", sorted(_TRANSIENT))
+    async def test_a_silent_database_writes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, kind: str,
+    ) -> None:
+        """More attempts than the ceiling while the database does not
+        answer: the row is the same, column by column; no row in the
+        path; the job rests in the process, uncounted -- then, the
+        database back, it is delivered."""
+        failure = await _TRANSIENT[kind]()
+        job_id = await _job()
+        before = await _columns(job_id)
+        kinds: list[Any] = []
         with monkeypatch.context() as patch:
             _failing(patch, "rollup_notification", failure)
-            for _ in range(settings.notification_max_pipeline_attempts + 1):
-                await _attempt(job_id)
-                job = await _row(job_id)
-                assert job.status in (NotificationStatus.PENDING,
-                                      NotificationStatus.PROCESSING)
-                assert job.pipeline_attempts == 0
-                assert job.pipeline_retry_at is not None
-                assert job.pipeline_transient_since is not None
-                # (a) the counted failures' trace stays empty
-                assert (job.pipeline_step, job.pipeline_error) == (None, None)
-                assert job.pipeline_transient_step == "rollup"
-        await _attempt(job_id)  # the failure has passed
-        job = await _row(job_id)
-        assert job.status == NotificationStatus.SENT
-        assert job.pipeline_retry_at is None
-        assert job.pipeline_transient_since is None
+            _silence_the_database(patch)
+            with capture_logs() as logs:
+                for _ in range(settings.notification_max_pipeline_attempts + 1):
+                    await processor._attempt_job(
+                        job_id, asyncio.Semaphore(4), rest=kinds.append,
+                    )
+        assert await _columns(job_id) == before
+        assert await _rows_with_error(job_id) == []
+        assert kinds == [processor._Recorded.TRANSIENT] * (
+            settings.notification_max_pipeline_attempts + 1
+        )
+        silent = [e for e in logs
+                  if e["event"] == "notification_pipeline_database_silent"]
+        assert len(silent) == len(kinds)
+        await _attempt(job_id)
+        assert (await _row(job_id)).status == NotificationStatus.SENT
+
+    async def test_the_lane_rests_it_uncounted(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """In the lane: a rest of the backoff, not a count toward the park."""
+        job_id = await _job()
+        _failing(monkeypatch, "rollup_notification", await real_deadlock())
+        _silence_the_database(monkeypatch)
+        jobs = await _in_a_lane(job_id)
+        assert job_id in jobs.resting
+        assert jobs.resting[job_id] != float("inf")
+        assert jobs.unrecorded == {}
 
     async def test_the_pair_an_ordinary_failure_reaches_the_ceiling(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """The probe is not asked for an ordinary failure. Since WK-2 the
+        gate holds the next attempt back, so the backoff is run out
+        between attempts (_open_gate) -- before, the attempt wiped it."""
         failure = await real_lock_not_available()
         assert not is_transient_db_error(failure)
         job_id = await _job()
+        answers = _asked(monkeypatch)
         # deliver, not rollup: the close at the ceiling goes through the fold
         _failing(monkeypatch, "deliver_notification", failure)
         for _ in range(settings.notification_max_pipeline_attempts):
+            await _open_gate(job_id)
             await _attempt(job_id)
         job = await _row(job_id)
         assert job.pipeline_attempts == settings.notification_max_pipeline_attempts
         assert job.status not in (NotificationStatus.PENDING,
                                   NotificationStatus.PROCESSING)
+        assert answers == []
 
     @pytest.mark.parametrize("client", ["aiohttp", "httpx"])
     async def test_a_providers_network_error_is_the_deliverys(
@@ -225,7 +541,11 @@ class TestTransientOnAStep:
     ) -> None:
         """A real ClientConnectorError (an OSError, ECONNREFUSED) and a
         real httpx.ConnectError from the channel are caught inside
-        _deliver_single: the delivery's outcome, never a database gate."""
+        _deliver_single: the delivery's outcome, never the job's count.
+        The pair (WK-2): a real transient failure of the database on that
+        step, the database answering -- counted. Since WK-2 the attempt
+        takes only a ready job, so the delivery's wait is run out first
+        (_write_deliveries_due) -- before, the attempt took it anyway."""
         async def refusing(*_args: Any, **_kwargs: Any) -> bool:
             if client == "aiohttp":
                 async with aiohttp.ClientSession() as http:
@@ -242,260 +562,29 @@ class TestTransientOnAStep:
         job = await _row(job_id)
         assert job.pipeline_attempts == 0
         assert job.pipeline_retry_at is None
-        assert job.pipeline_transient_since is None
-        # the pair: a real transient failure of the database on that step
         failure = await real_serialization_failure()
         _failing(monkeypatch, "deliver_notification", failure)
+        await _write_deliveries_due(job_id)
         await _attempt(job_id)
-        job = await _row(job_id)
-        assert job.pipeline_attempts == 0
-        assert job.pipeline_transient_since is not None
-
-
-# ---------------------------------------------------------------------------
-# 2 -- the journal: one row per wait
-# ---------------------------------------------------------------------------
-
-
-class TestTheWaitsRows:
-    async def test_a_many_repeats_one_row(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        job_id = await _job()
-        _failing(monkeypatch, "rollup_notification", await real_serialization_failure())
-        for _ in range(5):
-            await _attempt(job_id)
-        assert len(await _rows_with_error(job_id)) == 1
-
-    async def test_b_a_success_ends_the_wait(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Transient -> a step that succeeds (the job stays open: the
-        channel answered transiently) -> the same transient on the same
-        step: a second row."""
-        failure = await real_serialization_failure()
-        job_id = await _job()
-        with monkeypatch.context() as patch:
-            _failing(patch, "rollup_notification", failure)
-            await _attempt(job_id)
-
-        async def no_fold(*_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        with monkeypatch.context() as patch:
-            # A step that succeeds and leaves the job open: a fold that
-            # decides nothing yet.
-            patch.setattr(processor, "rollup_notification", no_fold)
-            await _attempt(job_id)
-        job = await _row(job_id)
-        assert job.pipeline_transient_since is None
-        assert job.status == NotificationStatus.PROCESSING
-        with monkeypatch.context() as patch:
-            _failing(patch, "rollup_notification", failure)
-            await _attempt(job_id)
-        assert len(await _rows_with_error(job_id)) == 2
-
-    async def test_c_a_change_of_step_or_class(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        job_id = await _job()
-        serialization = await real_serialization_failure()
-        idle = await real_own_backend_terminated(mid_statement=False)
-        with monkeypatch.context() as patch:
-            _failing(patch, "rollup_notification", serialization)
-            await _attempt(job_id)
-        with monkeypatch.context() as patch:
-            _failing(patch, "rollup_notification", idle)  # another class
-            await _attempt(job_id)
-        with monkeypatch.context() as patch:
-            _failing(patch, "resolve_notification", idle)  # another step
-            await _attempt(job_id)
-        rows = await _rows_with_error(job_id)
-        assert len(rows) == 3
-        assert [r[0] for r in rows] == ["rollup", "rollup", "resolve"]
-
-    async def test_d_an_ordinary_failure_of_the_same_class_ends_it(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The corner a comparison with the job's last error missed:
-        transient (DBAPIError) -> ordinary (DBAPIError, 55P03) on the
-        same step -> transient again: a row for the new wait."""
-        job_id = await _job()
-        transient = await real_serialization_failure()
-        ordinary = await real_lock_not_available()
-        assert type(transient) is type(ordinary)
-        for failure in (transient, ordinary, transient):
-            with monkeypatch.context() as patch:
-                _failing(patch, "rollup_notification", failure)
-                await _attempt(job_id)
-        assert len(await _rows_with_error(job_id)) == 3
         job = await _row(job_id)
         assert job.pipeline_attempts == 1
+        assert job.pipeline_step == "deliver"
 
-    async def test_the_counted_trace_is_not_the_waits(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """(b) A counted failure, then a transient one: attempts, step and
-        error stay the counted failure's; the wait's fields are the
-        transient one's. (c) The wait ended by a step that succeeds: its
-        fields empty, the counted trace in place."""
+
+class TestTheGateHasAGround:
+    """Since 0038 a gate stands only behind a counted failure again
+    (0015's ck_notifications_pipeline_gate): no path writes a gate at
+    zero attempts -- the wait of TX-3 that did is gone with its fields."""
+
+    async def test_a_gate_with_no_counted_failure_is_refused(self) -> None:
         job_id = await _job()
-        ordinary = await real_lock_not_available()
-        transient = await real_own_backend_terminated(mid_statement=False)
-        with monkeypatch.context() as patch:
-            _failing(patch, "rollup_notification", ordinary)
-            await _attempt(job_id)
-        counted = await _row(job_id)
-        with monkeypatch.context() as patch:
-            _failing(patch, "resolve_notification", transient)
-            await _attempt(job_id)
-        job = await _row(job_id)
-        assert (job.pipeline_attempts, job.pipeline_step, job.pipeline_error) == (
-            1, "rollup", counted.pipeline_error,
-        )
-        assert job.pipeline_transient_step == "resolve"
-        assert job.pipeline_transient_error is not None
-        assert job.pipeline_transient_error.startswith("sqlalchemy.exc.InterfaceError")
+        with pytest.raises(IntegrityError, match="ck_notifications_pipeline_gate"):
+            await _write(job_id, pipeline_retry_at=datetime.now(UTC))
 
-        async def not_now(*_args: Any, **_kwargs: Any) -> bool:
-            return False
-
-        with monkeypatch.context() as patch:
-            patch.setattr(service.get_formatter("in_app"), "deliver", not_now)
-            await _attempt(job_id)
-        job = await _row(job_id)
-        assert (job.pipeline_transient_since, job.pipeline_transient_step,
-                job.pipeline_transient_error) == (None, None, None)
-        assert (job.pipeline_attempts, job.pipeline_step, job.pipeline_error) == (
-            1, "rollup", counted.pipeline_error,
-        )
-
-    async def test_the_database_holds_the_waits_shape(self) -> None:
-        """(d) The wait's fields not whole, and a gate with no ground (no
-        counted attempt, no open wait): refused by name."""
+    async def test_the_pair_a_gate_behind_a_counted_failure(self) -> None:
         job_id = await _job()
-        for values, check in (
-            ({"pipeline_retry_at": datetime.now(UTC),
-              "pipeline_transient_since": datetime.now(UTC)},
-             "ck_notifications_transient_wait_whole"),
-            ({"pipeline_retry_at": datetime.now(UTC)},
-             "ck_notifications_pipeline_gate"),
-        ):
-            with pytest.raises(IntegrityError, match=check):
-                async with get_session_factory()() as s:
-                    await s.execute(update(Notification)
-                                    .where(Notification.id == job_id).values(**values))
-                    await s.commit()
-
-
-# ---------------------------------------------------------------------------
-# 2b -- no close leaves a wait behind: in the code and in the database
-# ---------------------------------------------------------------------------
-
-
-async def _open_wait(job_id: UUID) -> None:
-    """Put the job in an open transient wait, as the gate leaves it."""
-    async with get_session_factory()() as s:
-        await s.execute(update(Notification).where(Notification.id == job_id).values(
-            pipeline_retry_at=datetime.now(UTC) - timedelta(seconds=1),
-            pipeline_transient_since=datetime.now(UTC) - timedelta(minutes=1),
-            pipeline_transient_step="rollup",
-            pipeline_transient_error=(
-                "sqlalchemy.exc.DBAPIError"
-                " at app/engine/processor.py:1"
-            ),
-        ))
-        await s.commit()
-
-
-class TestNoCloseLeavesAWait:
-    """(a) Every close of the TX-3 report's table, from an open wait: the
-    field is empty after it and the CHECK did not fire. Under the
-    mutation "one close skips end_transient_wait" the close itself fails
-    in the database -- an IntegrityError of ck_notifications_transient_wait_open."""
-
-    async def test_the_fold(self) -> None:
-        job_id = await _job()
-        await _open_wait(job_id)
-        await _attempt(job_id)
-        job = await _row(job_id)
-        assert job.status == NotificationStatus.SENT
-        assert job.pipeline_transient_since is None
-
-    async def test_no_recipients(self) -> None:
-        async with get_session_factory()() as s:
-            job = await service.create_notification(
-                s, **intake_fields(), type="unit_event_in_app", title="T", body="B",
-                target_type=TargetType.USER, target_value=str(uuid4()),
-            )
-            await s.commit()
-        await _open_wait(job.id)
-        await _attempt(job.id)
-        row = await _row(job.id)
-        assert row.status == NotificationStatus.NO_RECIPIENTS
-        assert row.pipeline_transient_since is None
-
-    async def test_expiry(self) -> None:
-        job_id = await _job()
-        await _open_wait(job_id)
-        async with get_session_factory()() as s:
-            await s.execute(update(Notification).where(Notification.id == job_id)
-                            .values(expiry_at=datetime.now(UTC) - timedelta(minutes=1)))
-            await s.commit()
-        await processor.expire_overdue_notifications(settings.worker_lanes)
-        row = await _row(job_id)
-        assert row.status == NotificationStatus.EXPIRED
-        assert row.pipeline_transient_since is None
-
-    async def test_cancellation_directly(self) -> None:
-        """close_notifications itself, in a session of the test -- the
-        path expiry, cancellation and forgetting share. Without its
-        end_transient_wait the database refuses the close here, an
-        IntegrityError of ck_notifications_transient_wait_open (the
-        expiry pass above swallows its own failures into its log)."""
-        job_id = await _job()
-        await _open_wait(job_id)
-        async with get_session_factory()() as s:
-            closed = await service.close_notifications(
-                s, Notification.id == job_id, NotificationStatus.CANCELLED,
-            )
-            await s.commit()
-        assert closed == 1
-        row = await _row(job_id)
-        assert row.status == NotificationStatus.CANCELLED
-        assert row.pipeline_transient_since is None
-        assert row.pipeline_retry_at is None
-
-    async def test_the_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        job_id = await _job()
-        _failing(monkeypatch, "deliver_notification", await real_lock_not_available())
-        for _ in range(settings.notification_max_pipeline_attempts):
-            await _open_wait(job_id)
-            await _attempt(job_id)
-        row = await _row(job_id)
-        assert row.status not in ACTIVE_STATUSES
-        assert row.pipeline_transient_since is None
-
-    async def test_the_database_refuses_a_close_with_a_wait(self) -> None:
-        job_id = await _job()
-        await _open_wait(job_id)
-        refused = "ck_notifications_transient_wait_open"
-        with pytest.raises(IntegrityError, match=refused):
-            async with get_session_factory()() as s:
-                await s.execute(update(Notification).where(Notification.id == job_id)
-                                .values(status=NotificationStatus.EXPIRED))
-                await s.commit()
-
-    async def test_the_checks_set_is_the_codes(self) -> None:
-        """One copy: the CHECK's statuses are ACTIVE_STATUSES."""
-        async with get_session_factory()() as s:
-            definition = await s.scalar(text(
-                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                "WHERE conname = 'ck_notifications_transient_wait_open'"
-            ))
-        assert definition is not None
-        found = set(re.findall(r"'([a-z_]+)'::character varying", definition))
-        assert found == {status.value for status in ACTIVE_STATUSES}
+        await _gated_by_another(job_id)
+        assert (await _row(job_id)).pipeline_retry_at is not None
 
 
 # ---------------------------------------------------------------------------
@@ -642,75 +731,6 @@ class TestTheRest:
         assert job in jobs.resting
 
 
-class TestTheWaitAndTheCount:
-    async def test_an_ordinary_failure_from_a_wait_at_zero(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A wait at zero attempts, then an ordinary failure: the wait and
-        its gate go first, the counted failure sets its own -- attempts 1,
-        a gate, the wait's fields empty, no CHECK fired."""
-        job_id = await _job()
-        await _open_wait(job_id)
-        _failing(monkeypatch, "deliver_notification", await real_lock_not_available())
-        await _attempt(job_id)
-        job = await _row(job_id)
-        assert job.pipeline_attempts == 1
-        assert job.pipeline_retry_at is not None
-        assert job.pipeline_step == "deliver"
-        assert (job.pipeline_transient_since, job.pipeline_transient_step) == (
-            None, None,
-        )
-
-    async def test_the_wait_survives_a_failed_attempt(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The attempt clears the wait at its start -- in its own
-        transaction: when it fails again on the same transient failure,
-        the rollback gives the wait back, the same episode: one row, the
-        same pipeline_transient_since."""
-        failure = await real_serialization_failure()
-        job_id = await _job()
-        _failing(monkeypatch, "rollup_notification", failure)
-        await _attempt(job_id)
-        since = (await _row(job_id)).pipeline_transient_since
-        await _attempt(job_id)
-        await _attempt(job_id)
-        assert (await _row(job_id)).pipeline_transient_since == since
-        assert len(await _rows_with_error(job_id)) == 1
-
-    @pytest.mark.parametrize("attempts", [0, 1])
-    async def test_closes_from_both_counts(self, attempts: int) -> None:
-        """Expiry (cancellation and forgetting close through the same
-        close_notifications) from an open wait: at zero attempts the wait
-        and its gate go; with an attempt counted the wait goes and the
-        counted failure's gate stays. No CHECK fires."""
-        job_id = await _job()
-        await _open_wait(job_id)
-        if attempts:
-            async with get_session_factory()() as s:
-                await s.execute(update(Notification)
-                                .where(Notification.id == job_id).values(
-                    pipeline_attempts=1, pipeline_step="deliver",
-                    pipeline_error=(
-                        "sqlalchemy.exc.DBAPIError"
-                        " at app/engine/processor.py:2"
-                    ),
-                ))
-                await s.commit()
-        async with get_session_factory()() as s:
-            await s.execute(update(Notification).where(Notification.id == job_id)
-                            .values(expiry_at=datetime.now(UTC) - timedelta(minutes=1)))
-            await s.commit()
-        await processor.expire_overdue_notifications(settings.worker_lanes)
-        job = await _row(job_id)
-        assert job.status == NotificationStatus.EXPIRED
-        assert job.pipeline_transient_since is None
-        if attempts:
-            assert job.pipeline_retry_at is not None
-        else:
-            assert job.pipeline_retry_at is None
-
-
 class TestABrokenFold:
     """BEFORE TX-3 (established in the TX-3 report): a job whose rollup
     failed every time was counted up to the ceiling less one, and AT the
@@ -722,9 +742,12 @@ class TestABrokenFold:
     async def _to_the_ceiling(
         self, monkeypatch: pytest.MonkeyPatch, failure: BaseException,
     ) -> UUID:
+        """Since WK-2 the gate holds the next attempt back: the backoff is
+        run out between attempts (_open_gate)."""
         job_id = await _job()
         _failing(monkeypatch, "rollup_notification", failure)
         for _ in range(settings.notification_max_pipeline_attempts):
+            await _open_gate(job_id)
             await _attempt(job_id)
         return job_id
 
@@ -763,15 +786,14 @@ class TestABrokenFold:
         )
         assert await self._selected(job_id)
 
-    async def test_a_transient_failure_of_the_close_is_a_wait(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The close at the ceiling fails once on a REAL 40001: a wait, not
-        stuck; the next attempt closes the job at the ceiling."""
+    async def _close_failing_once(
+        self, monkeypatch: pytest.MonkeyPatch, transient: BaseException,
+    ) -> tuple[UUID, list[Any]]:
+        """Ordinary failures of deliver up to the ceiling; at the ceiling
+        the close fails once on `transient`. Returns the job and the kinds
+        the attempts reported."""
         job_id = await _job()
-        ordinary = await real_lock_not_available()
-        transient = await real_serialization_failure()
-        _failing(monkeypatch, "deliver_notification", ordinary)
+        _failing(monkeypatch, "deliver_notification", await real_lock_not_available())
         real_close = processor._close_at_ceiling
         calls = 0
 
@@ -783,16 +805,64 @@ class TestABrokenFold:
             return await real_close(*args, **kwargs)
 
         monkeypatch.setattr(processor, "_close_at_ceiling", close_once_failing)
-        ceiling = settings.notification_max_pipeline_attempts
-        for _ in range(ceiling):
-            await _attempt(job_id)
-        waiting = await _row(job_id)
-        assert waiting.pipeline_attempts == ceiling - 1
-        assert waiting.pipeline_transient_since is not None
+        kinds: list[Any] = []
+        for _ in range(settings.notification_max_pipeline_attempts):
+            await _open_gate(job_id)
+            await processor._attempt_job(job_id, asyncio.Semaphore(4),
+                                         rest=kinds.append)
+        return job_id, kinds
+
+    async def test_a_transient_failure_of_the_close_while_it_answers_is_stuck(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WK-2 (replaces TX-3's "a transient failure of the close is a
+        wait", right while a transient failure was never counted): the
+        close at the ceiling fails on a REAL 40001 while the database
+        answers -- an ordinary failure of the close: STUCK, recorded,
+        no longer selected. A retry of the close would be TX-3's loop."""
+        transient = await real_serialization_failure()
+        job_id, kinds = await self._close_failing_once(monkeypatch, transient)
+        job = await _row(job_id)
+        assert kinds == []  # every failure written
+        assert job.pipeline_attempts == settings.notification_max_pipeline_attempts
+        assert job.status in ACTIVE_STATUSES
+        assert job.pipeline_error is not None
+        assert job.pipeline_error.startswith("sqlalchemy.exc.DBAPIError at ")
+        assert not await self._selected(job_id)
+
+    async def test_the_pair_while_the_database_is_silent_nothing_is_written(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same close failure while the database does not answer:
+        nothing written -- the count stays below the ceiling, the job
+        rests; once the database answers, the next attempt -- its step
+        failing as before -- reaches the ceiling and the close goes
+        through."""
+        transient = await real_serialization_failure()
+        with monkeypatch.context() as patch:
+            silent_from = settings.notification_max_pipeline_attempts
+            real_answers = processor.database_answers
+            asked = 0
+
+            async def silent_at_the_close() -> bool:
+                nonlocal asked
+                asked += 1
+                with pytest.MonkeyPatch.context() as inner:
+                    _silence_the_database(inner)
+                    return await real_answers()
+
+            patch.setattr(processor, "database_answers", silent_at_the_close)
+            job_id, kinds = await self._close_failing_once(monkeypatch, transient)
+            assert asked == 1  # only the close's failure is transient
+        job = await _row(job_id)
+        assert kinds == [processor._Recorded.TRANSIENT]
+        assert job.pipeline_attempts == silent_from - 1
+        assert job.status in ACTIVE_STATUSES
+        await _open_gate(job_id)
         await _attempt(job_id)
         closed = await _row(job_id)
         assert closed.status not in ACTIVE_STATUSES
-        assert closed.pipeline_attempts == ceiling
+        assert closed.pipeline_attempts == settings.notification_max_pipeline_attempts
 
 
 @pytest.mark.usefixtures("pristine_tables")
@@ -804,26 +874,7 @@ class TestThePriceOfTheSelection:
     and buffers no worse than the old selection's by more than 1.25."""
 
     async def test_no_seq_scan_and_buffers(self) -> None:
-        async with get_session_factory()() as s:
-            await s.execute(text(
-                "INSERT INTO notifications (id, type, title, body, target_type, "
-                "target_value, scheduled_at, status, created_at, idempotency_key, "
-                "fingerprint, channels, expiry_layer, pipeline_attempts, push_on, "
-                "retry_max_attempts, retry_backoff_seconds, recipient_schedule, "
-                "lane, pipeline_step, pipeline_error) SELECT gen_random_uuid(), "
-                "'unit_event_in_app', 'T', 'B', "
-                "'all', '*', now() - interval '1 hour', CASE WHEN g % 10 = 0 "
-                "THEN 'pending' ELSE 'sent' END, now(), 'price:' || g, "
-                "repeat('f', 64), '[\"in_app\"]', 'none', CASE WHEN g % 50 = 0 "
-                "THEN 3 ELSE 0 END, 'none', 3, 30, 'respect', CASE WHEN g % 4 = 0 "
-                "THEN 'bulk' ELSE 'normal' END, CASE WHEN g % 50 = 0 THEN 'rollup' "
-                "END, CASE WHEN g % 50 = 0 THEN 'builtins.RuntimeError at "
-                "app/engine/processor.py:1' END FROM generate_series(1, 40000) g"
-            ))
-            await s.commit()
-        async with get_engine().connect() as connection:
-            auto = await connection.execution_options(isolation_level="AUTOCOMMIT")
-            await auto.execute(text("ANALYZE notifications"))
+        await _seed_the_price()
         now = datetime.now(UTC)
         new = select(Notification.id).where(
             Notification.lane == Lane.NORMAL.value, processor.ready_now(now),
@@ -861,6 +912,64 @@ class TestThePriceOfTheSelection:
         assert buffers["new"] <= 1.25 * max(buffers["old"], 1), buffers
 
 
+    async def test_the_attempts_lock_reads_one_row(self) -> None:
+        """WK-2: the attempt's lock carries ready_now (processor._lock_of)
+        -- on the same seeded table, its plan reads the job by its primary
+        key, never a Seq Scan of notifications or of its deliveries."""
+        await _seed_the_price()
+        async with get_session_factory()() as s:
+            job_id = await s.scalar(text(
+                "SELECT id FROM notifications WHERE status = 'pending' LIMIT 1"
+            ))
+            raw = await s.connection()
+            compiled = processor._lock_of(job_id, datetime.now(UTC)).compile(
+                dialect=raw.dialect,
+            )
+            params = tuple(compiled.params[key] for key in compiled.positiontup or [])
+            plan: Any = (await raw.exec_driver_sql(
+                "EXPLAIN (FORMAT JSON) " + str(compiled), params,
+            )).scalar_one()
+            await s.rollback()
+        nodes = _plan_nodes(plan[0]["Plan"])
+        scans = {(n["Node Type"], n.get("Relation Name"), n.get("Index Name"))
+                 for n in nodes if "Scan" in n["Node Type"]}
+        assert ("Index Scan", "notifications", "notifications_pkey") in scans, scans
+        assert not [n for n in scans if n[0] == "Seq Scan"], scans
+
+
+async def _seed_the_price() -> None:
+    """notifications seeded as TestThePriceOfTheSelection measures it:
+    40000 jobs, one in ten pending, one in fifty at the ceiling, fresh
+    exact statistics."""
+    async with get_session_factory()() as s:
+        await s.execute(text(
+            "INSERT INTO notifications (id, type, title, body, target_type, "
+            "target_value, scheduled_at, status, created_at, idempotency_key, "
+            "fingerprint, channels, expiry_layer, pipeline_attempts, push_on, "
+            "retry_max_attempts, retry_backoff_seconds, recipient_schedule, "
+            "lane, pipeline_step, pipeline_error) SELECT gen_random_uuid(), "
+            "'unit_event_in_app', 'T', 'B', "
+            "'all', '*', now() - interval '1 hour', CASE WHEN g % 10 = 0 "
+            "THEN 'pending' ELSE 'sent' END, now(), 'price:' || g, "
+            "repeat('f', 64), '[\"in_app\"]', 'none', CASE WHEN g % 50 = 0 "
+            "THEN 3 ELSE 0 END, 'none', 3, 30, 'respect', CASE WHEN g % 4 = 0 "
+            "THEN 'bulk' ELSE 'normal' END, CASE WHEN g % 50 = 0 THEN 'rollup' "
+            "END, CASE WHEN g % 50 = 0 THEN 'builtins.RuntimeError at "
+            "app/engine/processor.py:1' END FROM generate_series(1, 40000) g"
+        ))
+        await s.commit()
+    async with get_engine().connect() as connection:
+        auto = await connection.execution_options(isolation_level="AUTOCOMMIT")
+        await auto.execute(text("ANALYZE notifications"))
+
+
+def _plan_nodes(node: dict[str, Any]) -> list[dict[str, Any]]:
+    out = [node]
+    for child in node.get("Plans", []):
+        out.extend(_plan_nodes(child))
+    return out
+
+
 def _without_not_stuck(now: datetime) -> Any:
     """ready_now as it was before TX-3: its terms less not_stuck."""
     full = processor.ready_now(now)
@@ -873,34 +982,41 @@ def _shared_buffers(node: dict[str, Any]) -> int:
 
 
 class TestARecordTheDatabaseRefuses:
-    async def test_a_refused_gate_takes_the_ordinary_path(
+    async def _record_failing_on(
+        self, monkeypatch: pytest.MonkeyPatch, failure: BaseException,
+    ) -> processor.LaneJobs:
+        """The step fails (ordinary); the failure's record fails on
+        `failure` at its journal row. One attempt in a lane."""
+        job_id = await _job()
+
+        def refused(*_args: Any, **_kwargs: Any) -> None:
+            raise failure
+
+        _failing(monkeypatch, "rollup_notification", RuntimeError("tore"))
+        monkeypatch.setattr(processor.journal, "record_job", refused)
+        return await _in_a_lane(job_id)
+
+    async def test_a_record_failing_transiently_while_it_answers_is_counted(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The gate of a transient failure refused for a reason no rest
-        cures -- here 0015's ck_notifications_pipeline_gate put back for
-        the length of the test: the ordinary path is taken, an attempt is
-        counted. From then on 0015's CHECK allows the gate (an attempt is
-        counted), so the next transient failures are gated in the
-        database and journaled -- a visible wait, not a rest in memory and
-        not a quiet loop."""
+        """WK-2 (_kind_of by the rule): the record meets a REAL 40001
+        while the database answers -- counted in the process toward the
+        park (LaneJobs.unrecordable), not a rest without a count."""
+        jobs = await self._record_failing_on(
+            monkeypatch, await real_serialization_failure(),
+        )
+        (job_id,) = jobs.resting
+        assert jobs.unrecorded == {job_id: 1}
+
+    async def test_the_pair_while_the_database_is_silent_a_rest(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         failure = await real_serialization_failure()
-        job_id = await _job()
-        _failing(monkeypatch, "deliver_notification", failure)
-        await _set_gate_check("pipeline_retry_at IS NULL OR pipeline_attempts > 0")
-        try:
-            for _ in range(settings.notification_max_pipeline_attempts):
-                await _attempt(job_id)
-        finally:
-            await _set_gate_check(
-                "pipeline_retry_at IS NULL OR pipeline_attempts > 0 "
-                "OR pipeline_transient_since IS NOT NULL"
-            )
-        job = await _row(job_id)
-        assert job.pipeline_attempts == 1  # the one fallback, counted
-        assert job.pipeline_retry_at is not None
-        assert job.pipeline_transient_since is not None
-        assert job.status in ACTIVE_STATUSES
-        assert len(await _rows_with_error(job_id)) == 2  # the count, the wait
+        _silence_the_database(monkeypatch)
+        jobs = await self._record_failing_on(monkeypatch, failure)
+        (job_id,) = jobs.resting
+        assert jobs.resting[job_id] != float("inf")
+        assert jobs.unrecorded == {}
 
     async def test_nothing_can_be_written_the_job_is_parked(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -934,17 +1050,6 @@ class TestARecordTheDatabaseRefuses:
         events = [e["event"] for e in logs]
         assert events.count("notification_pipeline_unrecordable") == attempts
         assert "notification_pipeline_parked" in events
-
-
-async def _set_gate_check(definition: str) -> None:
-    async with get_engine().begin() as conn:
-        await conn.execute(text(
-            "ALTER TABLE notifications DROP CONSTRAINT ck_notifications_pipeline_gate"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE notifications ADD CONSTRAINT "
-            f"ck_notifications_pipeline_gate CHECK ({definition})"
-        ))
 
 
 async def real_constraint_violations_once() -> Exception:
@@ -1167,13 +1272,40 @@ _DOC = (_REPO / "deploy" / "INTEGRATION.md").read_text(encoding="utf-8")
 
 
 class TestTheContract:
-    def test_the_wait_is_said(self) -> None:
-        assert "A transient failure of comms' own database" in _DOC
-        part = _DOC.split("**A wait on a transient failure of comms' database is "
-                          "one row, not one\nper retry.**", 1)[1].split("\n\n", 1)[0]
-        for said in ("does not spend an attempt", "when the wait begins",
-                     "A step that succeeds ends the wait",
-                     "an ordinary failure"):
-            assert said in part.replace("\n", " "), said
+    """deploy/INTEGRATION.md, the job's `pipeline` and its path, against
+    the code both ways. WK-2 replaces TX-3's "the wait is said": a
+    transient failure of the database is counted while it answers, and
+    no gate stands at zero attempts."""
 
+    def _pipeline(self) -> str:
+        return _DOC.split("### `pipeline`", 1)[1].split("**A job STUCK", 1)[0]
 
+    def test_the_rule_is_said(self) -> None:
+        block = self._pipeline().replace("\n", " ")
+        for said in ("counts while that database answers",
+                     "while it does not answer, nothing is counted or written",
+                     "never with `attempts` 0"):
+            assert said in block, said
+        part = _DOC.split("**A transient failure of comms' database.**", 1)[1]
+        part = part.split("\n\n", 1)[0].replace("\n", " ")
+        for said in ("an attempt is counted", "at the ceiling the job gets its outcome",
+                     "nothing can be written", "no attempt is counted"):
+            assert said in part, said
+
+    def test_the_old_wait_is_not_said(self) -> None:
+        """"X is not" with "Y is": the old paragraph gone, the new one
+        there (test_the_rule_is_said)."""
+        assert "one row, not one\nper retry" not in _DOC
+        assert "**A transient failure of comms' database.**" in _DOC
+
+    async def test_the_database_holds_what_it_says(self) -> None:
+        """The code's side: the gate at zero attempts the contract rules
+        out is refused by the database (0015's CHECK, back since 0038)."""
+        async with get_session_factory()() as s:
+            definition = await s.scalar(text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'ck_notifications_pipeline_gate'"
+            ))
+        assert definition == (
+            "CHECK (((pipeline_retry_at IS NULL) OR (pipeline_attempts > 0)))"
+        )

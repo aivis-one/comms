@@ -24,7 +24,7 @@
 #      an uncommitted row is not visible to it, so nothing is published
 #      before its transition commits). The read takes the rows FOR
 #      UPDATE OF push_outbox SKIP LOCKED and lets go before the XADD
-#      (H2): a row a cascade is deleting is not read -- it is not
+#      (H2): a row another relay is deleting is not read -- it is not
 #      published again tick after tick, and it does not block the free
 #      rows behind it. OF push_outbox and nothing wider: the join's
 #      job row is held FOR NO KEY UPDATE by a delivery attempt, and a
@@ -40,18 +40,18 @@
 #   feed (app/engine/changes.py, the xmin rule), and a redis that hangs
 #   must not hold back the feed the product falls back on.
 #
-# THE DELETE NEVER WAITS (H1). Two other writers delete outbox rows: the
-# ON DELETE CASCADE of a job removed by retention
-# (app/engine/processor.py cleanup_terminal_notifications) or by the
-# expiry cleanup (cleanup_expired_notifications). A cascade locks the
-# rows of each job it deletes, job after job; a relay delete that WAITED
-# for one of those rows while holding another could close a cycle with
-# it -- 40P01. So the relay deletes only the rows it can lock at once
-# (FOR UPDATE SKIP LOCKED): a waiting relay is what a cycle needs, and
-# there is none. A row it skipped is held by a cascade: when that
-# commits, the row went with its job; when it rolls back, the row is
-# still owed and the next tick publishes it again -- a duplicate,
-# harmless. No row is lost either way (tests/test_relay_vs_retention.py).
+# THE DELETE NEVER WAITS (H1). The relay deletes only the rows it can
+# lock at once (FOR UPDATE SKIP LOCKED): a second relay (a deploy
+# rolling over) holding a row is skipped, not waited for, and the row
+# is deleted by whichever commits -- a duplicate push at worst, never a
+# lost one (tests/test_relay_vs_retention.py TestTwoRelays). The job
+# deleters no longer meet the relay: the expiry cleanup (H7) and
+# retention (REV-2) both skip a job whose push is still owed
+# (app/engine/service.py delete_expired_notifications_batch,
+# delete_terminal_notifications_batch), so their ON DELETE CASCADE never
+# reaches an outbox row. Until then it did, and SKIP LOCKED is what
+# kept a relay that waited for a cascade's row while holding another
+# from closing a cycle with it -- 40P01.
 #
 # REDIS AWAY: the tick fails, the rows stay, the next tick tries again.
 # The worker never touches redis, so transitions go on and the outbox
@@ -64,9 +64,9 @@
 #
 # THE PAUSE IS BY PROGRESS (H2): the loop goes straight on only after a
 # tick that published and deleted a full batch -- a backlog. A tick that
-# read rows it could not delete (a cascade took them between the read
-# and the delete) made no such progress and pauses, so a held row can
-# never spin the loop.
+# read rows it could not delete (another relay took them between the
+# read and the delete) made no such progress and pauses, so a held row
+# can never spin the loop.
 #
 # RUNS IN THE CONSUMER PROCESS (app/consumer.py), the one process that
 # already holds a redis URL; the API and the worker stay DB-only.
@@ -104,8 +104,8 @@ def push_entry(idempotency_key: str) -> dict[FieldT, EncodableT]:
 
 async def delete_published(session: AsyncSession, ids: list[int]) -> int:
     """Delete the published rows `ids` that can be locked without
-    waiting; skip the rest (a cascade holds them -- see THE DELETE NEVER
-    WAITS above). Commit-free; returns the number of rows deleted."""
+    waiting; skip the rest (another relay holds them -- see THE DELETE
+    NEVER WAITS above). Commit-free; returns the number of rows deleted."""
     lockable = (
         select(PushOutbox.id)
         .where(PushOutbox.id.in_(ids))
@@ -123,7 +123,7 @@ async def relay_once(redis: Redis) -> int:
 
     Returns the PROGRESS of the tick: the number of outbox rows it
     published AND deleted (0 when nothing was owed, or every row it
-    read was taken by a cascade before its delete). Rows read but not
+    read was taken by another relay before its delete). Rows read but not
     deleted are not counted -- the loop pauses on them. Raises whatever
     redis or the database raised -- the rows of a batch that failed
     before its delete stay owed.

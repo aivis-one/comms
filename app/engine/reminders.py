@@ -16,7 +16,8 @@
 #   an opaque string the product sent, never a key of the letter
 #   (F1.3; before, the match read action_data[correlation_key], which
 #   is comms reading the letter to decide) -- and take the outcome
-#   CANCELLED, not EXPIRED.
+#   CANCELLED, not EXPIRED. The lookup is served by the partial index
+#   ix_notifications_correlation (migration 0041, PERF-2).
 #
 #   The series scheduler that lived here (schedule_reminders) was
 #   removed in F1.2: nothing in the service called it, and every intake

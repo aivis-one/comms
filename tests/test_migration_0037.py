@@ -6,9 +6,15 @@
 # its CHECKs and replaces 0015's pipeline gate; down removes exactly
 # those and puts 0015's gate back; up again restores them -- definitions
 # compared, not names.
+#
+# AT 0037, NOT AT HEAD (WK-2): 0038 removes what 0037 adds, so this file
+# holds 0037 at its own revision (_0037) -- up to it, down from it.
+# Before 0038, head WAS 0037 and "upgrade head" said the same thing.
+# The fixture still leaves the database at head.
 # =============================================================================
 
 import asyncio
+import itertools
 import re
 import subprocess
 import sys
@@ -16,17 +22,16 @@ import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
 
 from app.core.database import dispose_engine, get_engine, get_session_factory
-from app.engine.constants import TargetType
-from app.engine.service import create_notification
-from tests.helpers import intake_fields
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _BEFORE = "0036_notification_email"
+_0037 = "0037_pipeline_transient_since"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
@@ -105,14 +110,15 @@ def _after(found: dict[str, Any]) -> None:
 
 
 async def test_up_down_up(at_head_afterwards: None) -> None:
+    await _migrate("downgrade", _0037)
     _after(await _objects())
     await _migrate("downgrade", _BEFORE)
     _before(await _objects())
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     _after(await _objects())
     await _migrate("downgrade", _BEFORE)
     _before(await _objects())
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     _after(await _objects())
 
 
@@ -132,6 +138,34 @@ async def _validated() -> dict[str, bool]:
         return {name: valid for name, valid in rows.all()}
 
 
+# A job as revision 0037 holds it, by an explicit INSERT of that
+# revision's columns -- never through the current ORM model, which carries
+# the columns of later revisions (FIX TPL-1 #1: 0040's
+# notification_transitions.template_unresolved reached this schema through
+# create_notification's journal row). No journal row: the tests read the
+# job's gate and wait only.
+_JOB_AT_0037 = (
+    "INSERT INTO notifications (id, type, title, body, target_type, "
+    "target_value, idempotency_key, fingerprint, channels, expiry_layer, "
+    "push_on, retry_max_attempts, retry_backoff_seconds, recipient_schedule, "
+    "lane) VALUES (:id, 'unit_event_in_app', 'T', 'B', 'all', '*', :key, "
+    ":fp, '[\"in_app\"]'::jsonb, 'default', 'none', 3, 0, 'respect', "
+    "'normal')"
+)
+
+
+async def _job_at_0037() -> UUID:
+    """One pending job written in the form of revision 0037."""
+    job_id = uuid4()
+    async with get_session_factory()() as session:
+        await session.execute(
+            text(_JOB_AT_0037),
+            {"id": job_id, "key": f"m0037:{job_id}", "fp": "a" * 64},
+        )
+        await session.commit()
+    return job_id
+
+
 async def _execute(*statements: str) -> None:
     async with get_session_factory()() as session:
         for statement in statements:
@@ -142,7 +176,7 @@ async def _execute(*statements: str) -> None:
 async def test_every_constraint_is_validated(at_head_afterwards: None) -> None:
     """Added NOT VALID, then VALIDATEd: at head every one is valid."""
     await _migrate("downgrade", _BEFORE)
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     assert await _validated() == dict.fromkeys(_CONSTRAINTS_0037, True)
 
 
@@ -161,7 +195,7 @@ async def test_a_half_applied_run_goes_through(at_head_afterwards: None) -> None
         "(pipeline_transient_since IS NULL OR pipeline_retry_at IS NOT NULL) "
         "NOT VALID",
     )
-    await _migrate("upgrade", "head")
+    await _migrate("upgrade", _0037)
     assert await _validated() == dict.fromkeys(_CONSTRAINTS_0037, True)
     _after(await _objects())
 
@@ -173,13 +207,8 @@ async def test_down_with_an_open_wait_at_zero_attempts(
     takes that gate away with the wait, first, and passes. (A CLOSED job
     holding a wait's fields cannot be built: ck_notifications_transient_
     wait_open refuses it -- so it is not a case down meets.)"""
-    async with get_session_factory()() as session:
-        job = await create_notification(
-            session, **intake_fields(), type="unit_event_in_app", title="T",
-            body="B", target_type=TargetType.ALL, target_value="*",
-        )
-        await session.commit()
-        job_id = job.id
+    await _migrate("downgrade", _0037)
+    job_id = await _job_at_0037()
     await _execute(
         "UPDATE notifications SET pipeline_retry_at = now(), "
         "pipeline_transient_since = now(), pipeline_transient_step = 'rollup', "
@@ -200,7 +229,12 @@ _BLOATED_ROWS, _LIVE_EVERY = 460_000, 42
 async def _bloat(rows: int) -> int:
     """notifications as velo-test had it: hundreds of MB of heap for ~11
     thousand live rows -- inserted, the rest deleted, VACUUMed (not
-    FULL). Returns its heap pages."""
+    FULL). Returns its heap pages. Autovacuum is left OFF on the table
+    (MEAS-1): the test turns it back on after both measures
+    (_autovacuum_back) -- an autoanalyze of the hundreds of thousands of
+    rows just changed, met by 0037's ALTER, makes the ALTER wait up to
+    deadlock_timeout before it cancels the worker, and every write waits
+    in the queue behind it."""
     engine = get_engine()
     async with engine.connect() as connection:
         auto = await connection.execution_options(isolation_level="AUTOCOMMIT")
@@ -225,81 +259,186 @@ async def _bloat(rows: int) -> int:
         # not fit (DiskFullError). Without workers the list lives in this
         # backend's own memory; the heap is cleaned the same.
         await auto.execute(text("VACUUM (PARALLEL 0) notifications"))
-        await auto.execute(text("ALTER TABLE notifications RESET (autovacuum_enabled)"))
         pages = await auto.scalar(text(
             "SELECT pg_relation_size('notifications') / 8192"))
     return int(pages)
 
 
-async def _measure() -> tuple[float, float, float]:
-    """Run 0036 -> head through the CLI; meanwhile watch pg_locks for a
-    granted AccessExclusiveLock on notifications and time an UPDATE of
-    a job row in a loop. Returns (held, longest write, the migration)."""
+async def _autovacuum_back() -> None:
+    await _execute("ALTER TABLE notifications RESET (autovacuum_enabled)")
+
+
+# One look at the holder of a granted ACCESS EXCLUSIVE on notifications:
+# the SERVER's clock, and what the holder is doing (pg_stat_activity).
+_LOOK = text(
+    "SELECT clock_timestamp(), a.state, a.wait_event_type, a.wait_event, "
+    "left(a.query, 40) FROM pg_locks l "
+    "JOIN pg_class c ON c.oid = l.relation "
+    "JOIN pg_stat_activity a ON a.pid = l.pid "
+    "WHERE c.relname = 'notifications' "
+    "AND l.mode = 'AccessExclusiveLock' AND l.granted "
+    "AND l.database = (SELECT oid FROM pg_database "
+    "WHERE datname = current_database())"
+)
+
+# A look: (server time, holder's state, wait_event_type, wait_event,
+# its statement) -- or (server time, None, ...) when no one holds it.
+_Look = tuple[Any, str | None, str | None, str | None, str | None]
+
+
+async def _look(observer: Any) -> list[_Look]:
+    """One look (the observer's connection); every holder's row, or one
+    row with no holder carrying the server's clock."""
+    rows = [tuple(r) for r in (await observer.execute(_LOOK)).all()]
+    if not rows:
+        now = await observer.scalar(text("SELECT clock_timestamp()"))
+        rows = [(now, None, None, None, None)]
+    await observer.rollback()
+    return rows  # type: ignore[return-value]
+
+
+def _busy(look: _Look) -> bool:
+    """The holder is doing the migration's own work in the server: a
+    statement running (`active`), not waiting for its client and not a
+    COMMIT's WAL fsync."""
+    _, state, kind, _event, query = look
+    return (
+        state == "active"
+        and kind != "Client"
+        and not (query or "").lstrip().upper().startswith("COMMIT")
+    )
+
+
+def _work(looks: list[_Look]) -> float:
+    """Server seconds the holder spent working under the lock: every
+    interval between two consecutive looks that BOTH saw it busy. A
+    pause of this process between two looks is no time of the server's
+    to it unless the server worked through it; an interval at the edge
+    of a busy run is left out (at most one look's gap, under)."""
+    total = 0.0
+    for earlier, later in itertools.pairwise(looks):
+        if _busy(earlier) and _busy(later):
+            total += (later[0] - earlier[0]).total_seconds()
+    return total
+
+
+def _phase(looks: list[_Look]) -> str:
+    """What the phase was made of: its span on the server's clock and the
+    holder's states, counted -- said by a red assertion."""
+    held = [look for look in looks if look[1] is not None]
+    if not held:
+        return "no look saw the lock"
+    span = (held[-1][0] - held[0][0]).total_seconds()
+    states: dict[str, int] = {}
+    for _, state, kind, event, query in held:
+        key = f"{state}/{kind}/{event}" + (
+            " COMMIT" if (query or "").lstrip().upper().startswith("COMMIT") else ""
+        )
+        states[key] = states.get(key, 0) + 1
+    return f"held {span:.3f}s on the server, {len(held)} looks: {states}"
+
+
+class _Measure:
+    """One measure of 0036 -> 0037: the migration's work under the lock,
+    the longest write, the migration's whole time, what the phase was."""
+
+    def __init__(self, looks: list[_Look], writes: list[float], took: float) -> None:
+        self.looks = looks
+        self.work = _work(looks)
+        self.write = max(writes, default=0.0)
+        self.took = took
+        self.seen = sum(1 for look in looks if look[1] is not None)
+        self.phase = _phase(looks)
+
+
+async def _measure() -> _Measure:
+    """Run 0036 -> 0037 through the CLI; meanwhile look at the holder of
+    a granted ACCESS EXCLUSIVE on notifications without pause, and write
+    a job row in a loop, each write's wait taken by the server inside
+    its own statement (RETURNING clock_timestamp() -
+    statement_timestamp()): a pause of this process is in neither."""
     await _migrate("downgrade", _BEFORE)
-    held: list[float] = []
+    looks: list[_Look] = []
     writes: list[float] = []
     stop = asyncio.Event()
 
     async def watch() -> None:
         async with get_engine().connect() as observer:
             while not stop.is_set():
-                seen = await observer.scalar(text(
-                    "SELECT count(*) FROM pg_locks l JOIN pg_class c "
-                    "ON c.oid = l.relation WHERE c.relname = 'notifications' "
-                    "AND l.mode = 'AccessExclusiveLock' AND l.granted "
-                    "AND l.database = (SELECT oid FROM pg_database "
-                    "WHERE datname = current_database())"))
-                await observer.rollback()
-                if seen:
-                    held.append(time.monotonic())
-                await asyncio.sleep(0.02)
+                looks.extend(await _look(observer))
 
     async def write() -> None:
         async with get_engine().connect() as writer:
             while not stop.is_set():
-                started = time.monotonic()
-                await writer.execute(text(
+                waited = await writer.scalar(text(
                     "UPDATE notifications SET body = body WHERE id = "
-                    "(SELECT id FROM notifications LIMIT 1)"))
+                    "(SELECT id FROM notifications LIMIT 1) RETURNING "
+                    "extract(epoch FROM clock_timestamp() - statement_timestamp())"))
                 await writer.commit()
-                writes.append(time.monotonic() - started)
+                writes.append(float(waited))
                 await asyncio.sleep(0.02)
 
     tasks = [asyncio.ensure_future(watch()), asyncio.ensure_future(write())]
     await asyncio.sleep(0.2)
     started = time.monotonic()
     await dispose_engine()
-    done = await asyncio.to_thread(_alembic, "upgrade", "head")
+    done = await asyncio.to_thread(_alembic, "upgrade", _0037)
     took = time.monotonic() - started
     stop.set()
     await asyncio.gather(*tasks)
     assert done.returncode == 0, done.stderr
-    return (held[-1] - held[0] if held else 0.0), max(writes, default=0.0), took
+    return _Measure(looks, writes, took)
 
 
 @pytest.mark.usefixtures("pristine_tables")
 async def test_the_lock_does_not_grow_with_the_heap(
     at_head_afterwards: None,
 ) -> None:
-    """THE RULE, written before the measure: 0037 holds ACCESS EXCLUSIVE
-    on notifications 1 s at most, and no longer on a bloated heap than
-    on a small one. Measured on ~600 MB of heap with ~11 thousand live
-    rows (velo-test before its VACUUM FULL) and on the same rows
-    without the bloat. The migration's whole time is printed too: comms'
-    API does not serve during it (comms-app migrates before uvicorn)."""
-    small = await _bloat(_BLOATED_ROWS // 42)
-    small_held, small_write, small_took = await _measure()
-    await _execute("TRUNCATE notifications CASCADE")
-    pages = await _bloat(_BLOATED_ROWS)
-    held, write, took = await _measure()
-    print(f"\nsmall: {small} pages, held {small_held:.2f}s, write max "
-          f"{small_write:.2f}s, migration {small_took:.2f}s"
-          f"\nbloated: {pages} pages, held {held:.2f}s, write max "
-          f"{write:.2f}s, migration {took:.2f}s")
+    """THE RULE, written before the measure: under ACCESS EXCLUSIVE on
+    notifications 0037 does no work that grows with the heap, and works
+    under it 1 s at most -- no longer on a bloated heap than on a small
+    one. Measured on ~600 MB of heap with ~11 thousand live rows
+    (velo-test before its VACUUM FULL) and on the same rows without the
+    bloat. The migration's whole time is printed too: comms' API does
+    not serve during it (comms-app migrates before uvicorn).
+
+    WHAT IS COUNTED (MEAS-1): the server's seconds in which the holder of
+    the lock runs a statement of its own (state `active`, not waiting
+    for its client, not a COMMIT) -- the work the migration does under
+    the lock; a statement that reads the heap (a CHECK added without
+    NOT VALID) is counted whole. WHAT IS NOT: the holder waiting for the
+    next statement from its own client (`ClientRead`, `idle in
+    transaction` -- the alembic process between its statements) and
+    the WAL fsync of the COMMIT. Both are the machine, not the
+    migration: on a slow runner the alembic process or the disk stalls,
+    the lock is held longer, and the old measure -- the client's clock
+    between the first and the last look that saw the lock -- went red on
+    CI with 0.47 s and 0.28 s, where the server, measured here, showed a
+    phase of 10-15 ms on either heap, the holder in ClientRead and WAL
+    I/O. The time is the server's (clock_timestamp()): a pause of this
+    test's own process is not in it. The writes too: each write's wait
+    is taken inside its statement; autovacuum is off on the table for
+    the whole of it (_bloat, _autovacuum_back) -- an autoanalyze met by
+    the ALTER makes the writes wait deadlock_timeout (1 s).
+    A red assertion says what the phase was made of (_phase)."""
+    try:
+        small = await _bloat(_BLOATED_ROWS // 42)
+        before = await _measure()
+        await _execute("TRUNCATE notifications CASCADE")
+        pages = await _bloat(_BLOATED_ROWS)
+        bloated = await _measure()
+    finally:
+        await _autovacuum_back()
+    print(f"\nsmall: {small} pages, work {before.work:.3f}s, write max "
+          f"{before.write:.3f}s, migration {before.took:.2f}s; {before.phase}"
+          f"\nbloated: {pages} pages, work {bloated.work:.3f}s, write max "
+          f"{bloated.write:.3f}s, migration {bloated.took:.2f}s; {bloated.phase}")
     assert pages > 60_000, pages  # the instrument: the heap IS bloated
-    assert held <= 1.0, held
-    assert held - small_held <= 0.2, (held, small_held)
-    assert write <= 1.0, write  # writes went on through the VALIDATEs
+    # the instrument: the looks saw the lock at all, on either heap
+    assert before.seen > 0 and bloated.seen > 0, (before.phase, bloated.phase)
+    assert bloated.work <= 1.0, bloated.phase
+    assert bloated.work - before.work <= 0.2, (bloated.phase, before.phase)
+    assert bloated.write <= 1.0, bloated.write  # writes went on through the VALIDATEs
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +471,7 @@ async def test_a_downgrade_that_fails_later_keeps_stamp_and_schema_together(
     so the stamp and the schema stay at head together. With an
     autocommit_block in 0037's downgrade, its undoing was committed while
     the stamp rolled back to 0037 -- the stamp ahead of the schema."""
+    await _migrate("downgrade", _0037)
     await _execute("CREATE VIEW zz_holds_email AS SELECT email FROM notifications")
     try:
         await dispose_engine()
@@ -379,9 +519,13 @@ async def test_upgrade_runs_again_after_its_stamp_was_left_behind(
     """An upgrade() with an autocommit_block commits its first part before
     alembic stamps it: when a later step of the same run fails, the stamp
     goes back to the revision before while the schema stays. Upgrading
-    again must go through, to the same schema, every constraint valid."""
+    again must go through, to the same schema, every constraint valid.
+    The database is brought to `revision` itself from head, down as well
+    as up (WK-2): with 0038 after it, "upgrade 0037" at head moved
+    nothing and the run compared head's schema with 0037's."""
     revision, previous = _revisions(path)
-    await _migrate("upgrade", revision)
+    await _migrate("upgrade", "head")
+    await _migrate("downgrade", revision)
     before = await _objects()
     await _migrate("stamp", previous)  # the stamp left behind
     await _migrate("upgrade", revision)

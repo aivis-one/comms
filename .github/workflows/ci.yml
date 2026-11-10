@@ -1,9 +1,18 @@
 # =============================================================================
 # COMMS Service -- CI (handoff item 5)
 # =============================================================================
-# Two jobs, side by side:
+# Three jobs. First, alone (CI-1):
+#   checks what reads the tree and the schema and takes seconds: ruff,
+#          mypy, the two fences, `alembic upgrade head` + `alembic
+#          check`, the suite's collection, the tree's guards -- a small
+#          mistake is red in minutes, and the two full jobs do not start.
+#          It also makes the suite's THREE PARTS (CI-2, step `parts`) and
+#          holds that together they are the whole suite, nothing twice.
+# Then, side by side, both after `checks` (needs), each in the same three
+# parts at once -- a matrix, every part run to its end:
 #   test   the suite on the runner's Python 3.12 against Postgres; schema
-#          via `alembic upgrade head`; then ruff, the fences, mypy.
+#          via `alembic upgrade head`; the slowest nodes and the time of
+#          every file printed (--durations, the junit report).
 #   image  the comms image built from the Dockerfile -- its base pinned
 #          by digest -- and the suite run INSIDE it, as the `test` verb of
 #          deploy/comms-deploy.sh does on a box: the Python and Debian the
@@ -22,12 +31,175 @@ on:
   pull_request:
 
 # THE TOKEN GETS NOTHING BY DEFAULT (TX-4): each job says what it needs,
-# and both only read the repository. tests/test_deploy_hardening.py holds
+# and every one only reads the repository. tests/test_deploy_hardening.py holds
 # every job to a `permissions` of its own.
 permissions: {}
 
 jobs:
+  # THE FAST CHECKS FIRST (CI-1): until CI-1 ruff, mypy and the fences
+  # ran after the whole suite, and a broken reference in a comment (the
+  # guard in tests/test_g2_hygiene.py) was red only at its end -- a
+  # one-line fix cost the full run. Everything here reads the tree or the
+  # schema; the guards are listed by file (a file renamed or gone is an
+  # error of pytest, red), and they stay in the full suite too.
+  checks:
+    runs-on: ubuntu-latest
+    # Its commands take ~1 min, the setup ~2 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # The pytest arguments of the three parts, read by `test` and `image`
+    # (needs.checks.outputs): made once, held once, below.
+    outputs:
+      part1: ${{ steps.parts.outputs.part1 }}
+      part2: ${{ steps.parts.outputs.part2 }}
+      part3: ${{ steps.parts.outputs.part3 }}
+
+    env:
+      APP_ENV: ci
+      DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
+      COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+      # The package from the checkout, as the image has it from /app
+      # (Dockerfile, PYTHONPATH) -- not installed (REV-5, see below).
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # No token left in .git/config: the checkout is mounted into the
+        # containers the suite runs in (REV-5).
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # Every package from the lock, hash-checked; the project itself is
+      # not installed (REV-5): `pip install -e .` built it with whatever
+      # setuptools the index served, no pin and no hash. PYTHONPATH
+      # (above) finds it, as the image does.
+      - name: Install dependencies (pinned)
+        run: pip install -r requirements.lock
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Domain-literal fence (arch doc §2.6 / decision 13)
+        run: python scripts/check_domain_literals.py
+
+      - name: Product-literal fence (arch doc #15, Release-Hardening)
+        run: python scripts/check_product_literals.py
+
+      - name: Type check (mypy)
+        run: mypy app
+
+      # Every test module imports: a syntax or import error in one is red
+      # here, not after the suite's first 3000 nodes.
+      - name: The suite collects
+        run: pytest --collect-only -q
+
+      # THE THREE PARTS (CI-2), the one place they are written. Parts 1
+      # and 2 are lists of files, by the time of each file measured in CI
+      # (the step `Suite time by file`, run #299: ~247 s and ~237 s);
+      # part 3 is every other file -- `tests` without them (--ignore),
+      # so a new test file is in part 3 by itself. Held here: the parts
+      # together collect as many nodes as the whole suite and share no
+      # file. By count and by file, not by node id: one id is made at
+      # collection from the clock (tests/test_changes_feed.py, the
+      # malformed cursor) and differs between two collections. A file
+      # of a list that is not in the tree fails its collection: red.
+      - name: The three parts are the suite
+        id: parts
+        env:
+          PART_1: >-
+            tests/test_migration_0037.py
+            tests/test_migration_0013.py
+            tests/test_migration_0038.py
+            tests/test_migration_0012.py
+            tests/test_migration_0014.py
+            tests/test_migration_0035.py
+          PART_2: >-
+            tests/test_lane_wake.py
+            tests/test_lane_jobs.py
+            tests/test_unread_index.py
+            tests/test_waiting_probe.py
+            tests/test_h9_release.py
+            tests/test_json_null.py
+        run: |
+          set -o pipefail
+          part3=tests
+          for f in $PART_1 $PART_2; do part3="$part3 --ignore=$f"; done
+          nodes() { pytest --collect-only -q "$@" | grep '::'; }
+          nodes > "$RUNNER_TEMP/whole"
+          whole=$(wc -l < "$RUNNER_TEMP/whole")
+          total=0
+          : > "$RUNNER_TEMP/files"
+          for n in 1 2 3; do
+            case $n in 1) args=$PART_1 ;; 2) args=$PART_2 ;; 3) args=$part3 ;; esac
+            # unquoted on purpose: a list of arguments
+            nodes $args > "$RUNNER_TEMP/part$n"
+            count=$(wc -l < "$RUNNER_TEMP/part$n")
+            echo "part $n: $count nodes"
+            total=$((total + count))
+            cut -d: -f1 "$RUNNER_TEMP/part$n" | sort -u >> "$RUNNER_TEMP/files"
+          done
+          echo "the whole suite: $whole nodes; the three parts: $total"
+          shared=$(sort "$RUNNER_TEMP/files" | uniq -d)
+          if [ -n "$shared" ]; then echo "in more than one part: $shared"; exit 1; fi
+          if [ "$total" -ne "$whole" ]; then echo "the parts are not the suite"; exit 1; fi
+          {
+            echo "part1=$PART_1"
+            echo "part2=$PART_2"
+            echo "part3=$part3"
+          } >> "$GITHUB_OUTPUT"
+
+      # The same step as in `test` below.
+      - name: Start Postgres (the image deploy/docker-compose.yml pins)
+        run: |
+          image=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-postgres']['image'])")
+          echo "comms-postgres image: $image"
+          docker run -d --name comms-postgres -p 5432:5432 \
+            -e POSTGRES_USER=comms -e POSTGRES_PASSWORD=comms \
+            -e POSTGRES_DB=comms_test "$image"
+          for _ in $(seq 60); do
+            if docker exec comms-postgres pg_isready -h 127.0.0.1 -U comms -d comms_test; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs comms-postgres
+          exit 1
+
+      - name: Apply migrations (alembic upgrade head)
+        run: alembic upgrade head
+
+      - name: Schema matches the models (alembic check)
+        run: alembic check
+
+      # The guards that read the tree and take seconds: references in
+      # comments, the pytest cache, SQL by shape, the fences' own tests.
+      # Not here: tests/test_g1_hygiene.py (it calls the API and races
+      # real sessions) and tests/test_hygiene_r7.py (it starts the app).
+      - name: The tree's guards
+        run: >-
+          pytest -q
+          tests/test_g2_hygiene.py
+          tests/test_fence_roots.py
+          tests/test_domain_literal_fence.py
+          tests/test_product_literal_fence.py
+
   test:
+    needs: checks
+    # THE SUITE IN THREE PARTS AT ONCE (CI-2): the arguments are the
+    # `checks` job's (step `parts`); every part runs to its end -- a red
+    # part does not cancel the others, whose defects would surface only
+    # on the next round.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     runs-on: ubuntu-latest
     # A HANG IS RED (FIX review 3.13.0, the second): the last green run's
     # suite took 931 s (~16 min with its setup) -- 40 gives ~2.5x.
@@ -42,23 +214,28 @@ jobs:
       # builds the settings before the suite's own fence runs. A test
       # value -- the suite replaces it anyway (tests/conftest.py).
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+      PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
+      # The package from the checkout, as in `checks` (REV-5).
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # No token left in .git/config: the checkout is mounted into the
+        # containers the suite runs in (REV-5).
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
-      # From the lock, so CI tests the package set the image ships --
-      # the project itself without deps, since the lock already has
-      # them and re-resolving would defeat the pin.
+      # From the lock, so CI tests the package set the image ships; the
+      # project itself is not installed -- PYTHONPATH (above), as the
+      # image (REV-5).
       - name: Install dependencies (pinned)
-        run: |
-          pip install -r requirements.lock
-          pip install -e . --no-deps
+        run: pip install -r requirements.lock
 
       # The pinned image, from deploy/docker-compose.yml. Ready is asked
       # over TCP: during initdb the image's temporary server listens on
@@ -92,31 +269,50 @@ jobs:
       - name: Schema matches the models (alembic check)
         run: alembic check
 
+      # This part of the suite (PART_ARGS); the 50 slowest nodes are
+      # printed at its end (CI-1), and every node's time goes to a junit
+      # report outside the checkout.
       - name: Run tests
-        run: pytest -q
+        run: >-
+          pytest -q --durations=50 $PART_ARGS
+          -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/suite.xml"
 
-      - name: Lint (ruff)
-        run: ruff check .
-
-      - name: Domain-literal fence (arch doc §2.6 / decision 13)
-        run: python scripts/check_domain_literals.py
-
-      - name: Product-literal fence (arch doc #15, Release-Hardening)
-        run: python scripts/check_product_literals.py
-
-      - name: Type check (mypy)
-        run: mypy app
+      # This part's time by file, from that report, the slowest first --
+      # what the split is made of. Run whether the part was green or red.
+      - name: Suite time by file
+        if: always()
+        run: >-
+          test -f "$RUNNER_TEMP/suite.xml" &&
+          python -c "import collections, sys, xml.etree.ElementTree as E;
+          t = collections.Counter();
+          [t.update({c.get('file'): float(c.get('time', 0))}) for c in E.parse(sys.argv[1]).getroot().iter('testcase')];
+          [print(f'{s:8.1f}s  {f}') for f, s in t.most_common()];
+          print(f'{sum(t.values()):8.1f}s  total')" "$RUNNER_TEMP/suite.xml"
 
   image:
+    needs: checks
+    # The same three parts as `test` (CI-2), each on its own runner with
+    # its own build of the image.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     runs-on: ubuntu-latest
-    # The image's build plus the same suite inside it.
+    # The image's build plus a part of the suite inside it.
     timeout-minutes: 45
     permissions:
       contents: read
 
+    env:
+      PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
+
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # No token left in .git/config: the checkout is mounted into the
+        # containers the suite runs in (REV-5).
+        with:
+          persist-credentials: false
 
       # Only to read the compose file (PyYAML at the lock's version).
       - name: Set up Python 3.12
@@ -124,8 +320,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # PyYAML's own stanza of the lock -- its version and its hashes, one
+      # source -- installed hash-checked (REV-5; was a bare pin).
       - name: Read the compose file's pins
-        run: pip install pyyaml==6.0.3
+        run: |
+          awk '/^pyyaml==/{on=1} on && /^[a-z]/ && !/^pyyaml==/{exit} on && !/^ *#/{print}' requirements.lock > "$RUNNER_TEMP/pyyaml.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/pyyaml.txt"
 
       # Every image the compose file pins is pulled by its digest -- a pin
       # that does not resolve (a typo, a digest withdrawn) is red here,
@@ -172,7 +372,10 @@ jobs:
       # deploy/docker-compose.yml gives comms-app (tests/test_deploy_hardening.py
       # holds both: every /app path of this step is in the image or
       # mounted, and TEMPLATES_DIR is the compose file's).
+      # Once per build is enough: in part 1 only (CI-2) -- the same image
+      # is built in each part, and the start says the same of each.
       - name: The image starts (GET /ready)
+        if: matrix.part == 1
         run: |
           token="123456789:$(printf 'A%.0s' $(seq 35))"
           docker run -d --name comms-app --network host \
@@ -209,4 +412,4 @@ jobs:
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
-            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q"
+            comms:ci sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50 $PART_ARGS"

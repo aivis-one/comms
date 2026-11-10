@@ -28,10 +28,10 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DbSession, require_service_auth
+from app.api.deps import DbSession
 from app.audience.prefs import (
     RecipientPreferences,
     get_preferences,
@@ -45,7 +45,6 @@ from app.profile.registry import registry
 router = APIRouter(
     prefix="/api/v1/recipients/{recipient_id}/preferences",
     tags=["preferences"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 
@@ -83,7 +82,11 @@ def _codes_to_iso_days(codes: list[str]) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-_TIME_RE = re.compile(r"^([01]\d|2[0-4]):([0-5]\d)$")
+# Matched WHOLE (fullmatch) and in ASCII digits (TIME-1): with match and
+# `$` a trailing newline passed ("09:00\n" -- `$` also matches before a
+# final newline), and `\d` took any script's digits ("0\u0669:00" read as
+# 09:00); both were stored as a time the product never wrote.
+_TIME_RE = re.compile(r"([01][0-9]|2[0-4]):([0-5][0-9])")
 
 
 def _minutes(value: str, field: str) -> int:
@@ -99,7 +102,7 @@ def _minutes(value: str, field: str) -> int:
     24:xx is not a time, and a period is rejected later if it starts
     at 24:00 (a start has nothing after it).
     """
-    match = _TIME_RE.match(value)
+    match = _TIME_RE.fullmatch(value)
     if match is None:
         raise ValueError(
             f"{field} must be HH:MM between 00:00 and 24:00, got {value!r}"
@@ -169,7 +172,9 @@ class PreferencesPatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    categories: dict[str, bool] | None = None
+    # StrictBool (REV-3): lax mode read "off" or 0 as false -- a mute
+    # the product never sent.
+    categories: dict[str, StrictBool] | None = None
     # None is meaningful (clear the schedule) -- presence is checked
     # via model_fields_set, not via the value. A LIST, not an object:
     # a recipient has as many allowed periods as their week needs, and

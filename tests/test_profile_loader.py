@@ -401,17 +401,16 @@ class TestLocaleFallbackChain:
 
     def test_missing_placeholder_does_not_break_send(self) -> None:
         """A variable the job does not carry does not break the send:
-        render returns None, the caller's stored-text fallback takes the
-        field, and no braces reach the person.
+        the field renders with its placeholder (TPL-1).
 
-        It asserted "B [{extra}]" -- right while SafeDict printed a
-        missing variable back as "{extra}" and the send survived that
-        way. G5 removed SafeDict: surviving is still the property, but
-        by the fallback, not by a literal."""
+        It asserted "B [{extra}]" while SafeDict printed a missing
+        variable back, then None while G5 made the stored-text fallback
+        the rule; the owner withdrew G5 -- the hole is printed again,
+        by render's own formatter, a null and a path included."""
         assert render(
             "unit_event", "telegram", "body",
             locale="en", variables={"body": "B"},
-        ) is None
+        ) == "B [{extra}]"
         assert render(
             "unit_event", "telegram", "body",
             locale="en", variables={"body": "B", "extra": "E"},
@@ -510,14 +509,21 @@ class TestFormatSpecProbing:
             variables={"user": {"name": "Zo"}},
         ) == "Hi Zo"
 
-    def test_nested_spec_passes(self, tmp_path: Path) -> None:
-        """Nested specs ({x:{width}.2f}) expand and validate."""
+    def test_nested_spec_is_refused(self, tmp_path: Path) -> None:
+        """A field inside a format spec ({x:{width}.2f}) is refused at
+        startup (TPL-1): its width would come from the letter, and a
+        width is the memory of the string comms builds.
+
+        It asserted that the template loads -- right while a nested spec
+        was a template like any other; no product profile uses one, and
+        the owner's ruling on TPL-1 put it with the oversized width."""
         root = _write_profile(
             tmp_path,
             "unit_event: {}\n",
             {"en": 'unit_event:\n  telegram:\n    body: "{x:{width}.2f}"\n'},
         )
-        load_profile(FileProfileSource(root))
+        with pytest.raises(ProfileError, match="inside the format spec"):
+            load_profile(FileProfileSource(root))
 
     def test_render_survives_attribute_access_at_runtime(self) -> None:
         """Second line of defense: a template registered PAST the

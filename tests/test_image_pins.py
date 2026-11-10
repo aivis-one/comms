@@ -106,13 +106,21 @@ class TestCiNamesNone:
                 )
 
     def test_ci_reads_postgres_from_the_compose_file(self) -> None:
+        """Every job that starts Postgres reads its image from the compose
+        file, by name: the fast checks (CI-1), the suite, the image. Until
+        CI-1 the count was 2 -- the two jobs there were."""
         text = (_WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
-        reads = re.findall(
+        read = re.compile(
             r"yaml\.safe_load\(open\('deploy/docker-compose\.yml'\)\)"
             r"\['services'\]\['comms-postgres'\]\['image'\]",
-            text,
         )
-        assert len(reads) == 2  # the suite's job and the image's job
+        assert len(read.findall(text)) == 3
+        jobs: dict[str, Any] = yaml.safe_load(text)["jobs"]
+        reading = {
+            name for name, job in jobs.items()
+            if any(read.search(step.get("run", "")) for step in job["steps"])
+        }
+        assert reading == {"checks", "test", "image"}
 
 
 class TestDependabot:

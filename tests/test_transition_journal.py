@@ -953,11 +953,14 @@ class TestAppendOnly:
             await process_pending_notifications()
         assert await _rows(nid)
         monkeypatch.setattr(settings, "notification_retention_days", 1)
+        # Created and due two days ago: retention ages a job from the
+        # later of the two (REV-2), so both go back.
+        two_days_ago = datetime.now(UTC) - timedelta(days=2)
         async with get_session_factory()() as session:
             await session.execute(
                 update(Notification)
                 .where(Notification.id == nid)
-                .values(created_at=datetime.now(UTC) - timedelta(days=2))
+                .values(created_at=two_days_ago, scheduled_at=two_days_ago)
             )
             await session.commit()
         assert await cleanup_terminal_notifications() == 1
@@ -993,9 +996,6 @@ _POINTS: dict[tuple[str, str], str] = {
     ("app/engine/service.py", "close_notifications"): _RECORDS,
     ("app/engine/service.py", "close_waiting_deliveries"): _RECORDS,
     ("app/engine/processor.py", "_record_pipeline_failure"): _RECORDS,
-    # A transient failure of the database on a step (TX-3): the gate
-    # without an attempt spent, journaled when the wait begins.
-    ("app/engine/processor.py", "_record_transient_gate"): _RECORDS,
     # A job comms could not close at the ceiling (TX-3): stuck, journaled
     # under the ceiling, no longer selected.
     ("app/engine/processor.py", "_record_stuck"): _RECORDS,
@@ -1007,18 +1007,11 @@ _POINTS: dict[tuple[str, str], str] = {
     ("app/engine/service.py", "_apply_transient_failure"): (
         "by caller: deliver_notification"
     ),
-    # The end of a transient wait (TX-3): its fields and, at zero
-    # attempts, its gate -- every caller records the transition that
-    # ends it. Its callers in this module are named here; in
-    # app/engine/processor.py _attempt_job (a step that succeeds -- its
-    # steps record), _record_pipeline_failure and _record_stuck (both
-    # classified above) call it too.
-    ("app/engine/service.py", "end_transient_wait"): (
-        "by caller: resolve_notification, rollup_notification, "
-        "close_notifications"
-    ),
     # Not a transition: the gate that let a successful attempt through
-    # is cleared; the attempt's transitions are recorded by its steps.
+    # is cleared, and a success ends the run of failures (REV-2: the
+    # count, step and error back to 0 / null -- the failures themselves
+    # stay in the journal); the attempt's transitions are recorded by
+    # its steps.
     # (The attempt moved into the lane's pass in P4-1, and into a task
     # of its own, one per job in work, in P5-L.)
     ("app/engine/processor.py", "_attempt_job"): ("not a transition"),

@@ -513,12 +513,18 @@ unit_event:
     def test_a_variable_the_type_does_not_have(
         self, base_dir: Path, overlay_dir: Path,
     ) -> None:
-        """{amount} is in no base template of unit_event. The nested
-        spec is read too. M4b."""
+        """{amount} and {width} are in no base template of unit_event:
+        both named. M4b.
+
+        It also read a nested spec ({x:{width}}) for its variables -- right
+        while a field inside a spec was a template like any other. TPL-1
+        refuses that template first, by another sentence
+        (test_the_same_leaf_checks_as_the_base holds it), so this one no
+        longer carries a spec."""
         _write(overlay_dir, "en.yaml",
-               'unit_event: {telegram: {title: "{title} {amount} {x:{width}}"}}')
+               'unit_event: {telegram: {title: "{title} {amount} {width}"}}')
         refusal = _refusal(base_dir, overlay_dir)
-        assert "uses {amount}, {width}, {x}, which the type does not have" \
+        assert "uses {amount}, {width}, which the type does not have" \
             in refusal
         assert "its variables: body, extra, title" in refusal
 
@@ -558,6 +564,7 @@ unit_event: {email: {body: "{extra[k]} {body}"}}
             ("true", "must be a string, got bool"),
             ('"{a:zzz}"', "broken format spec"),
             ('"{user.name}"', "attribute access"),
+            ('"{x:{width}}"', "inside the format spec"),
             ('"see https://example.com/x"', "external domain literal"),
         ],
     )

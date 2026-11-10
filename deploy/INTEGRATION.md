@@ -127,12 +127,40 @@ delivery is the inbox entry, which shows the `title`/`body` the product
 sent -- a template there would never be shown. Nor is there a sheet for
 `llm`: its letter is the product's own.
 
-**A variable the job does not carry is not printed.** A template field
-that names a variable absent from the job -- or a path into one that
-does not resolve, `{user[name]}` with no `user` or no `name` in it --
-does not render: the field comes out as it does with no template for
-it (see "What it can change" under `PROFILE_OVERLAY_DIR` below, and
-"What email reads from the profile" in §3a).
+**A variable the job does not carry is printed as its placeholder.** A
+template field that names a variable absent from the job, a path into
+one that does not resolve (`{user[name]}` with no `user` or no `name` in
+it), or a variable that is `null` prints its path in braces --
+`{paid_amount}`, `{user[name]}` -- where its value would stand; the rest
+of the letter renders as usual, in every field: the telegram title,
+body and button, the email subject and body. The job is accepted and
+the letter goes: the channel's `accepted` row in the job's path names
+the paths (`template_unresolved`, section 8). A type with no template
+for a field still takes the stored title or body you sent -- your own
+text, not a hole in one (see "What it can change" under
+`PROFILE_OVERLAY_DIR` below, and "What email reads from the profile" in §3a).
+
+**What a template field may not do.** The start refuses a template that
+takes an attribute of a variable (`{user.name}`, `{x.__class__}` -- use
+`{user[name]}`), puts a field inside a format spec (`{amount:{width}}`),
+or asks a width or a precision above 4096 (`{x:99999999}`).
+
+**What else the start refuses in the templates.** A text that is blank
+(`""`, or spaces only) in `templates/{locale}.yaml` -- leave the field out
+instead, and the letter takes your own title and body (the default label
+for a button). A telegram title and body whose HTML Telegram would not
+parse, checked together as they are sent, for a recipient of every
+locale of the profile -- each field by the chain the send walks (the
+recipient's locale, then `DEFAULT_LOCALE`), and a variable standing as a
+value with a link's characters -- a tag Telegram does not support
+(`<div>`, `<br>`), one left open or closed out of order, a raw `<`
+(write `&lt;`), a variable in an unquoted attribute (`<a href={link}>`
+-- quote it): every letter of the type would be refused. An entry
+in `templates/` that is not a `<locale>.yaml` file (`en.yml`, a
+directory); a hidden entry (`.gitkeep`, `.DS_Store`) is skipped. No
+`templates/` at all is a profile whose letters come as
+you write them; a directory beside `types.yaml` and `templates/` is only
+logged (`profile_unknown_directory`) -- the start goes on.
 
 It is delivered by BIND, not by a copy: the product installer writes
 `PROFILE_DIR=/opt/velo/repo/comms-profile` into `/opt/comms/.env` on
@@ -170,13 +198,24 @@ fields further, and do not repeat them.
 | `lane` | one of `interactive`, `critical`, `normal`, `bulk` | `normal` | the lane its jobs travel in (`lane`, below) |
 | `push_on` | one of `outcome`, `outcome_and_deferral`, `none` | `none` | what comes back on the push stream (section 10) |
 | `recipient_schedule` | one of `respect`, `bypass` (not on an llm type) | `respect` | whether its deliveries wait for the recipient's allowed periods (`recipient_schedule`, below) |
-| `expires_after` | a duration: a whole number and `s`, `m`, `h` or `d` -- `30s`, `15m`, `24h`, `7d` | none | how long a request of the type stays deliverable; a request's own `expiry_at` wins (section 7) |
+| `expires_after` | a duration: a whole number and `s`, `m`, `h` or `d` -- `30s`, `15m`, `24h`, `7d`; at most `3650d` | none | how long a request of the type stays deliverable; a request's own `expiry_at` wins (section 7) |
 | `retry_max_attempts` | an integer, 1..100 | the deploy's `NOTIFICATION_MAX_DELIVERY_ATTEMPTS` | how many times one delivery is attempted -- a number, never a condition |
 | `retry_backoff_seconds` | an integer, 0..86400, not above the deploy's `NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS` | the deploy's `NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS` | the first wait between attempts, in seconds (0 = none); the waits grow from it up to that cap |
 | `max_body_chars` | an integer, 1..5000 (not on an llm type) | `5000` | the longest body a request of the type may carry; a longer one is refused at intake |
 | `llm_sets` | a list of key set names defined in `LLM_KEY_SETS` (the llm kind only, required there) | none | the key sets the model call goes through, in order (section 11) |
 | `answer_keep` | a duration, as `expires_after`, not longer than `NOTIFICATION_RETENTION_DAYS` (the llm kind only) | `24h` | how long the model's answer is kept after it came (section 11) |
 | `max_audio_bytes` | an integer, 1..20971520 (the llm kind only) | `2097152` | the largest audio body a job may link to, in bytes as fetched (section 11) |
+
+**A telegram letter has Telegram's limits.** `max_body_chars` bounds the
+body a request carries; Telegram bounds the whole text it is sent -- the
+title, the body and the template's own text together: at most 4096 characters
+once its markup is read (an emoji is one character, a tag none, `&amp;`
+one), at most 32768 bytes as sent, and not empty once read. A letter
+certain to be past one of them is `failed`, `message_rejected` on its first
+attempt, Telegram not asked; the delivery's text names the size and the
+limit, never the letter. A letter Telegram itself refuses for the same
+reasons is `failed`, `message_rejected` on that attempt too -- never
+retried until it expires.
 
 ### `PROFILE_OVERLAY_DIR` -- the text overlay
 
@@ -420,8 +459,10 @@ sender address -- and all three must be set together or left empty
 together. The sender has no default because it is a product fact; a
 default would make an incomplete set look complete. It accepts either a
 bare address or the display form `Name <address>`, since a signed
-sender delivers better, and a value carrying a line break is refused at
-startup.
+sender delivers better -- in the env file the display form only in
+quotes (`EMAIL_FROM_ADDRESS="Comms <noreply@example.com>"`): the file is
+read by `source`, and an unquoted `<` is a redirection there. A value
+carrying a line break is refused at startup.
 
 The provider region is different in kind: it has a default, so
 "unset" and "set to the default" cannot be told apart, and it therefore
@@ -440,6 +481,18 @@ the first refusal the provider attributes to configuration rather than
 to the message is logged as `email_channel_not_viable`, once, naming
 the channel; the messages after it are ordinary per-message lines, so a
 dead channel is a signal instead of a thousand identical entries.
+
+**What the provider's answer means.** For each email, by the provider's
+status: any `2xx` is its acceptance -- the delivery is `sent` (accepted is
+not delivered; what happens after is the provider's). `401`, `402`, `403`,
+and a `400` or `404` whose JSON message names the sender -- a domain the
+provider does not have (`404`, "Domain not found"), one not verified, a
+sender outside it -- are the channel: `failed`, `configuration`, logged as
+above. `429` waits the provider's `Retry-After`, or is retried without
+one; `408` and `5xx` are retried. A redirect (`3xx`) is the channel too:
+`EMAIL_API_BASE_URL` is not the provider's API. Every other answer -- a
+`400` on the recipient, a `404` that names no sender -- is this email:
+`failed`, `message_rejected`.
 
 **What email reads from the profile.** Its own fields under its own
 channel: `{type: {email: {subject, body}}}`. Nothing new enters the
@@ -540,15 +593,17 @@ body, with a class a program can branch on:
 
 | status | class | when |
 |---|---|---|
-| 401 | `unauthorized` | the service token is missing or wrong |
+| 400 | `bad_request` | the request could not be read -- a body that is not UTF-8 JSON, or one nested deeper than its JSON can be read on a route that takes a body model; any other client status this table does not list travels with this class too. Fix the request; repeating it changes nothing |
+| 401 | `unauthorized` | the service token is missing or wrong -- asked first, on every path but `/health` and `/ready`, before anything of the request is read: without it an unknown route, another method, a body of any size or shape is this 401 too |
 | 403 | `forbidden` | the actor has no role in this thread |
-| 404 | `not_found` | the entity or the route does not exist |
-| 405 | `method_not_allowed` | the route exists, the method does not |
+| 404 | `not_found` | the entity or the route does not exist (a route: with the token) |
+| 405 | `method_not_allowed` | the route exists, the method does not (with the token) |
 | 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator, or changed by another call while it was being assigned or released (section 14) |
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
-| 422 | `validation` | the input is wrong; `fields` names each input |
+| 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
+| 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read on a route that takes no body model -- on one that does, the framework answers `400` `bad_request` (above) |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
 
@@ -577,7 +632,10 @@ the changes feed -- takes `limit` (1..100, default 20) and `cursor`
 `{"items": [...], "next_cursor": "<opaque>" | null}`; the inbox adds its
 `unread` badge beside them, and the changes feed's `next_cursor` is
 never `null` (section 9). A `limit` outside 1..100 is **refused**
-(422), not clamped, and so is a malformed cursor.
+(422), not clamped, and so is a malformed cursor -- anything comms did
+not hand out: a cursor of another listing, one whose time lost its
+zone, one whose number is past the 64-bit range. The refusal names
+the cursor, never its value.
 
 **A query key given twice is refused**, on every route: 422
 `validation`, naming the key. `?limit=5&limit=500` is not read as its
@@ -590,14 +648,16 @@ never meaningful. Build the query from a mapping, one value per key.
 same key with the same request -- method, path with its query, body
 bytes -- answers with the SAME thread or message in its current state,
 and pings nobody again; the same key with another request is a 409
-`conflict`. Every other mutating call is safe to repeat by
+`conflict`. This holds when two requests with one key race as well: the
+one that loses the insert answers as the creating request (`created:
+true`, the same thread) or, with another body, the 409. Every other mutating call is safe to repeat by
 construction, so it takes no key:
 
 | call | why a repeat is safe |
 |---|---|
 | `PUT /recipients/{id}` | a versioned snapshot: the version is its key |
 | `DELETE /recipients/{id}` | forgetting twice is forgetting once |
-| `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to, 409 for anyone else |
+| `POST /threads/{id}/claim` | answers "is it yours now": `claimed: true` for the operator it belongs to -- even after the roster has dropped them since; a user thread is never claimed (403) --, 409 for anyone else |
 | `POST /threads/{id}/assign` | answers "whose is it now": a thread already with that assignee is returned as it is |
 | `POST /threads/{id}/release` | a thread already in the pool is returned as it is |
 | `DELETE /threads/{id}` | a thread that is not there -- never was, or already deleted -- is answered as one deleted: 204 |
@@ -646,7 +706,12 @@ they were part of stay: a conversation belongs to both sides, and what
 happens to message bodies -- and to their variants (section 12) -- is
 the product's decision. That decision is a thread at a time: deleting a
 thread (section 14) removes every message in it, whoever wrote it. A deletion is
-final -- a person who returns gets a new id in the product. A
+final -- a person who returns gets a new id in the product. One copy is
+not forgotten: the fields of the address book kept in a dead letter
+(`<COMMS_EVENTS_STREAM>:dlq`, "How long comms keeps things") stay there
+-- the products hide a person rather than erase them and comms follows
+them, and that stream is for an investigation by hand, capped by
+`DLQ_MAXLEN` and trimmed. A
 recipient deactivated or deleted after a job was resolved is not sent
 to either: their delivery ends `recipient_inactive`, which is neither a
 failure nor a mute.
@@ -845,6 +910,11 @@ would store the opposite of what the person chose.
 - `schedule` -- FULL REPLACE when present; `null` clears it; omitted,
   it is left untouched.
 - An unknown key -- `timezone` included -- is a 422, never ignored.
+- A PATCH that writes anything -- a toggle, a schedule, `null` -- for a
+  recipient you deleted (`user_deleted`, `DELETE /recipients/{id}`) is a
+  409 `recipient_deleted`, and nothing is written: a deleted person has
+  no preferences. A deletion that lands while a PATCH is in flight
+  waits for it and then forgets what it wrote.
 
 A period:
 
@@ -853,6 +923,11 @@ A period:
 | `day` | `mon` `tue` `wed` `thu` `fri` `sat` `sun` | one day per period |
 | `from` | `HH:MM`, `00:00`..`23:59` | the start |
 | `to` | `HH:MM`, up to `24:00` | after `from` on the same day; `24:00` = end of the day |
+
+`HH:MM` is exact: two digits `0`-`9`, a colon, two digits -- nothing
+before or after it (`"09:00\n"`, `"09:00 "` are refused) and no other
+script's digits; hour 24 only as `24:00`, only in `to`. Anything else
+is a 422 `validation` naming `from` or `to`.
 
 A list is refused (422) when it is empty -- send `null` to clear --
 or when two periods of one day overlap or touch: one stretch is one
@@ -890,12 +965,12 @@ never interprets.
 | `type` | required | envelope | declared by the profile; the profile routes it to its channels |
 | `target_type` | by type | envelope | `user` \| `group` \| `all` -- required for a type delivered to people, refused for an llm type (section 11) |
 | `target_value` | by type | envelope | a recipient uuid, a group key, or `*`, matching `target_type`; with `target_type` or not at all |
-| `scheduled_at` | optional | envelope | ISO 8601 with a zone -- "not before" |
+| `scheduled_at` | optional | envelope | ISO 8601 with a zone -- "not before"; at most 3650 days ahead of the intake, refused under the key past that |
 | `expiry_at` | optional | envelope | ISO 8601 with a zone; in the future and after `scheduled_at`; wins over the profile's `expires_after` |
 | `correlation` | optional | envelope | string, 1..200 -- the product's own reference, stored untouched (see below) |
 | `title` | by type | letter | 1..500 -- the stored fallback; templates override it at delivery. Required for a type delivered to people, refused for an llm type |
 | `body` | by type | letter | 1..5000; as `title` |
-| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters), every other key a scalar template variable; refused for an llm type |
+| `action_data` | optional | letter | a JSON object: `action` (the deep-link intent), `params` (scalar deep-link parameters; one whose value is `null` is no parameter -- the telegram link is built as if it were absent), every other key a scalar template variable; at most 65536 bytes as compact UTF-8 JSON, the whole object; refused for an llm type |
 | `llm` | by type | letter | the model's letter (section 11) -- required for an llm type, refused for any other |
 | `email` | optional | letter | your own email, sent as it is (section 3a, "Your own email"): an object of `subject` (1..500, one line: no `\r` or `\n`), `text` (1..64000) and an optional `html` (1..256000, or absent, or `null`); none of them blank (only whitespace); no other key; `null` is no block. Only for a type with `email` among its channels -- refused for any other, an llm type included. One block per job: every recipient of the job gets the same email |
 | `llm_audio` | optional | envelope | the signed link to the letter's audio body, and its format (section 11) -- an llm type only |
@@ -931,11 +1006,22 @@ writers emit them), a literal past the float range (`1e309`), an
 integer of more than 4300 digits -- is rejected naming the field; so
 is `data` nested deeper than 64 levels (the `data` object itself the
 first), and a `scheduled_at` or `expiry_at` that lies, in UTC, before
-the year 1 or after 9999 (the year 1 at `+01:00`, say). A request is
-rejected under its key whenever the key can be read. Data that cannot
-be read at all -- broken JSON, a nesting past what the reader can
-follow -- leaves no key, and the request goes to the dead-letter
-stream.
+the year 1 or after 9999 (the year 1 at `+01:00`, say). A request
+refused for what it holds is rejected under its key whenever the key
+can be read. Data that cannot be read at all -- broken JSON, a nesting
+past what the reader can follow -- leaves no key, and the request goes
+to the dead-letter stream. So does a request whose key can be read but
+whose handling failed -- transient failures past the retries while the
+database answers, or an error no retry mends: this version of comms
+gives it no outcome under its key, and the product sees that absence (a
+read by the key finds no job).
+
+**The size of an entry.** An entry whose `data` is larger than 4194304
+bytes (4 MiB) is refused for its size before any of it is read, and goes
+to the dead-letter stream with that reason, naming the field and the
+limit; the dead letter keeps its size and fingerprint, not its data.
+The number sits above the largest entry the field limits of this
+section allow (an email job at its limits, about 1.3 MB in UTF-8).
 
 **What intake answers.** A request is decided the moment it is read:
 
@@ -1068,7 +1154,11 @@ already delivered.
 | `operator_id` | the operator's user uuid; `user_upserted` comes first |
 | `member` | `true` adds the operator to the section, `false` removes them |
 
-Idempotent both ways. The section may arrive before any thread is
+Idempotent both ways. The first `member: true` declares the section's
+roster, for good: from then on only its members serve it, and once you
+remove them all nobody does ("Serves the section", section 14). A
+`member: false` for somebody who was never on the roster declares
+nothing. The section may arrive before any thread is
 opened in it: operators are hired before anybody writes in. An operator
 comms has not been told about yet is retried, the same lag
 `group_changed` has.
@@ -1105,7 +1195,8 @@ non-ASCII all survive. One trap: a `+` sent **unencoded** reads as a
 space; encode it as `%2B` (every standard query encoder does).
 
 **Answers.** The same service token as every route (401 without it).
-`key` empty, missing or longer than 200 -> 422 `validation`. The
+`key` empty, missing, longer than 200 or holding a NUL (`%00`, which
+no accepted key holds -- intake refuses it) -> 422 `validation`. The
 deliveries and path pages take `limit` and `cursor` like every listing
 (section 5); a cursor from one listing is refused by the other (422).
 
@@ -1206,10 +1297,10 @@ job's outcome, within `keep_until`.
 
 | field | value |
 |---|---|
-| `attempts` | failed pipeline attempts; 0 when none. A transient failure of comms' own database (a deadlock, a lost connection, a restart) is not counted |
-| `step` | the step of the last counted failure: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null`. A transient failure of comms' database is not one |
-| `error` | the class and the place of the last counted failure, or `null` |
-| `retry_at` | when the job is tried again, or `null`. With `attempts` 0 it is a wait on a transient failure of comms' database; that wait is recorded in the job's path, one row per wait |
+| `attempts` | failed pipeline attempts **in a row**; 0 when none. An attempt that succeeds ends the run: `attempts` goes back to 0, `step` and `error` to `null` -- every failure stays in the job's path (`by-key/path`). The ceiling (`NOTIFICATION_MAX_PIPELINE_ATTEMPTS`) is of failures in a row: a long send in portions is not closed by a few failures spread over it. A transient failure of comms' own database (a deadlock, a lost connection, a restart) counts while that database answers; while it does not answer, nothing is counted or written |
+| `step` | the step of the last failure of the current run: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
+| `error` | the class and the place of the last failure of the current run, or `null` |
+| `retry_at` | when the job is tried again after its last counted failure, or `null`; never with `attempts` 0 |
 
 **A job STUCK at the ceiling.** A job whose `attempts` equal comms' ceiling
 (`NOTIFICATION_MAX_PIPELINE_ATTEMPTS`) while its `status` is not an
@@ -1254,24 +1345,23 @@ One row per transition, in order.
 | `outcome` | the status after it; for `channel`: `accepted`, `refused`, `rate_limited`, `transient`, `timeout`, `error`; for `gate`: `suppressed` |
 | `recipient_id` | for `delivery`, `channel`, `gate`; else `null` |
 | `channel` | for `delivery`, `channel`; else `null` |
-| `attempt` | the attempt number |
+| `attempt` | the attempt number: on a `delivery` or `channel` row, the delivery's; on a `job` row, the job's pipeline failures in a row at that row -- a failure's row carries its number in its run, which starts again at 1 after an attempt that succeeded |
 | `wait_reason` | a wait: the delivery's, or `pipeline_retry` for the job; else `null` |
 | `wait_until` | until when, or `null` |
 | `failure_class` | as on a delivery, or `null` |
 | `category` | the category a mute gate decided by, or `null` |
 | `error` | an exception of comms' own: class and place, never its text; or `null` |
 | `provider_text` | the provider's answer, sanitized; `null` when it said nothing or its recipient was forgotten |
+| `template_unresolved` | on a `channel` row with `accepted`: the template's paths that did not resolve in the letter the channel took, as the template writes them (`["paid_amount", "user[name]"]`), their placeholders in the letter; `null` when every field resolved, and on every other row |
 
-**A wait on a transient failure of comms' database is one row, not one
-per retry.** Such a failure does not spend an attempt; the job waits
-behind its retry gate (`wait_reason: pipeline_retry`) and is tried again.
-Its row in the path -- the step, the failure's class and place,
-`wait_until` -- is written when the wait begins, and again only when the
-step or the failure's class changes within it. The job's `pipeline`
-(`attempts`, `step`, `error`) keeps the counted failures only; a wait
-leaves them as they were. A step that succeeds ends the wait,
-and so does an ordinary failure: the next transient failure begins a new
-wait, with a row of its own.
+**A transient failure of comms' database.** While comms' database
+answers, such a failure -- a deadlock that keeps coming back, say -- is
+a failure like any other: an attempt is counted, its row in the path
+carries the step, the class and the place and `wait_until`, and at the
+ceiling the job gets its outcome -- the ceiling of failures in a row
+(`attempts` above). While the database does not answer, nothing can be
+written: the job keeps its state, no attempt is counted, and comms
+takes it again once the database is back.
 
 ## 9. What changed since a cursor
 
@@ -1599,9 +1689,14 @@ and to ask again with a new letter, under a new key.
 
 **A failure is the transport's only,** and only then is the NEXT set of
 the list asked, in the same call: the status of the response (401, 402,
-403, 404 -- the set is wrong; 429; 408, 409, 5xx), a failure the
+403, 404 -- the set is wrong, except a 403 that declines the request on
+a policy -- a moderation flag, a guardrail, a content filter, read from
+the provider's `error.metadata` -- which is this request's; 429; 408,
+409, 5xx), a failure the
 provider puts inside a 200 (an `error` object), an answer that is not a
-chat completion, no answer in time. A request the provider refuses
+chat completion, an answer larger than 4194304 bytes (by its
+`Content-Length`, or counted while reading -- read no further), no
+answer in time. A request the provider refuses
 (another 4xx) goes to the next set too. When every set failed:
 
 | the sets | the delivery |
@@ -1861,11 +1956,20 @@ operator from its own session and never forwards one the user sent.
 | `POST /threads/{id}/status` | `operator`, `status` | the thread's assignee; on a section thread also an operator who serves its section | `<thread>` |
 | `POST /threads/{id}/retag` | `operator`, `section`, `subject_type`, `subject_id` | as for `status` | `<thread>`, back in the new section's pool (section 5) |
 
-"Serves the section": a section with members declared
-(`section_membership_changed`, section 7) is served by its members; a
-section with none declared is served by every operator. The thread's
+"Serves the section": a section whose roster was declared
+(`section_membership_changed` with `member: true`, section 7) is served
+by its members, and a section whose operators were all removed is served
+by nobody -- its pool shows to nobody, nobody may claim it, and a new
+message in it pings nobody; a section whose roster was never declared
+is served by every operator, as before any roster existed. The thread's
 assignee may act on it even after leaving the roster -- whoever took a
-conversation can finish it or hand it on.
+conversation can finish it or hand it on. A section emptied before comms
+3.14.0 has no record of its roster and is served by every operator until
+you declare a member of it again.
+
+The right is decided when the call writes: an operator removed from the
+roster while their call is in flight either acted before the removal or
+gets 403 -- the removal never lands between the check and the write.
 
 ### Handing a ticket over -- `assign` and `release`
 
@@ -2114,8 +2218,14 @@ too. A model's answer is kept by its type.
 
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is
-  removed by the worker's retention pass after that many days. Nothing
-  is removed while a delivery is still pending.
+  removed by the worker's retention pass after that many days, counted
+  from the later of its creation and its `scheduled_at` -- a job sent
+  late lives its days from when it was due -- except a `cancelled` one,
+  counted from its creation: a cancel is the one outcome a job can
+  reach before it is due, and a reminder cancelled years ahead is not
+  kept for those years. Nothing is removed while a delivery is still
+  pending, nor while a push of the job (section 10) is still owed --
+  it goes once comms has published it.
 - **A model's answer** (section 11): the type's `answer_keep`, default
   **24h**, counted from the answer; the letter it answered, and the
   link to its audio body, are deleted at the job's outcome; the body
@@ -2150,13 +2260,26 @@ retain its own copy: comms is the delivery service, not the archive.
 says so; every other field of the entry, and every other key of its
 `data`, is dropped and only its NAME is listed.
 
+A dead letter is bounded in bytes as well, and is written whatever came
+in: only what it holds is cut. Lengths are of the form written -- JSON
+with every non-ASCII character escaped, so a character is a byte. A
+value of `data` longer than **2048** is not kept, its key is dropped by
+name; an `event` longer than **128** bytes is not kept, `event` is
+dropped by name; `_dlq_dropped` lists the first **20** names in sorted
+order, each at most **128** long as JSON, and `_dlq_dropped_more` counts
+the names it does not list. `_dlq_error` is at most 2000 characters --
+up to 8000 bytes in UTF-8. Every value a valid event sends fits, but a
+`reminder_cancel` `types` list of many keys. A dead letter is then
+about 25 KB at most, about 250 MB at the default `DLQ_MAXLEN`.
+
 | field | what it holds |
 |---|---|
-| `event` | the entry's event name as sent; absent when the entry had none, or it was not UTF-8 |
-| `_dlq_data` | a JSON object of the keys of `data` the event's own field set names (section 7): for `notification_request` the frame and the envelope without `llm_audio` -- the signed link to a person's voice (section 11); for the other events their fields. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
+| `event` | the entry's event name as sent; absent when the entry had none, or it was not UTF-8, or longer than 128 bytes |
+| `_dlq_data` | a JSON object of the keys of `data` the event's own field set names (section 7): for `notification_request` the frame and the envelope without `llm_audio` -- the signed link to a person's voice (section 11); for the other events their fields; a key whose value is longer than 2048 as JSON is left out. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
 | `_dlq_data_fingerprint` | the SHA-256 of the `data` bytes as sent -- the digest a rejection at intake records; absent without `data` |
 | `_dlq_data_bytes` | the length of those bytes; absent without `data` |
-| `_dlq_dropped` | a JSON list of the names of everything not kept: a field of the entry by its name, a key of `data` as `data.<key>`, the whole of `data` as `data`; `[]` when nothing was |
+| `_dlq_dropped` | a JSON list of the names of everything not kept: a field of the entry by its name, a key of `data` as `data.<key>`, the whole of `data` as `data`; sorted, the first 20 of those at most 128 long as JSON; `[]` when nothing was |
+| `_dlq_dropped_more` | how many names of what was not kept the list leaves out -- past the first 20, or longer than 128; `0` when it lists them all |
 | `_dlq_error` | why: comms' own refusal (it names fields and the address, never the letter), or the class and the place of the failure -- never an exception's text |
 | `_dlq_attempts` | the attempts made; `0` -- refused as it was read |
 | `_dlq_source_entry_id` | the entry's id in the stream it came from |

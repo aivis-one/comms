@@ -76,7 +76,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from html import escape
+from html import escape, unescape
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 
 import structlog
@@ -93,10 +93,11 @@ from app.core.channels import (
     evaluate_channels,
 )
 from app.core.config import Settings, settings
-from app.core.sanitize import sanitize_error, sanitize_text, sanitized_traceback
+from app.core.constants import MAX_LLM_ANSWER_BYTES
+from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
 from app.engine.constants import DeliveryChannel
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.template_engine import render, resolve_flag
+from app.engine.template_engine import RenderedField, render_field, resolve_flag
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -178,6 +179,26 @@ class LLMTransientError(Exception):
     answer, set by set, as the journal records it."""
 
 
+@dataclass(frozen=True)
+class Sent:
+    """A letter the channel took, rendered from a template in which some
+    fields did not resolve (TPL-1): their paths, the template's text --
+    never a value of the letter. Truthy, like the True it stands for."""
+
+    unresolved: tuple[str, ...]
+
+
+def sent_letter(rendered: Sequence[RenderedField | None]) -> bool | Sent:
+    """What a channel returns for a letter it sent: True, or Sent with
+    every path that did not resolve in its fields, once, in order."""
+    unresolved: list[str] = []
+    for field_ in rendered:
+        for path in () if field_ is None else field_.unresolved:
+            if path not in unresolved:
+                unresolved.append(path)
+    return Sent(tuple(unresolved)) if unresolved else True
+
+
 class ChannelFormatter(Protocol):
     """Protocol for channel-specific notification delivery."""
 
@@ -186,7 +207,7 @@ class ChannelFormatter(Protocol):
         notification: Notification,
         delivery: NotificationDelivery,
         recipient: Recipient,
-    ) -> bool:
+    ) -> bool | Sent:
         """Attempt to deliver a notification via this channel.
 
         Args:
@@ -195,7 +216,12 @@ class ChannelFormatter(Protocol):
             recipient: The recipient (telegram_id, email, locale).
 
         Returns:
-            True if delivery succeeded, False otherwise.
+            True if delivery succeeded, False otherwise -- or Sent: the
+            letter went, and fields of its template did not resolve
+            (TPL-1; the service writes their paths with the channel's
+            answer). Two forms on purpose: a channel without templates
+            (in_app) and every stand-in that returns True stay what they
+            are, and Sent is truthy wherever the answer is only "sent".
 
         Raises:
             PermanentDeliveryError: If delivery failed permanently.
@@ -303,7 +329,101 @@ _PERMANENT_ERRORS = frozenset({
     # Review 1.2: the button URL is built from immutable action_data --
     # an invalid URL is deterministic, retrying cannot fix it.
     "button_url_invalid",
+    # CH-1: the letter itself does not fit, and no retry changes it. The
+    # descriptions as the Bot API sends them (tdlib/telegram-bot-api,
+    # Client.cpp fail_query_with_error: "Bad Request: " and the first
+    # letter lowered), and as aiogram raises them (TelegramBadRequest,
+    # "Telegram server says - <description>"):
+    #   - more characters than message_text_length_max once the markup
+    #     is read -- TDLib MessageContent.cpp, "Message is too long";
+    "message is too long",
+    #   - nothing but whitespace once the markup is read -- TDLib
+    #     MessageEntity.cpp fix_formatted_text, "Text must be non-empty".
+    #     ("message text is empty" is the Bot API's answer to an EMPTY
+    #     raw text, which comms never sends: the title and the body are
+    #     joined by "\n\n");
+    "text must be non-empty",
+    #   - more than 1 << 15 bytes as sent -- Client.cpp
+    #     get_formatted_text, "Text is too long".
+    "text is too long",
 })
+
+# THE TELEGRAM LETTER'S LIMITS (CH-1), checked before the call
+# (TelegramFormatter.deliver): what is certain not to fit is refused
+# without asking Telegram, with its size and the limit, never its text.
+#
+# KNOWN CEILING -- the limits are Telegram's, copied here.
+#   1. Mechanics: TELEGRAM_MAX_TEXT_CHARS is the server option
+#      message_text_length_max (TDLib OptionManager.cpp, default 4096)
+#      and TELEGRAM_MAX_TEXT_BYTES the Bot API's 1 << 15 (Client.cpp
+#      get_formatted_text). If Telegram raises either, comms refuses
+#      letters Telegram would now take; if it lowers either, the letters
+#      between go to Telegram and come back refused -- the answers above
+#      make that a message_rejected on the first attempt.
+#   2. Status: acknowledged by design.
+#   3. Task: none -- the Bot API does not report the option to a bot.
+#   4. Unfreeze trigger: a Telegram delivery refused here while the same
+#      text goes through the Bot API by hand, or a "message is too long"
+#      answer for a letter this check let through by more than the
+#      lower-bound gap described in telegram_text_length.
+#   5. Agreed fix: the new numbers here, and the paragraph in
+#      deploy/INTEGRATION.md with them (tests/test_telegram_letter_limits.py
+#      holds the two equal).
+#   6. Rejected: refusing at profile load a telegram type whose
+#      max_body_chars is above the limit (the template adds text, so it
+#      proves nothing, and every profile without max_body_chars -- 5000
+#      by default -- would refuse the start); splitting a long letter
+#      into several messages (how a text is cut is the product's call).
+TELEGRAM_MAX_TEXT_CHARS = 4096
+TELEGRAM_MAX_TEXT_BYTES = 1 << 15
+# A tag of the HTML parse mode; a quoted attribute may hold ">".
+_TELEGRAM_TAG_RE = re.compile(r"<(?:[^>\"']|\"[^\"]*\"|'[^']*')*>")
+# What TDLib deletes from a text (tdutils misc.cpp clean_input_string):
+# \r, U+2028..U+202E, and the combining U+0333, U+033F, U+030A ...
+_TELEGRAM_DROPPED_RE = re.compile("[\r\u2028-\u202e\u0333\u033f\u030a]")
+# ... and the control characters it turns into a space (\n stays).
+_TELEGRAM_CONTROL_RE = re.compile("[\x00-\x09\x0b\x0c\x0e-\x1f]")
+
+
+def _telegram_read_text(text: str) -> str:
+    """The text as Telegram is left with once the markup is read and the
+    text cleaned -- before trimming: tags out, entities in (unescape
+    reads every entity Telegram reads, and more), the dropped characters
+    out, the control characters a space."""
+    read = unescape(_TELEGRAM_TAG_RE.sub("", text))
+    return _TELEGRAM_CONTROL_RE.sub(" ", _TELEGRAM_DROPPED_RE.sub("", read))
+
+
+def telegram_text_length(text: str) -> int:
+    """A LOWER BOUND of the characters Telegram counts for `text` (code
+    points, TDLib utf8_length -- not UTF-16): every step can only make
+    it shorter than Telegram's count -- str.strip trims a superset of
+    the spaces and newlines Telegram trims, and an entity Telegram does
+    not know stays longer there. So a count above the limit is certain,
+    and a letter refused for it is one Telegram refuses too; the gap
+    goes to Telegram and its own answer (_PERMANENT_ERRORS)."""
+    return len(_telegram_read_text(text).strip())
+
+
+def _telegram_text_refusal(text: str) -> str | None:
+    """Why Telegram is certain to refuse `text`, as sizes and limits, or
+    None. Empty: nothing but spaces and newlines once read -- what
+    Telegram trims and then finds nothing."""
+    if not _telegram_read_text(text).strip(" \n"):
+        return "telegram: the text is empty once its markup is read"
+    size = len(text.encode("utf-8"))
+    if size > TELEGRAM_MAX_TEXT_BYTES:
+        return (
+            f"telegram: the text is {size} bytes as sent, "
+            f"the limit is {TELEGRAM_MAX_TEXT_BYTES}"
+        )
+    length = telegram_text_length(text)
+    if length > TELEGRAM_MAX_TEXT_CHARS:
+        return (
+            f"telegram: the text is at least {length} characters once its "
+            f"markup is read, the limit is {TELEGRAM_MAX_TEXT_CHARS}"
+        )
+    return None
 
 
 # Deep-link encoding limits (Phase 3a item 3, arch doc §2.6).
@@ -362,7 +482,8 @@ class TelegramFormatter:
 
         Args:
             action_data: {"action": "open_thread",
-                          "params": {"thread_id": "<uuid>"}}
+                          "params": {"thread_id": "<uuid>"}}; a param
+                whose value is null is treated as absent.
 
         Returns:
             Deep link URL, or None when there is nothing to link
@@ -379,7 +500,14 @@ class TelegramFormatter:
         if not action:
             return None
 
-        params = action_data.get("params") or {}
+        # A parameter whose value is null is no parameter (TPL-1): it is
+        # dropped BEFORE the count, so {"x": null} links like an action
+        # without params, never as `{action}__None`.
+        params = {
+            key: value
+            for key, value in (action_data.get("params") or {}).items()
+            if value is not None
+        }
         if len(params) > 1:
             # The refusal names counts and limits, never a value of the
             # letter: its text is kept as the answer of this call in the
@@ -414,7 +542,7 @@ class TelegramFormatter:
         notification: Notification,
         delivery: NotificationDelivery,
         recipient: Recipient,
-    ) -> bool:
+    ) -> bool | Sent:
         """Send a Telegram message to the recipient.
 
         COMPOSITION RULE (Phase 3a item 2): the markup source follows
@@ -468,34 +596,44 @@ class TelegramFormatter:
             else settings.default_locale
         )
 
-        rendered_title = render(
+        # A placeholder (TPL-1) enters ParseMode.HTML too: escaped like a
+        # value, so a path cannot open a tag.
+        rendered_title = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.TELEGRAM,
             field="title",
             locale=locale,
             variables=variables,
+            escape=escape,
         )
         # Markup follows the content source (see docstring): only the
         # stored-fallback title gets the service-supplied <b> wrap.
         title = (
-            rendered_title
+            rendered_title.text
             if rendered_title is not None
             else f"<b>{escape(notification.letter_text()[0])}</b>"
         )
-        rendered_body = render(
+        rendered_body = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.TELEGRAM,
             field="body",
             locale=locale,
             variables=variables,
+            escape=escape,
         )
         body = (
-            rendered_body
+            rendered_body.text
             if rendered_body is not None
             else escape(notification.letter_text()[1])
         )
+        rendered = [rendered_title, rendered_body]
 
         text = f"{title}\n\n{body}"
+        # CH-1: a letter certain not to fit is refused here, Telegram not
+        # asked -- the refusal is sizes and limits, never the letter.
+        refusal = _telegram_text_refusal(text)
+        if refusal is not None:
+            raise MessageRejectedError(refusal)
 
         # Build inline keyboard if a deep link is available.
         deep_link = self.format_deep_link(notification.action_data)
@@ -515,7 +653,7 @@ class TelegramFormatter:
             # there is no injection surface -- markup is not
             # interpreted, and the URL is validated separately.
             button_text = "Open"
-            rendered_button = render(
+            rendered_button = render_field(
                 notification_type=notification.type,
                 channel=DeliveryChannel.TELEGRAM,
                 field="button_text",
@@ -523,7 +661,8 @@ class TelegramFormatter:
                 variables=raw_variables,
             )
             if rendered_button is not None:
-                button_text = rendered_button
+                button_text = rendered_button.text
+            rendered.append(rendered_button)
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text=button_text, url=deep_link)]
@@ -552,7 +691,7 @@ class TelegramFormatter:
                 disable_web_page_preview=disable_preview,
                 disable_notification=silent,
             )
-            return True
+            return sent_letter(rendered)
 
         except TelegramAPIError as exc:
             # 429 first: TelegramRetryAfter IS-A TelegramAPIError, and
@@ -574,14 +713,16 @@ class TelegramFormatter:
             # ending as "transient attempts exhausted" -- a dead channel
             # disguised as weather.
             if isinstance(exc, TelegramUnauthorizedError):
+                # Not "token: <text>": the sanitizer would take the
+                # provider's words for the token's value (SAN-1).
                 raise ConfigurationError(
-                    f"Telegram rejected the bot token: {exc}"
+                    f"Telegram rejected the bot token -- {exception_text(exc)}"
                 ) from exc
             error_msg = str(exc).lower()
             for perm_error in _PERMANENT_ERRORS:
                 if perm_error in error_msg:
                     raise MessageRejectedError(
-                        f"Telegram permanent failure: {exc}"
+                        f"Telegram permanent failure: {exception_text(exc)}"
                     ) from exc
             # Transient error -- service layer retries.
             raise
@@ -591,22 +732,28 @@ class TelegramFormatter:
 # EmailFormatter
 # ===================================================================
 
-# Response statuses that mean the provider ACCEPTED the message. Accepted
-# is not delivered: what happens after -- the provider's own queue, the
-# receiving MX, greylisting -- is outside this service and, without
-# inbound status webhooks, not measurable here. The provider's message
-# id is logged for exactly that reason (see below).
-_EMAIL_ACCEPTED_STATUSES = frozenset({200, 202})
+# A 2xx -- ANY 2xx -- means the provider ACCEPTED the message (CH-2):
+# Mailgun answers a send with 200 and "Queued. Thank you." and says its
+# codes follow the standard HTTP definitions, where 2xx is "received and
+# accepted" (RFC 9110 15.3). Calling another 2xx a refusal wrote failed
+# for a message that may have gone, and nothing retries a failure; the
+# opposite risk -- a 2xx from something that did not pass the message
+# on -- is the one a 200 carries already. Accepted is not delivered:
+# what happens after -- the provider's own queue, the receiving MX,
+# greylisting -- is outside this service and, without inbound status
+# webhooks, not measurable here. The provider's message id is logged for
+# exactly that reason (see below).
 
 # Statuses that mean the CHANNEL is wrong, not the message: a bad API
 # key, an account out of credit, a forbidden operation. Every message
 # will die the same way until a human changes the configuration.
 _EMAIL_CONFIG_STATUSES = frozenset({401, 402, 403})
 
-# Substrings in the provider's own error text that place a 400 on the
-# SENDER rather than on the recipient -- an unverified domain or a from
-# address outside it kills the channel, not one message, and the status
-# code alone cannot tell the two apart. Lower-cased before matching.
+# Substrings in the provider's own error text that place a 400 or a 404
+# (_EMAIL_SENDER_FAULT_STATUSES) on the SENDER rather than on the
+# recipient -- an unverified domain or a from address outside it kills
+# the channel, not one message, and the status code alone cannot tell
+# the two apart. Lower-cased before matching.
 _EMAIL_SENDER_FAULT_MARKERS = (
     "domain not found",
     "domain is not verified",
@@ -616,6 +763,24 @@ _EMAIL_SENDER_FAULT_MARKERS = (
     "from address",
     "invalid domain",
 )
+
+# The statuses the sender-fault markers are read on (CH-2). 400: the
+# domain is not verified, the sender is outside it. 404: Mailgun's
+# answer to a domain it does not have -- "Domain not found: <domain>"
+# in the JSON message (mailgun-go mocks/mock_domains.go); on a send the
+# domain is the only resource there is, and a recipient is never a 404
+# (a bad address is a 400). A 404 that names no sender -- no JSON, a
+# proxy's page, another message -- stays ONE message: the markers are
+# read from the JSON body only, as on the 400.
+_EMAIL_SENDER_FAULT_STATUSES = frozenset({400, 404})
+
+# Statuses a retry can fix besides 429 and 5xx (CH-2). 408: the server
+# did not receive the whole request in the time it was prepared to wait
+# -- "it MAY repeat that request" (RFC 9110 15.5.9); no message was made
+# of half a request, so a repeat sends no second email. Not 425: a
+# server answers it only to a request sent in TLS early data or with
+# Early-Data: 1 (RFC 8470 5.2), and this client sends neither.
+_EMAIL_TRANSIENT_STATUSES = frozenset({408})
 
 # The characters a provider splits a RECIPIENT LIST on. The `to` field
 # below carries one address, and the provider parses that field as a
@@ -693,8 +858,9 @@ class EmailFormatter:
         notification: Notification,
         delivery: NotificationDelivery,
         recipient: Recipient,
-    ) -> bool:
-        """Send one email; True when the provider accepted it."""
+    ) -> bool | Sent:
+        """Send one email; True (or Sent, TPL-1) when the provider
+        accepted it."""
         address = _usable_email_address(recipient.email)
         if address is None:
             # The recipient snapshot arrives over the bus and an address
@@ -709,6 +875,7 @@ class EmailFormatter:
             )
 
         data: dict[str, Any]
+        rendered: list[RenderedField | None] = []
         if notification.email is not None:
             # The product's own email: its fields as they came -- html
             # only when it sent one -- and comms' own AFTER them: the
@@ -724,7 +891,7 @@ class EmailFormatter:
         else:
             # Composed from the profile, the request byte for byte as
             # before EM-1 -- the same fields in the same order.
-            subject, body = self._compose(notification, recipient)
+            subject, body, rendered = self._compose(notification, recipient)
             data = {
                 "from": self._from_address,
                 "to": [address],
@@ -750,19 +917,22 @@ class EmailFormatter:
                 delivery_id=str(delivery.id),
                 recipient_id=str(delivery.recipient_id),
                 sent_unknown=_request_may_have_arrived(exc),
-                error=sanitize_error(exc),
+                error=exception_text(exc),
             )
             raise
 
-        return self._interpret(response, notification, delivery)
+        self._interpret(response, notification, delivery)
+        return sent_letter(rendered)
 
     # -- composition --------------------------------------------------
 
     def _compose(
         self, notification: Notification, recipient: Recipient,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[RenderedField | None]]:
         """Subject and body for this notification, in the recipient's
-        locale, with the fallbacks the channel needs."""
+        locale, with the fallbacks the channel needs -- and the two
+        rendered fields, for the paths that did not resolve (TPL-1). The
+        text is plain: a placeholder goes as it is."""
         variables = build_variables(notification)
         # NULL is "no language" (F1.4) -- the one way to say it; a blank
         # string can no longer arrive (ck_recipients_locale_not_blank).
@@ -772,7 +942,7 @@ class EmailFormatter:
             else settings.default_locale
         )
 
-        rendered_subject = render(
+        rendered_subject = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.EMAIL,
             field="subject",
@@ -792,11 +962,14 @@ class EmailFormatter:
         #      derived from the body, not invented copy in one language
         #      on a multi-locale service, and traceable to the producer.
         stored_title, stored_body = notification.letter_text()
-        subject = _clean_subject(rendered_subject or stored_title)
+        subject = _clean_subject(
+            (rendered_subject.text if rendered_subject is not None else "")
+            or stored_title
+        )
         if not subject:
             subject = notification.type
 
-        rendered_body = render(
+        rendered_body = render_field(
             notification_type=notification.type,
             channel=DeliveryChannel.EMAIL,
             field="body",
@@ -806,8 +979,8 @@ class EmailFormatter:
         # BODY FALLBACK goes to the STORED body and never to another
         # channel's template: the telegram body carries HTML markup,
         # which would arrive as raw characters in a text email.
-        body = rendered_body if rendered_body is not None else stored_body
-        return subject, body
+        body = rendered_body.text if rendered_body is not None else stored_body
+        return subject, body, [rendered_subject, rendered_body]
 
     # -- response handling --------------------------------------------
 
@@ -829,7 +1002,7 @@ class EmailFormatter:
         status = int(response.status_code)
         payload = _response_payload(response)
 
-        if status in _EMAIL_ACCEPTED_STATUSES:
+        if 200 <= status < 300:
             # THE FORENSIC HANDLE. A message accepted here and never
             # seen in a mailbox is invisible in every log we own; the
             # provider's id is the only thing that can be looked up in
@@ -844,6 +1017,7 @@ class EmailFormatter:
                 notification_id=str(notification.id),
                 delivery_id=str(delivery.id),
                 recipient_id=str(delivery.recipient_id),
+                status=status,
                 provider_message_id=payload.get("id"),
             )
             return True
@@ -873,18 +1047,24 @@ class EmailFormatter:
                 f"provider rate limit (429){_reason_tail(reason, 200)}"
             )
 
-        if status in _EMAIL_CONFIG_STATUSES or (
-            status == 400 and _looks_like_sender_fault(message)
+        # A redirect is the channel's too (REV-4b): httpx follows none,
+        # and a 3xx to a POST says EMAIL_API_BASE_URL is not the API's
+        # address -- every message would get the same, as the llm
+        # channel already reads it.
+        if status in _EMAIL_CONFIG_STATUSES or 300 <= status < 400 or (
+            status in _EMAIL_SENDER_FAULT_STATUSES
+            and _looks_like_sender_fault(message)
         ):
             self._fail_configured(status, reason, notification, delivery)
 
-        if status >= 500:
+        if status >= 500 or status in _EMAIL_TRANSIENT_STATUSES:
             raise EmailTransientError(
                 f"provider error ({status}){_reason_tail(reason, 200)}"
             )
 
-        # Everything else -- a 400 on the recipient, and any 4xx whose
-        # body did not name the sender -- is ONE message failing.
+        # Everything else -- a 400 on the recipient, a 400 or 404 whose
+        # body did not name the sender, any other 4xx -- is ONE message
+        # failing.
         # Deliberately conservative: mistaking a channel fault for a
         # single message costs one email, the opposite declares a live
         # channel dead on an unparsed reply. The body is logged so the
@@ -1003,7 +1183,8 @@ LLM_GATEWAY_ROUTING: dict[str, Any] = {
 _LLM_PATH = "/chat/completions"
 
 # HTTP statuses that mean the SET is wrong, not this request: the key
-# (401, 403), the credit on the key (402 -- spec §14.12 item 6: "a
+# (401, 403 -- unless a policy declined the request, _declined_by_policy),
+# the credit on the key (402 -- spec §14.12 item 6: "a
 # configuration failure, the channel is dead, fix the deploy"), the
 # model the set names (404). A redirect means the endpoint is wrong.
 _LLM_CONFIG_STATUSES = frozenset({401, 402, 403, 404})
@@ -1096,6 +1277,33 @@ def _error_text(status: int, error: Any) -> str:
     return "; ".join(parts)
 
 
+# A 403 that declines THIS request, not the key (REV-4b): OpenRouter's
+# documented shapes (openrouter.ai/docs/api_reference/errors-and-
+# debugging) -- a moderation flag (`metadata.reasons`), a guardrail's
+# content filter (`metadata.patterns`), a typed policy decline
+# (`metadata.error_type` content_policy_violation or refusal). Read by
+# the KEYS of the provider's metadata, never by its text: flagged_input
+# is the letter's, and comms does not read it. Every other 403 -- no
+# body, a spent budget (`metadata.limit_source`), permissions -- stays
+# the set's configuration.
+_POLICY_DECLINES = frozenset({"content_policy_violation", "refusal"})
+
+
+def _declined_by_policy(error: Any) -> bool:
+    """Whether a provider's 403 error object declines the request on a
+    policy (the letter's), rather than the key's rights or budget."""
+    if not isinstance(error, dict):
+        return False
+    metadata = error.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        "reasons" in metadata
+        or "patterns" in metadata
+        or metadata.get("error_type") in _POLICY_DECLINES
+    )
+
+
 def _error_code(error: Any) -> int | None:
     """The HTTP-like code a provider put in an error object (a gateway
     reports a failure inside a 200 so -- its documented error shape is
@@ -1142,6 +1350,8 @@ def interpret_llm_response(
             # the code the provider put there.
             code = _error_code(error)
             text = f"{_error_text(status, error)} (inside the answer)"
+            if code == 403 and _declined_by_policy(error):
+                return _SetFailure(set_name, _SetOutcome.REJECTED, text)
             if code in _LLM_CONFIG_STATUSES:
                 return _SetFailure(set_name, _SetOutcome.CONFIGURATION, text)
             if code == 429:
@@ -1170,6 +1380,8 @@ def interpret_llm_response(
         )
 
     text = _error_text(status, error)
+    if status == 403 and _declined_by_policy(error):
+        return _SetFailure(set_name, _SetOutcome.REJECTED, text)
     if status in _LLM_CONFIG_STATUSES or 300 <= status < 400:
         return _SetFailure(set_name, _SetOutcome.CONFIGURATION, text)
     if status == 429:
@@ -1339,12 +1551,13 @@ class LLMFormatter:
             logger.warning(
                 "llm_body_download_failed",
                 outcome="refused",
-                detail=str(exc),
+                detail=exception_text(exc),
             )
             raise
         except LLMTransientError as exc:
             logger.warning(
-                "llm_body_download_failed", outcome="transient", detail=str(exc),
+                "llm_body_download_failed", outcome="transient",
+                detail=exception_text(exc),
             )
             raise
         except Exception as exc:
@@ -1370,15 +1583,46 @@ class LLMFormatter:
         content = json.dumps(
             build_llm_request(letter, key_set, body), ensure_ascii=False,
         ).encode("utf-8")
+        import httpx
+
+        # THE ANSWER IS READ WITH A CEILING (CH-2), as the audio body is
+        # (_fetch_body): a declared length above MAX_LLM_ANSWER_BYTES is
+        # not read at all, and a body is counted while it is read and
+        # left the moment it passes it -- never taken whole into the
+        # worker's memory first. What was read is then the response the
+        # boundary reads, unchanged (interpret_llm_response).
         try:
-            response = await self._client.post(
+            async with self._client.stream(
+                "POST",
                 f"{key_set.endpoint}{_LLM_PATH}",
                 content=content,
                 headers={
                     "Authorization": f"Bearer {key_set.key}",
                     "Content-Type": "application/json",
                 },
-            )
+            ) as streamed:
+                status = int(streamed.status_code)
+                declared = streamed.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > MAX_LLM_ANSWER_BYTES:
+                    return _answer_too_large(
+                        key_set.name, status, "by its Content-Length")
+                received = bytearray()
+                async for chunk in streamed.aiter_bytes():
+                    received.extend(chunk)
+                    if len(received) > MAX_LLM_ANSWER_BYTES:
+                        return _answer_too_large(
+                            key_set.name, status, "counted while reading")
+                # The body is DECODED already (aiter_bytes undoes the
+                # Content-Encoding): the rebuilt response carries neither
+                # that header nor the length of the encoded body.
+                headers = [
+                    (name, value) for name, value in streamed.headers.multi_items()
+                    if name.lower() not in ("content-encoding", "content-length")
+                ]
+                response = httpx.Response(
+                    status, headers=headers, content=bytes(received),
+                    request=streamed.request,
+                )
         except Exception as exc:
             # Transient by construction. Class only, never the text: an
             # exception of the client may carry the request.
@@ -1389,6 +1633,19 @@ class LLMFormatter:
                 f"{'; it may have reached the provider' if arrived else ''})",
             )
         return interpret_llm_response(key_set.name, response)
+
+
+def _answer_too_large(set_name: str, status: int, how: str) -> _SetFailure:
+    """A provider's answer above MAX_LLM_ANSWER_BYTES (CH-2): the set's
+    TRANSPORT failure, as an answer that is not a chat completion is --
+    no model's answer to a letter comms takes is that large, so this is a
+    broken gateway or another server at the set's address, and the next
+    set is asked. Its size and the ceiling, never a byte of it."""
+    return _SetFailure(
+        set_name, _SetOutcome.TRANSIENT,
+        f"status {status}; the answer is larger than {MAX_LLM_ANSWER_BYTES} "
+        f"bytes ({how}; not read further)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1555,7 +1812,7 @@ def _retry_after_seconds(response: Any) -> float | None:
 
 
 def _looks_like_sender_fault(message: str) -> bool:
-    """Whether a 400 blames the SENDER (the channel), not the recipient.
+    """Whether a 400 or a 404 blames the SENDER (the channel), not the recipient.
 
     Read from the provider's own text, which says what it objects to.
     A "several 400s in a row" counter was deliberately not built: it is
@@ -1570,32 +1827,50 @@ def _request_may_have_arrived(exc: Exception) -> bool:
     """True when the request could already be at the provider.
 
     A connect failure never produced a message; a read timeout may
-    have. The provider offers no idempotency on this endpoint, so the
-    distinction cannot PREVENT a duplicate -- it only makes it
-    attributable afterwards. Named by class rather than by an httpx
-    import: this module must stay importable on a deploy without email.
+    have. A pool timeout never got a connection to send on (REV-4b: it
+    was counted with the reads). The provider offers no idempotency on
+    this endpoint, so the distinction cannot PREVENT a duplicate -- it
+    only makes it attributable afterwards. Named by class rather than
+    by an httpx import: this module must stay importable on a deploy
+    without email.
     """
     name = type(exc).__name__
-    return "Read" in name or "Pool" in name or "Remote" in name
+    return "Read" in name or "Remote" in name
 
 
 def _escape_html_variables(variables: dict[str, Any]) -> dict[str, Any]:
     """Escape variable VALUES for ParseMode.HTML (review 1.1).
 
     Strings are HTML-escaped; numbers/bools/None pass through so
-    numeric format specs ("{amount:,.2f}") keep working; anything else
-    is stringified and escaped -- an unexpected repr must not be able
-    to break entity parsing.
+    numeric format specs ("{amount:,.2f}") keep working; a JSON object
+    -- `params`, the one object the intake lets into action_data
+    (app/transport/events.py: every other variable is a scalar) -- keeps
+    its shape with every value escaped (TPL-1), so a path into it
+    ("{params[practice_id]}") resolves as it does for the button and the
+    email. It was stringified whole before, and such a path never
+    resolved in a telegram title or body, a defect G5's fallback hid.
+    Anything else is stringified and escaped -- an unexpected repr must
+    not be able to break entity parsing.
     """
-    escaped: dict[str, Any] = {}
-    for key, value in variables.items():
-        if isinstance(value, str):
-            escaped[key] = escape(value)
-        elif isinstance(value, (int, float)) or value is None:
-            escaped[key] = value
-        else:
-            escaped[key] = escape(str(value))
-    return escaped
+    return {key: _escape_html_value(value) for key, value in variables.items()}
+
+
+def _escape_html_value(value: Any) -> Any:
+    """One value, escaped for ParseMode.HTML (see _escape_html_variables)."""
+    if isinstance(value, str):
+        return escape(value)
+    if isinstance(value, (int, float)) or value is None:
+        return value
+    if isinstance(value, dict):
+        # The keys too: a template that prints the object whole
+        # ("{params}") prints its keys, and a key is the product's text
+        # as much as a value is. A path into it ("{params[name]}") names
+        # an identifier, which escaping leaves as it is.
+        return {
+            escape(key) if isinstance(key, str) else key: _escape_html_value(item)
+            for key, item in value.items()
+        }
+    return escape(str(value))
 
 
 def build_variables(notification: Notification) -> dict[str, Any]:

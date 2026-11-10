@@ -13,7 +13,9 @@
 #   rows a, m, b, n; X's set is {a, m, b}, Y's is {b, n, a};
 #   Z holds m and n;
 #   without ORDER BY, X scans a, m, b (a sequential scan, heap order)
-#   and Y scans b, n, a (the lane index, scheduled_at order) -- X takes
+#   and Y scans b, n, a (the lane index, scheduled_at order; Y's
+#   correlation is matched through coalesce, so the index migration 0041
+#   gave correlation is not a path of it -- PERF-2) -- X takes
 #   a and waits on m, Y takes b and waits on n;
 #   Z commits: X takes m and needs b (Y's), Y takes n and needs a (X's)
 #   -> 40P01, every time.
@@ -44,7 +46,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import and_, select, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -283,7 +285,12 @@ class TestTheDeadlockIsADbapiError:
 @pytest.mark.usefixtures("pristine_tables")
 class TestCloseAgainstClose:
     """done-when R-A (2): expiry and cancellation over overlapping sets
-    at once -- both end, no 40P01, every job closed once. M1."""
+    at once -- both end, no 40P01, every job closed once. M1.
+
+    Y's set names its correlation through coalesce (since PERF-2): the
+    plain equality would be served by ix_notifications_correlation in
+    heap order, and the crossing this harness builds needs Y on the lane
+    index."""
 
     async def test_both_end(self) -> None:
         def sets(rows: dict[str, UUID], shared: str) -> tuple[Any, Any]:
@@ -291,7 +298,13 @@ class TestCloseAgainstClose:
                 Notification.id.in_([rows["a"], rows["m"], rows["b"]]),
                 and_(
                     Notification.lane == "normal",
-                    Notification.correlation == shared,
+                    # Not `correlation == shared`: since migration 0041
+                    # that equality has its own index
+                    # (ix_notifications_correlation), whose walk is heap
+                    # order -- a, b, n -- and the crossing needs Y on the
+                    # lane index's walk (the header). The coalesce keeps
+                    # the set and leaves the lane index the only path.
+                    func.coalesce(Notification.correlation, "") == shared,
                 ),
             )
 

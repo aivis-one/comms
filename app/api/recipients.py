@@ -54,9 +54,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DbSession, require_service_auth
+from app.api.deps import DbSession
 from app.api.paging import PAGE_LIMIT_DEFAULT, decode_cursor, page, page_limit
 from app.audience import sync
 from app.audience.book import list_book
@@ -75,7 +76,6 @@ from app.forgetting import forget_recipient
 router = APIRouter(
     prefix="/api/v1/recipients",
     tags=["recipients"],
-    dependencies=[Depends(require_service_auth)],
 )
 
 
@@ -96,13 +96,16 @@ class RecipientSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int = Field(ge=1, le=MAX_SNAPSHOT_VERSION, strict=True)
+    # STRICT, as the stream's user_upserted is (REV-3): lax mode read
+    # `true` as telegram id 1 and "no" as inactive -- a silent change of
+    # what the product sent.
     telegram_id: int | None = Field(
-        ge=MIN_TELEGRAM_ID, le=MAX_TELEGRAM_ID,
+        ge=MIN_TELEGRAM_ID, le=MAX_TELEGRAM_ID, strict=True,
     )
     email: str | None = Field(max_length=MAX_EMAIL_LEN)
     locale: str | None = Field(max_length=MAX_LOCALE_LEN)
     timezone: str | None = Field(max_length=MAX_TIMEZONE_LEN)
-    active: bool
+    active: bool = Field(strict=True)
 
 
 class RecipientDeletion(BaseModel):
@@ -195,6 +198,10 @@ async def delete_recipient(
     await forget_recipient(
         session, recipient_id=recipient_id, version=deletion.version,
     )
-    recipient = await session.get(Recipient, recipient_id)
-    assert recipient is not None
+    # The row is there by construction: the tombstone above took it, or
+    # inserted it, in this transaction. scalar_one, not an assert (gone
+    # under `python -O`) -- REV-3.
+    recipient = (await session.execute(
+        select(Recipient).where(Recipient.id == recipient_id)
+    )).scalar_one()
     return _wire(recipient)

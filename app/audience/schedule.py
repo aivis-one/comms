@@ -42,19 +42,39 @@
 # touching periods (09:00-12:00 and 12:00-18:00): one continuous
 # stretch has one spelling.
 #
-# DST: local moments are built with fold=0; around a transition the
-# deferred moment may shift by the offset delta. Two cases are named
-# rather than pretended away. In autumn a period inside the repeated
-# hour opens twice -- harmless. In spring a period lying ENTIRELY
-# inside the skipped hour (02:00-03:00) does not open on that date;
-# the search below walks on to the next date that has it, so a weekly
-# schedule loses one occurrence and recovers by itself. For a "when
-# may we reach you" feature that error bar is accepted, and the search
-# logs when it runs out of days, so the case is observable rather than
-# silent.
+# DST. A period's start is a wall time; the search turns it into the
+# instants that wall time names and compares INSTANTS with `now` (TIME-1).
+#   - Autumn, the repeated hour: a wall time inside it names two
+#     instants, and both are openings -- a period inside that hour opens
+#     twice, harmless. The search used to compare wall times and build
+#     the start with fold=0: on the hour's second pass it took the FIRST
+#     instant, already past, and deferred the delivery into the past --
+#     picked up at once, deferred again, a journal row each time, until
+#     the second opening came. Now each instant is a candidate and the
+#     earliest one after `now` wins.
+#     A period need not START in that hour to open in it: one that runs
+#     on into it (00:00-02:30) or ends inside it (01:00-02:15) closes on
+#     the first pass and opens again the moment the clocks go back. That
+#     moment is a candidate too, when a period holds it (REV-5) -- the
+#     search used to know starts only, and deferred such a delivery to
+#     the next week.
+#   - Spring, the skipped hour: a wall time inside it names no instant.
+#     It is read with fold=0 -- the offset before the jump -- and so lands
+#     as far past the jump as it lay past the hour's start (02:30 ->
+#     03:30). A period lying ENTIRELY inside the skipped hour (02:00-03:00)
+#     is waited for at that reading of its start, where it has already
+#     closed; the search run at that moment goes on to the next date that
+#     has the period: a weekly schedule loses one occurrence and recovers
+#     by itself. A period only partly inside opens late by what was
+#     skipped (02:30-04:00 is waited for until 03:30, though 03:00 is
+#     already inside it): the deferred moment shifts by at most the offset
+#     delta. For a "when may we reach you" feature that error bar is
+#     accepted, and so the moment the clocks jump FORWARD is no candidate
+#     (only the moment they go back is, above). Nothing is logged for it
+#     -- the search always finds an occurrence (_next_open).
 # =============================================================================
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -120,26 +140,38 @@ def _next_open(
     tz: ZoneInfo,
     windows: list[dict[str, int]],
 ) -> datetime | None:
-    """The earliest period start strictly after `now`, in UTC."""
-    local_now = now.astimezone(tz)
-    today = local_now.date()
+    """The earliest opening strictly after `now`, in UTC.
 
+    An opening is a period's start -- or the moment the clocks go back
+    into a period (the module header, DST). Compared as instants, never
+    as wall times: on the repeated hour of autumn one wall time is two
+    instants.
+    """
+    instant_now = now.astimezone(UTC)
+    today = instant_now.astimezone(tz).date()
+
+    openings: list[datetime] = []
     for offset in range(_SEARCH_DAYS):
         date = today + timedelta(days=offset)
         midnight = datetime.combine(date, datetime.min.time(), tzinfo=tz)
-        starts = sorted(
-            midnight + timedelta(minutes=window["from"])
-            for window in windows
-            if window["day"] == date.isoweekday()
-        )
-        for start in starts:
-            if start > local_now:
-                return start.astimezone(UTC)
+        for window in windows:
+            if window["day"] == date.isoweekday():
+                openings += _instants(
+                    midnight + timedelta(minutes=window["from"]), tz,
+                )
+        back = _clocks_back(date, tz)
+        if back is not None and is_delivery_allowed(back, tz=tz, windows=windows):
+            openings.append(back)
+    later = [opening for opening in openings if opening > instant_now]
+    if later:
+        return min(later)
 
-    # Reachable only if a DST skip swallows the sole period of the
-    # sole configured day. Logged rather than asserted: a delivery
-    # must not die on an assertion, and returning None here means
-    # "send it" -- the safe direction for a postponement feature.
+    # Not reached while the search covers eight dates: every configured
+    # weekday recurs within the next seven, and a start on a later date
+    # is after `now` even when read inside a skipped hour. Kept as the
+    # guard a shorter search would need -- logged rather than asserted:
+    # a delivery must not die on an assertion, and returning None here
+    # means "send it", the safe direction for a postponement feature.
     logger.warning(
         "schedule_has_no_opening",
         windows=windows,
@@ -147,6 +179,45 @@ def _next_open(
         searched_days=_SEARCH_DAYS,
     )
     return None
+
+
+def _clocks_back(day: date, tz: ZoneInfo) -> datetime | None:
+    """The UTC moment, to the minute, the clocks go back during `day`
+    -- None on a day they do not.
+
+    The offset at the next midnight is below this midnight's on such a
+    day; the moment of the change is found by halving the day in UTC.
+    """
+    start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+    before, after = start.utcoffset(), end.utcoffset()
+    if before is None or after is None or after >= before:
+        return None
+    low, high = start.astimezone(UTC), end.astimezone(UTC)
+    while high - low > timedelta(minutes=1):
+        middle = low + (high - low) / 2
+        if middle.astimezone(tz).utcoffset() == before:
+            low = middle
+        else:
+            high = middle
+    return high.replace(second=0, microsecond=0)
+
+
+def _instants(wall: datetime, tz: ZoneInfo) -> list[datetime]:
+    """The UTC instants a local wall time names: one; two inside the
+    repeated hour of autumn (fold 0 and 1); none inside the skipped hour
+    of spring -- read then with fold=0, the offset before the jump (the
+    module header, DST).
+
+    A fold names an instant only when that instant, back in the zone, is
+    the same wall time: inside the skipped hour neither fold comes back.
+    """
+    found = []
+    for fold in (0, 1):
+        instant = wall.replace(fold=fold).astimezone(UTC)
+        if instant.astimezone(tz).replace(tzinfo=None) == wall.replace(tzinfo=None):
+            found.append(instant)
+    return found or [wall.replace(fold=0).astimezone(UTC)]
 
 
 def recipient_deferred_until(

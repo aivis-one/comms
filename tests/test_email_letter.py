@@ -570,7 +570,6 @@ class TestDates:
 
     @pytest.mark.parametrize(("field", "value"), [
         ("scheduled_at", "0001-01-01T01:00:00+01:00"),  # UTC 0001-01-01
-        ("scheduled_at", "9999-12-31T22:59:59-01:00"),  # UTC 9999-12-31
         ("expiry_at", "9999-12-31T22:59:59-01:00"),
         ("scheduled_at", "2030-06-01T12:00:00+02:00"),
     ])
@@ -579,6 +578,21 @@ class TestDates:
     ) -> None:
         data = _request(**{field: value})
         assert await _handle(db_session, data) is HandleResult.PROCESSED
+
+    async def test_the_upper_border_of_scheduled_at_is_its_ceiling(
+        self, db_session: AsyncSession,
+    ) -> None:
+        """UTC 9999-12-31 is inside a timestamp, and the pair above used
+        to accept it as scheduled_at -- right while scheduled_at had no
+        bound but the type's. REV-8 holds it to MAX_DURATION_DAYS ahead
+        of now (app/engine/service.py create_notification): the date is
+        refused under the key, by its ceiling, not by the range.
+        tests/test_transport_consumer.py TestTheScheduleCeiling holds the
+        border itself."""
+        data = _request(scheduled_at="9999-12-31T22:59:59-01:00")
+        assert await _handle(db_session, data) is HandleResult.REJECTED
+        reason = await _reason(db_session, data["idempotency_key"])
+        assert "scheduled_at" in reason and "3650 days ahead" in reason
 
 
 # ---------------------------------------------------------------------------
