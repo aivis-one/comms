@@ -20,6 +20,7 @@
 #   product's comms-profile/.
 #
 # ENVIRONMENT:
+#     channels switched off,
 #     channel keys empty   -> nothing ever leaves the process (the
 #                             CHANNEL FENCE below, set by this file)
 #     TEMPLATES_DIR empty  -> startup profile load is a no-op in dev;
@@ -49,16 +50,21 @@
 #   "you are about to erase production".
 #
 # CHANNEL FENCE -- why this file writes os.environ before importing app:
-#   A channel is live when its key set is full (app/core/channels.py),
-#   and the suite may run where a live key set sits in the environment
-#   (the deployed container carries the real bot token). So the fence
-#   lives HERE, not in whoever invokes pytest: before the settings
-#   object is built, every declared key of every channel is blanked --
-#   environment variables beat the .env file -- and every external
-#   channel reads as not configured. The keys come from the channel
-#   spec, so a channel added later is fenced without anyone remembering.
-#   A test that needs a LIVE channel builds one explicitly
-#   (formatters.build_formatters with full settings and a fake Bot).
+#   A channel is live when its flag is true and its key set full
+#   (app/core/channels.py), and the suite may run where a live channel
+#   sits in the environment (the deployed container carries the real
+#   bot token). So the fence lives HERE, not in whoever invokes pytest:
+#   before the settings object is built, every channel's flag is set to
+#   false and every declared key blanked -- environment variables beat
+#   the .env file -- and every external channel reads as not
+#   configured. The keys are blanked as well, so a test that switches a
+#   channel on gets exactly the keys it passes and never the
+#   environment's. The flags and keys come from the channel spec, so a
+#   channel added later is fenced without anyone remembering. A test
+#   that needs a LIVE channel builds one explicitly, its flag true
+#   (formatters.build_formatters with full settings and a fake Bot), and
+#   a test of a switched-off channel passes its flag false itself rather
+#   than lean on this fence.
 #   Second line: the network tripwire fixtures below make any real
 #   outbound request fail the test -- ONE PER CLIENT LIBRARY. The
 #   telegram tripwire patches aiogram's transport, which says nothing
@@ -79,8 +85,10 @@ from __future__ import annotations
 
 import os
 
-from app.core.channels import channel_env_keys
+from app.core.channels import channel_env_keys, channel_flag_keys
 
+for _key in channel_flag_keys():
+    os.environ[_key] = "false"
 for _key in channel_env_keys():
     os.environ[_key] = ""
 os.environ["COMMS_SERVICE_TOKEN"] = "suite-service-token"

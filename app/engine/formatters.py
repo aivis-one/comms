@@ -88,9 +88,8 @@ from app.core.channels import (
     ChannelState,
     LLMKeySet,
     body_endpoint,
-    channel_env_keys,
     channel_spec,
-    evaluate_channels,
+    switched_off_reason,
 )
 from app.core.config import Settings, settings
 from app.core.constants import MAX_LLM_ANSWER_BYTES
@@ -260,10 +259,11 @@ class InAppFormatter:
 class UnavailableChannelFormatter:
     """A channel this deploy does not have -- every delivery FAILS.
 
-    Not configured (its key set is empty) or not implemented: either
-    way the channel will not appear between attempts, so the failure is
-    permanent (PermanentDeliveryError -> immediate FAILED, no attempt
-    increment, no retry).
+    Not configured (switched off by its flag) or not implemented:
+    either way the channel will not appear between attempts, so the
+    failure is permanent (PermanentDeliveryError -> immediate FAILED, no
+    attempt increment, no retry) -- the outcome "channel unavailable",
+    class `configuration`, the job's other channels going on.
     """
 
     def __init__(self, channel: str, reason: str) -> None:
@@ -1928,13 +1928,12 @@ HttpClientFactory = Callable[..., Any]
 def channel_map(source: Settings) -> dict[str, str]:
     """State of EVERY DeliveryChannel on this deploy (the startup log).
 
-    live / not_configured (implemented, key set empty) /
+    live / not_configured (implemented, switched off by its flag) /
     not_implemented. Only ever called on validated settings, so a
-    broken key set cannot reach here -- startup was refused before.
+    broken flag or key set cannot reach here -- startup was refused
+    before.
     """
-    states, _ = evaluate_channels({
-        key: getattr(source, key.lower()) for key in channel_env_keys()
-    })
+    states = source.channel_states
     return {
         channel.value: states.get(
             channel.value, ChannelState.NOT_IMPLEMENTED,
@@ -2036,12 +2035,14 @@ _BUILDERS: dict[str, Callable[[Settings, _Factories], _Built]] = {
     DeliveryChannel.LLM: _build_llm,
 }
 
-_UNAVAILABLE_REASONS = {
-    ChannelState.NOT_CONFIGURED.value: (
-        "not configured (every key of the channel is empty)"
-    ),
-    ChannelState.NOT_IMPLEMENTED.value: "not implemented in this service",
-}
+def _unavailable_reason(channel: str, state: str) -> str:
+    """Why `channel` takes no delivery on this deploy: switched off by
+    its flag, named (app/core/channels.py switched_off_reason), or not
+    implemented."""
+    if state == ChannelState.NOT_CONFIGURED:
+        return switched_off_reason(channel)
+    return "not implemented in this service"
+
 
 
 def build_formatters(
@@ -2054,8 +2055,8 @@ def build_formatters(
     """Build the formatter of every channel from validated settings.
 
     Pure apart from constructing the network objects: no logging, no
-    globals. Tests pass a full key set plus fake factories to get a live
-    channel without the network.
+    globals. Tests pass a switched-on channel with its full key set plus
+    fake factories to get a live channel without the network.
     """
     factories = _Factories(
         bot=bot_factory,
@@ -2081,7 +2082,7 @@ def build_formatters(
             closers.extend(built.closers)
         else:
             unavailable = UnavailableChannelFormatter(
-                channel, _UNAVAILABLE_REASONS[state],
+                channel, _unavailable_reason(channel, state),
             )
             if channel == DeliveryChannel.LLM:
                 model = unavailable

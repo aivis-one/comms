@@ -4,26 +4,38 @@
 #
 # THE RULE -- one for every channel, no per-channel exceptions:
 #
-#   A channel EXISTS on a deploy when it has an IMPLEMENTATION and every
-#   one of its DECLARED KEYS is set. Its key set decides, and nothing
-#   else does:
+#   A channel EXISTS on a deploy when it has an IMPLEMENTATION and its
+#   FLAG switches it on. The flag decides, and nothing else does: under
+#   the Primer's machine a channel is an option of the instance, the
+#   instance's passport switches it, and comms learns of it only by the
+#   flag (Primer protocol 5.2.3, contract 3 item 38).
 #
-#     all keys empty   -> the channel is absent by design; the service
-#                         starts, and a request for the channel fails
-#                         permanently and loudly (never a quiet success)
-#     all keys set     -> the channel is live
-#     some keys set    -> an integrator typo; startup is REFUSED, and the
-#                         message names the channel and every missing key
-#     a malformed value-> same: startup is refused, the key is named
+#     flag `false`     -> the channel is switched off on this deploy; its
+#                         keys -- the optional ones too -- are NOT read
+#                         and NOT checked, whatever they hold; the
+#                         service starts, and a delivery into the
+#                         channel ends in the outcome "channel
+#                         unavailable" (never a quiet success)
+#     flag `true`      -> every declared key must be set and well
+#                         formed: then the channel is live; a missing or
+#                         malformed key REFUSES startup, and the message
+#                         names the channel and every such key
+#     any other value, or no flag at all
+#                      -> startup is REFUSED, naming the flag: exactly
+#                         `true` or `false`, nothing else (a red start,
+#                         never a guess)
 #
-#   A channel with an EMPTY declared key list is live by definition --
-#   the empty set is trivially complete. That is how in_app works: its
-#   delivery IS the row the inbox reads, nothing leaves the process, so
-#   there is nothing to configure. It is not a special case of the rule;
-#   it is the rule applied to zero keys.
+#   A channel with NO FLAG and an EMPTY declared key list is live by
+#   definition: there is nothing to switch and nothing to configure.
+#   That is in_app: its delivery IS the row the inbox reads, nothing
+#   leaves the process.
 #
 #   A channel with NO entry here has no implementation and is therefore
 #   absent on every deploy, whatever the environment says.
+#
+#   The value a machine writes into the keys of a switched-off option is
+#   not known here and never compared: the keys of a switched-off
+#   channel are simply not read.
 #
 # WHAT THIS REGISTRY IS NOT: it describes SENDING channels only. A
 # future inbound side (receiving bot updates) is a separate capability
@@ -33,9 +45,10 @@
 # a deploy that only asked to send.
 #
 # WHY A SEPARATE MODULE: it imports no settings. The test suite reads
-# the declared keys BEFORE the settings object exists, to blank every
-# external channel's keys (tests/conftest.py) -- so a channel added here
-# is kept out of the network in tests without anyone remembering to.
+# the flags and the declared keys BEFORE the settings object exists, to
+# switch every external channel off and blank its keys
+# (tests/conftest.py) -- so a channel added here is kept out of the
+# network in tests without anyone remembering to.
 #
 # Channel names are plain strings on purpose: app.core sits below
 # app.engine (package DAG), so it cannot import DeliveryChannel. A test
@@ -61,11 +74,11 @@ Validator = Callable[[str], str | None]
 
 @dataclass(frozen=True)
 class ChannelSpec:
-    """An implemented channel and the keys that make it live."""
+    """An implemented channel, its flag and the keys it needs when on."""
 
     name: str
-    # The keys that decide the channel: all empty = absent, all set =
-    # live, some set = refusal.
+    # The keys a switched-on channel needs: every one set and well
+    # formed, or startup is refused. Not read at all when it is off.
     keys: tuple[str, ...]
     validators: Mapping[str, Validator] = field(default_factory=dict)
     # Keys that carry a DEFAULT and therefore do not decide anything --
@@ -90,6 +103,10 @@ class ChannelSpec:
     # out and holds the channel's own timeout above its client instead;
     # app/engine/service.py takes the bound from it).
     own_deliver_timeout: bool = False
+    # The environment variable that switches the channel on (`true`) or
+    # off (`false`) -- required, exactly one of the two. None only for a
+    # channel with nothing to switch (in_app, no keys).
+    flag: str | None = None
 
     @property
     def client_timeout_total(self) -> float:
@@ -104,11 +121,15 @@ class ChannelSpec:
         return sum(self.client_timeouts.values())
 
 
+# The two values a channel's flag may hold, spelled exactly.
+FLAG_VALUES: tuple[str, ...] = ("true", "false")
+
+
 class ChannelState(StrEnum):
     """What a deploy has for one channel (the startup channel map)."""
 
     LIVE = "live"
-    # Implemented, but this deploy declared none of its keys.
+    # Implemented, but this deploy switched it off (its flag is false).
     NOT_CONFIGURED = "not_configured"
     # No implementation exists in this service.
     NOT_IMPLEMENTED = "not_implemented"
@@ -147,12 +168,11 @@ def _telegram_url(value: str) -> str | None:
 
 # -- email ------------------------------------------------------------------
 #
-# ONE PREFIX PER CHANNEL (EMAIL_), including the provider-named keys:
-# the agreed fix of the KNOWN CEILING below scans the environment for a
-# channel's prefix, and a channel spread over two prefixes would make it
-# unperformable. The provider IS in the key names on purpose -- "domain"
-# and "region" are its concepts, and a neutral name over a single
-# provider would mislead the next integrator.
+# ONE PREFIX PER CHANNEL (EMAIL_), the flag and the provider-named keys
+# alike: an operator reading an env file finds a channel's variables
+# together. The provider IS in the key names on purpose -- "domain" and
+# "region" are its concepts, and a neutral name over a single provider
+# would mislead the next integrator.
 
 # The provider serves two regions from two different base addresses. A
 # CLOSED SET, so an unknown region refuses startup instead of failing
@@ -235,9 +255,10 @@ def _email_sender(value: str) -> str | None:
 # so they cannot be fields of the settings class. LLM_KEY_SETS carries
 # them all as one JSON object: {"<set name>": {"endpoint": ..., "key":
 # ..., "model": ..., "gateway": true|false}}. The channel rule applies to
-# that one key unchanged: empty -> the deploy has no llm; set -> every
-# set in it must be whole and well-formed, or startup is refused naming
-# the set and the field -- never the value: the key is a secret.
+# that one key unchanged: LLM_ENABLED false -> it is not read; true ->
+# it is required, and every set in it must be whole and well-formed, or
+# startup is refused naming the set and the field -- never the value:
+# the key is a secret.
 #
 # `gateway` HAS NO DEFAULT. A set that points at an aggregating gateway
 # carries the gateway's routing conditions in every request (spec §12.1:
@@ -523,6 +544,7 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
         # 30 s every lane defaults to (app/core/config.py).
         # See KNOWN CEILING (client totals) below.
         client_timeouts={"timeout": 29.0},
+        flag="TELEGRAM_ENABLED",
     ),
     ChannelSpec(
         name="email",
@@ -535,10 +557,10 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
             "EMAIL_FROM_ADDRESS": _email_sender,
         },
         # NOT a declared key: it has a default, so "unset" and "set to
-        # the default" are indistinguishable, and counting it would make
-        # an EMPTY set look PARTIAL -- refusing startup on every deploy
-        # that has no email at all. Its FORM is still checked, but only
-        # when the deploy spells it out.
+        # the default" are indistinguishable, and requiring it would
+        # refuse a deploy that relies on the default. Its FORM is still
+        # checked, but only when the channel is on and the deploy spells
+        # it out.
         optional_validators={
             "EMAIL_MAILGUN_REGION": _email_region,
         },
@@ -553,14 +575,15 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
         # below httpx's 100 pooled connections a call never waits for
         # one. 29 in all, below the 30 s every lane defaults to.
         client_timeouts={"connect": 5.0, "read": 15.0, "write": 5.0, "pool": 4.0},
+        flag="EMAIL_ENABLED",
     ),
     ChannelSpec(
         name="llm",
         keys=("LLM_KEY_SETS",),
         validators={"LLM_KEY_SETS": _llm_key_sets},
-        # Defaulted (empty = no body is ever fetched), so not a key that
-        # decides whether llm exists; its form is checked when spelled
-        # out (P5-2).
+        # Defaulted (empty = no body is ever fetched), so not a key the
+        # channel requires; its form is checked when the channel is on
+        # and the value is spelled out (P5-2).
         optional_validators={"LLM_BODY_HOSTS": _llm_body_hosts},
         # One call to one set. read is the model writing its answer: a
         # long answer of a slow model takes tens of seconds, and a read
@@ -571,6 +594,7 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
         # (own_deliver_timeout).
         client_timeouts={"connect": 5.0, "read": 100.0, "write": 5.0, "pool": 4.0},
         own_deliver_timeout=True,
+        flag="LLM_ENABLED",
     ),
 )
 
@@ -613,13 +637,17 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
 
 
 def channel_env_keys() -> tuple[str, ...]:
-    """Every DECIDING key of every channel, in declaration order.
+    """Every REQUIRED key of every channel, in declaration order.
 
     Defaulted keys are not here: blanking them (tests/conftest.py) would
-    replace a working default with an invalid empty value, and they
-    cannot make a channel live or absent anyway.
+    replace a working default with an invalid empty value.
     """
     return tuple(key for spec in CHANNEL_SPECS for key in spec.keys)
+
+
+def channel_flag_keys() -> tuple[str, ...]:
+    """Every channel's flag, in declaration order (in_app has none)."""
+    return tuple(spec.flag for spec in CHANNEL_SPECS if spec.flag is not None)
 
 
 def channel_spec(name: str) -> ChannelSpec:
@@ -634,22 +662,25 @@ def channel_optional_keys() -> tuple[str, ...]:
     )
 
 
-def _malformed_optionals(
-    spec: ChannelSpec, values: Mapping[str, str],
-) -> list[str]:
-    """Complaints about spelled-out defaulted values, if any."""
-    complaints: list[str] = []
-    for key, validator in spec.optional_validators.items():
-        value = values.get(key, "")
-        if value == "":
-            continue
-        if value.strip() == "":
-            complaints.append(f"{key} consists only of whitespace")
-            continue
-        complaint = validator(value)
-        if complaint is not None:
-            complaints.append(f"{key} is malformed: {complaint}")
-    return complaints
+def switched_off_reason(name: str) -> str:
+    """Why a switched-off channel takes no delivery -- the reason the
+    outcome "channel unavailable" carries (app/engine/formatters.py),
+    naming the flag that switched it off."""
+    return f"not configured ({channel_spec(name).flag}=false on this deploy)"
+
+
+def _flag_problem(spec: ChannelSpec, value: str | None) -> str:
+    """The refusal of a flag that is not exactly true or false."""
+    expected = " or ".join(FLAG_VALUES)
+    if value is None:
+        return (
+            f"{spec.flag} is not set: it switches channel '{spec.name}' "
+            f"on or off and must be exactly {expected}"
+        )
+    return (
+        f"{spec.flag}={value!r} is not a switch: channel '{spec.name}' "
+        f"is on or off by exactly {expected}"
+    )
 
 
 def _problem(
@@ -667,86 +698,56 @@ def _problem(
         )
     lines.extend(f"  {m}" for m in malformed)
     lines.append(
-        f"  Set every key of '{spec.name}', or leave all of "
-        f"{', '.join(spec.keys)} empty if this deploy has no "
-        f"{spec.name}."
+        f"  {spec.flag}=true: set every key of '{spec.name}' "
+        f"({', '.join(spec.keys)}), or set {spec.flag}=false if this "
+        f"deploy has no {spec.name}."
     )
     return "\n".join(lines)
 
 
 def evaluate_channels(
-    values: Mapping[str, str],
+    values: Mapping[str, str | None],
 ) -> tuple[dict[str, ChannelState], list[str]]:
-    """Apply the rule to one deploy's key values.
+    """Apply the rule to one deploy's flags and key values.
 
     Args:
-        values: Declared key name -> configured value ("" = not set).
-            A key missing from the mapping counts as not set.
+        values: Flag or key name -> configured value. A key that is
+            missing or "" is not set; a flag that is missing (or None)
+            is not set either -- and that is a refusal.
 
     Returns:
         (states, problems): the state of every IMPLEMENTED channel, and
         one human-readable problem per broken channel -- ALL of them,
-        so an integrator fixes every typo in one pass. A channel with a
-        problem has no state entry: it must never be reported as live
+        so an integrator fixes every mistake in one pass. A channel with
+        a problem has no state entry: it must never be reported as live
         or absent, because the deploy must not start.
+
+    A flag that is not exactly true or false is named alone: whether
+    the channel's keys are wanted is not known, so they are not judged.
     """
     states: dict[str, ChannelState] = {}
     problems: list[str] = []
     for spec in CHANNEL_SPECS:
-        present = [k for k in spec.keys if values.get(k, "") != ""]
-        if spec.keys and not present:
-            # A defaulted value of the wrong shape on an ABSENT channel
-            # is still a refusal: it is a typo in this deploy's env, and
-            # silently ignoring it would teach the integrator that the
-            # key does not exist.
-            stray = _malformed_optionals(spec, values)
-            if stray:
-                problems.append(_problem(spec, [], present, stray))
+        if spec.flag is not None:
+            flag = values.get(spec.flag)
+            if flag not in FLAG_VALUES:
+                problems.append(_flag_problem(spec, flag))
                 continue
-            # KNOWN CEILING -- a typo in EVERY key name of a channel
-            # reads as "no such channel" (consequence of extra="ignore"
-            # on Settings, app/core/config.py -- a decision, described
-            # there in prose).
-            #   1. Mechanics: unknown env keys are ignored, so
-            #      TELEGRAM_BOT_TOKN plus TELEGRAM_BOT_UR leave both
-            #      declared keys empty -- by construction
-            #      indistinguishable from a deploy that has no telegram.
-            #      The service starts, and every request for the
-            #      channel fails permanently. A typo in ONE key name is
-            #      caught: the set is partial and startup is refused.
-            #   2. Status: acknowledged by design.
-            #   3. Backlog ref: none -- the case became visible in the
-            #      same change that introduced its detector (item 4),
-            #      and no automatic detection has been requested.
-            #   4. Promotion trigger (observable): the channel map
-            #      (`channels` field of the comms_started and
-            #      channel_formatters_built logs, and of the GET
-            #      /health body -- app/main.py) shows a channel as
-            #      not_configured although its keys were written into
-            #      the env. That map IS the detector: the ceiling is
-            #      "caught by eye from the first start", not "not
-            #      caught" -- before the map existed, this case was not
-            #      detectable at all.
-            #   5. Agreed fix: when a channel is not_configured, scan
-            #      the process environment for keys that share the
-            #      channel's prefix but are not declared (TELEGRAM_*)
-            #      and name them in the startup log -- an extension of
-            #      the existing channel map, not a new mechanism.
-            #   6. Rejected: extra="forbid" -- installers keep writing
-            #      keys this service no longer reads, and a leftover
-            #      key would refuse startup of a working deploy.
-            states[spec.name] = ChannelState.NOT_CONFIGURED
-            continue
+            if flag == "false":
+                # Switched off: nothing of the channel is read.
+                states[spec.name] = ChannelState.NOT_CONFIGURED
+                continue
 
+        present = [k for k in spec.keys if values.get(k) or ""]
         missing = [k for k in spec.keys if k not in present]
         malformed: list[str] = []
-        # Defaulted keys never make a set partial, but a spelled-out
-        # value of the wrong shape is still a refusal.
+        # Defaulted keys are never missing, but a spelled-out value of
+        # the wrong shape is still a refusal.
         checked = present + [
-            k for k in spec.optional_validators if values.get(k, "") != ""
+            k for k in spec.optional_validators if values.get(k) or ""
         ]
         for key in checked:
-            value = values[key]
+            value = values[key] or ""
             if value.strip() == "":
                 malformed.append(f"{key} consists only of whitespace")
                 continue

@@ -526,6 +526,7 @@ def model(
     types = (llm._FIXTURE / "types.yaml").read_text(encoding="utf-8")
     (root / "types.yaml").write_text(types + llm._LLM_TYPES, encoding="utf-8")
     provider = llm._Provider()
+    monkeypatch.setattr(settings, "llm_enabled", "true")
     monkeypatch.setattr(settings, "llm_key_sets", json.dumps(llm._SETS))
     registry.reset()
     install_profile(load_profile(

@@ -162,8 +162,8 @@ class TestBothWays:
         written = {name for _c, name, _v, _i in _variables(_TEMPLATE)}
         assert expected - written == set()
         # The pair: the walk compared settings, the knobs a review named
-        # among them.
-        assert len(expected) == 44
+        # among them. 47 since W2-1: the three channel flags.
+        assert len(expected) == 47
         assert {
             "NOTIFICATION_RETENTION_DAYS",
             "DLQ_MAXLEN",
@@ -227,7 +227,8 @@ class TestBothWays:
 
     def test_every_variable_is_written_once(self) -> None:
         names = [name for _c, name, _v, _i in _variables(_TEMPLATE)]
-        assert len(names) == len(set(names)) == 51
+        # 54 since W2-1: the three channel flags.
+        assert len(names) == len(set(names)) == 54
 
 
 class TestValues:

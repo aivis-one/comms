@@ -29,6 +29,7 @@ from app.transport.events import (
 _FULL_OK = {
     "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
+    "telegram_enabled": "true",
     "telegram_bot_token": "123456:test-token",
     "telegram_bot_url": "https://t.me/unit_test_bot",
     "comms_service_token": "unit-test-service-token",
@@ -62,7 +63,7 @@ def _settings(**overrides: Any) -> Settings:
 # lane's own lower edge (1) is reachable only on a deploy with no
 # network channel. The twin stands there, to test the bound and not the
 # client rule (tests/test_lane_timeouts.py tests that).
-_NO_CLIENT_CHANNEL = {"telegram_bot_token": "", "telegram_bot_url": ""}
+_NO_CLIENT_CHANNEL = {"telegram_enabled": "false"}
 
 
 def _at(name: str, value: int) -> dict[str, Any]:

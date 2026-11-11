@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # THE SECOND ANSWER. GET /health says what a deploy HAS: every channel's
-# key set (live / not_configured / not_implemented). That answer is true
+# state (live / not_configured / not_implemented). That answer is true
 # and was not enough -- at the aivis install it said `email: live` while
 # every letter died on a 401. This module gives the other half: what each
 # channel DID in the last N minutes, counted from the channel answers the

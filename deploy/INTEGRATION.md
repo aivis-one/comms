@@ -390,42 +390,64 @@ Every product has a different set of delivery channels, and a channel
 it does not have is not a failure -- it is a design decision. One rule
 expresses that, and it is the only mechanism:
 
-**A channel is decided by its own set of settings keys, and by nothing
-else.** A channel exists on a deploy when it has an implementation in
-this service and every key it declares is set:
+**A channel is decided by its flag, and by nothing else.** Under the
+Primer's machine a channel is an option of the instance: the passport
+switches it on or off, and comms learns of it only by the flag. A
+channel exists on a deploy when it has an implementation in this
+service and its flag is `true`:
 
-| the channel's key set | what it means | what happens |
+| the channel's flag | what it means | what happens |
 |---|---|---|
-| **every key empty** | this product has no such channel, by design | the service starts; the channel is absent |
-| **every key set** | the product has the channel | the channel is live |
-| **some keys set** | an integrator typo | **the service refuses to start**, naming the channel and every missing key |
-| **a malformed value** | an integrator typo | same refusal, naming the key and the shape expected |
+| **`false`** | this product has no such channel on this instance, by design | the service starts; the channel is absent; its keys are **not read and not checked**, whatever they hold |
+| **`true`**, every key set and well formed | the product has the channel | the channel is live |
+| **`true`**, a key missing or malformed | an integrator typo | **the service refuses to start**, naming the channel and every such key |
+| absent, or anything but `true` / `false` | an integrator typo | **the service refuses to start**, naming the flag |
 
-There is no mode, no global switch and no special case per channel. A
-channel that declares no keys at all is live by definition, because the
-empty set is trivially complete: that is how in-app delivery works --
-its delivery is the row the inbox reads, nothing leaves the process,
-and there is nothing to configure. A channel with no implementation in
-this service is absent on every deploy, whatever the environment says.
+### The channel flags
+
+| channel | flag |
+|---|---|
+| `telegram` | `TELEGRAM_ENABLED` |
+| `email` | `EMAIL_ENABLED` |
+| `llm` | `LLM_ENABLED` |
+
+The value is exactly `true` or `false`. Not `True`, not `1`, not `yes`;
+and a flag has no default: an env without it does not start. `in_app`
+has no flag: it is always on -- its delivery is the row the inbox reads,
+nothing leaves the process, and there is nothing to configure or to
+switch. A channel with no implementation in this service is absent on
+every deploy, whatever the environment says. Under the machine the flag
+comes from the passport (`options.<channel>`); the value the machine
+writes into the keys of a switched-off option is never read.
 
 The declared keys of every implemented channel live in one place,
 `app/core/channels.py`. That file is the answer to "which keys does
 this channel need"; this document does not duplicate the list.
 
 **A request never names a channel.** The profile routes each type to
-its channels (`types.<type>.channels`), and the startup refuses a
-profile that routes a type into a channel whose key set is empty on
-this deploy -- so a running service cannot be asked for a channel it
-does not have. A request that still carries `channels` (or any other
-unknown field) is rejected at intake and recorded under its key.
+its channels (`types.<type>.channels`). A request that still carries
+`channels` (or any other unknown field) is rejected at intake and
+recorded under its key.
 
-**One case still reaches a missing channel at delivery, and it is
-LOUD.** A job snapshots its channels when it is accepted. If a restart
-then removes a channel from both the profile and the deploy, jobs
-accepted before the restart still carry it: their delivery on that
-channel fails immediately, without retries, and says so in the log
-(`delivery_channel_unavailable`) and in the delivery row. It is never
-reported as a success.
+**A type routed into a switched-off channel is accepted, and its
+delivery there is the outcome "channel unavailable".** The profile
+loads; a job of the type is accepted; its delivery into the switched-off
+channel is `failed`, class `configuration`, at once and without
+retries, and says so in the log (`delivery_channel_unavailable`) and in
+the delivery row, whose `error_message` names the flag:
+
+    channel 'email' is not available on this deploy: not configured (EMAIL_ENABLED=false on this deploy)
+
+The job's other channels go as usual: a job for `[in_app, email]` with
+email off is `partial_sent`, its `in_app` delivery `sent`; a job whose
+every channel is off is `failed`. It is never reported as a success. An
+llm job with the llm channel off is accepted the same way -- its
+`llm_audio` link included, which is then not checked against
+`LLM_BODY_HOSTS` and never fetched -- and its one delivery is that
+outcome. A product that cannot do without a channel guards it with its
+own `options_required`; comms does not refuse the start for it. The
+same outcome meets a job accepted while a channel was on, delivered
+after a restart that switched it off.
 
 **Startup refusals are readable.** The configuration is built before
 logging is set up, so a refusal prints a message -- naming the channel
@@ -435,28 +457,25 @@ the application log where the installer output is, so the typo is
 visible without going looking for it.
 
 **What the first start tells you.** The `comms_started` log line
-carries a channel map: every channel with `live`, `not_configured` or
-`not_implemented`. The same map is served by `GET /health` under
-`channels`, so confirming it later needs a request rather than a grep
-through a container's log. That map is the way to confirm that a deploy
-sees the channels its installer meant to give it. One case needs it: a
-typo in *every* key name of a channel (unknown keys are ignored on
-purpose, so that a leftover variable in a shared env file cannot refuse
-a working deploy) leaves the key set empty and therefore reads as "no
-such channel". The map shows `not_configured` where the installer
-expected `live`; the in-code marker (`KNOWN CEILING` in
-`app/core/channels.py`) records the case and its agreed fix. The map
-says what a deploy HAS; what its channels DID is the second answer,
-"Channel health" in section 5.
+carries a channel map: every channel with `live`, `not_configured` (the
+flag is `false`) or `not_implemented`. The same map is served by
+`GET /health` under `channels`, so confirming it later needs a request
+rather than a grep through a container's log. That map is the way to
+confirm that a deploy sees the channels its installer meant to give it.
+Unknown variables are ignored on purpose, so that a leftover in a
+shared env file cannot refuse a working deploy -- and a misspelt channel
+variable is still caught: a misspelt flag is an absent flag, and a
+misspelt key of a switched-on channel is a missing key, both refusals.
+The map says what a deploy HAS; what its channels DID is the second
+answer, "Channel health" in section 5.
 
 **The llm channel, concretely,** is one key, `LLM_KEY_SETS`, holding
 named key sets: section 11.
 
-**Email, concretely.** The channel is decided by its key set like any
-other, and its keys are declared in `app/core/channels.py`. Three of
-them decide it -- the provider API key, the provider domain, and the
-sender address -- and all three must be set together or left empty
-together. The sender has no default because it is a product fact; a
+**Email, concretely.** The channel is decided by its flag like any
+other, and its keys are declared in `app/core/channels.py`. With
+`EMAIL_ENABLED=true` three of them are required -- the provider API
+key, the provider domain, and the sender address. The sender has no default because it is a product fact; a
 default would make an incomplete set look complete. It accepts either a
 bare address or the display form `Name <address>`, since a signed
 sender delivers better -- in the env file the display form only in
@@ -465,12 +484,11 @@ read by `source`, and an unquoted `<` is a redirection there. A value
 carrying a line break is refused at startup.
 
 The provider region is different in kind: it has a default, so
-"unset" and "set to the default" cannot be told apart, and it therefore
-does NOT take part in deciding whether the channel exists -- a deploy
-with no email at all is not made incomplete by it. Its VALUE is still
-checked whenever it is spelled out, against a closed set of the
-provider's regions: a plausible-looking `eu-west` refuses startup
-instead of failing every send later.
+"unset" and "set to the default" cannot be told apart, and it is
+therefore never a missing key. Its VALUE is still checked whenever it is
+spelled out with email on, against a closed set of the provider's
+regions: a plausible-looking `eu-west` refuses startup instead of
+failing every send later.
 
 **What the key set cannot check.** A syntactically perfect set with a
 wrong API key, or with a domain that is not verified with the provider,
@@ -1565,9 +1583,11 @@ The models a deploy can reach are **named key sets** in the comms
 
     LLM_KEY_SETS='{"llm.text": {"endpoint": "https://<gateway host>/api/v1", "key": "<key>", "model": "<vendor>/<model>", "gateway": true}, "llm.text_direct": {"endpoint": "https://<vendor host>/v1", "key": "<key>", "model": "<model>", "gateway": false}}'
 
-Empty: the deploy has no llm, and the rest of comms works as before.
-Set: every set must be whole, or comms refuses to start, naming the set
-and the field -- never the value. A set name is lower-case words joined
+It is read only with `LLM_ENABLED=true` (section 3a); with `false` the
+deploy has no llm, the variable is not read, and the rest of comms works
+as before. With `true` it is required, and every set must be whole, or
+comms refuses to start, naming the set and the field -- never the
+value. A set name is lower-case words joined
 by dots (`llm.text`), at most 64 characters; a name written twice is a
 refusal.
 
@@ -1672,7 +1692,9 @@ the audio comes last. The link never goes to the model -- the bytes do.
 **The operator names the store.** `LLM_BODY_HOSTS` in the comms `.env`
 is the exact `host:port` pairs a link may point at, comma separated
 (`rustfs:9000`). Empty, the default: this deploy fetches nothing, and a
-request with `llm_audio` is rejected at intake. A link to any other
+request with `llm_audio` is rejected at intake. Both only with the llm
+channel on: with `LLM_ENABLED=false` the list is not read, and the job
+is accepted and ends in the outcome "channel unavailable" (section 3a). A link to any other
 host -- `comms-postgres`, `comms-redis`, `comms-app`, a metadata
 address -- is rejected at intake, and refused again at the attempt if
 the list changed since.

@@ -11,11 +11,11 @@
 #   (bot token) are shared with the product and injected via env.
 #
 # CHANNELS:
-#   A channel is decided by its own key set and by nothing else -- see
-#   app/core/channels.py for the rule. Empty set: the deploy has no
-#   such channel. Full set: the channel is live. Partial set or a
-#   malformed value: startup is refused with a message naming the
-#   channel and the keys (load_settings below).
+#   A channel is decided by its flag (<CHANNEL>_ENABLED) and by nothing
+#   else -- see app/core/channels.py for the rule. false: the deploy has
+#   no such channel, and its keys are not read. true: every key of the
+#   channel is required and checked. No flag, or any other value:
+#   startup is refused naming the flag (load_settings below).
 #
 # DEFAULT_LOCALE:
 #   Per-deploy default used as the template-rendering fallback language
@@ -37,6 +37,7 @@ from app.core.channels import (
     ChannelState,
     LLMKeySet,
     channel_env_keys,
+    channel_flag_keys,
     channel_optional_keys,
     channel_spec,
     evaluate_channels,
@@ -534,36 +535,47 @@ class Settings(BaseSettings):
     # with a loud startup warning (app/main.py).
     comms_service_token: str = ""
 
+    # -- Channel flags (app/core/channels.py) --
+    # Exactly "true" or "false", no default: an absent flag, or any
+    # other value, refuses startup naming it. Kept as text, not as a
+    # bool, on purpose: pydantic would read "yes", "1" or "on" as true,
+    # and the refusal is collected with every other problem below
+    # rather than cut short by a type error. A switched-off channel's
+    # keys are never read -- the properties below that parse keys ask
+    # the flag first.
+    telegram_enabled: str | None = None
+    email_enabled: str | None = None
+    llm_enabled: str | None = None
+
     # -- Telegram (shared bot with the product, see arch doc §7) --
-    # A channel key set (app/core/channels.py): both empty = this
-    # deploy has no telegram; both set = live; anything else refuses
-    # startup.
+    # The channel's keys (app/core/channels.py): with TELEGRAM_ENABLED
+    # true both are required; with false neither is read.
     telegram_bot_token: str = ""
     # Base URL for deep-link buttons, e.g. "https://t.me/<product_bot>".
     # Consumed by TelegramFormatter.format_deep_link (ported from VELO).
     telegram_bot_url: str = ""
 
-    # -- Email (a channel key set, app/core/channels.py) --
-    # All three empty = this deploy has no email; all three set = live;
-    # anything else refuses startup. The sender has NO default on
-    # purpose: it is a product fact, and a default would make a partial
-    # set look complete.
+    # -- Email (the channel's keys, app/core/channels.py) --
+    # With EMAIL_ENABLED true all three are required; with false none is
+    # read. The sender has NO default on purpose: it is a product fact,
+    # and a default would make a partial set look complete.
     email_mailgun_api_key: str = ""
     email_mailgun_domain: str = ""
     # A bare address, or the display form "Name <address>" -- a signed
     # sender is materially better for deliverability, which is the
     # reason a provider is used at all.
     email_from_address: str = ""
-    # NOT part of the key set (it has a default), but its shape IS
-    # checked when spelled out: a closed set of two, so "eu-west" or
-    # "europe" refuses startup instead of failing every send.
+    # NOT a required key (it has a default), but its shape IS checked
+    # when the channel is on and the value spelled out: a closed set of
+    # two, so "eu-west" or "europe" refuses startup instead of failing
+    # every send.
     email_mailgun_region: str = "eu"
 
-    # -- LLM (a channel key set, app/core/channels.py; P5-1) --
+    # -- LLM (the channel's key, app/core/channels.py; P5-1) --
     # One JSON object of named key sets -- {"llm.text": {"endpoint":
-    # ..., "key": ..., "model": ..., "gateway": true|false}}. Empty =
-    # this deploy has no llm; anything else must be whole and
-    # well-formed, or startup is refused naming the set and the field.
+    # ..., "key": ..., "model": ..., "gateway": true|false}}. With
+    # LLM_ENABLED true it is required, whole and well-formed, or startup
+    # is refused naming the set and the field; with false it is not read.
     llm_key_sets: str = ""
     # Seconds one call to ONE set may take; the job's call over its list
     # of sets is bounded by this times the length of the list
@@ -577,8 +589,9 @@ class Settings(BaseSettings):
     @property
     def llm_body_host_set(self) -> frozenset[tuple[str, int]]:
         """The allowed (host, port) pairs; empty when nothing may be
-        fetched. Read only off validated settings."""
-        if self.llm_body_hosts == "":
+        fetched -- the llm channel switched off included, whose keys are
+        not read. Read only off validated settings."""
+        if self.llm_enabled != "true" or self.llm_body_hosts == "":
             return frozenset()
         allowed, _ = parse_llm_body_hosts(self.llm_body_hosts)
         return allowed
@@ -586,12 +599,23 @@ class Settings(BaseSettings):
     @property
     def llm_sets(self) -> dict[str, LLMKeySet]:
         """This deploy's llm key sets by name, in declaration order; {}
-        when the deploy has no llm. Only ever read on validated settings:
-        a malformed value refused startup, so nothing is lost here."""
-        if self.llm_key_sets == "":
+        when the llm channel is switched off -- its key is then not read.
+        Only ever read on validated settings: with the channel on, a
+        malformed value refused startup, so nothing is lost here."""
+        if self.llm_enabled != "true":
             return {}
         sets, _ = parse_llm_key_sets(self.llm_key_sets)
         return sets
+
+    @property
+    def channel_states(self) -> dict[str, ChannelState]:
+        """The state of every implemented channel on this deploy -- the
+        one reading of the flags and keys every reader shares (the
+        channel map of app/engine/formatters.py, the startup log, GET
+        /health). Read only off validated settings: a broken flag or key
+        set never got this far, so every channel has its state."""
+        states, _ = evaluate_channels(channel_values(self))
+        return states
 
     @property
     def email_api_base_url(self) -> str:
@@ -868,17 +892,16 @@ class Settings(BaseSettings):
         # integrator fixes all of them in one pass, not one per restart.
         problems: list[str] = []
 
-        # Phase 3b item 4 (3a flag 7.3), generalized: a channel with a
-        # PARTIAL key set must die AT STARTUP, not on the delivery path
-        # -- an empty bot URL next to a real token turns every deep-link
-        # button into a BUTTON_URL_INVALID storm of permanent FAILED
-        # deliveries. An EMPTY set is legal: the deploy has no channel.
-        # Every declared key is a field of this class under its
-        # lower-case name (pinned by a test).
-        channel_states, channel_problems = evaluate_channels({
-            key: getattr(self, key.lower())
-            for key in channel_env_keys() + channel_optional_keys()
-        })
+        # Phase 3b item 4 (3a flag 7.3), generalized: a switched-on
+        # channel with an incomplete key set must die AT STARTUP, not on
+        # the delivery path -- an empty bot URL next to a real token
+        # turns every deep-link button into a BUTTON_URL_INVALID storm of
+        # permanent FAILED deliveries. A switched-off channel is legal
+        # and is not read (W2-1). Every flag and declared key is a field
+        # of this class under its lower-case name (pinned by a test).
+        channel_states, channel_problems = evaluate_channels(
+            channel_values(self),
+        )
         problems.extend(channel_problems)
         problems.extend(self._free_route_problems())
 
@@ -951,8 +974,11 @@ class Settings(BaseSettings):
         third gateway condition: no free routes in production, debugging
         included). A gateway marks a free route by the suffix `:free`
         of the model id. Read only off well-formed sets: a malformed
-        value is refused by the channel rule already, naming its set."""
-        if self.is_dev or self.llm_key_sets == "":
+        value is refused by the channel rule already, naming its set;
+        and never off a switched-off channel, whose key is not read."""
+        if self.is_dev or self.llm_enabled != "true":
+            return []
+        if self.llm_key_sets == "":
             return []
         sets, _ = parse_llm_key_sets(self.llm_key_sets)
         return [
@@ -966,13 +992,26 @@ class Settings(BaseSettings):
     # extra="ignore" is a DECISION, not an oversight: a deploy's env is
     # shared with installers that write keys this service does not read
     # (including keys it used to read), and an unknown key must not
-    # refuse startup. Its consequence for channel keys is marked as a
-    # KNOWN CEILING in app/core/channels.py (evaluate_channels).
+    # refuse startup. A misspelt channel variable is still caught: a
+    # misspelt flag is an absent flag, and a misspelt key of a
+    # switched-on channel is a missing key -- both refuse startup.
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+
+def channel_values(source: Settings) -> dict[str, str | None]:
+    """Every channel flag and key of `source` by its variable name --
+    what app/core/channels.py evaluate_channels reads. Every one is a
+    field of Settings under its lower-case name (pinned by a test)."""
+    return {
+        key: getattr(source, key.lower())
+        for key in (
+            channel_flag_keys() + channel_env_keys() + channel_optional_keys()
+        )
+    }
 
 
 def worker_lane_problem(value: str | None) -> str | None:

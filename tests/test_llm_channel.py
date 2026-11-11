@@ -248,6 +248,7 @@ def provider(
     """A deploy with the llm channel live (two sets), the profile with
     the llm types installed, the registry built on the mock provider."""
     the_provider = _Provider()
+    monkeypatch.setattr(settings, "llm_enabled", "true")
     monkeypatch.setattr(settings, "llm_key_sets", json.dumps(_SETS))
     registry.reset()
     install_profile(load_profile(
@@ -430,6 +431,8 @@ def _settings(**overrides: Any) -> Settings:
         "app_env": "production",
         "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
         "comms_service_token": "unit-test-service-token",
+        # The llm channel switched on (W2-1): its key is read only then.
+        "llm_enabled": "true",
     }
     return Settings(**{**base, **overrides})
 
@@ -454,8 +457,17 @@ class TestRedStart:
             "llm.gw", "llm.direct",
         }
 
-    def test_empty_is_no_llm(self) -> None:
-        assert _settings(llm_key_sets="").llm_sets == {}
+    def test_switched_off_is_no_llm(self) -> None:
+        """Was test_empty_is_no_llm: an empty LLM_KEY_SETS was the deploy
+        without llm, and that was the rule until W2-1. Since then the
+        flag decides -- empty with the channel on is a refusal -- and a
+        switched-off channel's key is not read, whatever it holds."""
+        assert _settings(
+            llm_enabled="false", llm_key_sets=json.dumps(_SETS),
+        ).llm_sets == {}
+        refusal = _refusal(llm_key_sets="")
+        assert "channel 'llm' is misconfigured" in refusal
+        assert "missing: LLM_KEY_SETS" in refusal
 
     def test_a_free_route_refuses_outside_development(self) -> None:
         sets = json.loads(json.dumps(_SETS))
@@ -1370,6 +1382,7 @@ class TestTheTimeout:
             "email_mailgun_api_key": "unit-test-provider-key",
             "email_mailgun_domain": "mg.example.org",
             "email_from_address": "Unit <unit@example.org>",
+            "email_enabled": "true",
         }
         deploy = _settings(llm_key_sets=json.dumps(_SETS), **email)
         assert deploy.notification_lane_interactive_deliver_timeout_seconds == 30
@@ -1382,7 +1395,9 @@ class TestTheTimeout:
         assert "LLM_DELIVER_TIMEOUT_SECONDS=100 is not above the client" in refusal
         assert "llm (114 s)" in refusal
         # The pair: without llm the number binds nothing.
-        assert _settings(llm_deliver_timeout_seconds=100).llm_sets == {}
+        assert _settings(
+            llm_enabled="false", llm_deliver_timeout_seconds=100,
+        ).llm_sets == {}
 
     async def test_the_call_is_bounded_by_its_own_timeout_per_set(
         self, provider: _Provider, monkeypatch: pytest.MonkeyPatch,

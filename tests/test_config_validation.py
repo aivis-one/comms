@@ -10,7 +10,8 @@
 # R-0: until then both rules were gated by the "real" position of the
 # global channel switch, and its "stub" position was exempt from them.
 # The switch is gone: the telegram rule now follows the channel's own
-# key set (an EMPTY set is a legal deploy without telegram), and the
+# flag and key set (W2-1: TELEGRAM_ENABLED=false is the legal deploy
+# without telegram; with true the key set must be whole), and the
 # token rule follows APP_ENV, the same
 # axis as DATABASE_URL. The full matrix of key-set states lives in
 # test_channel_key_sets.py; this file keeps the original cases.
@@ -28,10 +29,14 @@ import pytest
 from app.core.config import Settings
 
 # Everything a production deploy WITH telegram needs to boot; tests
-# knock fields out one at a time.
+# knock fields out one at a time. Every flag is written: the suite's
+# own environment must not decide which channels these tests have.
 _FULL_OK = {
     "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
+    "telegram_enabled": "true",
+    "email_enabled": "false",
+    "llm_enabled": "false",
     "telegram_bot_token": "123456:test-token",
     "telegram_bot_url": "https://t.me/unit_test_bot",
     "comms_service_token": "unit-test-service-token",
@@ -71,12 +76,15 @@ class TestEmptyTelegramIsLegal:
         self,
     ) -> None:
         """R-0: was "stub mode boots with nothing configured" and
-        asserted the switch read "stub". What stays true: an empty
-        telegram set boots anywhere (a deploy without telegram), and an
-        empty service token boots in development. What the switch hid:
-        outside development the token is required -- pinned above."""
+        asserted the switch read "stub". What stays true: a deploy
+        without telegram boots anywhere, and an empty service token
+        boots in development. What the switch hid: outside development
+        the token is required -- pinned above. Since W2-1 the deploy
+        without telegram is TELEGRAM_ENABLED=false (an empty key set
+        with the flag true is a refusal, test_channel_key_sets)."""
         settings = _settings(
             app_env="development",
+            telegram_enabled="false",
             telegram_bot_token="",
             telegram_bot_url="",
             comms_service_token="",

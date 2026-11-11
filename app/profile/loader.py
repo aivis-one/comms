@@ -66,16 +66,19 @@
 # owner's decision (§14.12 item 5) is a term per type, and no class set
 # exists.
 #
-# CROSS-CHECK WITH THE DEPLOY (install_profile_from_settings): a type
-# routed to a channel whose key set is entirely empty on this deploy
-# (not_configured) refuses startup -- a route into a missing
-# capability must not reach a running service. So does an llm type
-# naming a key set that LLM_KEY_SETS does not define. The channel-name check
+# CROSS-CHECK WITH THE DEPLOY (install_profile_from_settings): an llm
+# type naming a key set that LLM_KEY_SETS does not define refuses
+# startup -- when the llm channel is switched on; switched off, its key
+# is not read and the sets are not checked. A type routed to a channel
+# this deploy switched off (its flag false, app/core/channels.py) is
+# ACCEPTED: the channel is an option of the instance, and a delivery
+# into it ends in the outcome "channel unavailable" while the type's
+# other channels go on (owner's decision 05.11; the product guards the
+# channel it needs by its own options_required). The channel-name check
 # against the capability registry is the same enumeration check every
-# channel list gets. A PARTIAL key set is not checked here at all: the
-# settings validator refuses it before this module runs
-# (app/core/config.py, via app/core/channels.py evaluate_channels), so
-# that state never reaches the loader.
+# channel list gets. A broken flag or key set is not checked here at
+# all: the settings validator refuses it before this module runs
+# (app/core/config.py, via app/core/channels.py evaluate_channels).
 #
 # EVERY VIOLATION AT ONCE. A broken profile raises ONE ProfileError
 # listing every violation -- type, field, what was found, what was
@@ -188,12 +191,7 @@ from typing import Any, Protocol
 import structlog
 import yaml
 
-from app.core.channels import (
-    CHANNEL_SPECS,
-    ChannelState,
-    channel_env_keys,
-    evaluate_channels,
-)
+from app.core.channels import CHANNEL_SPECS
 from app.core.config import NUMERIC_BOUNDS, settings
 from app.core.constants import (
     DOMAIN_LITERAL_PATTERNS,
@@ -892,16 +890,15 @@ class Profile:
 
 def parse_profile(
     raw: RawProfile,
-    channel_states: Mapping[str, ChannelState] | None = None,
     llm_set_names: Collection[str] | None = None,
 ) -> Profile:
     """Validate a raw profile and return the parsed form.
 
     Source-independent: everything loaded by any ProfileSource goes
-    through the same checks. `channel_states` is this deploy's channel
-    map, `llm_set_names` the names of its llm key sets; when given,
-    routes are cross-checked against them (the startup path passes
-    them, tests that only exercise the schema do not).
+    through the same checks. `llm_set_names` is the names of this
+    deploy's llm key sets; when given, llm routes are cross-checked
+    against them (the startup path passes them when the llm channel is
+    switched on, tests that only exercise the schema do not).
 
     Raises ProfileError: at once for a missing or wrong schema version;
     otherwise once, listing every violation found.
@@ -912,8 +909,6 @@ def parse_profile(
     if types is not None:
         _require_msg_type_categories(types, violations)
         _check_kinds(types, violations)
-        if channel_states is not None:
-            _check_routes(types, channel_states, violations)
         if llm_set_names is not None:
             _check_llm_set_routes(types, llm_set_names, violations)
 
@@ -1301,32 +1296,6 @@ def _check_llm_set_routes(
                     f"type {key!r} routes to key set {name!r}, which "
                     f"LLM_KEY_SETS on this deploy does not define (defined: "
                     f"{', '.join(sorted(defined)) or 'none'})",
-                ))
-
-
-def _check_routes(
-    types: dict[str, TypeRecord],
-    channel_states: Mapping[str, ChannelState],
-    violations: list[Violation],
-) -> None:
-    """Refuse a route into a capability this deploy did not configure.
-
-    Names were already checked against the capability registry; here
-    only the deploy's state matters. A channel with an empty DECLARED
-    key list (in_app) is live by definition and passes. A partial key
-    set never reaches here -- the settings validator refused it.
-    """
-    for key, record in types.items():
-        decided = record.fields["channels"]
-        for channel in decided.value:
-            if channel_states[channel] is ChannelState.NOT_CONFIGURED:
-                violations.append(Violation(
-                    _TYPES_FILE, key, "channels",
-                    f"type {key!r} routes to channel {channel!r} (decided "
-                    f"by: {decided.layer.value}), but every key of "
-                    f"{channel!r} is empty on this deploy; set the "
-                    f"channel's keys, or remove {channel!r} from the "
-                    f"type's channels",
                 ))
 
 
@@ -1944,11 +1913,10 @@ def load_overlay(source: FileOverlaySource, base: Profile) -> TextOverlay:
 
 def load_profile(
     source: ProfileSource,
-    channel_states: Mapping[str, ChannelState] | None = None,
     llm_set_names: Collection[str] | None = None,
 ) -> Profile:
     """Load and validate a profile from a source."""
-    return parse_profile(source.load(), channel_states, llm_set_names)
+    return parse_profile(source.load(), llm_set_names)
 
 
 @dataclass(frozen=True)
@@ -1982,20 +1950,6 @@ def lanes_mixing_llm(target: ProfileRegistry = registry) -> list[LaneMix]:
         for lane, (llm, other) in by_lane.items()
         if llm and other
     ]
-
-
-def deploy_channel_states() -> dict[str, ChannelState]:
-    """This deploy's channel states, from the validated settings.
-
-    The same key values the startup channel map reads
-    (app/engine/formatters.py channel_map, which this package cannot
-    import: profile sits below engine). The problems list is not
-    consulted: settings with a broken key set never got constructed.
-    """
-    states, _ = evaluate_channels({
-        key: getattr(settings, key.lower()) for key in channel_env_keys()
-    })
-    return states
 
 
 def install_profile(
@@ -2054,9 +2008,10 @@ def install_profile_from_settings() -> bool:
     local experiments register what they need. Anywhere else a
     missing profile is a deploy error -> ProfileError. An overlay
     without a base is refused everywhere: it replaces base texts, and
-    there are none. Routes are cross-checked against this deploy's
-    channel states. Nothing is installed until base and overlay both
-    passed.
+    there are none. llm routes are cross-checked against this deploy's
+    key sets when the llm channel is switched on; a route into a
+    switched-off channel is accepted (see CROSS-CHECK WITH THE DEPLOY).
+    Nothing is installed until base and overlay both passed.
     """
     if settings.templates_overlay_dir and not settings.templates_dir:
         raise ProfileError(
@@ -2077,8 +2032,10 @@ def install_profile_from_settings() -> bool:
         )
     profile = load_profile(
         FileProfileSource(Path(settings.templates_dir)),
-        channel_states=deploy_channel_states(),
-        llm_set_names=tuple(settings.llm_sets),
+        llm_set_names=(
+            tuple(settings.llm_sets) if settings.llm_enabled == "true"
+            else None
+        ),
     )
     overlay = (
         load_overlay(

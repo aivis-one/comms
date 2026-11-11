@@ -1,19 +1,22 @@
 # =============================================================================
-# COMMS Service -- The channel key-set rule (R-0)
+# COMMS Service -- The channel key-set rule (R-0, the flag since W2-1)
 # =============================================================================
 #
-# A channel is decided by its own set of settings keys and by nothing
-# else (app/core/channels.py):
-#   every key empty -> the deploy has no such channel; the service
-#                      starts, and a REQUEST for the channel fails
-#                      permanently and loudly
-#   every key set   -> the channel is live
-#   partial set or a malformed value -> startup is REFUSED, naming the
-#                      channel and the keys
+# A channel is decided by its flag, and with the flag on by its own set
+# of settings keys (app/core/channels.py; until W2-1 the key set alone
+# decided, every key empty being the deploy without the channel):
+#   flag false      -> the deploy has no such channel; its keys are not
+#                      read; the service starts, and a REQUEST for the
+#                      channel fails permanently and loudly
+#   flag true, every key set -> the channel is live
+#   flag true, a key missing or malformed -> startup is REFUSED,
+#                      naming the channel and the keys
+# The flag's own states (absent, not exactly true/false) are pinned in
+# tests/test_channel_flags.py.
 #
 # WHAT THIS FILE COVERS, beyond the table above:
-#   - the full state enumeration for the telegram key set, including
-#     whitespace-only values and both empty (a legal deploy);
+#   - the full state enumeration for the telegram key set with the flag
+#     on, including whitespace-only values and both empty (a refusal);
 #   - THE THREE DOUBLE AXES on both inputs this change touches, the key
 #     set (parse) and the channel lookup (formatter choice): REPEAT,
 #     EMPTY, SHORTFALL;
@@ -46,6 +49,7 @@ from app.core.channels import (
     CHANNEL_SPECS,
     ChannelState,
     channel_env_keys,
+    channel_flag_keys,
     evaluate_channels,
 )
 from app.core.config import Settings
@@ -74,10 +78,14 @@ _GOOD_TOKEN = "123456:unit-test-bot-token"
 _GOOD_URL = "https://t.me/unit_test_bot"
 
 # A production deploy that has telegram. Tests knock single keys out.
+# Every flag is written: the suite's environment must not decide them.
 _WITH_TELEGRAM: dict[str, Any] = {
     "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
     "comms_service_token": "unit-test-service-token",
+    "telegram_enabled": "true",
+    "email_enabled": "false",
+    "llm_enabled": "false",
     "telegram_bot_token": _GOOD_TOKEN,
     "telegram_bot_url": _GOOD_URL,
 }
@@ -89,6 +97,17 @@ def _settings(**overrides: str) -> Settings:
         "_env_file": None, **_WITH_TELEGRAM, **overrides,
     }
     return Settings(**kwargs)
+
+
+def _on(values: dict[str, str]) -> dict[str, str]:
+    """`values` with telegram switched on and the other channels off --
+    the rule's input as a deploy with telegram gives it (W2-1)."""
+    return {
+        "TELEGRAM_ENABLED": "true",
+        "EMAIL_ENABLED": "false",
+        "LLM_ENABLED": "false",
+        **values,
+    }
 
 
 class _FakeBot:
@@ -110,18 +129,25 @@ def _fake_factory(**kwargs: Any) -> _FakeBot:
 class TestKeySetStates:
     """The enumeration, state by state, on the parse function."""
 
-    def test_both_empty_is_a_deploy_without_the_channel(self) -> None:
-        states, problems = evaluate_channels({
+    def test_both_empty_with_the_flag_on_is_a_refusal(self) -> None:
+        """Was test_both_empty_is_a_deploy_without_the_channel: an empty
+        key set was the deploy without telegram until W2-1, and a typo
+        in both key names read the same (the KNOWN CEILING it carried).
+        Now the flag says whether the deploy has telegram, so an empty
+        set with the flag on is missing both keys -- named. The deploy
+        without telegram is the flag off (test_channel_flags.py)."""
+        states, problems = evaluate_channels(_on({
             "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_BOT_URL": "",
-        })
-        assert problems == []
-        assert states["telegram"] == ChannelState.NOT_CONFIGURED
+        }))
+        assert "telegram" not in states
+        (problem,) = problems
+        assert "missing: TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_URL" in problem
 
     def test_both_set_is_live(self) -> None:
-        states, problems = evaluate_channels({
+        states, problems = evaluate_channels(_on({
             "TELEGRAM_BOT_TOKEN": _GOOD_TOKEN,
             "TELEGRAM_BOT_URL": _GOOD_URL,
-        })
+        }))
         assert problems == []
         assert states["telegram"] == ChannelState.LIVE
 
@@ -146,7 +172,7 @@ class TestKeySetStates:
         """SHORTFALL on the parse: one key short, and the message names
         THAT key -- naming both would send an integrator to a key that
         is already correct."""
-        states, problems = evaluate_channels(values)
+        states, problems = evaluate_channels(_on(values))
         assert "telegram" not in states
         (problem,) = problems
         assert f"missing: {named}" in problem
@@ -161,9 +187,9 @@ class TestKeySetStates:
         ],
     )
     def test_malformed_token_is_a_refusal(self, token: str) -> None:
-        _, problems = evaluate_channels({
+        _, problems = evaluate_channels(_on({
             "TELEGRAM_BOT_TOKEN": token, "TELEGRAM_BOT_URL": _GOOD_URL,
-        })
+        }))
         (problem,) = problems
         assert "TELEGRAM_BOT_TOKEN is malformed" in problem
 
@@ -177,9 +203,9 @@ class TestKeySetStates:
         ],
     )
     def test_malformed_url_is_a_refusal(self, url: str) -> None:
-        _, problems = evaluate_channels({
+        _, problems = evaluate_channels(_on({
             "TELEGRAM_BOT_TOKEN": _GOOD_TOKEN, "TELEGRAM_BOT_URL": url,
-        })
+        }))
         (problem,) = problems
         assert "TELEGRAM_BOT_URL is malformed" in problem
 
@@ -192,9 +218,9 @@ class TestKeySetStates:
         """A space in a value is a typo, not a design decision: reading
         it as "empty" would silently drop a channel the integrator was
         trying to configure."""
-        states, problems = evaluate_channels({
+        states, problems = evaluate_channels(_on({
             "TELEGRAM_BOT_TOKEN": value, "TELEGRAM_BOT_URL": value,
-        })
+        }))
         assert "telegram" not in states
         (problem,) = problems
         assert "TELEGRAM_BOT_TOKEN consists only of whitespace" in problem
@@ -204,18 +230,18 @@ class TestKeySetStates:
         """Keys carry secrets: a complaint names the KEY, and a value is
         only ever echoed where it cannot be a secret (the URL shape)."""
         secret = "0000000000:absolutely-secret-value"
-        _, problems = evaluate_channels({
+        _, problems = evaluate_channels(_on({
             "TELEGRAM_BOT_TOKEN": secret, "TELEGRAM_BOT_URL": "",
-        })
+        }))
         assert secret not in "\n".join(problems)
 
     def test_every_problem_is_collected_not_just_the_first(self) -> None:
         """An integrator fixes everything in one pass, not one restart
         per typo."""
-        _, problems = evaluate_channels({
+        _, problems = evaluate_channels(_on({
             "TELEGRAM_BOT_TOKEN": "not-a-token",
             "TELEGRAM_BOT_URL": "also-not-a-url",
-        })
+        }))
         (problem,) = problems
         assert "TELEGRAM_BOT_TOKEN is malformed" in problem
         assert "TELEGRAM_BOT_URL is malformed" in problem
@@ -226,10 +252,15 @@ class TestChannelsWithoutKeys:
         self,
     ) -> None:
         """in_app is not an exception to the rule -- it is the rule
-        applied to zero keys: the empty set is trivially complete."""
+        applied to zero keys and no flag: the empty set is trivially
+        complete, and there is nothing to switch. Every other channel
+        off here (W2-1: the flags are required), in_app still live."""
         (in_app,) = [s for s in CHANNEL_SPECS if s.name == "in_app"]
         assert in_app.keys == ()
-        states, problems = evaluate_channels({})
+        assert in_app.flag is None
+        states, problems = evaluate_channels(
+            dict.fromkeys(channel_flag_keys(), "false"),
+        )
         assert problems == []
         assert states["in_app"] == ChannelState.LIVE
 
@@ -246,7 +277,10 @@ class TestSpecAgreesWithTheCode:
     """The spec is the single source; these pin it to both its users."""
 
     def test_every_declared_key_is_a_settings_field(self) -> None:
-        for key in channel_env_keys():
+        """The flags too, since W2-1: the rule reads them all off
+        Settings by lower-case name (app/core/config.py
+        channel_values)."""
+        for key in channel_env_keys() + channel_flag_keys():
             assert key.lower() in Settings.model_fields, key
 
     def test_every_channel_name_is_a_delivery_channel(self) -> None:
@@ -266,9 +300,11 @@ class TestSpecAgreesWithTheCode:
 
 
 class TestStartupRefusal:
-    def test_empty_set_boots(self) -> None:
-        """A product without telegram exists, and it starts."""
-        settings = _settings(telegram_bot_token="", telegram_bot_url="")
+    def test_switched_off_boots(self) -> None:
+        """A product without telegram exists, and it starts. Was
+        test_empty_set_boots: until W2-1 the empty key set was that
+        product; now the flag off is, its keys not read."""
+        settings = _settings(telegram_enabled="false")
         assert channel_map(settings)["telegram"] == (
             ChannelState.NOT_CONFIGURED
         )
@@ -291,6 +327,9 @@ class TestStartupRefusal:
                 "APP_ENV": "production",
                 "DATABASE_URL": "postgresql+asyncpg://u:p@db/comms_unit",
                 "COMMS_SERVICE_TOKEN": "unit-test-service-token",
+                "TELEGRAM_ENABLED": "true",
+                "EMAIL_ENABLED": "false",
+                "LLM_ENABLED": "false",
                 **env,
             },
             capture_output=True,
@@ -308,7 +347,7 @@ class TestStartupRefusal:
         # Names the channel, names the missing key, says what to do.
         assert "telegram" in output
         assert "TELEGRAM_BOT_URL" in output
-        assert "leave all of" in output
+        assert "or set TELEGRAM_ENABLED=false" in output
         # Not a traceback, and not pydantic's own wrapping.
         assert "Traceback" not in output
         assert "ValidationError" not in output
@@ -317,17 +356,18 @@ class TestStartupRefusal:
     def test_refusal_text_names_the_missing_service_token(self) -> None:
         result = self._import_settings(
             COMMS_SERVICE_TOKEN="",
-            TELEGRAM_BOT_TOKEN="",
-            TELEGRAM_BOT_URL="",
+            TELEGRAM_ENABLED="false",
         )
         assert result.returncode == 1
         assert "COMMS_SERVICE_TOKEN" in result.stderr
         assert "Traceback" not in result.stderr
 
-    def test_empty_set_import_succeeds(self) -> None:
+    def test_switched_off_import_succeeds(self) -> None:
         """The pair to the assertions above: the refusal fires on a
-        BROKEN set, not on every start -- an empty set imports fine."""
+        BROKEN set, not on every start -- a switched-off telegram
+        imports fine (was an empty set, until W2-1)."""
         result = self._import_settings(
+            TELEGRAM_ENABLED="false",
             TELEGRAM_BOT_TOKEN="", TELEGRAM_BOT_URL="",
         )
         assert result.returncode == 0, result.stderr
@@ -339,11 +379,12 @@ class TestStartupRefusal:
 
 
 class TestFormatterChoice:
-    def test_empty_set_channel_resolves_to_the_refusal(self) -> None:
+    def test_switched_off_channel_resolves_to_the_refusal(self) -> None:
         """EMPTY on the lookup: an absent channel is never a formatter
-        that succeeds."""
+        that succeeds. Absent was an empty key set until W2-1; now it is
+        the flag off, its keys -- here a full set -- not read."""
         registry = build_formatters(
-            _settings(telegram_bot_token="", telegram_bot_url=""),
+            _settings(telegram_enabled="false"),
             _fake_factory,
         )
         formatter = registry.formatters[DeliveryChannel.TELEGRAM]
@@ -394,7 +435,10 @@ class TestFormatterChoice:
 
     def test_in_app_is_live_even_with_nothing_configured(self) -> None:
         registry = build_formatters(
-            _settings(telegram_bot_token="", telegram_bot_url=""),
+            _settings(
+                telegram_enabled="false",
+                telegram_bot_token="", telegram_bot_url="",
+            ),
             _fake_factory,
         )
         assert isinstance(
@@ -642,8 +686,10 @@ class TestExistingDeployIsUnchanged:
         telegram key set AND the now-removed global switch as a leftover
         variable gets exactly what it had -- a live telegram on the same
         bot URL. extra="ignore" is what makes the leftover harmless;
-        removing it would refuse the start of a working deploy (see the
-        KNOWN CEILING in app/core/channels.py)."""
+        removing it would refuse the start of a working deploy (the
+        decision is prose on Settings.model_config, app/core/config.py;
+        the KNOWN CEILING this cited is gone with W2-1). Since W2-1 that
+        deploy also says TELEGRAM_ENABLED=true."""
         from app.engine.formatters import TelegramFormatter
 
         settings = Settings(
@@ -651,6 +697,9 @@ class TestExistingDeployIsUnchanged:
             app_env="production",
             database_url="postgresql+asyncpg://u:p@db/comms_unit",
             comms_service_token="unit-test-service-token",
+            telegram_enabled="true",
+            email_enabled="false",
+            llm_enabled="false",
             telegram_bot_token=_GOOD_TOKEN,
             telegram_bot_url=_GOOD_URL,
             channels_mode="real",  # type: ignore[call-arg]

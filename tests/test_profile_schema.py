@@ -14,7 +14,11 @@
 #     expression;
 #   - defaults are layered and explainable programmatically; the retry
 #     defaults are a reference to settings, not a copy;
-#   - routes are cross-checked against the deploy's channel states;
+#   - routes are cross-checked against the deploy where it has
+#     something to say: an llm route against its key sets (with the llm
+#     channel on); a route into a switched-off channel is ACCEPTED
+#     (W2-1 -- until it, a route into a channel with every key empty
+#     refused the start);
 #   - every violation is reported in ONE refusal, in a fixed order;
 #   - keys declared twice in YAML refuse instead of the last one
 #     silently winning.
@@ -29,11 +33,9 @@ from typing import Any
 
 import pytest
 
-from app.core.channels import ChannelState
 from app.core.config import Settings, settings
 from app.core.constants import MAX_BODY_LEN, MSG_TYPE_KEYS
 from app.core.exceptions import ProfileError
-from app.profile import loader as loader_module
 from app.profile.loader import (
     CHANNEL_NAMES,
     LANES,
@@ -58,15 +60,6 @@ _MSG_TYPES: dict[str, Any] = {
     key: {"category": "msg_cat"} for key in MSG_TYPE_KEYS
 }
 
-# A deploy with only in_app live (what the suite runs with).
-_ONLY_IN_APP = {
-    "in_app": ChannelState.LIVE,
-    "telegram": ChannelState.NOT_CONFIGURED,
-    "email": ChannelState.NOT_CONFIGURED,
-}
-_ALL_LIVE = dict.fromkeys(CHANNEL_NAMES, ChannelState.LIVE)
-
-
 def _doc(types: dict[str, Any] | None = None, **top: Any) -> dict[str, Any]:
     """A version-2 types document with the chat baseline added."""
     doc: dict[str, Any] = {"version": SCHEMA_VERSION}
@@ -75,13 +68,13 @@ def _doc(types: dict[str, Any] | None = None, **top: Any) -> dict[str, Any]:
     return doc
 
 
-def _parse(doc: Any, states: dict[str, ChannelState] | None = None) -> Any:
-    return parse_profile(RawProfile(types=doc), states)
+def _parse(doc: Any) -> Any:
+    return parse_profile(RawProfile(types=doc))
 
 
-def _refusal(doc: Any, states: dict[str, ChannelState] | None = None) -> str:
+def _refusal(doc: Any) -> str:
     with pytest.raises(ProfileError) as excinfo:
-        _parse(doc, states)
+        _parse(doc)
     return str(excinfo.value)
 
 
@@ -201,7 +194,7 @@ class TestClosedKeys:
         """The very defect §9.4 names: the typo must not load and route
         by the default channels."""
         with pytest.raises(ProfileError):
-            _parse(_doc({"t": {"chanels": ["telegram"]}}), _ALL_LIVE)
+            _parse(_doc({"t": {"chanels": ["telegram"]}}))
 
     def test_unknown_top_level_key_refused(self) -> None:
         message = _refusal(_doc(typse={}))
@@ -535,96 +528,75 @@ class TestLayers:
 
 
 class TestRoutes:
-    """REPEAT: two types into one missing channel -> two lines. EMPTY:
-    a channel whose keys are all empty (not_configured). SHORTFALL: a
-    partial key set -- refused by Settings, before the loader."""
+    """Until W2-1 this class held routes against the deploy's channel
+    states: a route into a channel whose keys were all empty refused
+    the start, every such route named. W2-1 cancelled that (owner's
+    decision 05.11): a channel is an option of the instance, a route
+    into a switched-off one is accepted, and its delivery ends in the
+    outcome "channel unavailable" -- tests/test_channel_flags.py holds
+    that, on the startup path. What stays here is the schema's own
+    check. REPEAT: two types into one channel. EMPTY: a type without
+    channels takes the default. SHORTFALL: a channel outside the
+    registry, and a broken key set -- refused by Settings, before the
+    loader."""
 
     def test_route_outside_the_registry_refused(self) -> None:
-        message = _refusal(_doc({"t": {"channels": ["sms"]}}), _ALL_LIVE)
+        message = _refusal(_doc({"t": {"channels": ["sms"]}}))
         assert "type 't': `channels` found ['sms']" in message
         assert "'sms' (str) is not a channel of this service" in message
 
-    def test_route_into_not_configured_channel_refused(self) -> None:
-        message = _refusal(
-            _doc({"t": {"channels": ["in_app", "telegram"]}}), _ONLY_IN_APP,
-        )
-        assert "type 't' routes to channel 'telegram' (decided by: profile)" in (
-            message
-        )
-        assert "every key of 'telegram' is empty on this deploy" in message
-        assert "'in_app'" not in message.split("routes to channel")[1][:12]
-
     def test_in_app_with_an_empty_declared_key_set_passes(self) -> None:
         """in_app has no declared keys and is live by definition."""
-        record = _parse(
-            _doc({"t": {"channels": ["in_app"]}}), _ONLY_IN_APP,
-        ).types["t"]
+        record = _parse(_doc({"t": {"channels": ["in_app"]}})).types["t"]
         assert record.value("channels") == ("in_app",)
 
-    def test_default_route_passes_on_a_deploy_without_externals(self) -> None:
-        profile = _parse(_doc({"t": {}}), _ONLY_IN_APP)
+    def test_default_route_passes(self) -> None:
+        profile = _parse(_doc({"t": {}}))
         assert profile.types["t"].value("channels") == ("in_app",)
 
-    def test_live_channel_passes(self) -> None:
-        live = {**_ONLY_IN_APP, "email": ChannelState.LIVE}
-        record = _parse(_doc({"t": {"channels": ["email"]}}), live).types["t"]
-        assert record.value("channels") == ("email",)
+    def test_every_channel_of_the_registry_passes(self) -> None:
+        """Was test_live_channel_passes, against a deploy map with email
+        live; the schema alone has no deploy since W2-1."""
+        doc = _doc({
+            "a": {"channels": ["telegram"]}, "b": {"channels": ["email"]},
+        })
+        types = _parse(doc).types
+        assert types["a"].value("channels") == ("telegram",)
+        assert types["b"].value("channels") == ("email",)
 
-    def test_every_offending_route_is_named(self) -> None:
-        message = _refusal(
-            _doc({"a": {"channels": ["telegram"]}, "b": {"channels": ["email"]}}),
-            _ONLY_IN_APP,
-        )
-        assert "(2 problems)" in message
-        assert "type 'a' routes to channel 'telegram'" in message
-        assert "type 'b' routes to channel 'email'" in message
-
-    def test_partial_key_set_is_refused_before_the_loader(self) -> None:
+    def test_broken_key_set_is_refused_before_the_loader(self) -> None:
         """The existing rule (app/core/channels.py via Settings) covers
         it; the loader has no second check. Settings refusing is what
-        makes the state unreachable there."""
+        makes the state unreachable there. Was ..._partial_key_set_...:
+        since W2-1 with the flag on, which the test now says."""
         with pytest.raises(ValueError, match="channel 'telegram' is misconfigured"):
             Settings(
                 _env_file=None,
                 app_env="production",
                 database_url="postgresql+asyncpg://u:p@db/comms_unit",
                 comms_service_token="unit-test-service-token",
+                telegram_enabled="true",
                 telegram_bot_token="123456:unit-test-bot-token",
                 telegram_bot_url="",
             )
 
-    def test_startup_path_cross_checks_the_real_deploy(
+    def test_startup_path_takes_a_route_into_a_switched_off_channel(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """install_profile_from_settings reads this deploy's states:
-        the suite blanks telegram, so a telegram route refuses; the
-        same profile loads once telegram's keys are set."""
+        """Was test_startup_path_cross_checks_the_real_deploy: the suite
+        had telegram's keys blanked, so a telegram route refused the
+        start, and the same profile loaded once the keys were set. Since
+        W2-1 both deploys load it -- telegram off and telegram on."""
         root = _write(
             tmp_path,
             "version: 2\ntypes:\n" + _MSG_YAML
             + "  t:\n    channels: [telegram]\n",
         )
         monkeypatch.setattr(settings, "templates_dir", str(root))
-        with pytest.raises(ProfileError, match="routes to channel 'telegram'"):
-            install_profile_from_settings()
-        monkeypatch.setattr(
-            settings, "telegram_bot_token", "123456:unit-test-bot-token",
-        )
-        monkeypatch.setattr(
-            settings, "telegram_bot_url", "https://t.me/unit_test_bot",
-        )
+        monkeypatch.setattr(settings, "telegram_enabled", "false")
         assert install_profile_from_settings() is True
-
-    def test_route_check_reuses_the_channel_rule(self) -> None:
-        """The deploy's states come from evaluate_channels itself, over
-        the same keys the startup channel map reads."""
-        from app.engine.formatters import channel_map
-
-        states = loader_module.deploy_channel_states()
-        assert {k: v.value for k, v in states.items()} == {
-            k: v for k, v in channel_map(settings).items()
-            if v != ChannelState.NOT_IMPLEMENTED.value
-        }
+        configure_every_channel(monkeypatch)
+        assert install_profile_from_settings() is True
 
 
 # -----------------------------------------------------------------------------
@@ -658,24 +630,31 @@ class TestCollectedRefusal:
         assert lines == sorted(lines)
 
     def test_different_checks_share_one_refusal(self) -> None:
-        doc = _doc({"t": {"lane": "fast", "channels": ["telegram"]}})
+        """The cross-check with the deploy was a route into a channel
+        with empty keys until W2-1, which accepts that route; the one
+        cross-check left -- an llm key set the deploy does not define
+        -- takes its place among the four."""
+        doc = _doc({
+            "t": {"lane": "fast", "channels": ["telegram"]},
+            "m": {"channels": ["llm"], "llm_sets": ["llm.gone"]},
+        })
         del doc["types"]["msg.thread_closed"]
         templates = {"en": {"ghost": {"telegram": {"body": "x"}}}}
         with pytest.raises(ProfileError) as excinfo:
             parse_profile(RawProfile(types=doc, templates_by_locale=templates),
-                          _ONLY_IN_APP)
+                          ())
         message = str(excinfo.value)
         assert "(4 problems)" in message
         assert "`lane` found 'fast'" in message
         assert "'msg.thread_closed' is not declared" in message
-        assert "routes to channel 'telegram'" in message
+        assert "routes to key set 'llm.gone'" in message
         assert "template for type 'ghost'" in message
 
     def test_one_violation_says_problem(self) -> None:
         assert "(1 problem)" in _refusal(_doc({"t": {"lane": "fast"}}))
 
     def test_clean_profile_raises_nothing(self) -> None:
-        assert "t" in _parse(_doc({"t": {"lane": "bulk"}}), _ALL_LIVE).types
+        assert "t" in _parse(_doc({"t": {"lane": "bulk"}})).types
 
 
 # -----------------------------------------------------------------------------
@@ -788,23 +767,20 @@ class TestShippedProfiles:
     def test_smoke_profile_loads_on_a_deploy_without_externals(self) -> None:
         profile = load_profile(
             FileProfileSource(REPO_ROOT / "deploy" / "smoke-profile"),
-            _ONLY_IN_APP,
         )
         assert set(profile.types) == set(MSG_TYPE_KEYS)
 
-    def test_fixture_profile_loads_against_a_full_deploy(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_fixture_profile_loads(self) -> None:
         """Was ..._against_the_suite_deploy: the fixture routed nothing
         but in_app, so the suite's own deploy (externals blanked) could
         load it. Since F1.2 the fixture routes types to telegram and
-        email -- the channel is the profile's -- so it is loaded on a
-        deploy that has every channel. What it pinned still holds: the
+        email -- the channel is the profile's -- so it was loaded on a
+        deploy that has every channel. Since W2-1 a route into a channel
+        the deploy lacks is accepted and load_profile takes no channel
+        map, so it is loaded as it is. What it pinned still holds: the
         reference record is decided by the profile, field by field."""
-        configure_every_channel(monkeypatch)
         profile = load_profile(
             FileProfileSource(REPO_ROOT / "tests" / "fixtures" / "profile"),
-            loader_module.deploy_channel_states(),
         )
         record = profile.types["unit_routed"]
         layers = {name: d.layer for name, d in record.fields.items()}

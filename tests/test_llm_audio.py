@@ -173,6 +173,7 @@ def deploy(
     monkeypatch: pytest.MonkeyPatch, audio_profile_dir: Path,
 ) -> Iterator[_Deploy]:
     provider, store = _Provider(), _Store()
+    monkeypatch.setattr(settings, "llm_enabled", "true")
     monkeypatch.setattr(settings, "llm_key_sets", json.dumps(_SETS))
     monkeypatch.setattr(settings, "llm_body_hosts", f"{_STORE}:{_STORE_PORT}")
     registry.reset()
@@ -427,6 +428,9 @@ class TestTheList:
                 _env_file=None, app_env="production",
                 database_url="postgresql+asyncpg://u:p@db/comms_unit",
                 comms_service_token="unit-test-service-token",
+                # The list is the llm channel's key: read, and refused
+                # when broken, only with the channel on (W2-1).
+                llm_enabled="true", llm_key_sets=json.dumps(_SETS),
                 llm_body_hosts=value,
             )
         refusal = format_startup_error(caught.value)

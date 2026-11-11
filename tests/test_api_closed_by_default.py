@@ -43,6 +43,7 @@ from httpx import AsyncClient
 from starlette.middleware.exceptions import ExceptionMiddleware
 from structlog.testing import capture_logs
 
+from app.core.channels import channel_flag_keys
 from app.core.config import settings
 from app.core.constants import MAX_REQUEST_BODY_BYTES
 from app.main import app
@@ -78,19 +79,24 @@ def _settings_in_a_fresh_process(
 
 
 _DATABASE = {"DATABASE_URL": "postgresql+asyncpg://u:p@db/comms_unit"}
+# Every channel's flag, written (W2-1: required at every start): these
+# tests are about APP_ENV and the token, not the channels.
+_CHANNELS_OFF = dict.fromkeys(channel_flag_keys(), "false")
 _READ = "from app.core.config import settings; print(settings.app_env, settings.is_dev)"
 
 
 class TestTheDefault:
     def test_no_app_env_and_no_token_refuses_the_start(self) -> None:
-        result = _settings_in_a_fresh_process(_READ, **_DATABASE)
+        result = _settings_in_a_fresh_process(
+            _READ, **_DATABASE, **_CHANNELS_OFF,
+        )
         assert result.returncode == 1, result.stdout
         assert "COMMS_SERVICE_TOKEN" in result.stderr
 
     def test_no_app_env_is_production(self) -> None:
         result = _settings_in_a_fresh_process(
             _READ,
-            **_DATABASE,
+            **_DATABASE, **_CHANNELS_OFF,
             COMMS_SERVICE_TOKEN=_TOKEN,
         )
         assert result.returncode == 0, result.stderr
@@ -99,14 +105,16 @@ class TestTheDefault:
     def test_no_app_env_mounts_no_schema(self) -> None:
         result = _settings_in_a_fresh_process(
             "from app.main import app; print(app.openapi_url, app.docs_url)",
-            **_DATABASE,
+            **_DATABASE, **_CHANNELS_OFF,
             COMMS_SERVICE_TOKEN=_TOKEN,
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout.split()[-2:] == ["None", "None"]
 
     def test_explicit_development_runs_without_a_token(self) -> None:
-        result = _settings_in_a_fresh_process(_READ, APP_ENV="development")
+        result = _settings_in_a_fresh_process(
+            _READ, APP_ENV="development", **_CHANNELS_OFF,
+        )
         assert result.returncode == 0, result.stderr
         assert result.stdout.split() == ["development", "True"]
 

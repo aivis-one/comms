@@ -287,7 +287,7 @@ class TestTheTypeRecordTable:
             types["t"] = record
             raw = RawProfile(types={"version": SCHEMA_VERSION, "types": types})
             try:
-                parse_profile(raw, None, ("llm.text",))
+                parse_profile(raw, llm_set_names=("llm.text",))
             except ProfileError:
                 return False
             return True

@@ -41,6 +41,8 @@ def _configured(**overrides: Any) -> Settings:
         "app_env": "production",
         "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
         "comms_service_token": "health-test-service-token",
+        "telegram_enabled": "true",
+        "email_enabled": "true",
         "telegram_bot_token": _TOKEN,
         "telegram_bot_url": _BOT_URL,
         "email_mailgun_api_key": _API_KEY,
@@ -94,14 +96,12 @@ async def test_health_names_the_channels_a_deploy_lacks(
 ) -> None:
     """A deploy without external channels gets the same full map: "this
     product has no email" is exactly what an operator comes to confirm,
-    and it must be readable as a state rather than as silence."""
-    bare = _configured(
-        telegram_bot_token="",
-        telegram_bot_url="",
-        email_mailgun_api_key="",
-        email_mailgun_domain="",
-        email_from_address="",
-    )
+    and it must be readable as a state rather than as silence.
+
+    Since W2-1 the deploy without them is the one that switched them off
+    -- their keys, here still set, are not read (before it, the keys
+    were emptied)."""
+    bare = _configured(telegram_enabled="false", email_enabled="false")
     with patch("app.main.settings", bare):
         channels = (await client.get("/health")).json()["channels"]
     assert set(channels) == {channel.value for channel in DeliveryChannel}

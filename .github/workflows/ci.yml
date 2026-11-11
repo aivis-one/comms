@@ -62,6 +62,12 @@ jobs:
       APP_ENV: ci
       DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+      # Every channel's flag is required at every start (W2-1,
+      # app/core/channels.py), `alembic` below included; off -- the
+      # suite switches on what it tests (tests/conftest.py).
+      TELEGRAM_ENABLED: "false"
+      EMAIL_ENABLED: "false"
+      LLM_ENABLED: "false"
       # The release every log line names (W3-2, protocol 9.4): what the
       # image carries from the machine's build argument (job `image`),
       # here from the run -- a process of comms without it refuses to
@@ -223,6 +229,10 @@ jobs:
       # builds the settings before the suite's own fence runs. A test
       # value -- the suite replaces it anyway (tests/conftest.py).
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
+      # The channel flags, as in `checks` (W2-1).
+      TELEGRAM_ENABLED: "false"
+      EMAIL_ENABLED: "false"
+      LLM_ENABLED: "false"
       PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
       # The release every log line names, as in `checks` (W3-2).
       PRIMER_RELEASE: ${{ github.ref_name }}
@@ -419,11 +429,11 @@ jobs:
           echo "both stages: PRIMER_RELEASE=$PRIMER_RELEASE PRIMER_COMMIT=$PRIMER_COMMIT"
 
       # The image's own command, as comms-app runs it: it starts and
-      # answers readiness (200 only with the database reached). The test
-      # profile routes to telegram and email, and startup refuses a
-      # channel with no keys -- so the channels get keys of the right
-      # shape that reach nothing (the token assembled here: a literal of
-      # a real token's shape would trip secret scanning).
+      # answers readiness (200 only with the database reached). Both
+      # sides of the channel rule (W2-1): telegram and email switched on
+      # with keys of the right shape that reach nothing (the token
+      # assembled here: a literal of a real token's shape would trip
+      # secret scanning), llm switched off -- its key not read.
       # THE PROFILE IS MOUNTED, AS ON A BOX (TX-4 FIX): the image carries
       # app/ and migrations/, not tests/ -- so the test profile is mounted
       # read-only on /profile and TEMPLATES_DIR names it, the same path
@@ -442,6 +452,9 @@ jobs:
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -v "$PWD/tests/fixtures/profile:/profile:ro" \
             -e TEMPLATES_DIR=/profile \
+            -e TELEGRAM_ENABLED=true \
+            -e EMAIL_ENABLED=true \
+            -e LLM_ENABLED=false \
             -e TELEGRAM_BOT_TOKEN="$token" \
             -e TELEGRAM_BOT_URL=https://t.me/comms_ci_bot \
             -e EMAIL_MAILGUN_API_KEY=ci-not-a-provider-key \
@@ -468,4 +481,5 @@ jobs:
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
+            -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \
             comms:test sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50 $PART_ARGS"

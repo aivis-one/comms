@@ -105,10 +105,12 @@ _BASE = {
     "comms_service_token": "unit-test-service-token",
 }
 _TELEGRAM = {
+    "telegram_enabled": "true",
     "telegram_bot_token": _BOT_TOKEN,
     "telegram_bot_url": "https://t.me/unit_test_bot",
 }
 _EMAIL = {
+    "email_enabled": "true",
     "email_mailgun_api_key": "unit-test-provider-key",
     "email_mailgun_domain": "mg.example.org",
     "email_from_address": "Unit <unit@example.org>",

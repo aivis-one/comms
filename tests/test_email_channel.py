@@ -3,11 +3,12 @@
 # =============================================================================
 #
 # Email becomes a channel under the SAME rule as every other one
-# (app/core/channels.py): its key set decides, and nothing else does.
+# (app/core/channels.py): its flag decides, and with the flag true its
+# key set must be whole (W2-1; before it, the key set alone decided).
 # What is specific to email and pinned here:
 #
-#   - the key set, including the DEFAULTED region -- which does NOT
-#     make an empty set partial, and whose shape is still checked;
+#   - the key set, including the DEFAULTED region -- which is never a
+#     missing key, and whose shape is checked while the channel is on;
 #   - the sender's two legal forms, and the refusal text naming the
 #     expected one;
 #   - subject and body: the channel reads its OWN profile fields, with
@@ -69,11 +70,17 @@ from tests.helpers import create_recipient, intake_fields
 _KEY = "key-0123456789"
 _DOMAIN = "mail.example.test"
 _SENDER = "noreply@mail.example.test"
+# One whole llm key set, for a deploy with the llm channel on.
+_LLM_SETS = json.dumps({"llm.text": {
+    "endpoint": "https://llm.example.test/v1", "key": "llm-unit-key",
+    "model": "unit-model", "gateway": False,
+}})
 
 _WITH_EMAIL: dict[str, Any] = {
     "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
     "comms_service_token": "unit-test-service-token",
+    "email_enabled": "true",
     "email_mailgun_api_key": _KEY,
     "email_mailgun_domain": _DOMAIN,
     "email_from_address": _SENDER,
@@ -86,8 +93,12 @@ def _settings(**overrides: str) -> Settings:
 
 
 def _keys(**overrides: str) -> dict[str, str]:
-    """The email key set as the parser sees it."""
+    """The email key set as the parser sees it: email switched on, the
+    other external channels off (W2-1: every flag is required)."""
     values = {
+        "TELEGRAM_ENABLED": "false",
+        "EMAIL_ENABLED": "true",
+        "LLM_ENABLED": "false",
         "EMAIL_MAILGUN_API_KEY": _KEY,
         "EMAIL_MAILGUN_DOMAIN": _DOMAIN,
         "EMAIL_FROM_ADDRESS": _SENDER,
@@ -218,10 +229,21 @@ async def _send(
 
 
 class TestEmailKeySet:
-    def test_all_empty_is_a_deploy_without_email(self) -> None:
-        states, problems = evaluate_channels({})
+    def test_switched_off_is_a_deploy_without_email(self) -> None:
+        """Was test_all_empty_is_a_deploy_without_email: every key empty
+        was the deploy without email, until W2-1 made the flag decide.
+        Now EMAIL_ENABLED=false is that deploy, its keys not read --
+        here every key set and still no email -- and every key empty
+        with the channel on is a refusal (the pair)."""
+        states, problems = evaluate_channels(_keys(EMAIL_ENABLED="false"))
         assert problems == []
         assert states["email"] == ChannelState.NOT_CONFIGURED
+        problem = _problem(_keys(
+            EMAIL_MAILGUN_API_KEY="", EMAIL_MAILGUN_DOMAIN="",
+            EMAIL_FROM_ADDRESS="",
+        ))
+        assert "missing: EMAIL_MAILGUN_API_KEY, EMAIL_MAILGUN_DOMAIN, " \
+            "EMAIL_FROM_ADDRESS" in problem
 
     def test_all_set_is_live(self) -> None:
         states, problems = evaluate_channels(_keys())
@@ -257,14 +279,17 @@ class TestEmailKeySet:
 
 
 class TestRegionIsDefaultedNotDeciding:
-    def test_absent_region_does_not_make_an_empty_set_partial(self) -> None:
-        """The trap this test exists for: a defaulted key counted as
-        part of the set would make EVERY deploy without email look
-        partial -- and refuse to start. That would take down the
-        products that have no email at all."""
-        states, problems = evaluate_channels({})
+    def test_an_absent_region_is_not_a_missing_key(self) -> None:
+        """Was test_absent_region_does_not_make_an_empty_set_partial:
+        a defaulted key counted as part of the set would have made every
+        deploy without email (its keys empty) look partial. Since W2-1 a
+        deploy without email is EMAIL_ENABLED=false and nothing is read;
+        what stays to pin is the other side -- a switched-on channel
+        with its three keys and no region is whole, live, on the
+        default."""
+        states, problems = evaluate_channels(_keys())
         assert problems == []
-        assert states["email"] == ChannelState.NOT_CONFIGURED
+        assert states["email"] == ChannelState.LIVE
 
     def test_default_is_a_known_region(self) -> None:
         assert _settings().email_mailgun_region in EMAIL_REGIONS
@@ -355,22 +380,35 @@ class TestRegionIsDefaultedNotDeciding:
         # where empty means "fetch nothing" -- so for it the pair is what
         # the default MEANS, and that a written value is read.
         if name == "llm_body_hosts":
-            assert _settings().llm_body_host_set == frozenset()
-            assert _settings(llm_body_hosts="store:9000").llm_body_host_set == {
-                ("store", 9000),
-            }
+            # Read only with the llm channel on (W2-1), which then needs
+            # its key set too.
+            llm_on = {"llm_enabled": "true", "llm_key_sets": _LLM_SETS}
+            assert _settings(**llm_on).llm_body_host_set == frozenset()
+            assert _settings(
+                **llm_on, llm_body_hosts="store:9000",
+            ).llm_body_host_set == {("store", 9000)}
         else:
             assert getattr(_settings(), name) != ""
 
-    def test_unknown_region_refuses_even_without_the_channel(self) -> None:
-        """A typo in a defaulted value on a deploy that has NO email is
-        still this deploy's typo: ignoring it would teach the integrator
-        that the key does not exist."""
-        problem = _problem({"EMAIL_MAILGUN_REGION": "europe"})
+    def test_an_unknown_region_is_not_read_while_email_is_off(self) -> None:
+        """Was test_unknown_region_refuses_even_without_the_channel: a
+        typo in the region of a deploy without email was refused, so
+        that ignoring it would not teach the integrator the key does not
+        exist. W2-1 cancelled that: email is an option of the instance,
+        and the keys of a switched-off option -- the defaulted ones too
+        -- are not read and not checked (Primer protocol 5.2.3: the
+        machine writes its own literal there). The pair: the same
+        region with email on is refused."""
+        states, problems = evaluate_channels(
+            _keys(EMAIL_ENABLED="false", EMAIL_MAILGUN_REGION="europe"),
+        )
+        assert problems == []
+        assert states["email"] == ChannelState.NOT_CONFIGURED
+        problem = _problem(_keys(EMAIL_MAILGUN_REGION="europe"))
         assert "EMAIL_MAILGUN_REGION is malformed" in problem
 
     def test_the_refusal_names_the_allowed_values(self) -> None:
-        problem = _problem({"EMAIL_MAILGUN_REGION": "europe"})
+        problem = _problem(_keys(EMAIL_MAILGUN_REGION="europe"))
         for region in EMAIL_REGIONS:
             assert region in problem
 
@@ -437,22 +475,19 @@ class TestStartupWithEmail:
     def test_full_set_makes_the_channel_live(self) -> None:
         assert channel_map(_settings())["email"] == ChannelState.LIVE
 
-    def test_empty_set_leaves_the_service_running_without_email(
+    def test_switched_off_leaves_the_service_running_without_email(
         self,
     ) -> None:
-        source = _settings(
-            email_mailgun_api_key="",
-            email_mailgun_domain="",
-            email_from_address="",
-        )
+        """Was test_empty_set_...: an empty key set was the deploy
+        without email until W2-1; now the flag is, its keys -- here all
+        three set -- not read."""
+        source = _settings(email_enabled="false")
         assert channel_map(source)["email"] == ChannelState.NOT_CONFIGURED
 
-    def test_unconfigured_email_resolves_to_the_refusal(self) -> None:
-        source = _settings(
-            email_mailgun_api_key="",
-            email_mailgun_domain="",
-            email_from_address="",
-        )
+    def test_switched_off_email_resolves_to_the_refusal(self) -> None:
+        """Was test_unconfigured_email_...: the keys emptied; since W2-1
+        the flag switched off, the keys as they were."""
+        source = _settings(email_enabled="false")
         built = build_formatters(
             source, _fake_bot_factory, _Provider().client,
         )
@@ -1375,14 +1410,17 @@ class TestThroughThePipeline:
 
 class TestConsumersAreUntouched:
     def test_a_deploy_with_telegram_only_has_no_email(self) -> None:
-        """Slice for the product that runs telegram and no email: its
-        key set for email is empty, so the channel is simply absent and
-        nothing about its telegram changes."""
+        """Slice for the product that runs telegram and no email: email
+        is switched off (W2-1; before it, its key set was empty), so the
+        channel is simply absent and nothing about its telegram
+        changes."""
         source = Settings(
             _env_file=None,  # type: ignore[call-arg]
             app_env="production",
             database_url="postgresql+asyncpg://u:p@db/comms_unit",
             comms_service_token="unit-test-service-token",
+            telegram_enabled="true",
+            email_enabled="false",
             telegram_bot_token="8123456789:AA-token",
             telegram_bot_url="https://telegram.me/some_bot",
         )

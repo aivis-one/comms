@@ -756,7 +756,12 @@ async def create_notification(
         target_type=target_type, target_value=target_value,
         action_data=action_data, llm=llm, llm_audio=llm_audio,
     )
-    if llm_audio is not None:
+    # The host of a body link is the llm channel's key (LLM_BODY_HOSTS):
+    # with the channel switched off it is not read, and the job is taken
+    # like any other into a switched-off channel -- its delivery ends in
+    # the outcome "channel unavailable", the body never fetched (owner's
+    # decision 05.11: an outcome, not a refusal at intake).
+    if llm_audio is not None and settings.llm_enabled == "true":
         _check_body_host(llm_audio["url"])
     if email is not None and DeliveryChannel.EMAIL not in record.value(
         "channels"

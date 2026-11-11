@@ -763,18 +763,23 @@ def notification_row_fields(channels: list[str] | None = None) -> dict[str, obje
 
 
 def configure_every_channel(monkeypatch: object) -> None:
-    """Make every external channel LIVE on the suite's settings.
+    """Make telegram and email LIVE on the suite's settings: flag true and
+    a full key set.
 
-    The suite runs with every external channel's keys blanked
-    (tests/conftest.py), and since F1.1 the startup path refuses a
-    route into a channel the deploy did not configure. The fixture
-    profile routes types to telegram and email (F1.2: the channel is
-    the profile's), so a test that loads it through the STARTUP path
-    must stand on a deploy that has them.
+    The suite runs with every external channel switched off and its
+    keys blanked (tests/conftest.py). Until W2-1 the startup path
+    refused a route into a channel the deploy did not have, so a test
+    that loaded the fixture profile -- it routes types to telegram and
+    email (F1.2: the channel is the profile's) -- through the STARTUP
+    path had to stand on a deploy that has them. Since W2-1 that route
+    is accepted; this keeps such a test on the deploy it was written
+    for, both channels live, and the channel map saying so.
     """
     from app.core.config import settings
 
     for name, value in {
+        "telegram_enabled": "true",
+        "email_enabled": "true",
         "telegram_bot_token": "123456:unit-test-bot-token",
         "telegram_bot_url": "https://t.me/unit_test_bot",
         "email_mailgun_api_key": "key-unit-test",
