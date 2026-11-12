@@ -1,7 +1,10 @@
 # =============================================================================
 # COMMS Service -- CI (handoff item 5)
 # =============================================================================
-# Three jobs. First, alone (CI-1):
+# Four jobs. Beside them all, on its own (W2-2):
+#   machine  primer.yaml checked by the deploy machine's own code, pinned
+#            to one commit of its repository (scripts/check_primer_yaml.py).
+# First of the other three, alone (CI-1):
 #   checks what reads the tree and the schema and takes seconds: ruff,
 #          mypy, the two fences, `alembic upgrade head` + `alembic
 #          check`, the suite's collection, the tree's guards -- a small
@@ -18,8 +21,8 @@
 #          suite runs INSIDE the `test` stage, as the deploy machine runs
 #          it (W1-1: the stage carries the tree, nothing is mounted), on
 #          the Python and Debian the boxes run, not the runner's; the
-#          `runtime` stage starts and answers, and carries exactly the
-#          runtime lock.
+#          `runtime` stage starts and answers, carries exactly the
+#          runtime lock, and has the `comms` command (W2-2).
 # Postgres is the image deploy/docker-compose.yml pins for comms-postgres,
 # read from there (H10): one pin, kept by Dependabot's docker-compose
 # ecosystem, and CI on the database the boxes run. A `services:` image
@@ -204,6 +207,59 @@ jobs:
           tests/test_fence_roots.py
           tests/test_domain_literal_fence.py
           tests/test_product_literal_fence.py
+
+  # PRIMER.YAML AS THE MACHINE READS IT (W2-2): the deploy machine's own
+  # code, pinned to one commit of its repository -- the loader, the seams
+  # of a box and the compose check of stop_for_migrate
+  # (scripts/check_primer_yaml.py says what each is and what is not yet
+  # asked). The machine is installed from ITS lock and ITS wheels, both in
+  # its repository at that commit, hash-checked -- into a venv of its own:
+  # its pydantic is not comms' (requirements-dev.lock), and comms' locks
+  # cannot carry it (a git dependency is not hash-checked). Nothing else
+  # runs in this venv. A new commit of the machine: the `ref` below, alone.
+  machine:
+    runs-on: ubuntu-latest
+    # Two checkouts, a venv from local wheels, one script: ~1 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the machine (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: inzoddwetrust/primer
+          ref: 213a3ed250f14203e6608b0d0733fb9d2dc889a2
+          path: .primer
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # The venv first on PATH for the steps after this one.
+      - name: A venv for the machine
+        run: |
+          python -m venv "$RUNNER_TEMP/machine"
+          echo "$RUNNER_TEMP/machine/bin" >> "$GITHUB_PATH"
+
+      # Its lock, from the wheels the machine keeps beside it -- no index.
+      - name: Install the machine's packages (its lock, pinned)
+        env:
+          PIP_NO_INDEX: "1"
+          PIP_FIND_LINKS: .primer/wheels
+        run: pip install --require-hashes -r .primer/requirements.lock
+
+      - name: primer.yaml by the machine
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.primer
+        run: python scripts/check_primer_yaml.py
 
   test:
     needs: checks
@@ -470,6 +526,35 @@ jobs:
           done
           docker logs comms-app
           exit 1
+
+      # THE `comms` COMMAND (W2-2): the machine runs `comms derive <name>`
+      # in a throwaway container of this image for primer.yaml's derived
+      # values, so the command is on the image's PATH -- asked here of the
+      # built image, not of the checkout. bot-id needs no network: its
+      # value from a token of the right shape (assembled here: a literal of
+      # a real token's shape would trip secret scanning), and a malformed
+      # token refused with a non-zero exit and nothing of the token in what
+      # it says. bot-url asks Telegram and is not run here (tests/test_derive.py).
+      - name: The image has the comms command
+        if: matrix.part == 1
+        run: |
+          token="123456789:$(printf 'B%.0s' $(seq 35))"
+          id=$(docker run --rm -e TELEGRAM_BOT_TOKEN="$token" comms:ci \
+              comms derive bot-id)
+          test "$id" = "123456789"
+          bad="not-a-token-$(printf 'C%.0s' $(seq 20))"
+          if docker run --rm -e TELEGRAM_BOT_TOKEN="$bad" comms:ci comms derive bot-id \
+              > "$RUNNER_TEMP/derive.out" 2> "$RUNNER_TEMP/derive.err"; then
+            echo "a malformed token derived a value"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/derive.err"
+          test -s "$RUNNER_TEMP/derive.err"
+          if grep -q "$bad" "$RUNNER_TEMP/derive.out" "$RUNNER_TEMP/derive.err"; then
+            echo "the refusal carries the token"
+            exit 1
+          fi
+          echo "comms derive bot-id: $id"
 
       # In the test stage, as the deploy machine runs it (W1-1): its
       # Python, Debian and packages, and its own copy of the tree --

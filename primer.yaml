@@ -1,0 +1,76 @@
+# =============================================================================
+# COMMS -- primer.yaml: the delivery under Primer's machine (contract 3 v1.30)
+# =============================================================================
+#
+# What the machine reads to install comms beside a product: the stack, where
+# each value of the instance comes from, and what comms gives the product.
+# No value lives here (contract 3 rule 1): only sources.
+#
+# env -- ONLY the values of an instance, the ones comms reads. A setting with
+# a default in code (app/core/config.py) is not here: the default is the
+# product's constant. tests/test_primer_yaml.py holds both directions against
+# the code, and names its exceptions there. Two values comms reads are built
+# from keys of this file by compose (W1-2): DATABASE_URL from
+# POSTGRES_PASSWORD, REDIS_URL from COMMS_EVENTS_PASSWORD.
+#
+# Not here, on purpose:
+#   - COMMS_SERVICE_TOKEN_NEXT -- the machine has no change of key yet
+#     (Primer's letter of 12.11); comms accepts it when set, nothing sets it;
+#   - TELEGRAM_BOT_ID -- the machine refuses a derived value shorter than 16
+#     characters and a bot id is 9-10 digits: declared, it would make every
+#     instance with telegram red. `comms derive bot-id` exists; the key comes
+#     back when the machine takes a short derived value.
+#
+# The machine's loader accepts this file without a finding:
+# scripts/check_primer_yaml.py, run by CI (job `machine`).
+# =============================================================================
+
+schema: 1
+name: comms
+kind: service
+options: [telegram, email, llm]
+
+stacks:
+  comms:
+    compose: deploy/docker-compose.yml
+    app: { service: comms-app, port: 8000, health: /health, ready: /ready }
+    migrate: alembic upgrade head
+    test: { run: python -m pytest tests/ --junitxml=/tmp/junit.xml, target: test }
+    # People's conversations: destroy and reinstall keep the volumes.
+    persistent: true
+    # Nothing of comms runs on a schema being migrated (owner, 10.11).
+    stop_for_migrate: [comms-app, comms-worker, comms-consumer]
+    expose:
+      events: { service: comms-redis, port: 6379, scheme: redis }
+
+env:
+  POSTGRES_PASSWORD: { source: minted }
+  COMMS_API_URL: { source: address }
+  COMMS_SERVICE_TOKEN: { source: minted }
+  COMMS_EVENTS_ADDRESS: { source: address, endpoint: events }
+  COMMS_EVENTS_PASSWORD: { source: minted }
+  # A channel is switched by its flag and by nothing else
+  # (app/core/channels.py); the passport switches the option.
+  TELEGRAM_ENABLED: { source: passport, key: options.telegram }
+  EMAIL_ENABLED: { source: passport, key: options.email }
+  LLM_ENABLED: { source: passport, key: options.llm }
+  TELEGRAM_BOT_TOKEN: { source: asked, when: telegram }
+  # The host deep links are built on (decision 13: a domain lives in the
+  # environment, never in code); read by `comms derive bot-url` only.
+  TELEGRAM_LINK_HOST: { source: param, when: telegram }
+  TELEGRAM_BOT_URL: { source: derived, run: comms derive bot-url, when: telegram }
+  EMAIL_MAILGUN_API_KEY: { source: asked, when: email }
+  EMAIL_MAILGUN_DOMAIN: { source: param, when: email }
+  EMAIL_FROM_ADDRESS: { source: param, when: email }
+  # A fact of the instance's provider account, though the code has a default.
+  EMAIL_MAILGUN_REGION: { source: param, when: email }
+  LLM_KEY_SETS: { source: asked, when: llm }
+
+provides:
+  - COMMS_API_URL
+  - COMMS_SERVICE_TOKEN
+  - COMMS_EVENTS_ADDRESS
+  - COMMS_EVENTS_PASSWORD
+  - TELEGRAM_BOT_URL
+
+report: { health: /health, ready: /ready, logs: json, junit: true }

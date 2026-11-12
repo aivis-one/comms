@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+# The `comms` command of the image (W2-2): app/cli.py is the command, this
+# file only puts it on PATH. The image copies it to /usr/local/bin/comms;
+# its python3 is the venv's, first on the image's PATH, and PYTHONPATH=/app
+# finds the package. Not a console script of pyproject.toml: the project is
+# never installed, in the image or in CI (Dockerfile, builder).
+import sys
+
+from app.cli import main
+
+sys.exit(main())

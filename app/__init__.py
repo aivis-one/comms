@@ -15,7 +15,8 @@
 #   rank 4  forgetting, notifier,        across engine, audience, messaging
 #           variants
 #   rank 5  api, transport               HTTP in, the stream in and out
-#   rank 6  main, worker, consumer       the processes
+#   rank 6  main, worker, consumer, cli  the processes; the `comms`
+#                                        command (W2-2)
 #
 # engine -> audience (3 -> 2), the edge the old headers named apart, is
 # a step down like any other; nothing goes sideways or up.

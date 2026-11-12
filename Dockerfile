@@ -13,7 +13,8 @@
 #            suite in a one-off container. It carries everything the suite
 #            reads (tests/, deploy/, scripts/, .github/, the *.md files),
 #            so nothing is mounted over it.
-#   runtime  the builder's venv, the service's code and its migrations;
+#   runtime  the builder's venv, the service's code, its migrations and
+#            the `comms` command (bin/comms on PATH);
 #            the LAST stage, so a build without --target (compose, the
 #            machine's service build) gives it. No test tool is in it:
 #            pytest, ruff, mypy and fakeredis are the test stage's only
@@ -131,6 +132,11 @@ COPY app/ ./app/
 COPY pyproject.toml ./
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
+# The `comms` command on PATH (W2-2): the machine runs `comms derive ...` in
+# a throwaway container of this image for primer.yaml's `derived` values.
+# The file is executable in the tree, and COPY keeps its mode; CI runs the
+# command in the built image (.github/workflows/ci.yml, job `image`).
+COPY bin/comms /usr/local/bin/comms
 
 ARG PRIMER_RELEASE
 ARG PRIMER_COMMIT

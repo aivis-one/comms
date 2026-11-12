@@ -102,11 +102,14 @@ Semantics:
 **Changing the service token without downtime.** comms accepts two
 service tokens: `COMMS_SERVICE_TOKEN`, the current one, and
 `COMMS_SERVICE_TOKEN_NEXT`, the next one. A request passes with either;
-any other token is the `401`. A change of key goes in three steps
-(Primer protocol 5.4): the next token is handed to comms beside the
-current one, and comms, restarted, accepts both; the product is moved
-onto the next token; the next token becomes the current one and the
-next is emptied, and comms, restarted, accepts it alone. The next token
+any other token is the `401`. comms is ready for a change of key in
+three steps (Primer protocol 5.4): the next token is handed to comms
+beside the current one, and comms, restarted, accepts both; the product
+is moved onto the next token; the next token becomes the current one
+and the next is emptied, and comms, restarted, accepts it alone. Primer's
+machine does not change the key yet: its `primer.yaml` declares no
+`COMMS_SERVICE_TOKEN_NEXT` (section 15), so on a box of the machine the
+current token is the only one in force. The next token
 is optional -- unset or empty, only the current one passes -- and never
 stands alone: set without `COMMS_SERVICE_TOKEN`, comms refuses to start,
 in development too. It may equal the current one. Neither token is ever
@@ -2172,6 +2175,48 @@ empty. None of them fails otherwise.
 messages -- a conversation belongs to both sides. Deleting a thread
 removes the messages of both sides in it. The two do not conflict: the
 first is about a person, the second about a conversation.
+
+## 15. Under Primer's machine -- `primer.yaml` and the seams
+
+Under Primer's deploy machine comms is a service: a repository, the
+file `primer.yaml` at its root, and a tag. The file holds no value --
+only where each value of the instance comes from: minted by the machine
+(the database and Redis passwords, the service token), asked of the
+operator (the channels' secrets), a parameter of the instance (the mail
+domain, the sender, the region, the host of Telegram links), the
+passport (the channel flags, `options.<channel>`), the machine's
+addresses, or derived by comms itself. A key of a switched-off channel
+holds the machine's literal, which comms never reads (section 3a). The
+file is the list; this section does not repeat it.
+
+**The seams: what comms gives the product.** Each is a key of comms'
+`env`, and the product takes it by the same name as a seam from comms:
+
+| seam | what it is |
+|---|---|
+| `COMMS_API_URL` | the address of `comms-app` on the machine's network -- the comms HTTP API |
+| `COMMS_SERVICE_TOKEN` | the shared secret the product presents as `Authorization: Bearer <token>`; minted |
+| `COMMS_EVENTS_ADDRESS` | `<host>:<port>` of comms' Redis, the point `events` -- where the relay writes `notification_request` and the push stream is read (sections 7, 10); no scheme |
+| `COMMS_EVENTS_PASSWORD` | the password of that Redis; minted |
+| `TELEGRAM_BOT_URL` | `https://<host>/<bot username>`, derived by `comms derive bot-url` (below); only with the `telegram` option |
+
+`TELEGRAM_BOT_ID` waits for the machine: it refuses a derived value
+shorter than 16 characters, and a bot id is 9-10 digits.
+
+**`comms derive`.** The machine runs `comms derive <name>` in a
+throwaway container of the comms image, with the instance's other
+values in its environment; the value is the command's one line of
+output.
+
+- `bot-id` -- the digits before the colon of `TELEGRAM_BOT_TOKEN`, the
+  bot's id. No network.
+- `bot-url` -- `https://<TELEGRAM_LINK_HOST>/<username>`, the username
+  asked of Telegram (getMe, bounded by the telegram channel's client
+  timeout). The host is a parameter of the instance, never a literal of
+  code: the link host has changed before.
+
+A wrong token or host is a non-zero exit and one line on stderr naming
+the variable -- never the token.
 
 ## Operating the comms stack
 

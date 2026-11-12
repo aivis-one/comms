@@ -59,7 +59,7 @@ _RANKS: dict[str, int] = {
     "engine": 3,
     "forgetting": 4, "notifier": 4, "variants": 4,
     "api": 5, "transport": 5,
-    "main": 6, "worker": 6, "consumer": 6,
+    "main": 6, "worker": 6, "consumer": 6, "cli": 6,
 }
 
 
