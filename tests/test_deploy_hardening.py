@@ -705,9 +705,17 @@ class TestImageRuns:
         assert "/app" in _image_paths("test")  # the whole tree (W1-1)
         runs = _image_runs(_CI)
         # Until W1-1 two runs, both of the runtime: the start and the
-        # suite. Now each stage three: what it carries (pip list), the
+        # suite. W1-1: each stage three -- what it carries (pip list), the
         # machine's arguments, and the start (runtime) or the suite (test).
-        assert sorted(stage for stage, _ in runs) == ["runtime"] * 3 + ["test"] * 3
+        # W2-2: the runtime two more -- the `comms` command of the working
+        # image, `comms derive bot-id` of a well-formed token and of a
+        # malformed one.
+        assert sorted(stage for stage, _ in runs) == ["runtime"] * 5 + ["test"] * 3
+        derives = [
+            stage for stage, run in runs
+            if re.search(r"comms:ci\s+comms derive bot-id\b", run)
+        ]
+        assert derives == ["runtime"] * 2
         for stage, run in runs:
             assert _unreachable(run, _image_paths(stage)) == [], run
 
