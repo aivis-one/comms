@@ -571,9 +571,12 @@ def api_auth_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run the API with auth off, as a development deploy runs it.
 
     The fence above supplies a token only so that settings can be built
-    under APP_ENV=ci; tests that exercise auth set their own token.
+    under APP_ENV=ci; tests that exercise auth set their own token. The
+    next token too (W2-1b), so that no environment the suite runs in
+    hands a test one it did not set.
     """
     monkeypatch.setattr(settings, "comms_service_token", "")
+    monkeypatch.setattr(settings, "comms_service_token_next", "")
 
 
 # ---------------------------------------------------------------------------

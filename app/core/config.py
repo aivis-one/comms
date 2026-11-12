@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from pydantic import ValidationError, model_validator
+from pydantic import Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.channels import (
@@ -533,7 +533,21 @@ class Settings(BaseSettings):
     # unauthenticated "internal" API is effectively open) -- the same
     # axis as DATABASE_URL. In development an empty token disables auth
     # with a loud startup warning (app/main.py).
-    comms_service_token: str = ""
+    #
+    # TWO TOKENS, for a change of key without downtime (Primer protocol
+    # 5.4, owner's decision 01.11): the current one and the next one. A
+    # request passes with either; the next one is optional ("" or unset:
+    # only the current one passes) and never stands alone -- set without
+    # the current one, startup is refused in every APP_ENV, development
+    # included: an integrator who set a token must not get an open API.
+    # The next one may equal the current one (a repeated step of the
+    # machine): one key, compared twice. Which tokens are in force is
+    # said in ONE place, service_tokens below.
+    #
+    # repr=False on both: the settings object's repr never carries a
+    # token (pydantic prints every field by default).
+    comms_service_token: str = Field(default="", repr=False)
+    comms_service_token_next: str = Field(default="", repr=False)
 
     # -- Channel flags (app/core/channels.py) --
     # Exactly "true" or "false", no default: an absent flag, or any
@@ -792,6 +806,19 @@ class Settings(BaseSettings):
         return self.app_env == "development"
 
     @property
+    def service_tokens(self) -> tuple[str, ...]:
+        """The service tokens a request may present: the current one,
+        then the next one when set. An empty value is not a token and
+        is never in the list -- so an empty presented token matches
+        nothing. Read by app/api/deps.py require_service_auth, which
+        compares the presented token with every one of them."""
+        return tuple(
+            token
+            for token in (self.comms_service_token, self.comms_service_token_next)
+            if token
+        )
+
+    @property
     def worker_lanes(self) -> tuple[Lane, ...]:
         """The lanes this worker process takes, in Lane order.
 
@@ -920,6 +947,15 @@ class Settings(BaseSettings):
                 "COMMS_SERVICE_TOKEN is required outside development: "
                 "the comms API is internal (arch decision 14) and must "
                 "not run open."
+            )
+        # W2-1b: the next token rides beside a current one, never alone
+        # -- in development too, where an empty current token would
+        # leave the API open while a token was meant to guard it.
+        if self.comms_service_token_next and not self.comms_service_token:
+            problems.append(
+                "COMMS_SERVICE_TOKEN_NEXT is set without COMMS_SERVICE_TOKEN: "
+                "the next token is accepted beside a current one, never "
+                "alone."
             )
 
         if problems:

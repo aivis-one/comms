@@ -99,6 +99,20 @@ Semantics:
   here. Treat this file with the same care as the rest of your
   secrets: the URL carries the redis password.
 
+**Changing the service token without downtime.** comms accepts two
+service tokens: `COMMS_SERVICE_TOKEN`, the current one, and
+`COMMS_SERVICE_TOKEN_NEXT`, the next one. A request passes with either;
+any other token is the `401`. A change of key goes in three steps
+(Primer protocol 5.4): the next token is handed to comms beside the
+current one, and comms, restarted, accepts both; the product is moved
+onto the next token; the next token becomes the current one and the
+next is emptied, and comms, restarted, accepts it alone. The next token
+is optional -- unset or empty, only the current one passes -- and never
+stands alone: set without `COMMS_SERVICE_TOKEN`, comms refuses to start,
+in development too. It may equal the current one. Neither token is ever
+written to a log, and nothing comms logs says which of the two a
+request passed with.
+
 **The stream and group names are half of an agreement, so they are
 written down on both sides.** The relay XADDs into the stream
 `comms:events`; comms reads it as the consumer group `comms`. Both are

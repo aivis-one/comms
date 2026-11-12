@@ -16,10 +16,22 @@
 # responsibility each part is, in ONE place: deploy/INTEGRATION.md,
 # "What comms takes on trust". This module is where that model stops.
 #
+# TWO TOKENS (W2-1b, Primer protocol 5.4): COMMS_SERVICE_TOKEN and,
+# while a key is being changed, COMMS_SERVICE_TOKEN_NEXT. The machine
+# hands comms the next token beside the current one, moves the product
+# onto it, then takes the old one away -- a request passes with either
+# token in force (app/core/config.py Settings.service_tokens, the one
+# place that knows them).
+#
 # SECRET HANDLING:
 #   - comparison is constant-time (secrets.compare_digest) -- an
 #     internal API on an isolated network hardly invites timing
 #     attacks, but the correct primitive costs nothing;
+#   - the presented token is compared with EVERY token in force, never
+#     stopping at the first match: the answer's timing does not say
+#     which of the two matched, nor whether one did before the other;
+#   - nothing says, in a log or an answer, which token a request
+#     passed with;
 #   - the token NEVER appears in logs or error bodies (the same
 #     principle as the formatter's secret sanitizer): the 401 detail
 #     is a constant string, nothing from the request is echoed back;
@@ -91,13 +103,14 @@ async def require_service_auth(authorization: str | None) -> None:
 
     Raises HTTP 401 when the Authorization header is missing, is not
     a Bearer scheme (in any case: `bearer`, `BEARER`), or carries a
-    token that does not match COMMS_SERVICE_TOKEN. No-op when the token
-    is unset (an explicit development only -- any other APP_ENV, an
-    absent one included, refuses to start without it). Asked by
-    app/api/service_auth.py RequireServiceToken for every request.
+    token that matches none of the tokens in force -- COMMS_SERVICE_TOKEN
+    and, when set, COMMS_SERVICE_TOKEN_NEXT. No-op when the current
+    token is unset (an explicit development only -- any other APP_ENV,
+    an absent one included, refuses to start without it, and the next
+    token alone refuses everywhere). Asked by app/api/service_auth.py
+    RequireServiceToken for every request.
     """
-    expected = settings.comms_service_token
-    if not expected:
+    if not settings.comms_service_token:
         # Development with auth disabled (warned at startup).
         return
 
@@ -106,9 +119,12 @@ async def require_service_auth(authorization: str | None) -> None:
         logger.warning("service_auth_failed", reason="missing_or_not_bearer")
         raise _unauthorized()
 
-    if not secrets.compare_digest(
-        presented.encode("utf-8"), expected.encode("utf-8")
-    ):
+    offered = presented.encode("utf-8")
+    matched = False
+    for expected in settings.service_tokens:
+        # Every token is compared, a match or not: `|=`, never `or`.
+        matched |= secrets.compare_digest(offered, expected.encode("utf-8"))
+    if not matched:
         # Do NOT log the presented value -- a near-miss token is still
         # a secret (e.g. the prod token hitting the test deploy).
         logger.warning("service_auth_failed", reason="token_mismatch")
