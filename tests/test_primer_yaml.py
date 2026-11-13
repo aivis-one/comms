@@ -231,7 +231,24 @@ class TestTheContract:
         assert _PROVIDES
         assert [name for name in _PROVIDES if name not in _ENV] == []
 
-    def test_the_reader_sees_why_the_sixth_waits(self) -> None:
+    def test_the_bot_token_is_a_seam_for_the_transition(self) -> None:
+        """W2-3: the token is given for the product's Mini App sign-in until
+        Telegram's public key; the row says so and points at the marker,
+        which stands at the name in primer.yaml (one full copy)."""
+        (row,) = [
+            line for line in _section("15").splitlines()
+            if line.startswith("| `TELEGRAM_BOT_TOKEN` |")
+        ]
+        assert "public key" in row
+        assert "the seam is removed" in row
+        assert "KNOWN CEILING at this name in `primer.yaml`" in row
+        raw = (_REPO / "primer.yaml").read_text(encoding="utf-8")
+        marker = raw.index("# KNOWN CEILING (acknowledged by design -- the bot's")
+        name = raw.index("  - TELEGRAM_BOT_TOKEN\n")
+        assert raw.index("provides:") < marker < name
+        assert raw.count("KNOWN CEILING") == 1
+
+    def test_the_reader_sees_why_the_bot_id_waits(self) -> None:
         section = _section("15")
         assert "`TELEGRAM_BOT_ID` waits for the machine" in section
         assert "shorter than 16 characters" in section

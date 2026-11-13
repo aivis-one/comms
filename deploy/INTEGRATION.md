@@ -2151,6 +2151,7 @@ file is the list; this section does not repeat it.
 | `COMMS_EVENTS_ADDRESS` | `<host>:<port>` of comms' Redis, the point `events` -- where the relay writes `notification_request` and the push stream is read (sections 7, 10); no scheme |
 | `COMMS_EVENTS_PASSWORD` | the password of that Redis; minted |
 | `TELEGRAM_BOT_URL` | `https://<host>/<bot username>`, derived by `comms derive bot-url` (below); only with the `telegram` option |
+| `TELEGRAM_BOT_TOKEN` | the token of the bot comms sends through, asked of the operator once; only with the `telegram` option. For the transition: the product checks Mini App sign-in with it until it checks it by Telegram's public key, and then the seam is removed (the KNOWN CEILING at this name in `primer.yaml`) |
 
 `TELEGRAM_BOT_ID` waits for the machine: it refuses a derived value
 shorter than 16 characters, and a bot id is 9-10 digits.

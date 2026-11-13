@@ -175,8 +175,24 @@ class TestTheSeams:
         _storage_given(monkeypatch)
         seams = (await client.get("/health")).json()["seams"]
         assert seams["provides"] == _PRIMER["provides"] == list(PROVIDES)
-        assert len(PROVIDES) == 5
+        assert len(PROVIDES) == 6
         assert seams["requires_satisfied"] is True
+
+    async def test_a_seam_is_a_name_never_its_value(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """W2-3: TELEGRAM_BOT_TOKEN is a seam -- /health names it and never
+        shows it, though the process holds it in its environment and its
+        settings. The token is assembled here: a literal of a real token's
+        shape would trip secret scanning."""
+        secret = "Hm" * 17 + "w"
+        token = f"987654321:{secret}"
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+        monkeypatch.setattr(settings, "telegram_bot_token", token)
+        redis_answering(monkeypatch)
+        resp = await client.get("/health")
+        assert "TELEGRAM_BOT_TOKEN" in resp.json()["seams"]["provides"]
+        assert secret not in resp.text
 
     def test_requires_is_primer_yamls(self) -> None:
         """The code's list is the file's -- since W4-2 the product's

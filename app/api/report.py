@@ -93,6 +93,7 @@ PROVIDES: tuple[str, ...] = (
     "COMMS_EVENTS_ADDRESS",
     "COMMS_EVENTS_PASSWORD",
     "TELEGRAM_BOT_URL",
+    "TELEGRAM_BOT_TOKEN",
 )
 """`provides` of primer.yaml, in its order: what the machine checks every
 seam of the product from comms against (`seams_verify`). The runtime image

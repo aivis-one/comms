@@ -83,5 +83,22 @@ provides:
   - COMMS_EVENTS_ADDRESS
   - COMMS_EVENTS_PASSWORD
   - TELEGRAM_BOT_URL
+  # KNOWN CEILING (acknowledged by design -- the bot's token given away):
+  #   1. Mechanics: the token, comms' secret, is rendered into the env of
+  #      every product that takes this seam: a second holder of the bot,
+  #      and whatever reads that product's env can send as the bot.
+  #   2. Status: acknowledged by design (owner, 13.11).
+  #   3. Backlog ref: none in comms -- the end of it is the product's move
+  #      to Telegram's public key for Mini App sign-in.
+  #   4. Promotion trigger (observable): no product's primer.yaml takes
+  #      TELEGRAM_BOT_TOKEN as a seam from comms.
+  #   5. Agreed fix: the name leaves `provides`, PROVIDES of
+  #      app/api/report.py, tests/fixtures/health.json and the seams table
+  #      of deploy/INTEGRATION.md section 15 -- one delivery.
+  #   6. Rejected: the product asking the operator for the same token (two
+  #      copies of one secret, rule 2 of the passport: `asked` is the one
+  #      who checks); comms checking the sign-in for the product (comms
+  #      decides nothing for a product).
+  - TELEGRAM_BOT_TOKEN
 
 report: { health: /health, ready: /ready, logs: json, junit: true }
