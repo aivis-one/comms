@@ -114,6 +114,14 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         _NOT_A_JOB + "the product's event, its address in the log",
     ("app/transport/handlers.py", "handle_event", "target_value"):
         _NOT_A_JOB + "the product's event, its address in the log",
+    ("app/transport/consumer.py", "subjects_of", "target_type"):
+        _NOT_A_JOB
+        + "the product's event, its address: the person a held entry keeps "
+        "the order for",
+    ("app/transport/consumer.py", "subjects_of", "target_value"):
+        _NOT_A_JOB
+        + "the product's event, its address: the person a held entry keeps "
+        "the order for",
     ("app/api/idempotency.py", "request_fingerprint", "body"):
         _NOT_A_JOB + "Request.body(), the request digested whole",
     ("app/api/deps.py", "refuse_unstorable_body", "body"):
