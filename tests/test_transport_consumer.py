@@ -3,7 +3,8 @@
 # =============================================================================
 #
 # End-to-end over fakeredis: XADD into the stream -> StreamConsumer
-# processes -> rows in Postgres / entries in the DLQ. The consumer
+# processes -> rows in Postgres, or the entry dropped or held (W5-1:
+# no dead-letter stream since, app/transport/consumer.py). The consumer
 # loop runs as a background task and is cancelled once the awaited
 # condition holds (or the deadline hits).
 #
@@ -262,7 +263,7 @@ class TestIdempotency:
         db_session: AsyncSession,
     ) -> None:
         """The same event delivered twice -> ONE notification, both
-        entries acked, nothing dead-lettered (a replay is the
+        entries acked, nothing dropped (a replay is the
         at-least-once contract working)."""
         data = _request_data()
         await _xadd(redis, stream, "notification_request", data)
@@ -278,7 +279,7 @@ class TestIdempotency:
         assert await _notification_count(
             db_session, data["idempotency_key"],
         ) == 1
-        assert await redis.exists(settings.dlq_stream) == 0
+        assert await redis.keys("*") == [stream.encode()]
 
 
 class TestRestartRecovery:
@@ -328,7 +329,7 @@ class TestOrderingRetry:
     ) -> None:
         """Item 6a: group_changed arrives FIRST; the consumer retries
         with backoff, user_upserted lands mid-retry, membership
-        materializes -- no DLQ."""
+        materializes -- nothing dropped."""
         rid = uuid4()
         await _xadd(redis, stream, "group_changed", {
             "v": 1, "group_key": "practice_42",
@@ -360,32 +361,35 @@ class TestOrderingRetry:
             await _run_until(StreamConsumer(redis), member)
         finally:
             await inject
-        assert await redis.exists(settings.dlq_stream) == 0
+        assert await redis.keys("*") == [stream.encode()]
 
-    async def test_retries_exhausted_to_dlq(
+    async def test_retries_exhausted_dropped(
         self,
         redis: fakeaioredis.FakeRedis,
         stream: str,
         db_session: AsyncSession,
         fast_backoff: None,
     ) -> None:
-        """The upsert never arrives -> bounded retries, then DLQ with
-        attempt count; the entry is acked so the stream moves on."""
+        """The upsert never arrives -> bounded retries, then dropped (a
+        person comms was never told about -- the product's; until W5-1
+        the dead letter); the entry is acked so the stream moves on."""
         await _xadd(redis, stream, "group_changed", {
             "v": 1, "group_key": "practice_42",
             "recipient_id": str(uuid4()), "member": True,
         })
 
-        async def dead_lettered_and_acked() -> bool:
-            length: int = await redis.xlen(settings.dlq_stream)
-            return length == 1 and await _no_pending(redis, stream)
+        with capture_logs() as logs:
 
-        await _run_until(StreamConsumer(redis), dead_lettered_and_acked)
+            async def dropped_and_acked() -> bool:
+                return any(e["event"] == "event_dropped" for e in logs) \
+                    and await _no_pending(redis, stream)
 
-        entries = await redis.xrange(settings.dlq_stream)
-        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
-        assert "retries exhausted" in fields["_dlq_error"]
-        assert int(fields["_dlq_attempts"]) == 5  # 1 try + 4 fast retries
+            await _run_until(StreamConsumer(redis), dropped_and_acked)
+
+        (line,) = [e for e in logs if e["event"] == "event_dropped"]
+        assert (line["kind"], line["stage"]) == ("group_changed", "retries")
+        retries = [e for e in logs if e["event"] == "event_retry_scheduled"]
+        assert len(retries) == 4  # 1 try + 4 fast retries
 
 
 class TestPoisonPill:
@@ -395,11 +399,12 @@ class TestPoisonPill:
         stream: str,
         db_session: AsyncSession,
     ) -> None:
-        """Item 6b: broken JSON and an unknown event land in the DLQ; an
-        unsupported version with a READABLE key is recorded under that
-        key (F1.2 -- it used to land in the DLQ too: the refusal is the
-        same, it now has an address the product can use); the valid
-        event BEHIND them is still processed."""
+        """Item 6b: broken JSON and an unknown event are dropped (until
+        W5-1 the dead letter); an unsupported version with a READABLE key
+        is recorded under that key (F1.2 -- it used to land in the dead
+        letter too: the refusal is the same, it now has an address the
+        product can use); the valid event BEHIND them is still
+        processed."""
         rid = uuid4()
         await redis.xadd(stream, {"event": "notification_request",
                                   "data": "{broken"})
@@ -416,16 +421,14 @@ class TestPoisonPill:
                 return False
             return await _no_pending(redis, stream)
 
-        await _run_until(StreamConsumer(redis), tail_processed_and_acked)
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(redis), tail_processed_and_acked)
 
-        assert await redis.xlen(settings.dlq_stream) == 2
-        reasons = [
-            {k.decode(): v.decode() for k, v in fields.items()}["_dlq_error"]
-            for _id, fields in await redis.xrange(settings.dlq_stream)
+        dropped = [e for e in logs if e["event"] == "event_dropped"]
+        assert sorted(e["kind"] for e in dropped) == [
+            "notification_request", "unknown",
         ]
-        assert any("not valid JSON" in r for r in reasons)
-        assert any("unknown event" in r for r in reasons)
-        assert not any("unsupported schema version" in r for r in reasons)
+        assert await redis.keys("*") == [stream.encode()]
         outcomes = await intake_outcomes_for(
             db_session, versioned["idempotency_key"],
         )
@@ -444,8 +447,8 @@ class TestPoisonPill:
         type) is terminal too: no retry burn. Since F1.2 it is recorded
         under the request's key as rejected_at_intake instead of being
         dead-lettered -- one copy of the fact, where the product can
-        find it. (What a dead letter keeps, since G4 the address and
-        never the letter, is held in tests/test_dlq_no_letter.py.)"""
+        find it. (What the line of a dropped entry keeps, the address
+        and never the letter, is held in tests/test_drop_no_letter.py.)"""
         data = _request_data(type="not_in_profile")
         await _xadd(redis, stream, "notification_request", data)
 
@@ -461,7 +464,7 @@ class TestPoisonPill:
         )
         assert outcome.outcome == IntakeOutcomeClass.REJECTED_AT_INTAKE
         assert "Unregistered notification type" in outcome.reason
-        assert await redis.xlen(settings.dlq_stream) == 0
+        assert await redis.keys("*") == [stream.encode()]
         assert await _notification_count(
             db_session, data["idempotency_key"],
         ) == 0
@@ -550,16 +553,16 @@ class TestReminderCancel:
             by_key[bystander["idempotency_key"]].status
             == NotificationStatus.PENDING
         )
-        assert await redis.exists(settings.dlq_stream) == 0
+        assert await redis.keys("*") == [stream.encode()]
 
-    async def test_no_match_cancel_is_acked_not_dead_lettered(
+    async def test_no_match_cancel_is_acked_not_dropped(
         self,
         redis: fakeaioredis.FakeRedis,
         stream: str,
     ) -> None:
         """A cancel that matches nothing (already expired / never
         scheduled / replay) is the idempotency contract working --
-        acked, zero rows, no DLQ."""
+        acked, zero rows, nothing dropped."""
         await _xadd(redis, stream, "reminder_cancel", {
             "v": 1,
             "types": ["unit_rem_1h"],
@@ -571,10 +574,10 @@ class TestReminderCancel:
             return length == 1 and await _no_pending(redis, stream)
 
         await _run_until(StreamConsumer(redis), acked)
-        assert await redis.exists(settings.dlq_stream) == 0
+        assert await redis.keys("*") == [stream.encode()]
 
 
-# -- F0.1-comms item 4: the consumer's logs and DLQ carry no secret ---------
+# -- F0.1-comms item 4: the consumer's logs carry no secret -----------------
 
 # Built, never written whole (push protection reads literals).
 _TG_SECRET = "AAH" + "sentinel" * 4
@@ -610,63 +613,71 @@ def _operational_error() -> OperationalError:
     )
 
 
-# (id, the exception handle_event raises, the secret, what the DLQ
-# reason must still say, the log event that carries the text, its key).
+# (id, the exception handle_event raises, the secret, the line that
+# answers for the entry, its key and what it must still say, the log
+# event that carries the text, its key).
 #
 # Until G4 the reason of the two unexpected cases and of the exhausted
 # retries said the exception's TEXT, redacted ("send failed", "connection
 # refused"), and these rows held the redaction there. G4 put the class
 # and the place in its stead (pipeline_error_of): an OperationalError's
 # text is its bound parameters -- the letter, on a job's insert -- and
-# redaction removes secrets, not the letter. The secret is still asserted
-# absent from every DLQ field and every log value; the redaction of the
-# TEXT is held where the text still goes -- the log lines (log_key) and
-# the ValidationError row below. The place is the deepest frame of app/:
-# here the consumer's call of handle_event, whose line moves with the
-# file, hence a prefix up to the colon.
+# redaction removes secrets, not the letter. Until W5-1 that reason was
+# a dead letter's; since, it is the line of the held entry (event_held,
+# its `error`) or of the dropped one (event_dropped, its `reason` -- no
+# text at all: until W5-1 the dead letter carried the ValidationError's
+# text redacted, and the last row held that redaction). The secret is
+# still asserted absent from every log value; the redaction of the TEXT
+# is held where the text still goes -- the log lines (log_key). The place
+# is the deepest frame of app/: here the consumer's call of
+# handle_event, whose line moves with the file, hence a prefix up to the
+# colon.
 _CONSUMER_FAILURES = [
     (
         "unexpected_secret_only_in_cause",
         lambda: _chained(aiohttp.InvalidURL(_TG_URL),
                          RuntimeError("send failed")),
         _TG_SECRET,
-        "unexpected: builtins.RuntimeError at app/transport/consumer.py:",
-        "event_unexpected_error", "exception",
+        "event_held", "error",
+        "builtins.RuntimeError at app/transport/consumer.py:",
+        "event_held", "exception",
     ),
     (
         "unexpected_secret_in_text_and_cause",
         lambda: _chained(aiohttp.InvalidURL(_TG_URL),
                          RuntimeError(f"send failed {_TG_URL}")),
         _TG_SECRET,
-        "unexpected: builtins.RuntimeError at app/transport/consumer.py:",
-        "event_unexpected_error", "exception",
+        "event_held", "error",
+        "builtins.RuntimeError at app/transport/consumer.py:",
+        "event_held", "exception",
     ),
     (
         "operational_error_sql_and_params",
         _operational_error,
         _REDIS_PASS,
-        "retries exhausted: sqlalchemy.exc.OperationalError at "
-        "app/transport/consumer.py:",
+        "event_held", "error",
+        "sqlalchemy.exc.OperationalError at app/transport/consumer.py:",
         "event_retries_exhausted", "error",
     ),
     (
         "terminal_validation_error",
         lambda: ValidationError(f"bad channel url {_TG_URL}"),
         _TG_SECRET,
-        "bad channel url https://api.telegram.org/[redacted]/sendMessage",
-        "event_dead_lettered", "reason",
+        "event_dropped", "reason",
+        "app.core.exceptions.ValidationError at app/transport/consumer.py:",
+        "event_dropped", "reason",
     ),
 ]
 
 
 class TestConsumerRedactsItsFailures:
-    """The DLQ is a stream in the shared redis; its reason and every
-    consumer log line pass through sanitize_text / sanitized_traceback.
-    Checked on the full path: a real event, the real loop, the DLQ
-    entry as redis holds it, every captured log field."""
+    """Every consumer log line passes through sanitize_text /
+    sanitized_traceback, or says no text at all. Checked on the full
+    path: a real event, the real loop, every captured log field."""
 
     @pytest.mark.parametrize(
-        ("make_error", "secret", "reason_says", "log_event", "log_key"),
+        ("make_error", "secret", "line_event", "line_key", "says",
+         "log_event", "log_key"),
         [case[1:] for case in _CONSUMER_FAILURES],
         ids=[case[0] for case in _CONSUMER_FAILURES],
     )
@@ -679,7 +690,9 @@ class TestConsumerRedactsItsFailures:
         monkeypatch: pytest.MonkeyPatch,
         make_error: Callable[[], BaseException],
         secret: str,
-        reason_says: str,
+        line_event: str,
+        line_key: str,
+        says: str,
         log_event: str,
         log_key: str,
     ) -> None:
@@ -689,25 +702,22 @@ class TestConsumerRedactsItsFailures:
         monkeypatch.setattr(consumer_module, "handle_event", failing)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
 
-        async def dead_lettered_and_acked() -> bool:
-            length: int = await redis.xlen(settings.dlq_stream)
-            return length == 1 and await _no_pending(redis, stream)
-
         with capture_logs() as logs:
-            await _run_until(StreamConsumer(redis), dead_lettered_and_acked)
 
-        entries = await redis.xrange(settings.dlq_stream)
-        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
-        for value in fields.values():
-            assert secret not in value
-        assert fields["_dlq_error"].startswith(reason_says)
+            async def answered() -> bool:
+                return any(e["event"] == line_event for e in logs)
 
+            await _run_until(StreamConsumer(redis), answered)
+
+        (line,) = [e for e in logs if e["event"] == line_event]
+        assert line[line_key].startswith(says)
         for entry in logs:
             assert "exc_info" not in entry
             for value in entry.values():
                 assert secret not in str(value)
         carriers = [e[log_key] for e in logs if e["event"] == log_event]
         assert carriers and all(carriers)
+        assert await redis.keys("*") == [stream.encode()]
 
     async def test_the_traceback_keeps_the_whole_chain(
         self,
@@ -722,14 +732,14 @@ class TestConsumerRedactsItsFailures:
         monkeypatch.setattr(consumer_module, "handle_event", failing)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
 
-        async def dead_lettered() -> bool:
-            length: int = await redis.xlen(settings.dlq_stream)
-            return length == 1
-
         with capture_logs() as logs:
-            await _run_until(StreamConsumer(redis), dead_lettered)
 
-        (entry,) = [e for e in logs if e["event"] == "event_unexpected_error"]
+            async def held() -> bool:
+                return any(e["event"] == "event_held" for e in logs)
+
+            await _run_until(StreamConsumer(redis), held)
+
+        (entry,) = [e for e in logs if e["event"] == "event_held"]
         assert entry["log_level"] == "error"
         assert "InvalidURL" in entry["exception"]
         assert "The above exception was the direct cause" in entry["exception"]
@@ -746,7 +756,7 @@ class TestConsumerRedactsItsFailures:
         """The pair of the OperationalError rows, on a REAL failure: a
         40001 from Postgres whose bound parameter carries the secret.
         Retried (TX-1), each retry line naming the failure without it;
-        then the dead letter, "retries exhausted", class and place.
+        then held (until W5-1 the dead letter), class and place.
 
         Until DB-1 the secret stood in the error's text ([parameters]) and
         the retry line carried that text redacted -- the SQL in it named the
@@ -766,12 +776,12 @@ class TestConsumerRedactsItsFailures:
         monkeypatch.setattr(consumer_module, "handle_event", failing)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
 
-        async def dead_lettered() -> bool:
-            length: int = await redis.xlen(settings.dlq_stream)
-            return length == 1
-
         with capture_logs() as logs:
-            await _run_until(StreamConsumer(redis), dead_lettered)
+
+            async def held() -> bool:
+                return any(e["event"] == "event_held" for e in logs)
+
+            await _run_until(StreamConsumer(redis), held)
 
         retries = [e for e in logs if e["event"] == "event_retry_scheduled"]
         assert len(retries) == 4
@@ -780,14 +790,11 @@ class TestConsumerRedactsItsFailures:
             assert "UPDATE sections" not in entry["error"]
             assert entry["error"].startswith("sqlalchemy.exc.DBAPIError at ")
             assert "SQLSTATE 40001" in entry["error"]
-        entries = await redis.xrange(settings.dlq_stream)
-        fields = {k.decode(): v.decode() for k, v in entries[0][1].items()}
-        assert fields["_dlq_error"].startswith(
-            "retries exhausted: sqlalchemy.exc.DBAPIError at "
-            "app/transport/consumer.py:"
+        (line,) = [e for e in logs if e["event"] == "event_held"]
+        assert line["error"].startswith(
+            "sqlalchemy.exc.DBAPIError at app/transport/consumer.py:"
         )
-        for value in fields.values():
-            assert _REDIS_PASS not in value
+        assert _REDIS_PASS not in str(line)
 
     async def test_every_retry_log_is_redacted(
         self,
@@ -807,12 +814,12 @@ class TestConsumerRedactsItsFailures:
         monkeypatch.setattr(consumer_module, "handle_event", failing)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
 
-        async def dead_lettered() -> bool:
-            length: int = await redis.xlen(settings.dlq_stream)
-            return length == 1
-
         with capture_logs() as logs:
-            await _run_until(StreamConsumer(redis), dead_lettered)
+
+            async def held() -> bool:
+                return any(e["event"] == "event_held" for e in logs)
+
+            await _run_until(StreamConsumer(redis), held)
 
         retries = [e for e in logs if e["event"] == "event_retry_scheduled"]
         assert len(retries) == 4
@@ -853,7 +860,7 @@ class TestTheScheduleCeiling:
         """A type with expires_after (unit_expiring, 1h): the expiry is
         scheduled_at + 1h, which for the year 9999 was an OverflowError
         and the event a dead letter `unexpected`. Now: refused under its
-        key, the field and the ceiling named, no dead letter, no job."""
+        key, the field and the ceiling named, nothing dropped, no job."""
         value = _ahead(3651) if scheduled_at == "far" else scheduled_at
         data = _request_data(type="unit_expiring", scheduled_at=value)
         key = data["idempotency_key"]
@@ -868,7 +875,7 @@ class TestTheScheduleCeiling:
         reason = str(outcome.reason)
         assert "scheduled_at" in reason
         assert "3650 days ahead" in reason
-        assert await redis.exists(settings.dlq_stream) == 0
+        assert await redis.keys("*") == [stream.encode()]
         assert await _notification_count(db_session, key) == 0
 
     @pytest.mark.parametrize("days", [3650, 30])
@@ -894,4 +901,4 @@ class TestTheScheduleCeiling:
         )).scalar_one()
         assert job.scheduled_at == datetime.fromisoformat(value)
         assert job.expiry_at == job.scheduled_at + timedelta(hours=1)
-        assert await redis.exists(settings.dlq_stream) == 0
+        assert await redis.keys("*") == [stream.encode()]

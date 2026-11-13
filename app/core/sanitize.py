@@ -136,13 +136,13 @@ _LLM_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
 #      operator: any of them surfacing bare in an error text passes
 #      through every pattern here unchanged. The machine cleans the
 #      values it holds out of the lines of comms' log itself (protocol
-#      9.4); a text comms stores (a delivery's error, a dead letter) is
+#      9.4); a text comms stores (a delivery's error) is
 #      not a line of the log.
 #   2. Status: acknowledged by design.
 #   3. Task: none -- outside the table of W1-2, which found it (the
 #      trigger below has fired: report of W1-2, observations).
 #   4. Unfreeze trigger: a secret of the instance in a text comms stores
-#      or answers -- a delivery's error, a dead letter, a response.
+#      or answers -- a delivery's error, a response.
 #   5. Agreed fix: redact by VALUE, not by shape -- read the configured
 #      secrets from settings once and replace their literal occurrences.
 #   6. Rejected: widening the shape patterns to "any long token" (eats
@@ -249,7 +249,7 @@ def pipeline_error_of(exc: BaseException) -> str:
     secrets, not content: a text raised from a template or a formatter
     can carry the letter's variables, a database error's text is its
     SQL and bound parameters, and a record of comms holds no letter
-    content (spec §6.4) -- nor does a dead letter
+    content (spec §6.4) -- nor does the line of a dropped event
     (app/transport/consumer.py). The class and the place say where it
     tore; the redacted traceback in the log says the rest. Lives here,
     in app/core, since DB-1: the rule for a database error's text in a

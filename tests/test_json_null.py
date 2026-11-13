@@ -493,8 +493,9 @@ async def test_the_migration_seeds_the_stream_case(
     at_head_afterwards: None, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Item 2 by the STREAM: a cleared schedule seeded as JSON null
-    before 0030; after it, user_deleted forgets the person and the
-    dead-letter stream stays empty.
+    before 0030; after it, user_deleted forgets the person and the entry
+    is neither held nor dropped (until W5-1: the dead-letter stream stays
+    empty).
 
     The consumer -- today's code -- runs at HEAD, which includes 0030:
     until EM-1 it ran at 0030 itself, which held while no later
@@ -503,8 +504,8 @@ async def test_the_migration_seeds_the_stream_case(
     async with get_session_factory()() as session:
         ids = await _seed_before(session)
     await _migrate("upgrade", "head")
-    dlq = await _consume_user_deleted(monkeypatch, ids["cleared"])
-    assert dlq == 0
+    failed = await _consume_user_deleted(monkeypatch, ids["cleared"])
+    assert failed == 0
     assert (await _sql(
         "SELECT deleted_at IS NOT NULL FROM recipients WHERE id = :v",
         v=ids["cleared"],
@@ -515,8 +516,8 @@ async def _consume_user_deleted(
     monkeypatch: pytest.MonkeyPatch, recipient_id: UUID,
 ) -> int:
     """One user_deleted through the real consumer on a fake redis, until
-    the entry is settled -- the person tombstoned, or the entry dead-
-    lettered; the length of the dead-letter stream after it."""
+    the entry is settled -- the person tombstoned, or the entry held or
+    dropped; how many lines of a held or dropped entry were written."""
     redis = fakeaioredis.FakeRedis()
     stream = f"comms:h13:{uuid4().hex[:8]}"
     monkeypatch.setattr(settings, "comms_events_stream", stream)
@@ -526,29 +527,34 @@ async def _consume_user_deleted(
         "data": json.dumps({"v": 1, "recipient_id": str(recipient_id),
                             "version": 2}),
     })
-    task = asyncio.ensure_future(StreamConsumer(redis).run())
-    try:
-        deadline = asyncio.get_event_loop().time() + 10
-        while not (
-            await redis.xlen(settings.dlq_stream)
-            or (await _sql(
-                "SELECT deleted_at IS NOT NULL FROM recipients WHERE id = :v",
-                v=recipient_id,
-            )).scalar_one()
-        ):
-            assert asyncio.get_event_loop().time() < deadline
-            await asyncio.sleep(0.02)
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-    length: int = await redis.xlen(settings.dlq_stream)
-    return length
+    with capture_logs() as logs:
+        task = asyncio.ensure_future(StreamConsumer(redis).run())
+
+        def failed() -> int:
+            return sum(e["event"] in ("event_held", "event_dropped") for e in logs)
+
+        try:
+            deadline = asyncio.get_event_loop().time() + 10
+            while not (
+                failed()
+                or (await _sql(
+                    "SELECT deleted_at IS NOT NULL FROM recipients WHERE id = :v",
+                    v=recipient_id,
+                )).scalar_one()
+            ):
+                assert asyncio.get_event_loop().time() < deadline
+                await asyncio.sleep(0.02)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    return failed()
 
 
 class TestForgettingWithASchedule:
     """Item 2: before H13 the tombstone of a recipient who ever had a
     schedule failed ck_recipients_tombstone (JSON null IS NOT NULL) --
-    by the stream into the dead letters, by the API a 500."""
+    by the stream into the dead letters (since W5-1 it would be held), by
+    the API a 500."""
 
     async def _with_schedule(self, db_session: AsyncSession) -> UUID:
         recipient = await create_recipient(db_session)

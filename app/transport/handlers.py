@@ -28,21 +28,22 @@
 # Error classification (consumed by consumer.py):
 #   HandleResult.REJECTED / CONFLICT -- a notification request that was
 #                      not accepted and IS recorded under its key: the
-#                      product's side of the line (spec §5.4). ACK,
-#                      no DLQ -- the record is the one copy of the fact.
-#   ValidationError -- terminal for the other events: the event will
-#                      never succeed -> DLQ + ACK.
+#                      product's side of the line (spec §5.4). ACK --
+#                      the record is the one copy of the fact.
+#   ValidationError -- the other events' malformation: the event will
+#                      never succeed -> dropped, one log line, ACK.
 #   ConflictError   -- a sync event that is late or repeated rather than
 #                      broken (a stale or conflicting snapshot, a
 #                      deleted recipient, F1.4): refused, its CLASS in
-#                      the log, ACK, no DLQ. There is no record under a
+#                      the log, ACK. There is no record under a
 #                      key -- sync events carry none -- so the log line
 #                      is the one programmatic trace.
 #   NotFoundError   -- retryable: group_changed arrived before its
 #                      user_upserted (momentary sync lag) -> bounded
-#                      backoff, then DLQ.
+#                      backoff, then dropped: a person comms was never
+#                      told about.
 #   HandleResult.DUPLICATE -- not an error: an at-least-once replay
-#                      of the same bytes -> ACK, no DLQ.
+#                      of the same bytes -> ACK.
 #
 # Each event is handled inside ITS OWN session/transaction (the
 # consumer opens it): a failed event rolls back completely and never
@@ -94,7 +95,7 @@ async def handle_event(
     """Apply one parsed event to the database.
 
     The caller owns the session lifecycle (commit on return, rollback
-    on raise). Raises ValidationError (terminal) or NotFoundError
+    on raise). Raises ValidationError (dropped) or NotFoundError
     (retryable) -- see the module header for the classification.
     """
     if isinstance(event, NotificationRequest):

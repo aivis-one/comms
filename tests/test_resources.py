@@ -863,7 +863,7 @@ async def test_a_stale_event_is_acked_with_its_class(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Amendment 3: no record under a key exists for a sync event -- the
-    log's refusal_class is the one programmatic trace; no dead letter."""
+    log's refusal_class is the one programmatic trace; nothing dropped."""
     rid = await _commit_person(5)
     redis = fakeaioredis.FakeRedis()
     stream = f"comms:test:{uuid4().hex[:8]}"
@@ -895,4 +895,4 @@ async def test_a_stale_event_is_acked_with_its_class(
             await asyncio.gather(task, return_exceptions=True)
     (entry,) = [e for e in logs if e["event"] == "event_refused"]
     assert entry["refusal_class"] == "stale_snapshot"
-    assert await redis.xlen(settings.dlq_stream) == 0
+    assert "event_dropped" not in [e["event"] for e in logs]

@@ -694,12 +694,7 @@ they were part of stay: a conversation belongs to both sides, and what
 happens to message bodies -- and to their variants (section 12) -- is
 the product's decision. That decision is a thread at a time: deleting a
 thread (section 14) removes every message in it, whoever wrote it. A deletion is
-final -- a person who returns gets a new id in the product. One copy is
-not forgotten: the fields of the address book kept in a dead letter
-(`<COMMS_EVENTS_STREAM>:dlq`, "How long comms keeps things") stay there
--- the products hide a person rather than erase them and comms follows
-them, and that stream is for an investigation by hand, capped by
-`DLQ_MAXLEN` and trimmed. A
+final -- a person who returns gets a new id in the product. A
 recipient deactivated or deleted after a job was resolved is not sent
 to either: their delivery ends `recipient_inactive`, which is neither a
 failure nor a mute.
@@ -795,8 +790,9 @@ moment of the request; nothing is stored as "depth".
 
 ### Reconciling the address book
 
-The book is synced eventually: an event that is lost or dead-lettered
-leaves comms' copy behind the product's, silently. To compare, page
+The book is synced eventually: an event that is lost or dropped (comms
+could not take it, section 7) leaves comms' copy behind the product's,
+silently. To compare, page
 through what comms has recorded:
 
     GET /api/v1/recipients?limit=100&cursor=<next_cursor>
@@ -938,7 +934,7 @@ an integer `v` (supported: `1`).
 log line comms writes while it processes the entry names it; one that
 is absent or of another form -- not UTF-8 either -- is replaced by an id
 comms mints, and the event is processed as it would be without the
-field: an event is never refused, and never dead-lettered, because of
+field: an event is never refused, and never dropped, because of
 its `request_id`.
 The field set of every event is **closed** -- `notification_request`,
 `reminder_cancel`, `user_upserted`, `user_deleted`, `group_changed` and
@@ -990,11 +986,10 @@ inside `action_data`, `llm` or `email`, an item of a list, a key of an
 object, a field's name. A `notification_request` is rejected under its
 key, naming the field and never the value. In the `idempotency_key`
 itself it makes the key unreadable: there is nothing to record the
-rejection under, and the request goes to the dead-letter stream. Every
-other event (`user_upserted`, `user_deleted`, `group_changed`,
-`section_membership_changed`, `reminder_cancel`) goes to the
-dead-letter stream at once, naming the field -- the event is malformed,
-not failing.
+rejection under, and the request is dropped. Every other event
+(`user_upserted`, `user_deleted`, `group_changed`,
+`section_membership_changed`, `reminder_cancel`) is dropped at once --
+the event is malformed, not failing.
 
 **The same holds for every value of that class -- one comms cannot
 store -- and for data nested too deep.** A number that is no JSON
@@ -1006,17 +1001,17 @@ first), and a `scheduled_at` or `expiry_at` that lies, in UTC, before
 the year 1 or after 9999 (the year 1 at `+01:00`, say). A request
 refused for what it holds is rejected under its key whenever the key
 can be read. Data that cannot be read at all -- broken JSON, a nesting
-past what the reader can follow -- leaves no key, and the request goes
-to the dead-letter stream. So does a request whose key can be read but
-whose handling failed -- transient failures past the retries while the
-database answers, or an error no retry mends: this version of comms
-gives it no outcome under its key, and the product sees that absence (a
-read by the key finds no job).
+past what the reader can follow -- leaves no key, and the request is
+dropped. A request whose key can be read but whose handling failed in
+comms -- transient failures past the retries while the database
+answers, or an error no retry mends -- is not dropped: comms holds it
+and handles it again until it is taken, in its order (see "Ordering
+the producer relies on"); meanwhile a read by the key finds no job.
 
 **The size of an entry.** An entry whose `data` is larger than 4194304
-bytes (4 MiB) is refused for its size before any of it is read, and goes
-to the dead-letter stream with that reason, naming the field and the
-limit; the dead letter keeps its size and fingerprint, not its data.
+bytes (4 MiB) is refused for its size before any of it is read, and is
+dropped; the line of the drop names its size and fingerprint, not its
+data.
 The number sits above the largest entry the field limits of this
 section allow (an email job at its limits, about 1.3 MB in UTF-8).
 
@@ -1028,10 +1023,20 @@ section allow (an email job at its limits, about 1.3 MB in UTF-8).
 - **rejected at intake** -- the key is readable but the request cannot be accepted (an undeclared type, a malformed address, an expiry already past, an unknown field): recorded under the key; the key is **not** taken, so a corrected request with the same key is accepted.
 
 A request whose key cannot be read at all -- a field of the entry that
-is not UTF-8 included -- goes to the dead-letter stream: there is
-nothing to record the rejection under. The dead letter keeps its
-address, never its letter, and the fingerprint of its `data` -- find
-the request in your outbox by it (see "How long comms keeps things").
+is not UTF-8 included -- is dropped: there is nothing to record the
+rejection under.
+
+**What "dropped" is.** An entry comms cannot take and cannot record
+under a key is acknowledged and kept nowhere -- no stream, no row, no
+replay -- and leaves one line in comms' log, `event_dropped`: the
+event's kind (one of the six above, or `unknown`), the stage
+(`parse`, `handle`, or `retries` for a person comms was never told
+about), the class and place of the refusal in comms' code -- never its
+text, nor any value of the entry -- and the SHA-256 of the `data` bytes
+as sent (`data_fingerprint`, the digest a rejection at intake records)
+with their length (`data_bytes`); find the event in your outbox by it.
+A dropped entry is your producer's to fix: once it is, your outbox
+sends the event again.
 
 ### The idempotency key names the request, not its subject
 
@@ -1165,13 +1170,20 @@ comms has not been told about yet is retried, the same lag
 **comms' own database down does not lose your event.** When it does not
 answer at all, comms waits -- without a limit, the delay growing to 30 s
 -- and processes the event once it is back. When it does answer and one
-event keeps meeting a transient failure, that event goes to the
-dead-letter stream after a short bounded series of retries, so the
-events behind it are not held.
+event keeps meeting a transient failure past a short bounded series of
+retries -- or its handling fails in comms in any other way -- comms
+holds the event: it is handled again at every pass over comms' pending
+entries, about once a minute, until it is taken. **The order of one
+subject is kept**: no later event about the same person (the
+`recipient_id` of a sync event, the `operator_id` of a section's
+roster, the person a request is addressed to), the same `correlation`
+or the same `idempotency_key` is applied before the held one -- they
+wait behind it and go after it, in their order. Events about everyone
+else are not held.
 
 - `user_upserted` for a new user precedes `group_changed` for them; a
   momentary inversion is retried by comms with a bounded backoff, a
-  persistent one ends in the dead-letter stream.
+  persistent one is dropped (comms was never told about that person).
 - Sync events are safe to replay any number of times.
 - `notification_request` replays collapse on the key.
 
@@ -1669,7 +1681,7 @@ class `configuration`, the store not asked -- if a restart gave comms
 another one since.
 
 **Every attempt fetches the body again,** and comms keeps it only in the
-attempt's memory -- never in its database, stream or dead letters. So:
+attempt's memory -- never in its database or stream. So:
 
 - **the link and the object must live at least as long as the job**
   (its `expiry_at`, or the type's `expires_after`, with its retries);
@@ -2241,8 +2253,7 @@ The questions every product asks once, answered here so the answer is
 not a trip through our source. The history and the threads are
 deploy-side settings with defaults; both are days-granular, and both
 treat zero as "never" (a negative value refuses the start, naming the
-variable). The dead letters are capped by count, a deploy-side setting
-too. A model's answer is kept by its type.
+variable). A model's answer is kept by its type.
 
 - **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
   **90**. A notification in a terminal state (and its deliveries) is
@@ -2270,44 +2281,11 @@ too. A model's answer is kept by its type.
   goes with its thread when you delete the thread -- and forgetting a
   person keeps them, as it keeps the bodies of their messages.
 
-- **Dead letters**: an entry comms cannot take -- a broken frame, an
-  unknown event, a request whose key cannot be read, an event that
-  failed past its retries -- lands in the dead-letter stream
-  `<COMMS_EVENTS_STREAM>:dlq` in comms' redis, for the investigation.
-  It keeps the entry's address and never its letter (the table below).
-  No expiry: the stream is capped at `DLQ_MAXLEN` entries, default
-  **10000**, the oldest trimmed first (approximately). Nothing is
-  replayed from it: once the cause is fixed, your outbox sends the
-  event again.
+- **An entry comms cannot take** (section 7, what "dropped" is):
+  nowhere. It is acknowledged and leaves one line in comms' log, its
+  address without its letter; nothing is replayed -- once the cause is
+  fixed, your outbox sends the event again.
 
 A deploy that wants either behaviour off sets the value to 0. A
 product that needs history kept longer than comms keeps it should
 retain its own copy: comms is the delivery service, not the archive.
-
-**What a dead letter holds.** A value is kept only where the table
-says so; every other field of the entry, and every other key of its
-`data`, is dropped and only its NAME is listed.
-
-A dead letter is bounded in bytes as well, and is written whatever came
-in: only what it holds is cut. Lengths are of the form written -- JSON
-with every non-ASCII character escaped, so a character is a byte. A
-value of `data` longer than **2048** is not kept, its key is dropped by
-name; an `event` longer than **128** bytes is not kept, `event` is
-dropped by name; `_dlq_dropped` lists the first **20** names in sorted
-order, each at most **128** long as JSON, and `_dlq_dropped_more` counts
-the names it does not list. `_dlq_error` is at most 2000 characters --
-up to 8000 bytes in UTF-8. Every value a valid event sends fits, but a
-`reminder_cancel` `types` list of many keys. A dead letter is then
-about 25 KB at most, about 250 MB at the default `DLQ_MAXLEN`.
-
-| field | what it holds |
-|---|---|
-| `event` | the entry's event name as sent; absent when the entry had none, or it was not UTF-8, or longer than 128 bytes |
-| `_dlq_data` | a JSON object of the keys of `data` the event's own field set names (section 7): for `notification_request` the frame and the envelope without `llm_audio` -- the signed link to a person's voice (section 11); for the other events their fields; a key whose value is longer than 2048 as JSON is left out. Absent for an unknown event, and for a `data` that is not a UTF-8 JSON object |
-| `_dlq_data_fingerprint` | the SHA-256 of the `data` bytes as sent -- the digest a rejection at intake records; absent without `data` |
-| `_dlq_data_bytes` | the length of those bytes; absent without `data` |
-| `_dlq_dropped` | a JSON list of the names of everything not kept: a field of the entry by its name, a key of `data` as `data.<key>`, the whole of `data` as `data`; sorted, the first 20 of those at most 128 long as JSON; `[]` when nothing was |
-| `_dlq_dropped_more` | how many names of what was not kept the list leaves out -- past the first 20, or longer than 128; `0` when it lists them all |
-| `_dlq_error` | why: comms' own refusal (it names fields and the address, never the letter), or the class and the place of the failure -- never an exception's text |
-| `_dlq_attempts` | the attempts made; `0` -- refused as it was read |
-| `_dlq_source_entry_id` | the entry's id in the stream it came from |

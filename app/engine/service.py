@@ -2143,7 +2143,7 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     # THE ONE EDIT OF THE JOURNAL, and why it is allowed: forgetting
     # outweighs append-only. Append-only is a property of the design;
     # forgetting is an obligation to a person (spec §10.4), within what
-    # app/forgetting.py WHAT STAYS names -- the dead letters among it.
+    # app/forgetting.py WHAT STAYS names.
     # A provider's words may quote the address being forgotten -- the
     # reason error_message is cleared just above -- and the journal keeps
     # the same words for the same recipient. Only that column, only this

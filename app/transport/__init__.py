@@ -12,7 +12,8 @@
 #                  group_changed), dedup via the DB unique index.
 #   consumer.py -- the XREADGROUP loop: group bootstrap, pending drain
 #                  on startup, retry-with-backoff for ordering lag,
-#                  poison-pill -> DLQ, XACK discipline.
+#                  the product's bad input refused or dropped and comms'
+#                  failure held by subject (W5-1), XACK discipline.
 #   push_relay.py -- the reverse direction (P3-1): publishes the
 #                  committed push_outbox rows -- a job's key, nothing
 #                  else -- into comms' own push stream, in the same

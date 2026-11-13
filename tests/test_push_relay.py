@@ -361,11 +361,9 @@ class TestBatch:
 
 
 class TestStreamName:
-    def test_the_name_is_derived_and_is_neither_inbound_nor_dlq(self) -> None:
+    def test_the_name_is_derived_and_is_not_the_inbound(self) -> None:
         assert settings.changes_stream == f"{settings.comms_events_stream}:changes"
-        assert settings.changes_stream not in (
-            settings.comms_events_stream, settings.dlq_stream,
-        )
+        assert settings.changes_stream != settings.comms_events_stream
 
     def test_the_defaults(self) -> None:
         fields = Settings.model_fields

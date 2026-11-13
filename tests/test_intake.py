@@ -207,7 +207,7 @@ class TestChannelsFromTheProfile:
 
 class TestKeyAndFingerprint:
     """REPEAT: same bytes; one byte of difference; a race. EMPTY: a
-    missing or empty key (DLQ -- no address). SHORTFALL: a key longer
+    missing or empty key (dropped -- no address). SHORTFALL: a key longer
     than its column."""
 
     async def test_same_key_same_bytes_is_the_same_job(

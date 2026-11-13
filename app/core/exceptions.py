@@ -54,7 +54,7 @@ class ConflictError(CommsError):
     the API maps each to its own error class under HTTP 409
     (app/api/errors.py). On the event stream a conflict is not a broken
     event -- it is a late or repeated one -- so the consumer logs its
-    class and acknowledges it, without a dead letter.
+    class and acknowledges it.
     """
 
     def __init__(self, *args: object) -> None:

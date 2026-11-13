@@ -1,23 +1,26 @@
 # =============================================================================
-# A dead letter is written to the end; a refusal of redis ends the process
+# A refusal of redis ends the process; the review's case N0
 # =============================================================================
 #
-#   1 the XADD of a dead letter is retried IN PLACE until redis takes it
-#     (_until_done): one letter, the entry acknowledged, the next entry
-#     not taken before; the review's case N0 -- a group_changed true that
-#     waited for its person, its dead letter failing, then the person and
-#     a false -- leaves no membership (TestTheDeadLetterIsWritten);
+#   1 the review's case N0 -- a group_changed true for a person not yet
+#     known, its retries run out, then the person and a false -- leaves
+#     no membership: the true is dropped once, never applied
+#     (TestTheReviewsCaseN0);
 #   2 a refusal of redis that no retry mends (a ResponseError but OOM, an
-#     authentication or authorization error) on the XACK or on the
-#     dead letter's XADD ends run() after _REDIS_REFUSALS_BEFORE_EXIT of
-#     them, the entry left pending and handled FIRST by the next run();
-#     the pair -- a lost connection is retried, the process alive, and is
-#     not counted among the refusals (TestARefusalEndsTheProcess,
-#     TestTheKinds).
+#     authentication or authorization error) on the XACK -- of a handled
+#     entry or a dropped one -- ends run() after
+#     _REDIS_REFUSALS_BEFORE_EXIT of them, the entry left pending and
+#     handled FIRST by the next run(); the pair -- a lost connection is
+#     retried, the process alive, and is not counted among the refusals
+#     (TestARefusalEndsTheProcess, TestTheKinds).
+#
+# Until W5-1 the file held the XADD of a dead letter too: retried in place
+# (1) and refused (2), and the cut of its error (TestTheErrorOfALetter).
+# W5-1 removed the dead letters; the XACK is the one operation of redis on
+# an entry left.
 #
 # MUTATIONS these tests were written against (each turns one red):
-#   M1 the dead letter's XADD tried once, the entry held -> TestTheDead-
-#      LetterIsWritten
+#   M1 (gone with the dead letter's XADD, W5-1)
 #   M2 a refusal retried like a lost connection -> TestARefusalEnds...
 #   M3 _process_guarded swallows RedisRefusedError -> TestARefusalEnds...
 #   M4 the exit on the first refusal -> test_seven_refusals_then_the_ack
@@ -25,9 +28,7 @@
 #   M6 OutOfMemoryError taken as a refusal -> TestTheKinds
 #   M7 a lost connection counted among the refusals ->
 #      test_lost_connections_between_refusals_are_not_counted
-#   M8 a dead letter that cannot be built retried in place ->
-#      tests/test_consumer_keeps_its_entries.py::TestHeld
-#   M9 _dlq_error not cut after the redaction -> TestTheErrorOfALetter
+#   M8, M9 (gone with the dead letter, W5-1)
 # =============================================================================
 
 import asyncio
@@ -63,7 +64,7 @@ from tests.test_transport_consumer import _user_upserted_data
 _BOUND = 5.0
 _REDRAIN = 0.1
 _N = 8  # the contract of this test: _REDIS_REFUSALS_BEFORE_EXIT
-_BAD = {"event": "user_deleted", "data": '{"v": 1}'}  # malformed: a dead letter
+_BAD = {"event": "user_deleted", "data": '{"v": 1}'}  # malformed: dropped
 
 
 @pytest.fixture
@@ -107,10 +108,6 @@ class _Failing:
             return await real(*args, **kwargs)
 
         setattr(redis, command, failing)
-
-
-def _the_dlq(name: Any, *_: Any, **__: Any) -> bool:
-    return bool(name == settings.dlq_stream)
 
 
 def _the_entry(entry_id: bytes) -> Callable[..., bool]:
@@ -162,11 +159,6 @@ async def _member(group_key: str, rid: UUID) -> bool:
         ) is not None
 
 
-async def _dlq(redis: fakeaioredis.FakeRedis) -> list[dict[str, str]]:
-    entries = await redis.xrange(settings.dlq_stream)
-    return [{k.decode(): v.decode() for k, v in e[1].items()} for e in entries]
-
-
 def _counted(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
     """The entries handled, in order."""
     met: list[bytes] = []
@@ -206,54 +198,20 @@ async def _ended(task: "asyncio.Future[None]") -> BaseException:
 
 
 # -----------------------------------------------------------------------------
-# 1 -- the dead letter is written to the end
+# 1 -- the review's case N0
 # -----------------------------------------------------------------------------
 
 
-class TestTheDeadLetterIsWritten:
-    async def test_one_letter_and_the_next_not_taken_before(
-        self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
-        db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The dead letter's XADD fails three times (a lost connection),
-        then works: one letter, the entry acknowledged, the entry behind
-        handled only after the letter -- each handled once; the retry said
-        and its end said."""
-        bad = await fake_redis.xadd(a_stream, _BAD)
-        later = uuid4()
-        later_id = await _xadd(fake_redis, a_stream, "user_upserted",
-                               _user_upserted_data(later))
-        failing = _Failing(fake_redis, "xadd", _the_dlq, [_lost()] * 3)
-        met = _counted(monkeypatch)
-        with capture_logs() as logs:
-            task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
-            try:
-                async def done() -> bool:
-                    return await _recipient(later) and not await _pending(
-                        fake_redis, a_stream,
-                    )
-
-                await _until(task, done)
-                await asyncio.sleep(_REDRAIN * 3)
-            finally:
-                await _stop(task)
-        assert failing.calls == 4
-        (dead,) = await _dlq(fake_redis)
-        assert dead["event"] == "user_deleted"
-        assert met == [bad, later_id]  # in order, each once
-        events = [e["event"] for e in logs]
-        assert events.count("dead_letter_write_failed") == 1
-        assert "dead_letter_written_after_retry" in events
-        assert "dead_letter_build_failed" not in events
-
+class TestTheReviewsCaseN0:
     async def test_the_reviews_case_n0(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession,
     ) -> None:
         """group_changed true for a person not yet known: its retries run
-        out, its dead letter fails three times; then the person, then
-        false. The true is dead-lettered once, never applied; several passes
-        over the pending list later the person is not in the group."""
+        out, it is dropped (until W5-1: its dead letter, whose write
+        failed three times); then the person, then false. The true is
+        dropped once, never applied; several passes over the pending list
+        later the person is not in the group."""
         person, group = uuid4(), f"admins-{uuid4().hex[:6]}"
         await _xadd(fake_redis, a_stream, "group_changed", {
             "v": 1, "group_key": group, "recipient_id": str(person),
@@ -265,23 +223,23 @@ class TestTheDeadLetterIsWritten:
             "v": 1, "group_key": group, "recipient_id": str(person),
             "member": False,
         })
-        failing = _Failing(fake_redis, "xadd", _the_dlq, [_lost()] * 3)
-        task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
-        try:
-            async def done() -> bool:
-                return failing.calls > 3 and not await _pending(
-                    fake_redis, a_stream,
-                )
+        with capture_logs() as logs:
+            task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
+            try:
+                async def done() -> bool:
+                    return await _recipient(person) and not await _pending(
+                        fake_redis, a_stream,
+                    )
 
-            await _until(task, done)
-            await asyncio.sleep(_REDRAIN * 5)
-            assert not task.done()
-        finally:
-            await _stop(task)
+                await _until(task, done)
+                await asyncio.sleep(_REDRAIN * 5)
+                assert not task.done()
+            finally:
+                await _stop(task)
         assert await _recipient(person)  # the pair: the person is known
         assert not await _member(group, person)
-        (dead,) = await _dlq(fake_redis)
-        assert dead["event"] == "group_changed"
+        (line,) = [e for e in logs if e["event"] == "event_dropped"]
+        assert (line["kind"], line["stage"]) == ("group_changed", "retries")
 
 
 # -----------------------------------------------------------------------------
@@ -332,18 +290,20 @@ class TestARefusalEndsTheProcess:
             await _stop(task)
         assert met == [first_id, second_id]
 
-    async def test_the_dead_letter_refused_ends_run(
+    async def test_the_ack_of_a_drop_refused_ends_run(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession,
     ) -> None:
+        """Until W5-1: the dead letter's XADD refused. The drop's XACK is
+        the one operation of redis on a dropped entry now."""
         bad = await fake_redis.xadd(a_stream, _BAD)
-        _Failing(fake_redis, "xadd", _the_dlq,
+        _Failing(fake_redis, "xack", _the_entry(bad),
                  [NoPermissionError("NOPERM") for _ in range(_N)])
         exc = await _ended(asyncio.ensure_future(
             StreamConsumer(fake_redis).run(),
         ))
         assert isinstance(exc, consumer_module.RedisRefusedError)
-        assert await _dlq(fake_redis) == []
+        assert await fake_redis.keys("*") == [a_stream.encode()]
         assert [p["message_id"] for p in await _pending(fake_redis, a_stream)
                 ] == [bad]
 
@@ -482,19 +442,3 @@ class TestTheKinds:
     ], ids=lambda e: f"{type(e).__module__.split('.')[0]}.{type(e).__name__}")
     def test_retried(self, exc: BaseException) -> None:
         assert not consumer_module._is_refusal(exc)
-
-
-class TestTheErrorOfALetter:
-    def test_cut_at_its_bound_after_the_redaction(
-        self, fake_redis: fakeaioredis.FakeRedis,
-    ) -> None:
-        """_dlq_error is cut at _DLQ_ERROR_MAX once redacted -- the number
-        the contract states ("What a dead letter holds"); the pair: a
-        short reason is kept whole."""
-        assert consumer_module._DLQ_ERROR_MAX == 2000
-        c = StreamConsumer(fake_redis)
-        fields = {b"event": b"user_deleted", b"data": b"{}"}
-        long = c._dead_letter_of("1-0", fields, reason="x" * 5000, attempts=0)
-        assert long["_dlq_error"] == "x" * 2000
-        short = c._dead_letter_of("1-0", fields, reason="why", attempts=0)
-        assert short["_dlq_error"] == "why"

@@ -211,9 +211,9 @@ async def set_membership(
     classifies RETRYABLE and retries with backoff until the identity
     sync catches up. Letting the recipient FK raise instead would look
     the same in the database and behave the opposite way in the queue --
-    an IntegrityError is not in the retryable set and would send a
-    perfectly recoverable ordering lag straight to the dead-letter
-    queue.
+    an IntegrityError is not in the retryable set and would hold a
+    perfectly recoverable ordering lag as a defect of comms
+    (app/transport/consumer.py, HELD BY SUBJECT).
     """
     section = await get_or_create_section(
         session, key=section_key, label=section_label

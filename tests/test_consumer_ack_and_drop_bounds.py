@@ -1,45 +1,44 @@
 # =============================================================================
 # The consumer's acknowledgement is retried in place; the wait never
-# overflows; a dead letter is bounded in bytes
+# overflows; the line of a dropped entry is bounded whatever came in
 # =============================================================================
 #
 #   1 an XACK after the commit is retried IN PLACE until it is written
 #     (_ack_until_done): the event applied once, the next entry not taken
 #     before the ack; a group_changed true whose ack failed is not
 #     replayed over the false behind it; an ack that never comes holds
-#     the consumer (alive, cancellable, the entry pending); a dead letter
-#     already written is acknowledged the same way -- one letter, not
-#     one per pass over the pending list (TestTheAckIsHeld);
+#     the consumer (alive, cancellable, the entry pending); a dropped
+#     entry is acknowledged the same way -- one line, not one per pass
+#     over the pending list (TestTheAckIsHeld);
 #   2 the doubling wait (_wait_delay) at any count stays within
 #     _WAIT_CEILING and raises nothing (TestTheWait);
-#   3 a dead letter is always written and bounded: a value of `data`
-#     over _DLQ_VALUE_MAX, an event name or a dropped name over
-#     _DLQ_NAME_MAX are not kept -- named, or counted; _dlq_dropped lists
-#     the first _DLQ_DROPPED_LISTED names and _dlq_dropped_more counts
-#     the rest; the pair -- an ordinary dead letter is what it was
-#     (TestTheBounds); the redis client checks its connection
+#   3 the line of a dropped entry is bounded whatever came in -- a value
+#     of `data` of megabytes, hundreds of thousands of keys, a key
+#     named with a megabyte, an event name of any length: it holds none
+#     of them (TestTheBounds); the redis client checks its connection
 #     (TestTheClient).
+#
+# Until W5-1, 3 held the bounds of a dead letter (review 3.14.0, 5): what
+# it kept of a value, of a name and how many names it listed. W5-1
+# removed the dead letters, and the line that took their place keeps no
+# value and no name of the entry -- the bound is the line's whole shape.
 #
 # MUTATIONS these tests were written against (each turns one red):
 #   M1  _ack_until_done = one XACK, as before -> TestTheAckIsHeld (next
 #       taken; membership true; pending stays)
 #   M2  the retry in a background task -> TestTheAckIsHeld::
 #       test_applied_once_and_the_next_not_taken
-#   M3  _dead_letter_or_hold acknowledges once -> TestTheAckIsHeld::
-#       test_a_dead_letter_written_is_acknowledged_once (two letters)
+#   M3  the drop acknowledges once -> TestTheAckIsHeld::
+#       test_a_dropped_entry_is_acknowledged_once (two lines)
 #   M4  the old wait formula -> TestTheWait (OverflowError)
 #   M5  no ceiling in the wait -> TestTheWait
-#   M6  a value of data kept whatever its length -> TestTheBounds
-#   M7  every dropped name listed -> TestTheBounds
-#   M8  a dropped name kept whatever its length -> TestTheBounds
-#   M9  _dlq_dropped_more counts only the names past N -> TestTheBounds
+#   M6-M9 (gone with the dead letter's bounds, W5-1)
 #   M10 the client without health_check_interval or socket_keepalive ->
 #       TestTheClient
 # =============================================================================
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -53,7 +52,6 @@ from app.audience.models import GroupMembership, Recipient
 from app.core import constants
 from app.core.config import settings
 from app.core.database import get_session_factory
-from app.engine.service import stream_fingerprint
 from app.transport import consumer as consumer_module
 from app.transport.connection import redis_client
 from app.transport.consumer import StreamConsumer
@@ -150,11 +148,6 @@ async def _member(group_key: str, rid: UUID) -> bool:
         ) is not None
 
 
-async def _dlq(redis: fakeaioredis.FakeRedis) -> list[dict[str, str]]:
-    entries = await redis.xrange(settings.dlq_stream)
-    return [{k.decode(): v.decode() for k, v in e[1].items()} for e in entries]
-
-
 async def _until(task: "asyncio.Future[None]", condition: Any) -> None:
     deadline = asyncio.get_event_loop().time() + _BOUND
     while not await condition():
@@ -182,7 +175,7 @@ class TestTheAckIsHeld:
         """The first entry's XACK fails while the gate is shut: the event is
         committed once, the entry behind it is not handled; the gate open,
         the ack is written, the next entry follows -- each handled once,
-        nothing pending, nothing dead-lettered, the hold said loudly and
+        nothing pending, nothing dropped or held, the hold said loudly and
         its end said too."""
         first, second = uuid4(), uuid4()
         first_id = await _xadd(fake_redis, a_stream, "user_upserted",
@@ -213,8 +206,8 @@ class TestTheAckIsHeld:
             finally:
                 await _stop(task)
         assert sorted(met.values()) == [1, 1]
-        assert await _dlq(fake_redis) == []
         events = [e["event"] for e in logs]
+        assert "event_dropped" not in events and "event_held" not in events
         assert "event_ack_failed" in events
         assert "event_acked_after_retry" in events
 
@@ -278,13 +271,13 @@ class TestTheAckIsHeld:
         assert [p["message_id"] for p in await _pending(fake_redis, a_stream)
                 ][:1] == [first_id]
 
-    async def test_a_dead_letter_written_is_acknowledged_once(
+    async def test_a_dropped_entry_is_acknowledged_once(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession,
     ) -> None:
-        """A malformed entry is dead-lettered; its XACK fails three times.
-        One dead letter, not one per pass over the pending list; the entry
-        behind it is handled; nothing pending."""
+        """A malformed entry is dropped; its XACK fails three times. One
+        line, not one per pass over the pending list; the entry behind it
+        is handled; nothing pending."""
         bad = await fake_redis.xadd(
             a_stream, {"event": "user_deleted", "data": '{"v": 1}'},
         )
@@ -292,18 +285,19 @@ class TestTheAckIsHeld:
         await _xadd(fake_redis, a_stream, "user_upserted",
                     _user_upserted_data(later))
         failing = _FailingXack(fake_redis, bad, failures=3)
-        task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
-        try:
-            async def done() -> bool:
-                return (failing.calls > 3 and await _recipient(later)
-                        and not await _pending(fake_redis, a_stream))
+        with capture_logs() as logs:
+            task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
+            try:
+                async def done() -> bool:
+                    return (failing.calls > 3 and await _recipient(later)
+                            and not await _pending(fake_redis, a_stream))
 
-            await _until(task, done)
-            await asyncio.sleep(_REDRAIN * 5)
-        finally:
-            await _stop(task)
-        (dead,) = await _dlq(fake_redis)
-        assert dead["event"] == "user_deleted"
+                await _until(task, done)
+                await asyncio.sleep(_REDRAIN * 5)
+            finally:
+                await _stop(task)
+        (line,) = [e for e in logs if e["event"] == "event_dropped"]
+        assert line["kind"] == "user_deleted"
 
     async def test_an_ack_that_works_says_nothing(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
@@ -355,22 +349,13 @@ class TestTheWait:
 
 
 # -----------------------------------------------------------------------------
-# 3 -- a dead letter is bounded in bytes
+# 3 -- the line of a dropped entry is bounded whatever came in
 # -----------------------------------------------------------------------------
 
-# The contract's numbers (deploy/INTEGRATION.md, "What a dead letter
-# holds"), held to the code's in TestTheBounds::test_the_numbers.
-_VALUE_MAX = 2048
-_NAME_MAX = 128
-_LISTED = 20
 _RID = "00000000-0000-4000-8000-000000000001"
-_DOC = Path(__file__).resolve().parents[1] / "deploy" / "INTEGRATION.md"
-
-
-def _dead(fields: dict[bytes, bytes]) -> dict[str, str]:
-    return consumer_module.dead_letter_fields(
-        fields, reason="why", attempts=1, entry_id="1-0",
-    )
+# The line's own size, whatever the entry's: an entry id, a kind, a
+# stage, a class and a place, a digest and a number.
+_LINE_MAX = 1000
 
 
 def _upserted(**overrides: Any) -> dict[str, Any]:
@@ -391,149 +376,48 @@ def _entry(event: str, data: dict[str, Any], **extra: bytes) -> dict[bytes, byte
     return fields
 
 
-def _within_the_bounds(dead: dict[str, str]) -> None:
-    for value in json.loads(dead["_dlq_data"]).values():
-        assert len(json.dumps(value, sort_keys=True)) <= _VALUE_MAX
-    names = json.loads(dead["_dlq_dropped"])
-    assert len(names) <= _LISTED
-    for name in names:
-        assert len(json.dumps(name)) <= _NAME_MAX
-    assert len(dead.get("event", "").encode()) <= _NAME_MAX
+_HUGE = [
+    ("email_of_4_mb", _entry(
+        "user_upserted", _upserted(email="a" * (4 * 1024 * 1024 - 300)))),
+    ("300_000_keys", _entry(
+        "user_deleted",
+        {"v": 1, "recipient_id": _RID, "version": 2,
+         **{f"x{i:06d}": 1 for i in range(300_000)}})),
+    ("a_key_named_with_a_megabyte", _entry(
+        "user_deleted", {"v": 1, "recipient_id": _RID, "version": 2,
+                         "x" * 1_000_000: 1})),
+    ("an_event_name_of_a_megabyte", {b"event": b"e" * 1_000_000, b"data": b"{}"}),
+]
 
 
 class TestTheBounds:
-    def test_the_numbers(self) -> None:
-        """The contract states the code's numbers, and the code holds them."""
-        assert consumer_module._DLQ_VALUE_MAX == _VALUE_MAX
-        assert consumer_module._DLQ_NAME_MAX == _NAME_MAX
-        assert consumer_module._DLQ_DROPPED_LISTED == _LISTED
-        text = " ".join(_DOC.read_text(encoding="utf-8").split())
-        assert f"value of `data` longer than **{_VALUE_MAX}** is not kept" in text
-        assert f"the first **{_LISTED}** names in sorted order" in text
-        assert f"each at most **{_NAME_MAX}** long as JSON" in text
-
-    def test_a_huge_value_is_not_kept_and_the_letter_is_written(self) -> None:
-        """The review's case (5): user_upserted with an email of ~4 MB --
-        before, all of it in _dlq_data. Now the letter is there, the email
-        is named, the rest of the address is kept."""
-        email = "a" * (4 * 1024 * 1024 - 300)
-        dead = _dead(_entry("user_upserted", _upserted(email=email)))
-        kept = json.loads(dead["_dlq_data"])
-        assert "email" not in kept
-        assert kept["recipient_id"] == _RID  # the pair: the address is kept
-        assert "data.email" in json.loads(dead["_dlq_dropped"])
-        assert dead["_dlq_dropped_more"] == "0"
-        assert dead["_dlq_data_bytes"] == str(
-            len(json.dumps(_upserted(email=email), separators=(",", ":"))),
-        )
-        _within_the_bounds(dead)
-        assert sum(len(v) for v in dead.values()) < 10_000
-
-    def test_the_value_at_the_bound_is_kept_one_past_is_not(self) -> None:
-        at = "a" * (_VALUE_MAX - 2)  # the quotes make it _VALUE_MAX
-        past = "a" * (_VALUE_MAX - 1)
-        assert json.loads(_dead(_entry("user_upserted", _upserted(email=at)))
-                          ["_dlq_data"])["email"] == at
-        assert "email" not in json.loads(
-            _dead(_entry("user_upserted", _upserted(email=past)))["_dlq_data"],
-        )
-
-    def test_hundreds_of_thousands_of_keys(self) -> None:
-        """The review's case (5): 300 000 keys not of the event -- before,
-        4.8 MB of names. Now the first twenty, sorted, and the count."""
-        data: dict[str, Any] = {"v": 1, "recipient_id": _RID, "version": 2}
-        extra = {f"x{i:06d}": 1 for i in range(300_000)}
-        data.update(extra)
-        dead = _dead(_entry("user_deleted", data))
-        names = json.loads(dead["_dlq_dropped"])
-        assert names == [f"data.x{i:06d}" for i in range(_LISTED)]
-        assert dead["_dlq_dropped_more"] == str(300_000 - _LISTED)
-        assert json.loads(dead["_dlq_data"]) == {
-            "v": 1, "recipient_id": _RID, "version": 2,
-        }
-        _within_the_bounds(dead)
-        assert sum(len(v) for v in dead.values()) < 10_000
-
-    @pytest.mark.parametrize(("extra", "more"), [(_LISTED, "0"), (_LISTED + 1, "1")])
-    def test_the_count_at_the_bound(self, extra: int, more: str) -> None:
-        data: dict[str, Any] = {"v": 1, "recipient_id": _RID, "version": 2}
-        data.update({f"k{i:03d}": 0 for i in range(extra)})
-        dead = _dead(_entry("user_deleted", data))
-        assert len(json.loads(dead["_dlq_dropped"])) == _LISTED
-        assert dead["_dlq_dropped_more"] == more
-
-    def test_a_long_name_is_counted_not_listed(self) -> None:
-        """A field of the entry named with a megabyte, and a name exactly
-        at the bound beside it: the long one counted, the other listed."""
-        at = "n" * (_NAME_MAX - 2)
-        dead = _dead(_entry("user_deleted",
-                            {"v": 1, "recipient_id": _RID, "version": 2},
-                            **{"x" * 1_000_000: b"1", at: b"1"}))
-        assert json.loads(dead["_dlq_dropped"]) == [at]
-        assert dead["_dlq_dropped_more"] == "1"
-        past = "n" * (_NAME_MAX - 1)
-        dead = _dead(_entry("user_deleted",
-                            {"v": 1, "recipient_id": _RID, "version": 2},
-                            **{past: b"1"}))
-        assert json.loads(dead["_dlq_dropped"]) == []
-        assert dead["_dlq_dropped_more"] == "1"
-
-    def test_a_long_event_name_is_not_kept(self) -> None:
-        dead = _dead({b"event": b"e" * 200, b"data": b"{}"})
-        assert "event" not in dead
-        assert json.loads(dead["_dlq_dropped"]) == ["data", "event"]
-        assert dead["_dlq_dropped_more"] == "0"
-        # the pair: a name at the bound is kept (an unknown event, so
-        # its data is not)
-        dead = _dead({b"event": b"e" * _NAME_MAX, b"data": b"{}"})
-        assert dead["event"] == "e" * _NAME_MAX
-
-    def test_an_ordinary_dead_letter_is_what_it_was(self) -> None:
-        """The pair: a dead letter of a valid size, every field as before,
-        _dlq_dropped_more "0" beside it."""
-        fields = _entry("user_upserted", _upserted(), x=b"y")
-        raw = fields[b"data"]
-        dead = _dead(fields)
-        assert dead == {
-            "event": "user_upserted",
-            "_dlq_data": json.dumps(_upserted(), sort_keys=True),
-            "_dlq_data_fingerprint": stream_fingerprint(raw),
-            "_dlq_data_bytes": str(len(raw)),
-            "_dlq_dropped": '["x"]',
-            "_dlq_dropped_more": "0",
-            "_dlq_error": "why",
-            "_dlq_attempts": "1",
-            "_dlq_source_entry_id": "1-0",
-        }
-
+    @pytest.mark.parametrize("fields", [f for _n, f in _HUGE],
+                             ids=[n for n, _f in _HUGE])
     async def test_on_the_real_loop(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
-        db_session: AsyncSession,
+        db_session: AsyncSession, fields: dict[bytes, bytes],
     ) -> None:
-        """The huge email through the consumer: refused, dead-lettered within
-        the bounds, acknowledged; the next event processed."""
-        email = "a" * (4 * 1024 * 1024 - 300)
-        await fake_redis.xadd(a_stream, _entry("user_upserted",
-                                               _upserted(email=email)))
+        """The review's cases (5) through the consumer: dropped, one line
+        within its bound, acknowledged; the next event processed."""
+        await fake_redis.xadd(a_stream, fields)
         later = uuid4()
         await _xadd(fake_redis, a_stream, "user_upserted",
                     _user_upserted_data(later))
-        task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
-        try:
-            async def done() -> bool:
-                return await _recipient(later) and not await _pending(
-                    fake_redis, a_stream,
-                )
+        with capture_logs() as logs:
+            task = asyncio.ensure_future(StreamConsumer(fake_redis).run())
+            try:
+                async def done() -> bool:
+                    return await _recipient(later) and not await _pending(
+                        fake_redis, a_stream,
+                    )
 
-            await _until(task, done)
-        finally:
-            await _stop(task)
-        (dead,) = await _dlq(fake_redis)
-        assert dead["event"] == "user_upserted"
-        assert "data.email" in json.loads(dead["_dlq_dropped"])
-        _within_the_bounds(dead)
-        assert sum(len(v) for v in dead.values()) < 10_000
-
+                await _until(task, done)
+            finally:
+                await _stop(task)
+        (line,) = [e for e in logs if e["event"] == "event_dropped"]
+        assert len(json.dumps(line)) < _LINE_MAX
+        # The pair: the line is the entry's -- its size, as it came.
+        assert line["data_bytes"] == len(fields[b"data"])
 
 # -----------------------------------------------------------------------------
 # The client checks its connection

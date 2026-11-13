@@ -25,7 +25,7 @@
 #
 # The profile is installed at startup: ingest validates notification
 # types against the registry (via create_notification), so a consumer
-# without a profile would dead-letter every request.
+# without a profile could accept no request.
 #
 # LIVENESS (W3-1, app/core/liveness.py): both loops are watched (their
 # bounds: app/transport/consumer.py consumer_step_bound,

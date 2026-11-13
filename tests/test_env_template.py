@@ -161,13 +161,13 @@ class TestBothWays:
             "  b:\n"
             "    build: .\n"
             "    environment:\n"
-            "      - DLQ_MAXLEN=5\n"
+            "      - CONSUMER_BATCH_SIZE=5\n"
             "  store:\n"
             "    environment:\n"
             "      POSTGRES_DB: comms\n"
         )
         assert _compose_values(text) == {
-            "TEMPLATES_DIR": {"/profile"}, "DLQ_MAXLEN": {"5"},
+            "TEMPLATES_DIR": {"/profile"}, "CONSUMER_BATCH_SIZE": {"5"},
         }
 
     def test_every_setting_is_there(self) -> None:
@@ -177,11 +177,12 @@ class TestBothWays:
         written = {name for _c, name, _v, _i in _variables(_TEMPLATE)}
         assert _settings() - written == set()
         # The pair: the walk compared settings, the knobs a review named
-        # among them. 50 since W1-2 (48 written before, and the two URLs).
-        assert len(_settings()) == 50
+        # among them. 50 since W1-2 (48 written before, and the two URLs);
+        # 49 since W5-1, DLQ_MAXLEN gone with the dead letters.
+        assert len(_settings()) == 49
         assert {
             "NOTIFICATION_RETENTION_DAYS",
-            "DLQ_MAXLEN",
+            "CONSUMER_BATCH_SIZE",
             "NOTIFICATION_LANE_NORMAL_BATCH_SIZE",
         } <= _settings() & written
 
@@ -242,8 +243,9 @@ class TestBothWays:
         # next service token; 52 since W1-2: the installer's seven
         # variables gone, DATABASE_URL and REDIS_URL kept, the two URLs'
         # keys (POSTGRES_PASSWORD kept, COMMS_EVENTS_PASSWORD new), the
-        # two template directories written.
-        assert len(names) == len(set(names)) == 52
+        # two template directories written; 51 since W5-1, DLQ_MAXLEN gone
+        # with the dead letters.
+        assert len(names) == len(set(names)) == 51
 
 
 class TestValues:

@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # RECONCILIATION, NOT REPAIR. The book is synced eventually: an event
-# lost or dead-lettered leaves comms' copy behind the product's, and
+# lost or dropped leaves comms' copy behind the product's, and
 # nobody knows. This module lists what comms has recorded so the
 # product can compare. comms decides nothing by the difference and
 # changes nothing here -- the product owns the book and fixes it by the

@@ -33,7 +33,7 @@
 # field-by-field upsert and not a session.merge.
 #
 # POISON-PILL RULE: a bad event never JAMS the stream -- it is refused
-# and acknowledged (a malformed one dead-letters, a stale or deleted one
+# and acknowledged (a malformed one is dropped, a stale or deleted one
 # is logged with its class). What is refused since F1.4: a blank string
 # or a zero standing for "no value" (THE SNAPSHOT RULE below). An
 # unknown but non-blank timezone is still stored as-is with a loud

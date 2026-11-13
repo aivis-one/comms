@@ -84,17 +84,18 @@ class TestTheTable:
         P3-1 added the push stream's cap (changes_stream_maxlen); 20
         since P4-1 replaced the one batch size with one per lane; 24
         since P4-3 gave every lane its own deliver timeout; 25 since
-        P5-1 gave the llm channel its own."""
+        P5-1 gave the llm channel its own; 24 since W5-1 took the dead
+        letters' cap (dlq_maxlen) away."""
         ints = {
             name
             for name, field in Settings.model_fields.items()
             if field.annotation is int
         }
-        assert len(ints) == 25, (
-            "25 numeric parameters: D1's 15, T12's, P3-1's, P4-1's "
+        assert len(ints) == 24, (
+            "24 numeric parameters: D1's 15, T12's, P3-1's, P4-1's "
             "four lane batch sizes in place of D1's one batch size, "
             "P4-3's four lane deliver timeouts and P5-1's llm deliver "
-            "timeout"
+            "timeout, less W5-1's dlq_maxlen"
         )
         assert ints == set(NUMERIC_BOUNDS)
 
@@ -108,7 +109,6 @@ class TestTheTable:
         } == {
             "consumer_batch_size": (1, 1000),
             "consumer_block_ms": (1, 60_000),
-            "dlq_maxlen": (1, 10_000_000),
             "changes_stream_maxlen": (1, 10_000_000),
             "notification_poll_interval_seconds": (1, 3600),
             "notification_max_backoff_seconds": (1, 3600),
@@ -191,10 +191,12 @@ class TestNamedCases:
 
     def test_every_violation_is_named_in_one_pass(self) -> None:
         with pytest.raises(ValueError) as caught:
-            _settings(notification_lane_bulk_batch_size=0, dlq_maxlen=0)
+            _settings(notification_lane_bulk_batch_size=0, consumer_batch_size=0)
         message = str(caught.value)
         assert "NOTIFICATION_LANE_BULK_BATCH_SIZE=0" in message
-        assert "DLQ_MAXLEN=0" in message
+        # Until W5-1 the second was DLQ_MAXLEN=0; the setting went with
+        # the dead letters.
+        assert "CONSUMER_BATCH_SIZE=0" in message
 
 
 class TestTheProfileDefaultLayer:

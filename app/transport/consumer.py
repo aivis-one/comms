@@ -1,5 +1,5 @@
 # =============================================================================
-# COMMS Service -- Redis Streams Consumer (Phase 3c items 1, 6)
+# COMMS Service -- Redis Streams Consumer (Phase 3c items 1, 6; W5-1)
 # =============================================================================
 #
 # The durable inbound loop. One consumer group on the product's event
@@ -17,36 +17,69 @@
 #             processed in ITS OWN DB transaction and acked
 #             individually -- a failed neighbor never holds back an
 #             acked one; and every _PENDING_REDRAIN_SECONDS the own
-#             pending list once more (WK-3), so an entry left pending
-#             does not wait for a restart.
+#             pending list once more (WK-3), so a held entry does not
+#             wait for a restart.
 #
-# ERROR DISCIPLINE (item 6, poison-pill rule from Phase 2):
-#   terminal   (ValidationError: broken envelope/JSON/schema/version,
-#              unregistered type, invalid channel) -> log + DLQ + XACK:
-#              the event can never succeed; the stream MUST keep
-#              moving.
-#   waiting    a TRANSIENT failure of the database while the database
-#              does NOT answer (SELECT 1): waited for, uncounted, the
-#              delay doubling to 30 s, said loudly on the 1st and every
-#              10th wait -- the event is not lost (FIX review 3.13.0).
-#              While it DOES answer, the transient failure is the
-#              event's: the bounded budget below, then the DLQ.
-#   retryable  (NotFoundError: group_changed before its user_upserted;
-#              a TRANSIENT failure of the database by the one rule,
-#              app/core/database.py is_transient_db_error -- a deadlock,
-#              a serialization failure, a lost or refused connection, a
-#              restart, an overload) -> bounded inline backoff, then
-#              DLQ + XACK, "retries exhausted". Until TX-1 only an
-#              OperationalError was retried here -- which asyncpg's
-#              adapter never raises: a deadlock or a dropped connection
-#              reached the DLQ on the first try, and the event (a
-#              user_deleted among them) was lost.
+# WHOSE ERROR IT IS (W5-1; the owner's decision of 10.11: a product's
+# wrong input is the product's problem). What the product sent wrong is
+# refused cheaply and kept nowhere -- no stream, no row, no replay:
+#   refused under the key  a notification_request whose key is readable
+#              and which cannot be accepted (events.py
+#              RejectedNotificationRequest, handlers.py) -> recorded under
+#              the key in the same transaction, XACK; the product reads it
+#              by the key (deploy/INTEGRATION.md section 7).
+#   dropped    anything else comms cannot take -- a broken frame, an
+#              unknown event, data that cannot be read, a request whose
+#              key cannot be read, an event refused by its parse or its
+#              handler (ValidationError), a person comms was never told
+#              about past the ordering retry (NotFoundError past
+#              _BACKOFF_DELAYS) -> ONE log line, event_dropped (_drop),
+#              and XACK. The line names the event's kind (a known kind,
+#              else "unknown"), the stage, the class and place of the
+#              refusal (pipeline_error_of -- never its text: a refusal
+#              quotes the values it refused) and the SHA-256 and length
+#              of the `data` bytes, by which the product finds the event
+#              in its outbox; nothing else of the entry.
+#   refused by class  a sync event late or repeated (ConflictError) ->
+#              event_refused, XACK.
 #   duplicate  (same key, same bytes) -> XACK only: a replay is the
 #              at-least-once contract working, not an error.
-#   rejected / conflict (a notification request not accepted, F1.2)
-#              -> XACK only: the refusal is RECORDED under the request's
-#              key in the same transaction; the DLQ would be a second
-#              copy of the same fact.
+# What comms broke is comms':
+#   waiting    a TRANSIENT failure of the database while the database
+#              does NOT answer (SELECT 1): waited for in place, uncounted,
+#              the delay doubling to 30 s, said loudly on the 1st and
+#              every 10th wait -- the event is not lost (FIX review
+#              3.13.0).
+#   retried    a NotFoundError (group_changed before its user_upserted)
+#              and a TRANSIENT failure of the database while it DOES
+#              answer, by the one rule (app/core/database.py
+#              is_transient_db_error) -> bounded inline backoff
+#              (_BACKOFF_DELAYS).
+#   held       a transient failure past that budget while the database
+#              answers, any other exception of the handling -> the entry
+#              is HELD (below): left pending, said once (event_held), and
+#              handled again at every pass over the pending list until
+#              comms is mended.
+#   dropped loudly  an exception of the parse that is not its refusal:
+#              event_dropped at ERROR -- an entry that was never parsed
+#              has no subject to be held by, and holding it would hold
+#              the whole stream behind one defect; the ERROR line is the
+#              defect's trace.
+#
+# HELD BY SUBJECT (W5-1). A held entry is handled again at the next
+# pass, after the newer entries read meanwhile -- so no newer entry of
+# its subject may be applied before it. Every parsed event names its
+# SUBJECTS (subjects_of): the person a sync event is about, the
+# correlation a request carries and a reminder_cancel cancels by, the
+# person a request is addressed to, the request's key. self._blocked
+# holds the subjects of the entries left pending: an entry with one of
+# them is not handled, it is left pending too (event_held_behind) and
+# its own subjects join the set -- a chain A{p}, B{p,q}, C{q} keeps C
+# behind B. Each pass over the pending list starts with the set empty
+# and goes in the stream's order from "0", so the held entry comes
+# first, then the entries behind it, each once; the set is rebuilt from
+# what stays pending. Invariant: the set holds the subjects of every
+# entry left pending. The events of every other subject flow.
 #
 # DURABILITY OF INTAKE -- the order is COMMIT, THEN XACK, and it must
 # never be swapped (spec §5.4: a receipt without a record is a promise
@@ -59,39 +92,18 @@
 # by the key: same bytes -> duplicate, nothing created twice. An ack
 # before the commit would lose the job on a crash in between; batching
 # acks or acknowledging on read would do exactly that.
-#   unexpected (any other exception) -> log with a redacted traceback + DLQ +
-#              XACK: an unknown bug in ONE event must not wedge the
-#              whole stream (poison-pill rule) -- the DLQ keeps what
-#              the investigation needs (DEAD LETTERS below).
 #
-# REDIS ITSELF, on the XACK and on the dead letter's XADD (review 3.14.0,
-# 2.3, N0, N3). Both are retried IN PLACE (_until_done), the next entry
-# not taken meanwhile: an entry left pending would be handled again
-# later, over the newer entries behind it. A lost connection, a timeout,
-# a redis loading its data, an OOM and an error of any other kind are
-# retried for as long as they last, said loudly. A REFUSAL -- a
-# ResponseError but OOM, an authentication or authorization error
-# (_is_refusal) -- that comes _REDIS_REFUSALS_BEFORE_EXIT times ends
-# run() with RedisRefusedError: the connection that keeps meeting a replica
-# after a failover is mended by the restart, not by a retry on it, and
-# the entry, still pending, is handled first at the next start.
-#
-# DEAD LETTERS -- for the investigation, never a replay. Nothing reads
-# the DLQ back into the stream: the product resends from its outbox, the
-# source of the request (deploy/INTEGRATION.md, "How long comms keeps
-# things"). So a dead letter keeps the ADDRESS of the entry, never its
-# letter: the event name, the keys of `data` named by the event's own
-# field set (dead_letter_fields), the fingerprint and length of the
-# `data` bytes -- by which the product finds the event at home -- the
-# names of everything dropped, the reason, the attempts and the source
-# entry id. The stream lives in the shared redis with no expiry; a
-# letter kept there would outlive every promise of the contract.
-# BOUNDED IN BYTES as well as in number (dlq_maxlen): a value of `data`
-# longer than _DLQ_VALUE_MAX, an event name or a dropped name longer
-# than _DLQ_NAME_MAX is not kept -- named in _dlq_dropped, or counted in
-# _dlq_dropped_more -- and _dlq_dropped lists the first
-# _DLQ_DROPPED_LISTED names. A dead letter is written whatever came in;
-# only what it holds is cut.
+# REDIS ITSELF, on the XACK (review 3.14.0, 2.3, N3). It is retried IN
+# PLACE (_until_done), the next entry not taken meanwhile: an entry left
+# pending would be handled again later, over the newer entries behind
+# it. A lost connection, a timeout, a redis loading its data, an OOM and
+# an error of any other kind are retried for as long as they last, said
+# loudly. A REFUSAL -- a ResponseError but OOM, an authentication or
+# authorization error (_is_refusal) -- that comes
+# _REDIS_REFUSALS_BEFORE_EXIT times ends run() with RedisRefusedError: the
+# connection that keeps meeting a replica after a failover is mended by
+# the restart, not by a retry on it, and the entry, still pending, is
+# handled first at the next start.
 #
 # KNOWN CEILING -- head-of-line blocking on the ordering retry (BL-4).
 # Mechanics: a group_changed that arrived before its user_upserted is
@@ -106,13 +118,38 @@
 # keep the main stream moving), instead of the inline sleep.
 # Rejected: re-XADD with a delay -- it breaks the ordering of events
 # for the same user and drags an attempt counter into the payload.
+#
+# KNOWN CEILING -- a subject held for good (W5-1).
+# Mechanics: an entry whose handling fails every time -- a defect of
+# comms on that entry, a transient failure that outlasts every budget --
+# stays pending and keeps its subjects in self._blocked: every later
+# event of that person, correlation or key is held behind it, and the
+# entry is handled again at every pass (_PENDING_REDRAIN_SECONDS), a
+# transient one with its inline budget (BL-4) each time. Said once per
+# entry and start (event_held, event_held_behind), not at every pass.
+# Status: acknowledged by design.
+# Task: none -- a defect of comms is mended by a release of comms, and
+# the entry is applied in its order once it is.
+# Unfreeze trigger: event_held in the log for an entry that a release
+# has not mended, OR XPENDING of the group growing while new events of
+# other people flow.
+# Agreed fix shape: mend the defect the event_held line names; nothing
+# in the consumer -- the held entry and the ones behind it then go out
+# in their order at the next pass.
+# Rejected: the dead-letter stream (W5-1: no reader, and a copy of the
+# product's input kept by comms); the entry dropped after N passes (an
+# event lost to a defect of comms, the product never told); the whole
+# stream held behind it (one defect on one product's event would stop
+# every other person's events -- REVIEW-ACCEPTED 9); the entry handled
+# again later without its subjects held (the reorder this closes: a
+# group_changed true applied over the false behind it).
 # =============================================================================
 
 import asyncio
-import json
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
+from uuid import UUID
 
 import structlog
 from redis.asyncio import Redis
@@ -122,7 +159,6 @@ from redis.exceptions import (
     OutOfMemoryError,
     ResponseError,
 )
-from redis.typing import EncodableT, FieldT
 
 from app.core import liveness
 from app.core.config import settings
@@ -141,21 +177,25 @@ from app.core.logging import request_id_of, serving
 from app.core.sanitize import (
     exception_text,
     pipeline_error_of,
-    sanitize_text,
     sanitized_traceback,
 )
+from app.engine.constants import TargetType
 from app.engine.service import stream_fingerprint
 from app.transport.connection import redis_client, redis_socket_timeout
 from app.transport.events import (
     ENVELOPE_DATA_FIELD,
     ENVELOPE_EVENT_FIELD,
     ENVELOPE_REQUEST_ID_FIELD,
-    EVENT_FIELDS,
-    EVENT_NOTIFICATION_REQUEST,
-    NOTIFICATION_REQUEST_ENVELOPE_FIELDS,
-    NOTIFICATION_REQUEST_FRAME_FIELDS,
+    KNOWN_EVENTS,
+    GroupChanged,
+    NotificationRequest,
+    ParsedEvent,
+    RejectedNotificationRequest,
+    ReminderCancel,
+    SectionMembershipChanged,
+    UserDeleted,
+    UserUpserted,
     entry_field_name,
-    event_data_or_none,
     parse_event,
 )
 from app.transport.handlers import HandleResult, handle_event
@@ -164,7 +204,8 @@ logger = structlog.get_logger()
 
 # Inline backoff for RETRYABLE failures: 6 attempts total (first try
 # + 5 retries), ~6.2s worst case -- sized for "the upsert is moments
-# behind", not for outages (outages land in the DLQ and are visible).
+# behind", not for outages (a database that does not answer is waited
+# for; one that answers and keeps failing holds the entry).
 _BACKOFF_DELAYS: tuple[float, ...] = (0.2, 0.4, 0.8, 1.6, 3.2)
 
 # Pause between EMPTY reads -- see the comment at the read site: real
@@ -196,55 +237,13 @@ _REDIS_REFUSALS_BEFORE_EXIT = 8
 # THE PENDING LIST AGAIN, WHILE RUNNING (WK-3): every this many seconds
 # run() reads its own pending list once more (_drain_pending, its cursor
 # rule kept) between its reads of new entries. An entry left pending --
-# a dead letter that could not be built, an entry whose handling
-# raised -- is offered again in the running process, no longer only at
-# the next start. An ack and a dead letter's write are never left
-# pending: they are retried in place (_until_done). The cost, named: an
-# entry pending for good is handled again every interval, an ordering
-# retry of it (BL-4) included.
+# held, or held behind a held one (HELD BY SUBJECT, the header) -- is
+# offered again in the running process, no longer only at the next
+# start. An ack is never left pending: it is retried in place
+# (_until_done). The cost, named: an entry held for good is handled
+# again every interval, an ordering retry of it (BL-4) included (the
+# KNOWN CEILING in the header).
 _PENDING_REDRAIN_SECONDS = 60.0
-
-# The fields of a dead letter -- the contract's list
-# (deploy/INTEGRATION.md, "How long comms keeps things"), held to this
-# tuple both ways by tests/test_dlq_no_letter.py. Every name the
-# consumer adds carries the _dlq_ prefix; `event` is the entry's own.
-DLQ_FIELDS: tuple[str, ...] = (
-    ENVELOPE_EVENT_FIELD,
-    "_dlq_data",
-    "_dlq_data_fingerprint",
-    "_dlq_data_bytes",
-    "_dlq_dropped",
-    "_dlq_dropped_more",
-    "_dlq_error",
-    "_dlq_attempts",
-    "_dlq_source_entry_id",
-)
-
-# Withheld from a dead letter although it is a field of the envelope:
-# llm_audio is the SIGNED link to a recording of a person's voice.
-# deploy/INTEGRATION.md section 11 promises the link is in no answer,
-# path, log line or error text and the body in no dead letter of comms;
-# a link kept in a stream without expiry would be the key to that body
-# for as long as the object lives. The one place this exception is
-# written.
-_DLQ_WITHHELD_ENVELOPE_FIELDS = frozenset({"llm_audio"})
-
-# THE BYTES OF A DEAD LETTER (deploy/INTEGRATION.md, "How long comms
-# keeps things"). Measured on the form written to redis -- JSON with
-# ensure_ascii, so a character is a byte. A lawful value of every kept
-# field fits _DLQ_VALUE_MAX however it escapes (the longest: an email of
-# 320 Cyrillic characters, 1920); an event or a field name is short
-# (_DLQ_NAME_MAX); twenty sorted names show the pattern of a broken
-# producer, and the count says how broken. _dlq_error is cut at
-# _DLQ_ERROR_MAX characters once it is redacted (_dead_letter_of), and
-# is written as UTF-8: up to 4 bytes a character. A letter is then
-# ~25 KB at most -- 7 kept values, 20 names, the event, the error, the
-# rest small -- ~250 MB at the default dlq_maxlen; before REV-1, ~4 MB
-# and ~40 GB.
-_DLQ_VALUE_MAX = 2048
-_DLQ_NAME_MAX = 128
-_DLQ_DROPPED_LISTED = 20
-_DLQ_ERROR_MAX = 2000
 
 
 class StreamConsumer:
@@ -265,8 +264,15 @@ class StreamConsumer:
         self._stream = settings.comms_events_stream
         self._group = settings.comms_consumer_group
         self._consumer = settings.comms_consumer_name
-        self._dlq = settings.dlq_stream
         self._session_factory = get_session_factory()
+        # The subjects of the entries left pending (HELD BY SUBJECT, the
+        # header): emptied at the start of every pass over the pending
+        # list, which rebuilds it.
+        self._blocked: set[str] = set()
+        # The entries whose hold is said: one line per entry, not one per
+        # pass (event_held, event_held_behind, event_left_pending); an
+        # entry leaves the set with its ack.
+        self._said: set[str] = set()
 
     # -- bootstrap ---------------------------------------------------------
 
@@ -347,28 +353,29 @@ class StreamConsumer:
     ) -> None:
         """THE LAST LINE (FIX review 3.13.0): whatever _process_entry
         still raises is the entry's, not the process's -- logged with its
-        class and place, the entry left pending for the next pass over
-        the pending list (WK-3: every _PENDING_REDRAIN_SECONDS, and at
-        the next start). A failure of the loop's own read (Redis down)
-        is outside this and still ends run(): the restart policy
-        reconnects. So does RedisRefusedError, let through here: a refusal of
-        redis on the entry's XACK or dead letter (REDIS ITSELF, the
-        module header) -- caught, it would leave the entry pending and
-        take the next, the window _until_done closes.
+        class and place, once per entry, the entry left pending (its
+        subjects held, _process_entry) for the next pass over the pending
+        list (WK-3: every _PENDING_REDRAIN_SECONDS, and at the next
+        start). A failure of the loop's own read (Redis down) is outside
+        this and still ends run(): the restart policy reconnects. So does
+        RedisRefusedError, let through here: a refusal of redis on the
+        entry's XACK (REDIS ITSELF, the module header) -- caught, it
+        would leave the entry pending and take the next, the window
+        _until_done closes.
 
         THE ENTRY'S REQUEST ID (W3-2, protocol 9.6): every line written
-        for the entry -- its parse, its handling, its dead letter, this
-        last line -- carries the id of its envelope (entry_request_id),
-        or one of comms' own; the next entry starts from its own, and a
-        line after the entry from none."""
+        for the entry -- its parse, its handling, its drop, this last
+        line -- carries the id of its envelope (entry_request_id), or one
+        of comms' own; the next entry starts from its own, and a line
+        after the entry from none."""
         with serving(entry_request_id(fields)):
             try:
                 await self._process_entry(entry_id, fields)
             except RedisRefusedError:
                 raise  # the process's, not the entry's (REDIS ITSELF, header)
             except Exception as exc:
-                logger.error(
-                    "event_left_pending",
+                self._say_once(
+                    entry_id, logger.error, "event_left_pending",
                     entry_id=_id_str(entry_id),
                     error=pipeline_error_of(exc),
                 )
@@ -378,10 +385,17 @@ class StreamConsumer:
         (crash between XREADGROUP and XACK, or an entry left pending).
         Reading from id "0" returns the pending list of this consumer
         name; a stable name makes restart recovery this one loop. Run at
-        the start and every _PENDING_REDRAIN_SECONDS (run, WK-3)."""
+        the start and every _PENDING_REDRAIN_SECONDS (run, WK-3).
+
+        The held subjects are emptied first (HELD BY SUBJECT, the module
+        header): every entry left pending is in this list and is met in
+        it in the stream's order -- the held one before the ones held
+        behind it -- so the pass rebuilds the set from what stays
+        pending, and a subject whose held entry goes out now lets the
+        entries behind it go out after it, in this same pass."""
+        self._blocked.clear()
         drained = 0
-        # A CURSOR, not "0" every time (FIX review 3.13.0): an entry left
-        # pending on purpose (a dead letter that could not be built)
+        # A CURSOR, not "0" every time (FIX review 3.13.0): a held entry
         # stays in the pending list, and reading from "0" again would meet
         # it forever -- no new event would ever be read. Each read starts
         # after the last entry seen: a held entry is met once per pass.
@@ -407,55 +421,88 @@ class StreamConsumer:
     async def _process_entry(
         self, entry_id: str | bytes, fields: dict[Any, Any]
     ) -> None:
-        """Parse -> handle -> ack. Never raises for a bad EVENT
-        (poison-pill rule), and never for a dead letter that cannot be
-        written either (FIX review 3.13.0): that leaves the entry pending
-        (_dead_letter_or_hold). An ack that fails is retried in place
-        until it is written (_ack_until_done): the next entry waits.
+        """Parse -> (held behind?) -> handle -> ack, or the entry held.
+        Never raises for a bad EVENT: what the product sent wrong is
+        refused or dropped and acknowledged (WHOSE ERROR IT IS, the
+        module header). An ack that fails is retried in place until it is
+        written (_ack_until_done): the next entry waits.
+
+        An entry one of whose subjects is held is not handled: it is left
+        pending behind the held one, and its own subjects are held too
+        (HELD BY SUBJECT, the module header). An entry whose handling
+        fails in comms (_apply returns the failure) is held: left pending,
+        its subjects held, said once (event_held). An exception out of
+        the handling holds the subjects too, and the last line
+        (_process_guarded) says it."""
+        try:
+            event = parse_event(fields)
+        except ValidationError as exc:
+            await self._drop(entry_id, fields, stage="parse", exc=exc)
+            return
+        except Exception as exc:
+            # ANY failure of the parse is the entry's, never the
+            # process's (poison-pill rule, EM-1 FIX-2) -- and a defect of
+            # comms: never parsed, the entry has no subject to be held by
+            # (WHOSE ERROR IT IS, the header), so it is dropped at ERROR.
+            # The class and the place, no traceback: what the parse raises
+            # may quote the data it was reading, and a request's data is
+            # the letter.
+            await self._drop(entry_id, fields, stage="parse", exc=exc, loud=True)
+            return
+
+        subjects = subjects_of(event)
+        if subjects & self._blocked:
+            self._blocked |= subjects
+            self._say_once(
+                entry_id, logger.info, "event_held_behind",
+                entry_id=_id_str(entry_id),
+                kind=_kind_of(fields),
+            )
+            return
+        try:
+            held = await self._apply(entry_id, fields, event)
+        except Exception:
+            self._blocked |= subjects  # left pending by the last line
+            raise
+        if held is None:
+            return
+        failure, attempts = held
+        self._blocked |= subjects
+        # Not logger.exception(): the renderer would print the chain raw
+        # -- a database error's text is its SQL and bound parameters. The
+        # `exception` key, redacted (app/core/sanitize.py).
+        self._say_once(
+            entry_id, logger.error, "event_held",
+            entry_id=_id_str(entry_id),
+            kind=_kind_of(fields),
+            attempts=attempts,
+            error=pipeline_error_of(failure),
+            exception=sanitized_traceback(failure),
+        )
+
+    async def _apply(
+        self, entry_id: str | bytes, fields: dict[Any, Any], event: ParsedEvent,
+    ) -> tuple[BaseException, int] | None:
+        """Handle the event and acknowledge it -- None -- or give back the
+        failure that holds it and the attempts made.
 
         RETRIES:
           - NotFoundError (the address book has not caught up) and a
             transient failure of the database WHILE THE DATABASE
-            ANSWERS -- the bounded budget, _BACKOFF_DELAYS, then the dead
-            letter, "retries exhausted": one event failing over and
-            over must not stop the stream behind it;
+            ANSWERS -- the bounded budget, _BACKOFF_DELAYS; past it a
+            NotFoundError is the product's (a person comms was never
+            told about): dropped; a transient failure is comms': held;
           - a transient failure while the database does NOT answer
             (app/core/database.py database_answers) -- WAIT, uncounted,
             the delay doubling to _WAIT_CEILING, said loudly on the
             first and every _WAIT_LOUD_EVERY-th wait: it says nothing of
-            the event, and
-            the event is not lost. Until this fix a restart of Postgres
-            longer than the budget (~6 s) dead-lettered every event of
-            the window, a user_deleted among them.
-        See the KNOWN CEILING (BL-4) in the module header: the inline
-        sleep blocks the whole stream -- as a database that does not
-        answer would anyway."""
-        try:
-            event = parse_event(fields)
-        except ValidationError as exc:
-            await self._dead_letter_or_hold(
-                entry_id, fields, reason=exception_text(exc), attempts=0,
-            )
-            return
-        except Exception as exc:
-            # ANY failure of the parse is the entry's, never the
-            # process's (poison-pill rule, EM-1 FIX-2). The class and the
-            # place -- in the dead letter and in the log alike, no
-            # traceback: what the parse raises may quote the data it was
-            # reading, and a request's data is the letter.
-            logger.error(
-                "event_unexpected_error",
-                entry_id=_id_str(entry_id),
-                stage="parse",
-                error=pipeline_error_of(exc),
-            )
-            await self._dead_letter_or_hold(
-                entry_id, fields,
-                reason=f"unexpected: {pipeline_error_of(exc)}",
-                attempts=0,
-            )
-            return
-
+            the event, and the event is not lost.
+        The retry lines of an entry already held are not written again:
+        its hold was said once (event_held), its retries every pass would
+        repeat it. See the KNOWN CEILING (BL-4) in the module header: the
+        inline sleep blocks the whole stream -- as a database that does
+        not answer would anyway."""
+        quiet = _id_str(entry_id) in self._said
         attempt = 0  # tries while the database answered
         waited = 0  # waits while it did not
         while True:
@@ -474,31 +521,13 @@ class StreamConsumer:
                     reason=exception_text(exc),
                 )
                 await self._ack_until_done(entry_id)
-                return
+                return None
             except ValidationError as exc:
-                await self._dead_letter_or_hold(
-                    entry_id, fields, reason=exception_text(exc), attempts=attempt,
-                )
-                return
+                await self._drop(entry_id, fields, stage="handle", exc=exc)
+                return None
             except Exception as exc:
                 if not _retryable(exc):
-                    # Unknown bug in ONE event must not wedge the stream
-                    # (poison-pill rule): preserve the evidence, move on.
-                    # Not logger.exception(): the renderer would print
-                    # the chain raw -- a database error's text is its SQL
-                    # and bound parameters. Same event, level and
-                    # `exception` key, redacted (app/core/sanitize.py).
-                    logger.error(
-                        "event_unexpected_error",
-                        entry_id=_id_str(entry_id),
-                        exception=sanitized_traceback(exc),
-                    )
-                    await self._dead_letter_or_hold(
-                        entry_id, fields,
-                        reason=f"unexpected: {pipeline_error_of(exc)}",
-                        attempts=attempt,
-                    )
-                    return
+                    return exc, attempt
                 if is_transient_db_error(exc) and not await self._database_answers():
                     attempt -= 1  # the database's moment, not the event's
                     waited += 1
@@ -514,30 +543,26 @@ class StreamConsumer:
                     await asyncio.sleep(delay)
                     continue
                 if attempt > len(_BACKOFF_DELAYS):
-                    logger.warning(
-                        "event_retries_exhausted",
+                    if not quiet:
+                        logger.warning(
+                            "event_retries_exhausted",
+                            entry_id=_id_str(entry_id),
+                            attempts=attempt,
+                            error=exception_text(exc),
+                        )
+                    if isinstance(exc, NotFoundError):
+                        await self._drop(entry_id, fields, stage="retries", exc=exc)
+                        return None
+                    return exc, attempt
+                delay = _BACKOFF_DELAYS[attempt - 1]
+                if not quiet:
+                    logger.info(
+                        "event_retry_scheduled",
                         entry_id=_id_str(entry_id),
-                        attempts=attempt,
+                        attempt=attempt,
+                        delay=delay,
                         error=exception_text(exc),
                     )
-                    # The class and the place, never the text: a database
-                    # error's text is its SQL and bound parameters -- the
-                    # letter, on a job's insert. The text stays in the
-                    # log line above (redacted).
-                    await self._dead_letter_or_hold(
-                        entry_id, fields,
-                        reason=f"retries exhausted: {pipeline_error_of(exc)}",
-                        attempts=attempt,
-                    )
-                    return
-                delay = _BACKOFF_DELAYS[attempt - 1]
-                logger.info(
-                    "event_retry_scheduled",
-                    entry_id=_id_str(entry_id),
-                    attempt=attempt,
-                    delay=delay,
-                    error=exception_text(exc),
-                )
                 await asyncio.sleep(delay)
                 continue
             if result is HandleResult.DUPLICATE:
@@ -556,11 +581,60 @@ class StreamConsumer:
                     attempt=attempt,
                 )
             # Acknowledged OUTSIDE the try (FIX review 3.13.0): an XACK
-            # that fails is no failure of the event to dead-letter. It is
-            # retried here, the session already closed -- no connection to
-            # the database and no row lock held while it waits.
+            # that fails is no failure of the event. It is retried here,
+            # the session already closed -- no connection to the database
+            # and no row lock held while it waits.
             await self._ack_until_done(entry_id)
+            return None
+
+    async def _drop(
+        self,
+        entry_id: str | bytes,
+        fields: dict[Any, Any],
+        *,
+        stage: str,
+        exc: BaseException,
+        loud: bool = False,
+    ) -> None:
+        """THE ONE WAY an entry is dropped (WHOSE ERROR IT IS, the module
+        header): one line, event_dropped, then the ack. WARNING for the
+        product's input, ERROR (`loud`) for a defect of comms met on it.
+
+        The line holds the ADDRESS of the entry, never its letter nor a
+        value of its fields: the kind (_kind_of), the stage, the class and
+        place of the refusal (pipeline_error_of -- a refusal's text quotes
+        the values it refused: an unknown event's name, a version), and
+        the SHA-256 of the `data` bytes as the stream delivered them -- the
+        digest a refusal at intake records (stream_fingerprint) -- with
+        their length; both None when the entry has no `data`."""
+        data = _data_of(fields)
+        (logger.error if loud else logger.warning)(
+            "event_dropped",
+            entry_id=_id_str(entry_id),
+            kind=_kind_of(fields),
+            stage=stage,
+            reason=pipeline_error_of(exc),
+            data_fingerprint=None if data is None else stream_fingerprint(data),
+            data_bytes=None if data is None else len(data),
+        )
+        await self._ack_until_done(entry_id)
+
+    def _say_once(
+        self,
+        entry_id: str | bytes,
+        log: Callable[..., Any],
+        event: str,
+        /,
+        **fields: Any,
+    ) -> None:
+        """Say the hold of an entry once, not at every pass over the
+        pending list that meets it again (the KNOWN CEILING of a subject
+        held for good, the module header)."""
+        key = _id_str(entry_id)
+        if key in self._said:
             return
+        self._said.add(key)
+        log(event, **fields)
 
     # KNOWN CEILING -- the process stopped while an ack is retried.
     # Mechanics: an event is committed and its XACK keeps failing; the
@@ -571,21 +645,15 @@ class StreamConsumer:
     # entry, which is read only after the drain -- so the stream's order
     # is kept, but the event is applied a second time. A sync event
     # re-applied with nothing newer between is the same state; a
-    # notification_request is collapsed by its key. The same for a dead
-    # letter's write: the entry is handled again from the start.
-    # Left as it is, v4.0's: an entry left pending after an exception in
-    # its handling (event_left_pending) is read again by the next pass
-    # over the pending list (WK-3), after the newer entries behind it --
-    # held in place instead, one poisoned entry would stop the stream for
-    # good.
+    # notification_request is collapsed by its key; a dropped entry is
+    # dropped again, one more line.
     # Status: acknowledged by design.
     # Task: none -- the closure is the ordering of membership events,
     # v4.0's, and no task of this repository carries it.
     # Unfreeze trigger: a writer of memberships outside the stream (a
     # REST route), OR a handler whose second application is not the same
     # state, OR event_ack_failed or redis_refused in the log followed by
-    # a restart before event_acked_after_retry, OR event_left_pending of
-    # a group_changed or section_membership_changed.
+    # a restart before event_acked_after_retry.
     # Agreed fix shape: an order for membership events -- the stream
     # entry id kept on the membership row, or a version from the product
     # -- and a replay older than the row refused.
@@ -603,13 +671,16 @@ class StreamConsumer:
         is committed, a replay of it would apply it again, and the next
         entry is not taken meanwhile -- a group_changed true replayed over
         the false behind it would put the person back (review 3.14.0,
-        2.3). _until_done; the KNOWN CEILING above."""
+        2.3). _until_done; the KNOWN CEILING above. Acknowledged, the
+        entry is no longer held: its hold may be said again if it ever
+        is (_say_once)."""
         await self._until_done(
             entry_id,
             lambda: self._ack(entry_id),
             failed="event_ack_failed",
             done_after_retry="event_acked_after_retry",
         )
+        self._said.discard(_id_str(entry_id))
 
     async def _until_done(
         self,
@@ -670,98 +741,8 @@ class StreamConsumer:
                 )
             return
 
-    async def _dead_letter_or_hold(
-        self,
-        entry_id: str | bytes,
-        fields: dict[Any, Any],
-        *,
-        reason: str,
-        attempts: int,
-    ) -> None:
-        """THE ONE WAY an entry goes to the dead letter (FIX review
-        3.13.0): built, written, then acknowledged.
-
-        A letter that cannot be BUILT (a defect of comms', not the
-        weather of redis) leaves the entry PENDING: not lost, seen in
-        XPENDING and in this log line, offered again at the next pass over
-        the pending list (_drain_pending, its cursor past it: every
-        _PENDING_REDRAIN_SECONDS and at the next start, WK-3). Never an
-        exception out of an except clause: before, a TypeError of the dead
-        letter's own JSON left _process_entry from inside one and took the
-        consumer down, again at every restart.
-
-        The WRITE and the ack are retried in place (_until_done, review
-        3.14.0 N0): left pending, the entry would be handled again at the
-        next pass -- written twice, or, its cause gone, applied late over
-        the newer entries behind it (a group_changed true that waited for
-        its person, over the false that followed)."""
-        try:
-            letter = self._dead_letter_of(
-                entry_id, fields, reason=reason, attempts=attempts,
-            )
-        except Exception as exc:
-            logger.error(
-                "dead_letter_build_failed",
-                entry_id=_id_str(entry_id),
-                error=pipeline_error_of(exc),
-            )
-            return
-        await self._until_done(
-            entry_id,
-            lambda: self._write_dead_letter(letter),
-            failed="dead_letter_write_failed",
-            done_after_retry="dead_letter_written_after_retry",
-        )
-        logger.warning(
-            "event_dead_lettered",
-            entry_id=_id_str(entry_id),
-            dlq=self._dlq,
-            reason=letter["_dlq_error"],
-            attempts=attempts,
-        )
-        await self._ack_until_done(entry_id)
-
     async def _ack(self, entry_id: str | bytes) -> None:
         await self._redis.xack(self._stream, self._group, entry_id)
-
-    def _dead_letter_of(
-        self,
-        entry_id: str | bytes,
-        fields: dict[Any, Any],
-        *,
-        reason: str,
-        attempts: int,
-    ) -> dict[str, str]:
-        """The dead letter of the entry, its address with diagnostics
-        attached -- DEAD LETTERS in the module header; the fields are
-        dead_letter_fields'. No redis: what fails here is comms'.
-
-        The reason is redacted HERE, the one point every dead-letter
-        path passes, and cut to _DLQ_ERROR_MAX after it (a redaction may
-        lengthen it). It is a refusal of comms' own (a ValidationError:
-        field names and the address, never the letter) or the class and
-        place of an exception (pipeline_error_of), never an exception's
-        text.
-        """
-        return dead_letter_fields(
-            fields,
-            reason=sanitize_text(reason)[:_DLQ_ERROR_MAX],
-            attempts=attempts,
-            entry_id=_id_str(entry_id),
-        )
-
-    async def _write_dead_letter(self, letter: dict[str, str]) -> None:
-        """XADD the letter. The stream is capped (approximate MAXLEN) so a
-        misbehaving producer cannot grow it without bound."""
-        # redis-py's FieldT alias is invariant in dict params, so a
-        # plain dict[str, str] does not satisfy it; alias it exactly.
-        entry: dict[FieldT, EncodableT] = dict(letter.items())
-        await self._redis.xadd(
-            self._dlq,
-            entry,
-            maxlen=settings.dlq_maxlen,
-            approximate=True,
-        )
 
 
 def _retryable(exc: BaseException) -> bool:
@@ -800,95 +781,57 @@ def _wait_delay(n: int) -> float:
     return float(min(_WAIT_CEILING, _BACKOFF_DELAYS[0] * 2 ** doublings))
 
 
-def dlq_kept_data_fields(event: str | None) -> frozenset[str] | None:
-    """The keys of `data` a dead letter keeps for this event; None when
-    it keeps none.
 
-    A list of what is ALLOWED, the event's own field set: a key that is
-    not in it -- `titel` is the letter under another name -- is dropped
-    like the letter. notification_request keeps its frame and envelope
-    (deploy/INTEGRATION.md section 7) without the withheld link; the
-    other events are the address book comms keeps anyway. An unknown or
-    absent event has no field set: nothing of its `data` is kept.
-    """
-    if event == EVENT_NOTIFICATION_REQUEST:
-        return NOTIFICATION_REQUEST_FRAME_FIELDS | (
-            NOTIFICATION_REQUEST_ENVELOPE_FIELDS - _DLQ_WITHHELD_ENVELOPE_FIELDS
-        )
-    if event is None:
-        return None
-    return EVENT_FIELDS.get(event)
+def subjects_of(event: ParsedEvent) -> frozenset[str]:
+    """The subjects whose events keep their order behind a held entry
+    (HELD BY SUBJECT, the module header) -- read from the envelope only,
+    never from the letter.
+
+    A sync event: the person it is about (an operator is a person of the
+    address book, set_membership checks it as one). A notification
+    request: its key (a second request under the same key is decided by
+    the first), its correlation (a reminder_cancel finds its jobs by it)
+    and the person it is addressed to, when it is one. A reminder_cancel:
+    its correlation. A request refused at its parse: its key. A person's
+    id is written in one form -- the UUID's -- whatever case the request
+    sent it in."""
+    if isinstance(event, UserUpserted | UserDeleted | GroupChanged):
+        return frozenset({f"person:{event.recipient_id}"})
+    if isinstance(event, SectionMembershipChanged):
+        return frozenset({f"person:{event.operator_id}"})
+    if isinstance(event, ReminderCancel):
+        return frozenset({f"correlation:{event.correlation}"})
+    if isinstance(event, RejectedNotificationRequest):
+        return frozenset({f"key:{event.idempotency_key}"})
+    assert isinstance(event, NotificationRequest)
+    subjects = {f"key:{event.idempotency_key}"}
+    if event.correlation is not None:
+        subjects.add(f"correlation:{event.correlation}")
+    if event.target_type == TargetType.USER and event.target_value is not None:
+        subjects.add(f"person:{UUID(event.target_value)}")
+    return frozenset(subjects)
 
 
-def dead_letter_fields(
-    fields: dict[Any, Any], *, reason: str, attempts: int, entry_id: str,
-) -> dict[str, str]:
-    """The dead letter of one stream entry (DEAD LETTERS, module header).
-
-    Values are written only where they are kept: `event` (when it is
-    UTF-8 and within _DLQ_NAME_MAX) and the allowed keys of `data` (when
-    it is a UTF-8 JSON object), each within _DLQ_VALUE_MAX. Everything
-    else is dropped by NAME -- a field of the entry under its own name
-    (entry_field_name: a byte that is not UTF-8 as a backslash escape), a
-    key of `data` as `data.<key>`, the whole of `data` as `data` -- and the
-    first _DLQ_DROPPED_LISTED names within _DLQ_NAME_MAX are listed in
-    _dlq_dropped, sorted; _dlq_dropped_more counts the others. The reader
-    sees what was there without seeing it. The fingerprint is of the
-    `data` bytes as the stream delivered them, the digest a refusal at
-    intake records (stream_fingerprint).
-    """
-    dead: dict[str, str] = {}
-    dropped: list[str] = []
-    event: str | None = None
-    raw_data: bytes | None = None
+def _kind_of(fields: dict[Any, Any]) -> str:
+    """The entry's `event` when it names a known kind, else "unknown":
+    an unknown name is the producer's value, and a line of comms carries
+    none (_drop)."""
     for key, value in fields.items():
-        name = entry_field_name(key)
-        raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
-        if name == ENVELOPE_EVENT_FIELD:
-            event = _utf8_or_none(raw)
-            if event is None or len(raw) > _DLQ_NAME_MAX:
-                event = None
-                dropped.append(name)
-        elif name == ENVELOPE_DATA_FIELD:
-            raw_data = raw
-        else:
-            dropped.append(name)
-    if event is not None:
-        dead[ENVELOPE_EVENT_FIELD] = event
-    if raw_data is not None:
-        dead["_dlq_data_fingerprint"] = stream_fingerprint(raw_data)
-        dead["_dlq_data_bytes"] = str(len(raw_data))
-        kept = dlq_kept_data_fields(event)
-        # Read by the one reader of event data (app/transport/events.py):
-        # a bomb is not recursed into here, a NaN is not written back.
-        data = event_data_or_none(raw_data)
-        if kept is None or data is None:
-            dropped.append(ENVELOPE_DATA_FIELD)
-        else:
-            # ensure_ascii: a lone surrogate (a JSON escape the producer
-            # may send) is not encodable as UTF-8 on the way to redis.
-            # A value is kept only when its written form fits.
-            short = {
-                k: v for k, v in data.items()
-                if k in kept and len(json.dumps(v, sort_keys=True)) <= _DLQ_VALUE_MAX
-            }
-            dead["_dlq_data"] = json.dumps(short, sort_keys=True)
-            dropped += [f"{ENVELOPE_DATA_FIELD}.{k}" for k in data if k not in short]
-    listable = sorted(n for n in dropped if len(json.dumps(n)) <= _DLQ_NAME_MAX)
-    listed = listable[:_DLQ_DROPPED_LISTED]
-    dead["_dlq_dropped"] = json.dumps(listed)
-    dead["_dlq_dropped_more"] = str(len(dropped) - len(listed))
-    dead["_dlq_error"] = reason
-    dead["_dlq_attempts"] = str(attempts)
-    dead["_dlq_source_entry_id"] = entry_id
-    return dead
+        if entry_field_name(key) != ENVELOPE_EVENT_FIELD:
+            continue
+        name = value if isinstance(value, str) else value.decode(
+            "utf-8", errors="replace",
+        )
+        return name if name in KNOWN_EVENTS else "unknown"
+    return "unknown"
 
 
-def _utf8_or_none(raw: bytes) -> str | None:
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
+def _data_of(fields: dict[Any, Any]) -> bytes | None:
+    """The `data` bytes as the stream delivered them, or None."""
+    for key, value in fields.items():
+        if entry_field_name(key) == ENVELOPE_DATA_FIELD:
+            return value if isinstance(value, bytes) else str(value).encode("utf-8")
+    return None
 
 
 def entry_request_id(fields: dict[Any, Any]) -> str:

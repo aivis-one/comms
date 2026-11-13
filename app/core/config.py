@@ -284,10 +284,6 @@ NUMERIC_BOUNDS: dict[str, Bound] = {
         1, 60_000, "XREADGROUP BLOCK: 0 blocks FOREVER, so the consumer "
         "never wakes to see a shutdown; above a minute it answers one late",
     ),
-    "dlq_maxlen": Bound(
-        1, 10_000_000, "XADD MAXLEN: 0 trims every entry -- a dead-letter "
-        "queue that keeps nothing",
-    ),
     "changes_stream_maxlen": Bound(
         1, 10_000_000, "XADD MAXLEN of the push stream: 0 trims every "
         "push as it is written -- a stream no listener can read",
@@ -488,8 +484,7 @@ class Settings(BaseSettings):
     # redis_url is refused at CONSUMER startup (app/consumer.py), not
     # here -- deliberately not coupled to any delivery channel.
     # Names below are FROZEN CONTRACT surface (Phase 3c item 7): the
-    # product's outbox relay XADDs into comms_events_stream; the DLQ
-    # is derived as f"{comms_events_stream}:dlq" (see dlq_stream).
+    # product's outbox relay XADDs into comms_events_stream.
     redis_url: str = ""
     comms_events_stream: str = "comms:events"
     comms_consumer_group: str = "comms"
@@ -498,28 +493,22 @@ class Settings(BaseSettings):
     # unacked messages replay without XAUTOCLAIM machinery. One
     # consumer per deploy by design.
     comms_consumer_name: str = "comms-1"
-    # XREADGROUP batch size / block timeout, and the cap on the DLQ
-    # stream length (approximate MAXLEN trimming).
+    # XREADGROUP batch size / block timeout. An entry comms cannot take
+    # is refused or dropped and kept nowhere (W5-1,
+    # app/transport/consumer.py WHOSE ERROR IT IS): no stream of its own.
     consumer_batch_size: int = 32
     consumer_block_ms: int = 5000
-    dlq_maxlen: int = 10000
-
-    @property
-    def dlq_stream(self) -> str:
-        """Dead-letter stream name, derived from the main stream."""
-        return f"{self.comms_events_stream}:dlq"
 
     # -- Event transport, the reverse direction (P3-1, spec §7) --
     # comms XADDs the key of a job that changed into this stream of its
     # own redis (the relay in the consumer process,
     # app/transport/push_relay.py); the product listens. The NAME is
-    # derived from the inbound stream, like the DLQ's -- it can be
-    # neither the inbound stream nor the DLQ, so comms never reads its
-    # own pushes -- and is FROZEN CONTRACT surface (deploy/INTEGRATION.md
-    # section 10). The cap is approximate MAXLEN trimming: a product
-    # away for longer than the stream holds reconciles by the changes
-    # feed (section 9), which is why a push may be lost and a result
-    # may not.
+    # derived from the inbound stream -- it cannot be the inbound stream,
+    # so comms never reads its own pushes -- and is FROZEN CONTRACT
+    # surface (deploy/INTEGRATION.md section 10). The cap is approximate
+    # MAXLEN trimming: a product away for longer than the stream holds
+    # reconciles by the changes feed (section 9), which is why a push may
+    # be lost and a result may not.
     changes_stream_maxlen: int = 100_000
 
     @property

@@ -484,8 +484,8 @@ def is_transient_db_error(exc: BaseException) -> bool:
     InterfaceError is also what it raises when code misuses a
     connection ("another operation is in progress"). Retrying that
     cannot help, and does not hide it: the consumer retries it a bounded
-    number of times and then dead-letters it, "retries exhausted" with
-    its class and place, and a route answers 503 -- repeated, it fails
+    number of times and then holds the entry, its class and place said
+    (event_held), and a route answers 503 -- repeated, it fails
     the same way. Telling the two apart would mean reading the message.
     """
     if isinstance(exc, (InterfaceError, OperationalError, PoolTimeoutError)):

@@ -180,8 +180,8 @@ class TestNotificationRequestSchema:
         assert event.expiry_at is None
 
     def test_missing_key_is_terminal(self) -> None:
-        """No key, no address: the one required field whose absence is
-        still a DLQ case (KNOWN CEILING in app/transport/events.py)."""
+        """No key, no address: the one required field whose absence still
+        drops the entry (KNOWN CEILING in app/transport/events.py)."""
         data = _request_data()
         del data["idempotency_key"]
         with pytest.raises(ValidationError, match="idempotency_key"):
@@ -236,7 +236,7 @@ class TestNotificationRequestSchema:
 
     def test_overlong_idempotency_key(self) -> None:
         """A key longer than its column cannot become an address: still
-        terminal, the DLQ."""
+        terminal, the entry dropped."""
         with pytest.raises(ValidationError, match="exceeds 200"):
             parse_event(_envelope(
                 "notification_request",
@@ -514,7 +514,7 @@ class TestReminderCancelSchema:
 
     def test_version_barrier_applies(self) -> None:
         """The new event sits behind the same v-gate as the frozen
-        three -- an unsupported version dead-letters, never parses."""
+        three -- an unsupported version is refused, never parses."""
         with pytest.raises(ValidationError, match="unsupported schema"):
             parse_event(_envelope(
                 "reminder_cancel", self._cancel_data(v=2),

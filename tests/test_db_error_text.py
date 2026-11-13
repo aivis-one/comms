@@ -401,13 +401,15 @@ class TestRealPaths:
         monkeypatch.setattr(consumer_module, "handle_event", broken)
         await _xadd(redis, stream, "user_upserted", _user_upserted_data(uuid4()))
 
-        async def dead() -> bool:
-            return await redis.xlen(settings.dlq_stream) == 1
-
         with capture_logs() as logs:
-            await _run_until(StreamConsumer(redis), dead)
-        dlq = await redis.xrange(settings.dlq_stream)
-        assert SENTINEL not in str(dlq)
+
+            async def held() -> bool:
+                return any(e["event"] == "event_held" for e in logs)
+
+            await _run_until(StreamConsumer(redis), held)
+        # Until W5-1 the dead letter was asserted here too; the entry is
+        # held now (a failure of comms), and its line is in `logs`.
+        assert await redis.keys("*") == [stream.encode()]
         assert SENTINEL not in _all_text(logs)
         assert "SQLSTATE 23514" in _all_text(logs)
 

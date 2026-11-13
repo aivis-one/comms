@@ -22,25 +22,26 @@
 # data} -- does not change: all evolution happens INSIDE data, gated by
 # its required integer field "v". The consumer
 # validates "v" on every event (review 3c amendment A): a missing or
-# unsupported version is a TERMINAL error -> DLQ, never a silent parse
+# unsupported version is a refusal of the event, never a silent parse
 # under old semantics. Currently supported: v=1.
 #
-# Validation failures raise ValidationError -- classified TERMINAL by the
-# consumer (log + DLQ + XACK), per the poison-pill rule. The one
-# exception is a notification_request whose key is readable: it is
-# returned as RejectedNotificationRequest and recorded under the key.
+# Validation failures raise ValidationError -- the product's input, which
+# the consumer drops: one log line and XACK (app/transport/consumer.py,
+# WHOSE ERROR IT IS). The one exception is a notification_request whose
+# key is readable: it is returned as RejectedNotificationRequest and
+# recorded under the key.
 #
 # KNOWN CEILING -- a request whose key cannot be read is invisible to
 # the product.
 #   1. Mechanics: without a readable idempotency_key (a field of the
 #      entry is not UTF-8, data is not a JSON object, the key is absent,
 #      not a string, empty or longer than the column) there is no
-#      address to record the rejection under; the entry goes only to
-#      the DLQ, which the product does not read.
+#      address to record the rejection under; the entry is dropped, one
+#      line in comms' log, which the product does not read.
 #   2. Status: acknowledged by design (spec §6.3 names this boundary).
 #   3. Backlog ref: none -- no key, no address; nothing to build.
-#   4. Promotion trigger (observable): an event_dead_lettered log line
-#      for a notification_request (the DLQ entry's `event` field).
+#   4. Promotion trigger (observable): an event_dropped log line of
+#      kind notification_request.
 #   5. Agreed fix shape: none on comms' side; the producer's outbox
 #      must never emit a request without a well-formed key.
 #   6. Rejected: recording under a DERIVED key (the entry id, a hash
@@ -382,8 +383,7 @@ def _is_scalar(value: Any) -> bool:
 # THE DATA OF AN EVENT: ONE READER, ONE CHECK (EM-1 FIX, FIX-2).
 #
 # load_event_data is the only json.loads of an event's `data`: parse_event
-# reads through it, and so does the dead letter (event_data_or_none, for
-# app/transport/consumer.py). check_event_data is the only walk over what
+# reads through it. check_event_data is the only walk over what
 # it read -- iterative, so no depth of the data costs a frame -- and
 # parse_event runs it first, before any rule that names a field or walks
 # a value. One class is refused there: JSON the intake would let through
@@ -400,7 +400,7 @@ def _is_scalar(value: Any) -> bool:
 # request's key stays readable and the refusal goes under it -- the line's
 # principle: a refusal under the product's key wherever the key can be
 # read. What cannot be read at all -- a nesting past the decoder's own
-# recursion, broken JSON -- leaves no key: the dead letter. (A date is a
+# recursion, broken JSON -- leaves no key: the entry is dropped. (A date is a
 # value of the same class; it is a field's own rule, _datetime.)
 # The string rule is the one the REST bodies use too: app/core/storable.py.
 _NO_NUMBER = (
@@ -460,9 +460,8 @@ def load_event_data(text: str, event: str) -> dict[str, Any]:
 def _defects(data: dict[str, Any]) -> Iterator[tuple[str, str]]:
     """Every thing in the data that comms cannot take, as (kind, the
     top-level field) -- kind "name", "string", "number" or "depth" -- in
-    order. Iterative: a stack, never a recursion. ONE walk, for the
-    parse (the first defect, _first_defect) and the dead letter (every
-    defect, event_data_or_none)."""
+    order. Iterative: a stack, never a recursion. The parse takes the
+    first (_first_defect)."""
     for name, value in data.items():
         if not storable(name):
             yield "name", name
@@ -497,7 +496,7 @@ def check_event_data(data: dict[str, Any], event: str) -> None:
     """Refuse the first defect of the data (see above), naming the
     top-level field, never the value. A field NAME that is itself a
     string the database cannot store is not repeated: the reason is
-    written down too (a refusal under the key, a dead letter)."""
+    written down too (a refusal under the key)."""
     defect = _first_defect(data)
     if defect is None:
         return
@@ -511,29 +510,6 @@ def check_event_data(data: dict[str, Any], event: str) -> None:
     raise ValidationError(
         f"{event}: field {name!r} is nested deeper than {MAX_JSON_DEPTH} levels"
     )
-
-
-def event_data_or_none(raw: bytes) -> dict[str, Any] | None:
-    """A stream entry's `data` as a dead letter may write it back: a
-    UTF-8 JSON object, read by the one reader, holding no number comms
-    cannot write and no depth a writer would recurse into -- or None,
-    and the dead letter keeps none of it. A string the database cannot
-    store is fine here: the dead letter writes JSON with ensure_ascii."""
-    if len(raw) > MAX_EVENT_DATA_BYTES:
-        # Refused for its size before it was read (parse_event): the
-        # dead letter does not read it either (PERF-3).
-        return None
-    try:
-        data = load_event_data(raw.decode("utf-8"), "dead letter")
-    except (UnicodeDecodeError, ValidationError):
-        return None
-    # EVERY defect, not the first (FIX review 3.13.0): a key with a NUL
-    # came first in the review's entry, and the NaN mark behind it went
-    # on into json.dumps -- a TypeError out of the dead letter's own
-    # writing, and the consumer down.
-    if any(kind in ("number", "depth") for kind, _ in _defects(data)):
-        return None
-    return data
 
 
 EMAIL_LETTER_LIMITS = {
@@ -849,8 +825,8 @@ def _validate_target(
 def entry_field_name(name: str | bytes) -> str:
     """A stream entry's field name as text that can always be written
     and printed: UTF-8 where it is UTF-8, a backslash escape for every
-    byte that is not. The one form a name takes in a refusal and in a
-    dead letter (app/transport/consumer.py)."""
+    byte that is not. The one form a name takes in a refusal and in the
+    consumer (app/transport/consumer.py)."""
     if isinstance(name, bytes):
         return name.decode("utf-8", errors="backslashreplace")
     return name
@@ -861,8 +837,8 @@ def _decode_entry(fields: dict[Any, Any]) -> dict[str, str]:
     request id's.
 
     The frame is UTF-8 (section 7); a byte that is not refuses the
-    ENTRY here, naming the field, so that it is dead-lettered like any
-    other broken frame. A decode error left to escape would end the
+    ENTRY here, naming the field, so that it is dropped like any other
+    broken frame. A decode error left to escape would end the
     consumer's process -- and the restart would replay the same entry
     from the pending list, forever (the poison-pill rule in
     app/transport/consumer.py).
@@ -898,7 +874,7 @@ def _is_utf8(value: str | bytes) -> bool:
 def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
     """Parse one stream entry's field map into a typed event.
 
-    Raises ValidationError (terminal -> DLQ) on ANY malformation:
+    Raises ValidationError (the entry dropped) on ANY malformation:
     a field name or value that is not UTF-8, missing envelope fields,
     unknown event name, broken JSON, missing or unsupported schema
     version, schema violations -- EXCEPT for a notification_request
@@ -926,8 +902,8 @@ def parse_event(fields: dict[Any, Any]) -> ParsedEvent:
         # The key first, then check_event_data under it -- see there.
         return _parse_notification_intake(data, _raw_data(fields))
     # Every other event: what comms cannot take is a malformation of the
-    # event, refused first -- the dead letter at once, naming the field,
-    # never a database error and its retries.
+    # event, refused first -- dropped at once, never a database error and
+    # its retries.
     check_event_data(data, event)
     _check_version(data, event)
 
@@ -946,8 +922,8 @@ def _check_data_size(fields: dict[Any, Any]) -> None:
     """Refuse an entry whose `data` is larger than MAX_EVENT_DATA_BYTES
     -- by its length, BEFORE a byte of it is decoded or parsed (PERF-3).
     The refusal names the field and the limit, never the value; it is a
-    defect like any other here, a dead letter with its reason, and the
-    dead letter does not read the data either (event_data_or_none)."""
+    defect like any other here, the entry dropped, and the line of the
+    drop does not read the data either (it hashes the bytes)."""
     for key, value in fields.items():
         if entry_field_name(key) != ENVELOPE_DATA_FIELD:
             continue
@@ -993,7 +969,7 @@ def _check_version(data: dict[str, Any], event: str) -> None:
 # The closed field set of notification_request (F1.2), split as
 # deploy/INTEGRATION.md section 7 splits it -- its "envelope / letter"
 # column, held to these three sets both ways by
-# tests/test_dlq_no_letter.py: the frame's version, the envelope comms
+# tests/test_event_contract.py: the frame's version, the envelope comms
 # reads, the letter it carries and never interprets. Anything else
 # refuses the request.
 NOTIFICATION_REQUEST_FRAME_FIELDS = frozenset({"v"})
@@ -1015,7 +991,7 @@ NOTIFICATION_REQUEST_LETTER_FIELDS = frozenset({
     "action_data",
     "llm",
     # The product's own email (EM-1): part of the letter -- never in the
-    # dead letter, the journal, a log line or an error.
+    # journal, a log line or an error.
     "email",
 })
 _NOTIFICATION_REQUEST_FIELDS = (
@@ -1031,7 +1007,7 @@ def _parse_notification_intake(
     """The key first, then everything else.
 
     The key is read BEFORE any other rule, so that a malformed title
-    does not take a readable key down to the DLQ with it: once the key
+    does not take a readable key down with it: once the key
     is known, every refusal has an address (spec §6.3). An unreadable
     key raises -- see the KNOWN CEILING in the module header.
     """
@@ -1042,8 +1018,8 @@ def _parse_notification_intake(
     )
     if not storable(idempotency_key):
         # A key that cannot be stored cannot carry a refusal either:
-        # this is the unreadable key's path -- the dead letter (spec
-        # §6.3), keeping the address and never the letter.
+        # this is the unreadable key's path -- the entry dropped (spec
+        # §6.3), its line keeping the address and never the letter.
         raise ValidationError(
             f"{event}: field 'idempotency_key' is {UNSTORABLE}; a refusal "
             f"cannot be recorded under it"

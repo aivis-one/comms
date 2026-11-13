@@ -12,20 +12,21 @@
 #   2 a string the database will not take (a NUL, a lone surrogate) in
 #     ANY string of ANY event -- a request refused under the key, the
 #     field named; in the key itself, the unreadable key's path; every
-#     other event a malformation, the dead letter at once (EM-1 FIX);
+#     other event a malformation, dropped at once (EM-1 FIX; until W5-1
+#     the dead letter);
 #   3 the delivery on the real path of the engine with the provider's
 #     transport faked: the provider gets subject / text / html byte for
 #     byte, nothing of the template or of title / body, no html key when
 #     there is none; the pair: no block, the request exactly as before;
 #     every recipient of a group the same block; a muted one none;
-#   4 the letter does not leak: not into the dead letter (the G4 grid,
-#     tests/test_dlq_no_letter.py), not into any row but the job's, not
+#   4 the letter does not leak: not into the line of a dropped entry (the
+#     G4 grid, tests/test_drop_no_letter.py), not into any row but the job's, not
 #     into a log line, not into an error when the provider refuses;
 #   5 the contract.
 #
 # MUTATIONS these tests were written against (each turns one red):
 #   M1  `email` in the envelope, not the letter -> the G4 grid and its
-#       split (tests/test_dlq_no_letter.py)
+#       split (tests/test_drop_no_letter.py)
 #   M2  deliver ignores the block -> TestTheDelivery
 #   M3  html sent as "" when there is none -> TestTheDelivery
 #   M4  the block's subject through _clean_subject -> TestTheDelivery
@@ -36,7 +37,7 @@
 #   M7  create_notification not keeping the block -> TestTheDelivery
 #   M8  a limit in the contract other than the constant -> TestTheContract
 #   M9  a refusal quoting the value -> TestTheIntake (the reasons)
-#   F1  the parse's catch-all off -> tests/test_dlq_no_letter.py
+#   F1  the parse's catch-all off -> tests/test_drop_no_letter.py
 #       TestPoisonPill (the consumer goes down)
 #   F2  the depth limit off -> TestDepth, TestPoisonPill
 #   F3  the date range check off -> TestDates
@@ -46,7 +47,7 @@
 #   M10 the rule of the string the database will not take (EM-1 FIX):
 #       without the surrogate -> the surrogate rows of TestUnstorable;
 #       taken out of the other events -> their rows; taken out of the
-#       request -> its rows (the request a database error, a dead letter)
+#       request -> its rows (the request a database error, held)
 # =============================================================================
 
 import json
@@ -303,8 +304,8 @@ _UNSTORABLE_SAID = "is a string the database cannot store"
 
 
 def _clean(reason: str) -> None:
-    """The reason is itself written down -- a refusal under the key, a
-    dead letter -- so it carries neither kind."""
+    """The reason is itself written down -- a refusal under the key --
+    so it carries neither kind."""
     assert "\x00" not in reason
     reason.encode("utf-8")
 
@@ -355,7 +356,7 @@ class TestUnstorable:
 
     def test_in_the_key_the_key_is_unreadable(self, bad: str) -> None:
         """Nothing to record a refusal under: parse_event raises -- the
-        dead letter's path (spec §6.3, tests/test_dlq_no_letter.py)."""
+        entry dropped (spec §6.3, tests/test_drop_no_letter.py)."""
         data = _request(idempotency_key=f"key{_BAD[bad]}")
         with pytest.raises(ValidationError, match="idempotency_key") as raised:
             parse_event({"event": "notification_request",
@@ -372,9 +373,9 @@ class TestUnstorable:
         ("reminder_cancel", "types"),
     ])
     def test_every_other_event(self, bad: str, event: str, field: str) -> None:
-        """A malformation of the event: parse_event raises -- the dead
-        letter at once (tests/test_dlq_no_letter.py TestUnstorable) --
-        naming the field. Never a database error and its retries."""
+        """A malformation of the event: parse_event raises -- dropped at
+        once (tests/test_drop_no_letter.py TestUnstorable) -- naming the
+        field. Never a database error and its retries."""
         data = _other_event(event)
         value = data[field]
         data[field] = (
@@ -541,7 +542,7 @@ class TestDepth:
 
     def test_a_nesting_the_reader_cannot_follow(self) -> None:
         """Past the decoder's own recursion the key is never read: the
-        dead letter (tests/test_dlq_no_letter.py TestPoisonPill)."""
+        entry dropped (tests/test_drop_no_letter.py TestPoisonPill)."""
         text = _with(_request(), "correlation", "[" * 200_000 + "]" * 200_000)
         with pytest.raises(ValidationError, match="nested deeper than"):
             parse_event({"event": "notification_request", "data": text})
@@ -827,7 +828,7 @@ class TestTheContract:
         for said in ("a NUL character", "a lone surrogate",
                      "in any\nevent is rejected at intake",
                      "rejected under its\nkey",
-                     "makes the key unreadable", "dead-letter stream at once"):
+                     "makes the key unreadable", "dropped at once"):
             assert said in nul, said
         for event in ("user_upserted", "user_deleted", "group_changed",
                       "section_membership_changed", "reminder_cancel"):

@@ -361,8 +361,9 @@ class TestMembershipSync:
         self, db_session: AsyncSession
     ) -> None:
         """An identity lag must come back as the error the consumer
-        retries -- a raw integrity failure would go to the dead-letter
-        queue and the roster would silently lose a person."""
+        retries -- a raw integrity failure would hold the entry as a
+        failure of comms (until W5-1: the dead-letter queue, and the
+        roster would silently lose a person)."""
         from uuid import uuid4
 
         with pytest.raises(NotFoundError):

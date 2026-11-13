@@ -740,6 +740,19 @@ async def _consume_until(
     return logs
 
 
+async def _consume_until_said(
+    redis_: fakeaioredis.FakeRedis, event: str,
+) -> list[dict[str, Any]]:
+    """Run the loop until a line `event` is written; the lines."""
+    with capture_logs() as logs:
+
+        async def said() -> bool:
+            return any(e["event"] == event for e in logs)
+
+        await _run_until(StreamConsumer(redis_), said)
+    return logs
+
+
 class TestTheConsumer:
     async def test_transient_once_then_applied(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
@@ -765,7 +778,8 @@ class TestTheConsumer:
                 is not None and await _no_pending(fake_redis, a_stream)
 
         logs = await _consume_until(fake_redis, a_stream, applied)
-        assert await fake_redis.xlen(settings.dlq_stream) == 0
+        said = [e["event"] for e in logs]
+        assert "event_held" not in said and "event_dropped" not in said
         assert calls == 2
         assert [e["event"] for e in logs].count("event_retry_scheduled") == 1
 
@@ -773,8 +787,8 @@ class TestTheConsumer:
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The stand's form of a refused connection: retried, not
-        dead-lettered (TX-1 FIX)."""
+        """The stand's form of a refused connection: retried, not held
+        (TX-1 FIX; until W5-1: not dead-lettered)."""
         failure = await real_combined_connect_failure()
         real = consumer_module.handle_event
         calls = 0
@@ -795,8 +809,9 @@ class TestTheConsumer:
             found = await _scalar(select(Recipient.id).where(Recipient.id == person))
             return found is not None and await _no_pending(fake_redis, a_stream)
 
-        await _consume_until(fake_redis, a_stream, applied)
-        assert await fake_redis.xlen(settings.dlq_stream) == 0
+        logs = await _consume_until(fake_redis, a_stream, applied)
+        said = [e["event"] for e in logs]
+        assert "event_held" not in said and "event_dropped" not in said
         assert calls == 2
 
     @pytest.mark.parametrize("make", [real_serialization_failure,
@@ -809,7 +824,8 @@ class TestTheConsumer:
     ) -> None:
         """A transient failure that never passes -- and a misuse of a
         connection, the bug the rule reads as transient: a bounded series
-        of retries, then the dead letter, its class and place."""
+        of retries, then held (until W5-1: the dead letter), its class and
+        place."""
         failure = await make()
 
         async def always(*_args: Any, **_kwargs: Any) -> Any:
@@ -818,16 +834,12 @@ class TestTheConsumer:
         monkeypatch.setattr(consumer_module, "handle_event", always)
         await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(uuid4()))
 
-        async def dead() -> bool:
-            return await fake_redis.xlen(settings.dlq_stream) == 1
-
-        await _consume_until(fake_redis, a_stream, dead)
-        (entry,) = await fake_redis.xrange(settings.dlq_stream)
-        fields = {k.decode(): v.decode() for k, v in entry[1].items()}
-        assert fields["_dlq_error"].startswith(
-            f"retries exhausted: {type(failure).__module__}."
-            f"{type(failure).__qualname__} at app/"
+        logs = await _consume_until_said(fake_redis, "event_held")
+        (line,) = [e for e in logs if e["event"] == "event_held"]
+        assert line["error"].startswith(
+            f"{type(failure).__module__}.{type(failure).__qualname__} at app/"
         )
+        assert line["attempts"] == len(consumer_module._BACKOFF_DELAYS) + 1
 
     async def test_not_transient_at_once(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
@@ -841,14 +853,9 @@ class TestTheConsumer:
         monkeypatch.setattr(consumer_module, "handle_event", always)
         await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(uuid4()))
 
-        async def dead() -> bool:
-            return await fake_redis.xlen(settings.dlq_stream) == 1
-
-        logs = await _consume_until(fake_redis, a_stream, dead)
-        (entry,) = await fake_redis.xrange(settings.dlq_stream)
-        fields = {k.decode(): v.decode() for k, v in entry[1].items()}
-        assert fields["_dlq_error"].startswith("unexpected: ")
-        assert fields["_dlq_attempts"] == "1"
+        logs = await _consume_until_said(fake_redis, "event_held")
+        (line,) = [e for e in logs if e["event"] == "event_held"]
+        assert line["attempts"] == 1
         assert "event_retry_scheduled" not in [e["event"] for e in logs]
 
 

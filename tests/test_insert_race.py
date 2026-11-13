@@ -20,7 +20,7 @@
 # Before D1 the event path had no SAVEPOINT: B's IntegrityError reached
 # the consumer's catch-all and the event went to the dead-letter stream.
 # Here the handler is called as the consumer calls it; "no exception out
-# of the handler" is "no dead letter".
+# of the handler" is "not held" (until W5-1: "no dead letter").
 #
 # MUTATIONS:
 #   M12 the helper without its SAVEPOINT -> every race test (the retry
@@ -153,9 +153,9 @@ class TestTheLoserDecidesByTheRule:
         assert row is not None
         assert (row.version, row.locale) == (2, "de")
 
-    async def test_an_older_loser_is_stale_not_a_dead_letter(self) -> None:
+    async def test_an_older_loser_is_stale_not_a_failure(self) -> None:
         """StaleSnapshotError is a ConflictError: the consumer refuses it
-        by class and acknowledges it -- never the DLQ."""
+        by class and acknowledges it -- never held."""
         rid = uuid4()
         with pytest.raises(StaleSnapshotError):
             await _race(

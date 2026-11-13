@@ -12,7 +12,7 @@
 # Item 4: the request_id of a stream entry names the lines of its
 # processing; absent or of another form -- not UTF-8 either -- it is
 # comms' own, and the event is processed as without it: no refusal, no
-# dead letter; the next entry starts from its own.
+# drop; the next entry starts from its own.
 #
 # The contract: deploy/INTEGRATION.md section 5 and section 7 name the
 # header, the envelope field and the form the code has -- both ways.
@@ -352,7 +352,7 @@ class TestTheStream:
         machine_lines: Callable[[], list[dict[str, Any]]],
     ) -> None:
         """R5, R6: comms' own id; the event processed as without the
-        field -- the row is there, no dead letter."""
+        field -- the row is there, nothing dropped."""
         recipient_id = uuid.uuid4()
         fields: dict[Any, Any] = {
             "event": "user_upserted", "data": _upserted(recipient_id),
@@ -363,7 +363,7 @@ class TestTheStream:
         await _until_acked(StreamConsumer(redis), redis, stream, 1)
         (minted,) = _ids_of(machine_lines(), "event_processed")
         assert minted is not None and _MINTED.fullmatch(minted)
-        assert await redis.exists(settings.dlq_stream) == 0
+        assert "event_dropped" not in {e.get("event") for e in machine_lines()}
         row = (await db_session.execute(
             select(Recipient).where(Recipient.id == recipient_id)
         )).scalar_one_or_none()
@@ -386,17 +386,42 @@ class TestTheStream:
         assert first == "env-A"
         assert second is not None and _MINTED.fullmatch(second)
 
-    async def test_a_dead_letter_s_lines_name_it(
+    async def test_a_dropped_entry_s_line_names_it(
         self, redis: fakeaioredis.FakeRedis, stream: str,
         machine_lines: Callable[[], list[dict[str, Any]]],
     ) -> None:
-        """An event refused for itself: its lines carry its id."""
+        """An event refused for itself: its line carries its id (until
+        W5-1 the line of its dead letter)."""
         await redis.xadd(stream, {
             "event": "user_deleted", "data": json.dumps({"v": 1}),
             ENVELOPE_REQUEST_ID_FIELD: "env-dead",
         })
         await _until_acked(StreamConsumer(redis), redis, stream, 1)
-        assert _ids_of(machine_lines(), "event_dead_lettered") == ["env-dead"]
+        assert _ids_of(machine_lines(), "event_dropped") == ["env-dead"]
+
+    async def test_a_held_entry_s_line_names_it(
+        self, redis: fakeaioredis.FakeRedis, stream: str,
+        monkeypatch: pytest.MonkeyPatch,
+        machine_lines: Callable[[], list[dict[str, Any]]],
+    ) -> None:
+        """A failure of comms on the event: the line of its hold carries
+        its id too (W5-1)."""
+        from app.transport import consumer as consumer_module
+
+        async def failing(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("a defect of comms")
+
+        monkeypatch.setattr(consumer_module, "handle_event", failing)
+        await redis.xadd(stream, {
+            "event": "user_upserted", "data": _upserted(uuid.uuid4()),
+            ENVELOPE_REQUEST_ID_FIELD: "env-held",
+        })
+
+        async def held() -> bool:
+            return "event_held" in {e.get("event") for e in machine_lines()}
+
+        await _run(StreamConsumer(redis), held)
+        assert _ids_of(machine_lines(), "event_held") == ["env-held"]
 
     @pytest.mark.parametrize(("fields", "kept"), [
         ({b"request_id": b"r.1-_Z"}, "r.1-_Z"),
@@ -435,7 +460,7 @@ class TestTheContract:
     def test_the_envelope_field_and_its_form(self) -> None:
         assert f"optionally, `{ENVELOPE_REQUEST_ID_FIELD}`" in self._FRAME
         assert f"`{REQUEST_ID_FORM.pattern}`" in self._FRAME
-        assert "never refused, and never dead-lettered" in self._FRAME
+        assert "never refused, and never dropped" in self._FRAME
 
     def test_the_doc_s_form_is_the_code_s(self) -> None:
         """The other way: every form either paragraph writes is the

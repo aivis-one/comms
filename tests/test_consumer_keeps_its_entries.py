@@ -2,25 +2,30 @@
 # FIX review 3.13.0 -- the consumer keeps its entries and itself
 # =============================================================================
 #
-#   1 a dead letter that cannot be built never takes the
-#     process down: the entry stays PENDING (_dead_letter_or_hold), the
-#     next entry is processed; the review's own entry (a key with a NUL,
-#     then 1e999) is dead-lettered without its data;
-#   2 an entry held pending is met ONCE per start (_drain_pending's
-#     cursor), goes to the dead letter at a start where it can, and stays
-#     at one where it cannot -- new events flow either way; and (WK-3)
-#     it is met again while the process runs, once per pass over the
-#     pending list (_PENDING_REDRAIN_SECONDS), not only at a restart;
+#   1 a failure of comms on one entry never takes the process down: the
+#     entry stays PENDING (held, W5-1), the next entry -- another
+#     person's -- is processed; the review's own entry (a key with a NUL,
+#     then 1e999) is dropped, its line without its data;
+#   2 a held entry is met ONCE per start (_drain_pending's cursor), goes
+#     out at a start where it can, and stays at one where it cannot --
+#     new events of other people flow either way; and (WK-3) it is met
+#     again while the process runs, once per pass over the pending list
+#     (_PENDING_REDRAIN_SECONDS), not only at a restart;
 #   3 a transient failure of the database: waited for, uncounted, while
 #     the database does not answer -- the event applied once it does;
-#     the bounded budget, then the dead letter, while it answers;
+#     the bounded budget, then held, while it answers;
 #   4 (gone in W1-2 with the old installer: the order of its update and
 #     install; under the deploy machine nothing of comms runs while the
 #     schema is migrated -- primer.yaml stop_for_migrate).
 #
+# Until W5-1 the entry held in 1 and 2 was one whose dead letter could
+# not be built, and the event of 3 went to the dead letter after its
+# budget; W5-1 removed the dead letters -- a failure of comms holds the
+# entry itself, by its subject (tests/test_consumer_drops_and_holds.py).
+#
 # MUTATIONS these tests were written against (each turns one red):
-#   M1 event_data_or_none on the first defect only -> TestTheReviewsEntry
-#   M2 _dead_letter_or_hold without its except -> TestHeld (process dies)
+#   M1 (gone with the dead letter's reader of the data, W5-1)
+#   M2 _process_guarded without its except -> TestHeld (process dies)
 #   M3 the transient failure always waited for -> TestWaitingForTheDatabase
 #      (b) and (c): the stream stands
 #   M4 _drain_pending from "0" again -> TestTheCursor (a)
@@ -50,7 +55,6 @@ from app.core.config import settings
 from app.core.database import database_answers, get_session_factory
 from app.transport import consumer as consumer_module
 from app.transport.consumer import StreamConsumer
-from app.transport.events import event_data_or_none
 from tests.helpers import (
     real_connection_refused,
     real_misuse_of_a_connection,
@@ -79,9 +83,8 @@ def a_stream(monkeypatch: pytest.MonkeyPatch) -> str:
     return name
 
 
-async def _dlq(redis: fakeaioredis.FakeRedis) -> list[dict[str, str]]:
-    entries = await redis.xrange(settings.dlq_stream)
-    return [{k.decode(): v.decode() for k, v in e[1].items()} for e in entries]
+async def _keys(redis: fakeaioredis.FakeRedis) -> set[str]:
+    return {k.decode() for k in await redis.keys("*")}
 
 
 async def _pending(redis: fakeaioredis.FakeRedis, stream: str) -> int:
@@ -99,14 +102,6 @@ _REVIEW = '{"v":1,"idempotency_key":"a\\u0000b","type":1e999}'
 
 
 class TestTheReviewsEntry:
-    def test_every_defect_is_seen(self) -> None:
-        """The NUL of the key came first; the number past the float range
-        behind it must still keep the data out of the dead letter."""
-        assert event_data_or_none(_REVIEW.encode()) is None
-        # the pair: a string defect alone is written (ensure_ascii)
-        kept = event_data_or_none(b'{"v":1,"idempotency_key":"a\\u0000b"}')
-        assert kept == {"v": 1, "idempotency_key": "a\x00b"}
-
     async def test_on_the_real_loop(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession,
@@ -119,44 +114,53 @@ class TestTheReviewsEntry:
         async def done() -> bool:
             return await _recipient(person) and await _no_pending(fake_redis, a_stream)
 
-        await _run_until(StreamConsumer(fake_redis), done)
-        (dead,) = await _dlq(fake_redis)
-        assert "data" in json.loads(dead["_dlq_dropped"])
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(fake_redis), done)
+        # The NUL of the key came first; the number past the float range
+        # behind it: dropped by the parse, nothing of its data in a line.
+        (line,) = [e for e in logs if e["event"] == "event_dropped"]
+        assert (line["kind"], line["stage"]) == ("notification_request", "parse")
+        assert line["data_bytes"] == len(_REVIEW)
+        assert "1e999" not in json.dumps(logs, default=str)
+        assert await _keys(fake_redis) == {a_stream}
 
 
-def _failing_dead_letters(monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
-    """The dead letter cannot be BUILT `times` times (a defect of comms'
-    -- dead_letter_fields raises), then it can.
+def _failing_handling(monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
+    """The handling of a user_deleted fails in comms `times` times (a
+    defect of comms -- handle_event raises), then it works.
 
-    Until review 3.14.0 (N0) this failed the WRITE (a ConnectionError of
-    the XADD) -- right then: a write that failed left the entry pending.
-    The write is retried in place now (_until_done,
-    tests/test_consumer_refusal_and_dlq_write.py); a letter that cannot
-    be built is what still leaves the entry pending, and what these tests
-    hold."""
-    real = consumer_module.dead_letter_fields
+    Until W5-1 these tests failed the BUILD of the entry's dead letter
+    (before review 3.14.0, N0, its WRITE): that was what left an entry
+    pending. W5-1 removed the dead letters; a failure of comms on the
+    entry is what holds it now."""
+    real = consumer_module.handle_event
     calls = [0]
 
-    def building(*args: Any, **kwargs: Any) -> dict[str, str]:
-        calls[0] += 1
-        if calls[0] <= times:
-            raise TypeError("the dead letter cannot be built")
-        return real(*args, **kwargs)
+    async def handling(session: Any, event: Any) -> Any:
+        if type(event).__name__ == "UserDeleted":
+            calls[0] += 1
+            if calls[0] <= times:
+                raise TypeError("a defect of comms")
+        return await real(session, event)
 
-    monkeypatch.setattr(consumer_module, "dead_letter_fields", building)
+    monkeypatch.setattr(consumer_module, "handle_event", handling)
     return calls
 
 
-_BAD = {"event": "user_deleted", "data": '{"v": 1}'}  # malformed: a dead letter
+def _bad() -> dict[str, str]:
+    """A user_deleted of a person of its own: its hold holds no one
+    else."""
+    data = {"v": 1, "recipient_id": str(uuid4()), "version": 1}
+    return {"event": "user_deleted", "data": json.dumps(data)}
 
 
 class TestHeld:
-    async def test_a_dead_letter_that_cannot_be_written(
+    async def test_a_failure_of_comms(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _failing_dead_letters(monkeypatch, times=99)
-        await fake_redis.xadd(a_stream, _BAD)
+        _failing_handling(monkeypatch, times=99)
+        await fake_redis.xadd(a_stream, _bad())
         person = uuid4()
         await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(person))
 
@@ -166,8 +170,8 @@ class TestHeld:
         with capture_logs() as logs:
             await _run_until(StreamConsumer(fake_redis), next_one)
         assert await _pending(fake_redis, a_stream) == 1  # the held one
-        assert await _dlq(fake_redis) == []
-        assert "dead_letter_build_failed" in [e["event"] for e in logs]
+        assert await _keys(fake_redis) == {a_stream}
+        assert "event_held" in [e["event"] for e in logs]
 
     async def test_an_ack_that_fails(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
@@ -200,10 +204,12 @@ class TestHeld:
         # duplicate. That replay re-applies a membership event over a newer
         # one; the ack is now retried in place (_ack_until_done), so
         # nothing is left pending. The property this test holds (M7) is the
-        # same: a failed ack is no failure of the event -- no dead letter.
+        # same: a failed ack is no failure of the event -- neither held nor
+        # dropped.
         assert calls[0] == 3  # the failed one, its retry, the second's
-        assert await _dlq(fake_redis) == []  # applied, not a failure
-        assert "event_ack_failed" in [e["event"] for e in logs]
+        said = [e["event"] for e in logs]
+        assert "event_held" not in said and "event_dropped" not in said
+        assert "event_ack_failed" in said
 
 
 class TestTheCursor:
@@ -211,8 +217,8 @@ class TestTheCursor:
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _failing_dead_letters(monkeypatch, times=1)
-        await fake_redis.xadd(a_stream, _BAD)
+        _failing_handling(monkeypatch, times=1)
+        await fake_redis.xadd(a_stream, _bad())
         person = uuid4()
         await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(person))
 
@@ -226,11 +232,11 @@ class TestTheCursor:
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """(a) and (c): at the restart the dead letter fails again --
-        the held entry is met ONCE, said again, still pending; a new
-        event behind it is processed."""
+        """(a) and (c): at the restart the handling fails again -- the
+        held entry is met ONCE, said again, still pending; a new event of
+        another person behind it is processed."""
         await self._hold_one(fake_redis, a_stream, monkeypatch)
-        _failing_dead_letters(monkeypatch, times=99)
+        _failing_handling(monkeypatch, times=99)
         later = uuid4()
         await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(later))
         met: list[str] = []
@@ -250,23 +256,23 @@ class TestTheCursor:
             await _run_until(StreamConsumer(fake_redis), later_done)
         assert len(met) == 1
         assert await _pending(fake_redis, a_stream) == 1
-        assert "dead_letter_build_failed" in [e["event"] for e in logs]
+        assert "event_held" in [e["event"] for e in logs]
 
     async def test_a_held_entry_goes_out_when_it_can(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """(b): at the next start the dead-letter stream answers -- the
-        held entry is dead-lettered and acknowledged, the pending list
-        empty."""
+        """(b): at the next start the handling works -- the held entry is
+        applied and acknowledged, the pending list empty."""
         await self._hold_one(fake_redis, a_stream, monkeypatch)
 
         async def emptied() -> bool:
             return await _pending(fake_redis, a_stream) == 0
 
-        await _run_until(StreamConsumer(fake_redis), emptied)
-        (dead,) = await _dlq(fake_redis)
-        assert dead["event"] == "user_deleted"
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(fake_redis), emptied)
+        (done,) = [e for e in logs if e["event"] == "event_processed"]
+        assert done["event_type"] == "UserDeleted"
 
 
 class TestNotUntilARestart:
@@ -325,11 +331,12 @@ class TestNotUntilARestart:
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A dead letter that can never be written: the entry is met once
+        """A handling that always fails in comms: the entry is met once
         per pass over the pending list -- more than once in a second of
-        running, never round and round -- and new events keep flowing."""
-        _failing_dead_letters(monkeypatch, times=10_000)
-        await fake_redis.xadd(a_stream, _BAD)
+        running, never round and round -- and new events of other people
+        keep flowing."""
+        _failing_handling(monkeypatch, times=10_000)
+        await fake_redis.xadd(a_stream, _bad())
         met: list[float] = []
         real = StreamConsumer._process_entry
 
@@ -404,45 +411,48 @@ class TestWaitingForTheDatabase:
 
         with capture_logs() as logs:
             await _run_until(StreamConsumer(fake_redis, database_probe=probe), applied)
-        assert await _dlq(fake_redis) == []
+        said = [e["event"] for e in logs]
+        assert "event_held" not in said and "event_dropped" not in said
         loud = [e for e in logs if e["event"] == "event_waiting_for_database"]
         assert [e["waits"] for e in loud] == [1, 10]
 
     @pytest.mark.parametrize("make", [real_serialization_failure,
                                       real_misuse_of_a_connection],
                              ids=["40001", "misuse"])
-    async def test_a_live_database_dead_letters_the_event_after_its_budget(
+    async def test_a_live_database_holds_the_event_after_its_budget(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
         db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
         make: Callable[[], Awaitable[Exception]],
     ) -> None:
         """(b) and (c): the database answers, the event keeps failing --
-        the budget, then the dead letter; the next event is processed by
-        the same process."""
+        the budget, then held (until W5-1: the dead letter); the next
+        event, another person's, is processed by the same process."""
         failure = await make()
 
         async def always(*_args: Any, **_kwargs: Any) -> Any:
             raise failure
 
         real = consumer_module.handle_event
-        first = [True]
+        failing = uuid4()
 
-        async def handle(*args: Any, **kwargs: Any) -> Any:
-            if first[0]:
-                return await always(*args, **kwargs)
-            return await real(*args, **kwargs)
+        async def handle(session: Any, event: Any) -> Any:
+            if getattr(event, "recipient_id", None) == failing:
+                return await always(session, event)
+            return await real(session, event)
 
         monkeypatch.setattr(consumer_module, "handle_event", handle)
-        await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(uuid4()))
+        await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(failing))
         person = uuid4()
         await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(person))
 
-        async def dead_then_next() -> bool:
-            if await fake_redis.xlen(settings.dlq_stream) == 1:
-                first[0] = False
-            return await _recipient(person)
+        with capture_logs() as logs:
 
-        await _run_until(StreamConsumer(fake_redis), dead_then_next)
-        (dead,) = await _dlq(fake_redis)
-        assert dead["_dlq_error"].startswith("retries exhausted: ")
+            async def held_then_next() -> bool:
+                return await _recipient(person) and any(
+                    e["event"] == "event_held" for e in logs)
+
+            await _run_until(StreamConsumer(fake_redis), held_then_next)
+        (held,) = [e for e in logs if e["event"] == "event_held"]
+        assert held["attempts"] == len(consumer_module._BACKOFF_DELAYS) + 1
+        assert await _pending(fake_redis, a_stream) == 1
 

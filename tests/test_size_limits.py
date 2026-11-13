@@ -4,11 +4,11 @@
 #
 # What is held here, against the code and against deploy/INTEGRATION.md:
 #   2 a stream entry whose `data` is one byte over MAX_EVENT_DATA_BYTES
-#     is a dead letter through the real consumer, naming the field and
-#     the limit -- and the whole of it was never json.loads-ed, neither
-#     by the parse nor by the dead letter (every json.loads of the
-#     process counted by its argument's size); exactly the limit is
-#     taken;
+#     is dropped through the real consumer (until W5-1 a dead letter),
+#     its line naming the size -- and the whole of it was never
+#     json.loads-ed, neither by the parse nor by the drop (every
+#     json.loads of the process counted by its argument's size); exactly
+#     the limit is taken;
 #   3 action_data one byte over MAX_ACTION_DATA_BYTES of compact UTF-8
 #     JSON is refused at intake, naming the field and the limit; exactly
 #     the limit is taken;
@@ -20,8 +20,7 @@
 #
 # MUTATIONS (each turns one red):
 #   M1 the size check taken out of parse_event -> TestTheStreamEntry
-#   M2 the dead letter reading data over the limit -> TestTheStreamEntry
-#      test_one_byte_over (a json.loads of the whole)
+#   M2 (gone with the dead letter's reader of the data, W5-1)
 #   M3 the action_data limit taken out -> TestActionData
 #   M4 the body layer not mounted -> TestTheRequestBody
 #   M5 the layer counting only Content-Length -> test_streamed_over
@@ -39,6 +38,7 @@ import fakeredis.aioredis as fakeaioredis
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select
+from structlog.testing import capture_logs
 
 from app.core.config import settings
 from app.core.constants import (
@@ -55,7 +55,7 @@ from app.transport.events import (
     RejectedNotificationRequest,
     parse_event,
 )
-from tests.test_consumer_keeps_its_entries import _dlq, _recipient
+from tests.test_consumer_keeps_its_entries import _recipient
 from tests.test_transport_consumer import _no_pending, _run_until, _user_upserted_data
 from tests.test_transport_events import _request_data
 
@@ -112,21 +112,27 @@ class TestTheStreamEntry:
         person = uuid4()
         raw = _padded(_user_upserted_data(person), MAX_EVENT_DATA_BYTES + 1)
         await fake_redis.xadd(a_stream, {"event": "user_upserted", "data": raw})
+        # The pair's entry: one the consumer reads, through the same
+        # json.loads. Until W5-1 the pair was this test's own load of the
+        # dead letter's names -- the counter seeing the test, not the
+        # process.
+        later = uuid4()
+        await fake_redis.xadd(a_stream, {
+            "event": "user_upserted",
+            "data": json.dumps(_user_upserted_data(later)),
+        })
 
-        async def done() -> bool:
-            return bool(await _dlq(fake_redis)) and await _no_pending(
-                fake_redis, a_stream
-            )
+        with capture_logs() as logs:
 
-        await _run_until(StreamConsumer(fake_redis), done)
-        (dead,) = await _dlq(fake_redis)
-        assert (
-            f"field 'data' is larger than {MAX_EVENT_DATA_BYTES} bytes"
-            in dead["_dlq_error"]
-        )
-        assert dead["_dlq_data_bytes"] == str(MAX_EVENT_DATA_BYTES + 1)
-        assert "data" in json.loads(dead["_dlq_dropped"])
-        assert "_dlq_data" not in dead
+            async def done() -> bool:
+                return await _recipient(later) and await _no_pending(
+                    fake_redis, a_stream,
+                )
+
+            await _run_until(StreamConsumer(fake_redis), done)
+        (line,) = [e for e in logs if e["event"] == "event_dropped"]
+        assert line["data_bytes"] == MAX_EVENT_DATA_BYTES + 1
+        assert line["stage"] == "parse"
         assert not await _recipient(person)
         assert loads_sizes, "the pair: the counter sees the process's loads"
         assert max(loads_sizes) < MAX_EVENT_DATA_BYTES, "the whole was parsed"
@@ -143,8 +149,9 @@ class TestTheStreamEntry:
                 fake_redis, a_stream
             )
 
-        await _run_until(StreamConsumer(fake_redis), done)
-        assert await _dlq(fake_redis) == []
+        with capture_logs() as logs:
+            await _run_until(StreamConsumer(fake_redis), done)
+        assert "event_dropped" not in [e["event"] for e in logs]
 
 
 # ---------------------------------------------------------------------------
