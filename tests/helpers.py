@@ -26,8 +26,10 @@
 # =============================================================================
 
 import itertools
+import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -1017,3 +1019,45 @@ async def row_waiters(relation: str) -> list[tuple[int, RowWait]]:
         if wait is not None:
             found.append((pid, wait))
     return found
+
+
+# ---------------------------------------------------------------------------
+# The command a comms service runs (W1-2)
+# ---------------------------------------------------------------------------
+#
+# comms-app has no `command:` in deploy/docker-compose.yml: it runs the
+# image's CMD, the one source of the API's command (Dockerfile). The
+# worker and the consumer keep theirs in compose. A test that reads "the
+# command of a service" reads it here, so a command written back into
+# compose is read from compose -- what docker would run.
+
+_DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
+
+
+def image_command(dockerfile: str | None = None) -> list[str]:
+    """The exec form of the runtime stage's CMD -- the Dockerfile's last
+    CMD, its line continuations joined. A shell-form CMD is refused here:
+    it would put a shell between docker and the process."""
+    text = dockerfile if dockerfile is not None else _DOCKERFILE.read_text(
+        encoding="utf-8",
+    )
+    joined = text.replace("\\\n", " ")
+    found = re.findall(r"^CMD (.*)$", joined, re.M)
+    assert found, "the Dockerfile has no CMD"
+    command = json.loads(found[-1])
+    assert isinstance(command, list) and all(isinstance(a, str) for a in command), (
+        f"CMD is not the exec form: {found[-1]!r}"
+    )
+    return command
+
+
+def service_command(service: dict[str, Any]) -> list[str]:
+    """What a compose service runs: its own `command:`, else the image's
+    CMD for a service built from the image."""
+    command = service.get("command")
+    if command is None:
+        assert "build" in service, "a service with no command and no build"
+        return image_command()
+    if isinstance(command, str):
+        return command.split()
+    return [str(part) for part in command]

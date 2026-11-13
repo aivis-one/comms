@@ -151,8 +151,17 @@ ENV PYTHONPATH="/app"
 USER comms
 EXPOSE 8000
 
+# THE API'S COMMAND, ONE SOURCE (W1-2): compose gives comms-app none of its
+# own, so this is what runs on a box, and what CI's job `image` starts.
+# No migration here: the schema is the deploy machine's step `migrate`
+# (primer.yaml), before `up`. --log-config: uvicorn's own lines -- its
+# supervisor under --workers and each worker's before the app's lifespan
+# -- leave in the line of protocol 9.4 (app/core/log_config.json,
+# SanitizingFormatter); the path is relative to WORKDIR /app.
+# tests/test_api_command.py holds the command and runs it.
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
      "--workers", "2", \
-     "--proxy-headers"]
+     "--proxy-headers", \
+     "--log-config", "app/core/log_config.json"]

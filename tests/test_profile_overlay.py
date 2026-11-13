@@ -4,7 +4,7 @@
 #
 # What the overlay is and what it is checked for: app/profile/loader.py,
 # THE TEXT OVERLAY; the contract with the products: deploy/INTEGRATION.md
-# section 3, `PROFILE_OVERLAY_DIR`.
+# section 3, `TEMPLATES_OVERLAY_DIR`.
 #
 # Items:
 #   1 the overlay loads: empty variable -> byte for byte as without it;
@@ -14,8 +14,8 @@
 #     an EMPTY directory -> start, zero overrides, said with the path
 #   2 a broken overlay refuses the start, naming the file and the place
 #   3 explain_texts names the layer of every field
-#   4 the deploy forms (compose, comms-deploy.sh, the env templates,
-#     INTEGRATION.md) held against the code
+#   4 the deploy forms (compose, the env reference, INTEGRATION.md) held
+#     against the code: until W4-1 compose gives the overlay nothing
 #
 # MUTATIONS (one run, every one red here):
 #   M1  install_overlay registers nothing   -> TestOneFieldFromTheOverlay,
@@ -35,10 +35,10 @@
 #   M8  plain yaml.safe_load for the overlay -> test_a_key_declared_twice
 #   M9  a flag accepted as a text           -> test_a_flag_is_not_a_text
 #   M10 only the first violation reported   -> test_every_problem_at_once
-#   M11 compose env without `:+`            -> TestTheDeployForms
+#   M11 (W1-2) TEMPLATES_OVERLAY_DIR back in compose -> TestTheDeployForms
 #   M12 an empty directory refused          -> test_an_empty_directory_
 #                                              is_zero_overrides
-#   M13 check_overlay_dir passes a missing  -> TestTheDeployGuard
+#   M13 (gone in W1-2 with the old installer's check_overlay_dir)
 #       path
 #   M14 explain_texts walks its own chain   -> test_the_chain_is_the_one_
 #                                              render_walks
@@ -49,7 +49,6 @@
 
 import re
 import shutil
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -745,30 +744,28 @@ class TestExplain:
 # ---------------------------------------------------------------------------
 
 _APP_SERVICES = ("comms-app", "comms-worker", "comms-consumer")
-_SCRIPT = _DEPLOY / "comms-deploy.sh"
 
 
 class TestTheDeployForms:
-    def test_compose_hands_the_overlay_to_every_process(self) -> None:
-        """M11. The in-container name is the setting's own."""
+    def test_compose_gives_the_overlay_nothing_until_w4_1(self) -> None:
+        """M11. Until W1-2 compose handed every process the overlay as
+        TEMPLATES_OVERLAY_DIR=${PROFILE_OVERLAY_DIR:+/profile-overlay}
+        with a bind of PROFILE_OVERLAY_DIR, a host variable of the old
+        installer. The machine takes no variable that is not a key of
+        primer.yaml `env`, and the overlay's form on a box is W4-1's: so
+        no process gets the variable or a mount at /profile-overlay -- the
+        overlay is off, the setting's default. The pair: the profile
+        itself is handed over, at the setting's own name."""
         compose = yaml.safe_load((_DEPLOY / "docker-compose.yml").read_text())
         name = "templates_overlay_dir".upper()
         assert "templates_overlay_dir" in Settings.model_fields
+        assert Settings.model_fields["templates_overlay_dir"].default == ""
         for service in _APP_SERVICES:
             spec = compose["services"][service]
-            assert spec["environment"][name] == \
-                "${PROFILE_OVERLAY_DIR:+/profile-overlay}", service
-            (mount,) = [
-                v for v in spec["volumes"]
-                if isinstance(v, dict) and v.get("target") == "/profile-overlay"
-            ]
-            assert mount == {
-                "type": "bind",
-                "source": "${PROFILE_OVERLAY_DIR:-${PROFILE_DIR}}",
-                "target": "/profile-overlay",
-                "read_only": True,
-                "bind": {"create_host_path": False},
-            }, service
+            assert name not in spec["environment"], service
+            assert not [v for v in spec["volumes"] if "/profile-overlay" in str(v)]
+            assert spec["environment"]["TEMPLATES_DIR"] == "/profile", service
+            assert "/srv/comms/profile:/profile:ro" in spec["volumes"], service
 
     def test_the_env_name_reaches_the_setting(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -776,32 +773,15 @@ class TestTheDeployForms:
         monkeypatch.setenv("TEMPLATES_OVERLAY_DIR", "/profile-overlay")
         assert Settings(_env_file=None).templates_overlay_dir == "/profile-overlay"
 
-    def test_the_templates_carry_the_variable_empty(self) -> None:
-        """Until G4 the root .env.example carried TEMPLATES_OVERLAY_DIR
-        empty, and this test held that. G4 left one template, the
-        deploy's (the root copy had drifted from it and is gone), where
-        the variable is not written at all: compose sets it for every
-        comms process from PROFILE_OVERLAY_DIR, and a value in .env would
-        be overridden. So the root's line is replaced by what decides the
-        value: the compose `environment:` of every comms-* service,
-        read as YAML."""
+    def test_the_template_carries_the_variable_empty(self) -> None:
+        """Until W1-2 the template carried the host's PROFILE_OVERLAY_DIR
+        and PROFILE_DIR (the old installer's variables) and not this one,
+        which compose set. Compose sets it no more, so the setting is a
+        line of the reference -- empty, the code's default -- and the
+        host's variables are gone."""
         deploy_env = (_DEPLOY / ".env.example").read_text()
-        assert re.search(r"^PROFILE_OVERLAY_DIR=$", deploy_env, re.M)
-        assert re.search(r"^PROFILE_DIR=\S+$", deploy_env, re.M)
-        assert not re.search(r"^#?TEMPLATES_OVERLAY_DIR=", deploy_env, re.M)
-        compose = yaml.safe_load((_DEPLOY / "docker-compose.yml").read_text())
-        processes = {
-            name: service for name, service in compose["services"].items()
-            if name in ("comms-app", "comms-worker", "comms-consumer")
-        }
-        assert len(processes) == 3
-        for service in processes.values():
-            assert service["environment"]["TEMPLATES_OVERLAY_DIR"] == (
-                "${PROFILE_OVERLAY_DIR:+/profile-overlay}"
-            )
-        generated = _function("generate_env")
-        assert re.search(r"^PROFILE_OVERLAY_DIR=$", generated, re.M)
-        assert re.search(r"^PROFILE_DIR=\$PROFILE_DIR_DEFAULT$", generated, re.M)
+        assert "\n# by: default\nTEMPLATES_OVERLAY_DIR=\n" in deploy_env
+        assert not re.search(r"^#?PROFILE(_OVERLAY)?_DIR=", deploy_env, re.M)
 
     def test_integration_names_what_the_code_does(
         self, base_dir: Path, overlay_dir: Path,
@@ -810,9 +790,9 @@ class TestTheDeployForms:
         the mount, the info line, the core variables, the in_app line,
         and the refusal a reader is told to expect."""
         text = (_DEPLOY / "INTEGRATION.md").read_text()
-        section = text[text.index("### `PROFILE_OVERLAY_DIR`"):
+        section = text[text.index("### `TEMPLATES_OVERLAY_DIR`"):
                        text.index("### `lane`")]
-        for name in ("PROFILE_OVERLAY_DIR", "TEMPLATES_OVERLAY_DIR=/profile-overlay",
+        for name in ("TEMPLATES_OVERLAY_DIR", "W4-1",
                      "in_app", "overrides=0", "`{locale}.yaml`"):
             assert name in section, name
         for variable in CORE_VARIABLES:
@@ -822,72 +802,3 @@ class TestTheDeployForms:
             install_overlay(load_overlay(FileOverlaySource(overlay_dir), base))
         (line,) = [e for e in logs if e["event"] == "profile_overlay_installed"]
         assert f"`{line['event']}`" in section
-
-
-def _function(name: str) -> str:
-    """One top-level function of comms-deploy.sh, verbatim."""
-    text = _SCRIPT.read_text(encoding="utf-8")
-    match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
-    assert match, f"{name} not found at column zero"
-    return match.group(0)
-
-
-class TestTheDeployGuard:
-    """comms-deploy.sh check_overlay_dir: some compose releases create a
-    missing bind source despite create_host_path: false, and an empty
-    directory is a legal overlay -- so the path is checked on the host
-    before every `up`."""
-
-    def _run(self, overlay: str) -> subprocess.CompletedProcess[str]:
-        program = "\n".join([
-            "set -u",
-            "RED= GREEN= YELLOW= NC= ENV_FILE=/dev/null",
-            f"load_env() {{ PROFILE_OVERLAY_DIR='{overlay}'; }}",
-            _function("check_overlay_dir"),
-            "check_overlay_dir",
-            "echo reached-up",
-        ])
-        return subprocess.run(
-            ["bash", "-c", program], capture_output=True, text=True, timeout=30,
-        )
-
-    def test_a_missing_path_stops_before_up(self, tmp_path: Path) -> None:
-        """M13."""
-        missing = tmp_path / "nowhere"
-        done = self._run(str(missing))
-        assert done.returncode == 1
-        assert f"PROFILE_OVERLAY_DIR={missing} is not an existing directory" \
-            in done.stdout
-        assert "reached-up" not in done.stdout
-
-    def test_a_file_stops_before_up(self, tmp_path: Path) -> None:
-        file = tmp_path / "en.yaml"
-        file.write_text("x")
-        assert self._run(str(file)).returncode == 1
-
-    @pytest.mark.parametrize("kind", ["empty", "directory"])
-    def test_empty_or_a_directory_passes(self, tmp_path: Path, kind: str) -> None:
-        done = self._run("" if kind == "empty" else str(tmp_path))
-        assert done.returncode == 0
-        assert "reached-up" in done.stdout
-
-    @pytest.mark.parametrize(
-        "verb", ["cmd_install", "cmd_update", "cmd_restart", "cmd_start"],
-    )
-    def test_every_verb_that_starts_checks_first(self, verb: str) -> None:
-        """The check comes before the first start, in any of its forms:
-        a literal `$COMPOSE_CMD up`, or since TX-4 the two helpers that
-        start -- converge_datastores (the datastores, before update's and
-        install's dump) and recreate_app (the three application
-        containers, one copy for restart, update and restore). Until
-        TX-4 the literal was the only form, and the assertion read it
-        alone; the helpers made it miss starts it now must see."""
-        body = _function(verb)
-        starts = [
-            body.index(form)
-            for form in ("$COMPOSE_CMD up", "converge_datastores", "recreate_app")
-            if form in body
-        ]
-        assert starts, f"{verb} starts nothing?"
-        assert "check_overlay_dir" in body
-        assert body.index("check_overlay_dir") < min(starts)

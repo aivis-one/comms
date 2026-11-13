@@ -14,8 +14,9 @@
 #   3 a transient failure of the database: waited for, uncounted, while
 #     the database does not answer -- the event applied once it does;
 #     the bounded budget, then the dead letter, while it answers;
-#   4 update and install stop comms before the datastores converge, and
-#     bring it back as it was on a failure.
+#   4 (gone in W1-2 with the old installer: the order of its update and
+#     install; under the deploy machine nothing of comms runs while the
+#     schema is migrated -- primer.yaml stop_for_migrate).
 #
 # MUTATIONS these tests were written against (each turns one red):
 #   M1 event_data_or_none on the first defect only -> TestTheReviewsEntry
@@ -23,8 +24,7 @@
 #   M3 the transient failure always waited for -> TestWaitingForTheDatabase
 #      (b) and (c): the stream stands
 #   M4 _drain_pending from "0" again -> TestTheCursor (a)
-#   M5 convergence before the stop -> TestTheOrder
-#   M6 no start of the old containers on a failure -> TestTheOrder
+#   M5, M6 (gone with item 4)
 #   M7 the success's ack back inside the try -> TestHeld::test_an_ack
 #   M8 no pass over the pending list while running (WK-3) ->
 #      TestNotUntilARestart (the entry waits for a restart)
@@ -56,7 +56,6 @@ from tests.helpers import (
     real_misuse_of_a_connection,
     real_serialization_failure,
 )
-from tests.test_deploy_hardening import _index, _run
 from tests.test_transport_consumer import (
     _no_pending,
     _run_until,
@@ -447,37 +446,3 @@ class TestWaitingForTheDatabase:
         (dead,) = await _dlq(fake_redis)
         assert dead["_dlq_error"].startswith("retries exhausted: ")
 
-
-class TestTheOrder:
-    def test_update_stops_comms_before_the_datastores(self, tmp_path: Any) -> None:
-        done, calls = _run(tmp_path, "cmd_update")
-        assert done.returncode == 0, done.stdout + done.stderr
-        stop = _index(calls, "compose stop comms-consumer comms-worker comms-app")
-        converge = _index(calls, "compose up -d comms-postgres comms-redis")
-        dump = _index(calls, "compose exec -T comms-postgres pg_dump")
-        app = _index(calls, "compose up -d --force-recreate --no-deps")
-        assert stop < converge < dump < app
-
-    @pytest.mark.parametrize("failure", [{"HEALTH": "starting",
-                                          "COMMS_HEALTH_WAIT_SECONDS": "2"},
-                                         {"DUMP_RC": "1"}],
-                             ids=["converge", "dump"])
-    def test_update_brings_the_old_ones_back(
-        self, tmp_path: Any, failure: dict[str, str],
-    ) -> None:
-        done, calls = _run(tmp_path, "cmd_update", **failure)
-        assert done.returncode == 1
-        assert any(c == "compose start comms-app comms-worker comms-consumer"
-                   for c in calls)
-        assert not any("--force-recreate" in c for c in calls)
-
-    def test_install_on_a_live_base_the_same(self, tmp_path: Any) -> None:
-        done, calls = _run(tmp_path, "cmd_install", SCHEMA="t")
-        assert done.returncode == 0, done.stdout + done.stderr
-        stop = _index(calls, "compose stop comms-consumer comms-worker comms-app")
-        converge = _index(calls, "compose up -d comms-postgres comms-redis")
-        dump = _index(calls, "compose exec -T comms-postgres pg_dump")
-        assert stop < converge < dump < calls.index("compose up -d")
-        failed, calls = _run(tmp_path, "cmd_install", SCHEMA="t", DUMP_RC="1")
-        assert failed.returncode == 1
-        assert "compose start comms-app comms-worker comms-consumer" in calls

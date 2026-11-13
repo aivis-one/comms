@@ -2,13 +2,16 @@
 # H7 R-G -- every comms process's pool, together, fits max_connections
 # =============================================================================
 #
-# THE SUM, read off deploy/docker-compose.yml as it ships:
+# THE SUM, read off deploy/docker-compose.yml as it ships, and the
+# Dockerfile's CMD for comms-app, which has no command of its own in
+# compose since W1-2 (tests/helpers.py service_command):
 #   api pool x comms-app's uvicorn --workers
 #   + worker pool + its wake listener (one connection, own engine)
 #   + consumer pool (the push relay shares it)
 #   + the database probe's connection, outside the pool, in the worker
 #     and in the consumer (PROBE_CONNECTIONS each, WK-2)
-#   + RESERVED_CONNECTIONS (migration, psql / pg_dump, the deploy probe)
+#   + RESERVED_CONNECTIONS (the machine's migration, psql / pg_dump, one
+#     spare)
 #   <= max_connections - superuser_reserved_connections
 # max_connections is the number written in the compose file -- never a
 # default assumed here. superuser_reserved_connections is Postgres'
@@ -43,6 +46,7 @@ from app.core.database import (
     get_engine,
     set_process_role,
 )
+from tests.helpers import service_command
 
 _COMPOSE = Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.yml"
 _SUPERUSER_RESERVED = 3  # Postgres' default superuser_reserved_connections
@@ -57,8 +61,7 @@ def _services() -> dict[str, Any]:
 
 
 def _command(service: dict[str, Any]) -> str:
-    command = service.get("command", "")
-    return " ".join(command) if isinstance(command, list) else str(command)
+    return " ".join(service_command(service))
 
 
 def _role_of(command: str) -> ProcessRole:
@@ -72,7 +75,7 @@ def _role_of(command: str) -> ProcessRole:
 
 
 def _max_connections() -> int:
-    command = _command(_services()["comms-postgres"])
+    command = " ".join(_services()["comms-postgres"]["command"])
     found = re.search(r"max_connections=(\d+)", command)
     assert found is not None, "comms-postgres must write max_connections"
     return int(found.group(1))

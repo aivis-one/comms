@@ -1,31 +1,32 @@
 # =============================================================================
-# COMMS Service -- the deploy's environment template is every knob (G4)
+# COMMS Service -- the deploy's environment reference is every knob (G4)
 # =============================================================================
 #
-# deploy/.env.example is the ONE template (the root copy drifted from it
-# and is gone). It is held to the code both ways, and to the compose file
-# both ways:
+# deploy/.env.example is the ONE reference of the deploy's variables (the
+# root copy drifted from it and is gone). No file is made from it since
+# W1-2: Primer's deploy machine renders the instance's values by
+# primer.yaml `env`, and deploy/docker-compose.yml hands them to the comms
+# processes. It is held to the code both ways, and to the compose file
+# and primer.yaml:
 #
-#   forward  every setting of app/core/config.py is a variable line,
-#            except what docker-compose.yml sets itself for the comms
-#            processes (`environment:`, read as YAML) -- a value in .env
-#            would be overridden there, and that fact lives once, in
-#            compose;
+#   forward  every setting of app/core/config.py is a variable line;
 #   reverse  every variable line is a setting, or a variable comms'
-#            compose file or installer reads, each found in that file in
-#            the form it is read;
+#            compose file reads, found there in the form it is read;
 #   compose  every name compose substitutes from the environment
 #            (${NAME}, ${NAME:-x}, ${NAME-x}, ${NAME:+x}, ${NAME:?x},
 #            $NAME; $$ is an escape, not a substitution) is a variable
-#            line -- compose takes it from the generated .env, so a name
-#            the template does not document is a knob nobody can find
-#            (review 3.10.0: until the fix a new ${NAME} in compose
+#            line (review 3.10.0: until the fix a new ${NAME} in compose
 #            passed every test above);
-#   values   a line commented out, and an operator's line, holds the
-#            setting's default (an example only for a setting whose
-#            default is "unset", and the comment says so);
-#   writers  the `# by:` line above each variable; the ones `install`
-#            writes are exactly the ones generate_env writes.
+#   values   a line by `default` holds the setting's default (an example
+#            only for a setting whose default is "unset", and the comment
+#            says so); a line by `compose` holds what compose sets;
+#   writers  the `# by:` line above each variable: `primer.yaml` are
+#            exactly the names compose substitutes, each a key of
+#            primer.yaml `env`; `compose` are exactly the names compose
+#            sets. Until W1-2 the writers were the old installer's, held
+#            to its generate_env, and compose's own values were left out
+#            of the file; the installer is gone, and a value compose sets
+#            is written as compose sets it, held here.
 #
 # Mutations (built once, by hand):
 #   M12 a variable line taken out           -> test_every_setting_is_there
@@ -34,6 +35,8 @@
 #   M17 ${EXTRA_ASSETS_DIR} into compose    -> test_every_name_compose_
 #                                              substitutes_is_there
 #   M18 $EXTRA_ASSETS_DIR into compose      -> the same
+#   W1-2 the DATABASE_URL line not compose's -> test_what_compose_sets_is_
+#                                              written_as_compose_sets_it
 # =============================================================================
 
 import re
@@ -47,24 +50,15 @@ from app.core.config import Settings
 _REPO = Path(__file__).resolve().parents[1]
 _TEMPLATE = (_REPO / "deploy" / ".env.example").read_text(encoding="utf-8")
 _COMPOSE = (_REPO / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
-_INSTALLER = (_REPO / "deploy" / "comms-deploy.sh").read_text(encoding="utf-8")
+_PRIMER = yaml.safe_load((_REPO / "primer.yaml").read_text(encoding="utf-8"))
 
 _LINE = re.compile(r"^(#?)([A-Z][A-Z0-9_]+)=(.*)$")
-_WRITERS = {"install", "install, then a product installer",
-            "a product installer", "operator"}
+_WRITERS = {"primer.yaml", "compose", "default"}
 
-# Variables of the template that are not settings, and where each is
-# read: by the compose file (interpolation, or the image of a service
-# that takes ./.env) or by the installer.
-_NOT_SETTINGS = {
-    "POSTGRES_USER": "compose",
-    "POSTGRES_DB": "compose",
-    "REDIS_PASSWORD": "compose",
-    "PROFILE_DIR": "compose",
-    "PROFILE_OVERLAY_DIR": "compose",
-    "POSTGRES_PASSWORD": "installer",
-    "PRODUCT_ENV_PATH": "installer",
-}
+# Variables of the template that are not settings: keys of primer.yaml
+# `env` the compose file reads to build a setting or to give a datastore
+# its own variable.
+_NOT_SETTINGS = {"POSTGRES_PASSWORD", "COMMS_EVENTS_PASSWORD"}
 
 
 def _variables(text: str) -> list[tuple[bool, str, str, int]]:
@@ -77,18 +71,30 @@ def _variables(text: str) -> list[tuple[bool, str, str, int]]:
     return found
 
 
-def _compose_environment(text: str) -> set[str]:
-    """The keys every service of a compose file SETS in `environment:`,
-    read as YAML -- a name in a comment is not one.
+def _by(writer: str) -> dict[str, str]:
+    """name -> value of every variable line whose `# by:` is `writer`."""
+    lines = _TEMPLATE.splitlines()
+    return {
+        name: value for _c, name, value, index in _variables(_TEMPLATE)
+        if lines[index - 1] == f"# by: {writer}"
+    }
 
-    A key that only passes its own variable through from .env
-    (`POSTGRES_USER: ${POSTGRES_USER:?...}`) is not set by compose: the
-    value is the template's. Until TX-4 every `environment:` key was
-    one compose set itself, and the subtraction was right as it was;
-    TX-4 gave comms-postgres and comms-redis their own variables this
-    way instead of the whole .env, and those stay the template's."""
-    names: set[str] = set()
+
+def _compose_values(text: str) -> dict[str, set[str]]:
+    """What the comms processes of a compose file -- the services built
+    from the image -- SET in `environment:`, read as YAML (a name in a
+    comment is not one): name -> every value it takes. The datastores'
+    own variables are theirs, not settings of comms.
+
+    A key that only passes its own variable through
+    (`COMMS_SERVICE_TOKEN: ${COMMS_SERVICE_TOKEN:?}`) is not set by
+    compose: the value is the machine's. TX-4 gave comms-postgres and
+    comms-redis their own variables; W1-2 made every comms process take
+    its values this way, the file has no env_file."""
+    values: dict[str, set[str]] = {}
     for service in (yaml.safe_load(text).get("services") or {}).values():
+        if "build" not in service:
+            continue
         environment = service.get("environment") or {}
         if isinstance(environment, list):
             pairs = [[*item.split("=", 1), ""] for item in environment]
@@ -97,19 +103,17 @@ def _compose_environment(text: str) -> set[str]:
             items = dict(environment)
         for name, value in items.items():
             if re.fullmatch(rf"\$\{{{name}(?::?[-?][^}}]*)?\}}", str(value or "")):
-                continue  # passed through from .env, not set here
-            names.add(name)
-    return names
+                continue  # passed through, not set here
+            values.setdefault(name, set()).add(str(value))
+    return values
+
+
+def _compose_environment(text: str) -> set[str]:
+    return set(_compose_values(text))
 
 
 def _settings() -> set[str]:
     return {name.upper() for name in Settings.model_fields}
-
-
-def _generate_env() -> str:
-    match = re.search(r"^generate_env\(\) \{\n.*?^\}\n", _INSTALLER, re.S | re.M)
-    assert match, "generate_env not found at column zero"
-    return match.group(0)
 
 
 # A name compose substitutes: `$` and a name, braced or bare (compose's
@@ -137,70 +141,76 @@ def _code_lines(text: str) -> str:
 
 
 class TestBothWays:
-    def test_compose_sets_what_the_template_leaves_out(self) -> None:
-        """The pair of the subtraction: it is not empty, and it holds
-        both template directories."""
-        subtracted = _compose_environment(_COMPOSE)
-        assert {"TEMPLATES_DIR", "TEMPLATES_OVERLAY_DIR"} <= subtracted
-        assert subtracted <= _settings()
+    def test_compose_sets_what_it_builds(self) -> None:
+        """The pair of the compose rows: compose sets values, the two URLs
+        it builds and the profile's mount point among them, all of them
+        settings."""
+        set_here = _compose_environment(_COMPOSE)
+        assert {"TEMPLATES_DIR", "DATABASE_URL", "REDIS_URL"} <= set_here
+        assert set_here <= _settings()
 
-    def test_a_name_in_a_compose_comment_is_not_subtracted(self) -> None:
+    def test_a_name_in_a_compose_comment_is_not_set(self) -> None:
         text = (
             "services:\n"
             "  a:\n"
+            "    build: .\n"
             "    # LOG_LEVEL: DEBUG\n"
             "    environment:\n"
             "      TEMPLATES_DIR: /profile\n"
+            "      COMMS_SERVICE_TOKEN: ${COMMS_SERVICE_TOKEN:?}\n"
             "  b:\n"
+            "    build: .\n"
             "    environment:\n"
             "      - DLQ_MAXLEN=5\n"
+            "  store:\n"
+            "    environment:\n"
+            "      POSTGRES_DB: comms\n"
         )
-        assert _compose_environment(text) == {"TEMPLATES_DIR", "DLQ_MAXLEN"}
+        assert _compose_values(text) == {
+            "TEMPLATES_DIR": {"/profile"}, "DLQ_MAXLEN": {"5"},
+        }
 
     def test_every_setting_is_there(self) -> None:
-        expected = _settings() - _compose_environment(_COMPOSE)
+        """Until W1-2 the settings compose sets were subtracted (a value
+        in the generated .env would have been overridden); no .env is
+        generated now, and they are written as compose writes them."""
         written = {name for _c, name, _v, _i in _variables(_TEMPLATE)}
-        assert expected - written == set()
+        assert _settings() - written == set()
         # The pair: the walk compared settings, the knobs a review named
-        # among them. 47 since W2-1: the three channel flags; 48 since
-        # W2-1b: the next service token.
-        assert len(expected) == 48
+        # among them. 50 since W1-2 (48 written before, and the two URLs).
+        assert len(_settings()) == 50
         assert {
             "NOTIFICATION_RETENTION_DAYS",
             "DLQ_MAXLEN",
             "NOTIFICATION_LANE_NORMAL_BATCH_SIZE",
-        } <= expected & written
+        } <= _settings() & written
 
-    def test_nothing_compose_sets_is_written(self) -> None:
-        written = {name for _c, name, _v, _i in _variables(_TEMPLATE)}
-        assert written & _compose_environment(_COMPOSE) == set()
+    def test_what_compose_sets_is_written_as_compose_sets_it(self) -> None:
+        values = _compose_values(_COMPOSE)
+        assert values  # the pair: compose sets something
+        for name, given in values.items():
+            assert len(given) == 1, f"{name}: two values over the services"
+        assert _by("compose") == {
+            name: value for name, (value,) in values.items()
+        }
 
     def test_every_variable_is_read(self) -> None:
         compose = _code_lines(_COMPOSE)
-        installer = _code_lines(_INSTALLER)
         for _c, name, _v, _i in _variables(_TEMPLATE):
             if name in _settings():
                 continue
-            where = _NOT_SETTINGS.get(name)
-            assert where is not None, f"{name} is read by nobody"
-            if where == "compose":
-                assert re.search(
-                    rf"\$\{{{name}\b|\$\$\{{{name}\}}|\$\${name}\b", compose,
-                ), name
-            else:
-                assert re.search(rf"\b{name}\b", installer), name
-        assert all(
-            name in {n for _c, n, _v, _i in _variables(_TEMPLATE)}
-            for name in _NOT_SETTINGS
-        )
+            assert name in _NOT_SETTINGS, f"{name} is read by nobody"
+            assert re.search(rf"\$\{{{name}\b", compose), name
+        written = {n for _c, n, _v, _i in _variables(_TEMPLATE)}
+        assert written >= _NOT_SETTINGS
 
     def test_every_name_compose_substitutes_is_there(self) -> None:
         substituted = _compose_substituted(_code_lines(_COMPOSE))
         written = {name for _c, name, _v, _i in _variables(_TEMPLATE)}
         assert substituted - written == set()
-        # The pair: the scan found names, the two compose reads for the
-        # profile among them.
-        assert {"PROFILE_DIR", "PROFILE_OVERLAY_DIR"} <= substituted
+        # The pair: the scan found names, the two compose builds the URLs
+        # from among them.
+        assert {"POSTGRES_PASSWORD", "COMMS_EVENTS_PASSWORD"} <= substituted
 
     @pytest.mark.parametrize(
         ("text", "names"),
@@ -229,18 +239,21 @@ class TestBothWays:
     def test_every_variable_is_written_once(self) -> None:
         names = [name for _c, name, _v, _i in _variables(_TEMPLATE)]
         # 54 since W2-1: the three channel flags; 55 since W2-1b: the
-        # next service token.
-        assert len(names) == len(set(names)) == 55
+        # next service token; 52 since W1-2: the installer's seven
+        # variables gone, DATABASE_URL and REDIS_URL kept, the two URLs'
+        # keys (POSTGRES_PASSWORD kept, COMMS_EVENTS_PASSWORD new), the
+        # two template directories written.
+        assert len(names) == len(set(names)) == 52
 
 
 class TestValues:
     def test_the_values_are_the_defaults(self) -> None:
         lines = _TEMPLATE.splitlines()
         checked = 0
-        for commented, name, value, index in _variables(_TEMPLATE):
-            operator = lines[index - 1] == "# by: operator"
-            if not (commented or operator) or name not in _settings():
+        for _commented, name, value, index in _variables(_TEMPLATE):
+            if lines[index - 1] != "# by: default":
                 continue
+            assert name in _settings(), name
             default = Settings.model_fields[name.lower()].default
             if default is None:
                 # "Unset" has no value to write: the line is an example,
@@ -261,12 +274,12 @@ class TestWriters:
             assert marker.startswith("# by: "), name
             assert marker[len("# by: "):] in _WRITERS, name
 
-    def test_install_writes_what_the_template_says(self) -> None:
-        lines = _TEMPLATE.splitlines()
-        marked = {
-            name for _c, name, _v, index in _variables(_TEMPLATE)
-            if lines[index - 1][len("# by: "):].split(",")[0] == "install"
-        }
-        written = set(re.findall(r"^([A-Z][A-Z0-9_]+)=", _generate_env(), re.M))
-        assert marked == written
-        assert len(written) > 15
+    def test_the_machines_are_what_compose_takes_from_it(self) -> None:
+        """`primer.yaml` lines: exactly the names compose substitutes,
+        each a key of primer.yaml `env` (the machine refuses any other in
+        compose: scripts/check_primer_yaml.py). Until W1-2 the installer's
+        lines were held to its generate_env here."""
+        marked = set(_by("primer.yaml"))
+        assert marked == _compose_substituted(_code_lines(_COMPOSE))
+        assert marked <= set(_PRIMER["env"])
+        assert len(marked) > 10

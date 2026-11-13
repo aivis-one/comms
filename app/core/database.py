@@ -122,11 +122,10 @@ POOLS: dict[ProcessRole, Pool] = {
     ProcessRole.CONSUMER: Pool(size=5, overflow=5),
 }
 
-# Connections outside every pool: the migration (alembic in comms-app,
-# its own engine -- migrations/env.py -- running beside the old worker
-# and consumer during an update), an operator's psql or pg_dump
-# (comms-deploy.sh db, backup, restore), and the deploy script's own
-# asyncpg probe (comms-deploy.sh drain).
+# Connections outside every pool: the migration (alembic, its own engine
+# -- migrations/env.py -- in the deploy machine's throwaway container of
+# comms-app, its step `migrate`), an operator's psql or pg_dump (the
+# machine's `db_dump` among them), and one spare.
 RESERVED_CONNECTIONS = 3
 
 # The probe's own connection (database_answers), outside the pool, in

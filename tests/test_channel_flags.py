@@ -637,9 +637,12 @@ class TestTheContract:
         assert f"\n    {caught.value}\n" in _DOC
 
     def test_the_env_template_carries_every_flag(self) -> None:
+        """Until W1-2 the writer was "a product installer" (its second
+        pass); the flag is now the passport's option, a key of
+        primer.yaml `env` (tests/test_primer_yaml.py TestChannels)."""
         for flag in channel_flag_keys():
             assert re.search(
-                rf"^# by: a product installer\n{flag}=(true|false)$",
+                rf"^# by: primer.yaml\n{flag}=(true|false)$",
                 _TEMPLATE, re.M,
             ), flag
 

@@ -764,12 +764,6 @@ class TestTemplateKeys:
 
 
 class TestShippedProfiles:
-    def test_smoke_profile_loads_on_a_deploy_without_externals(self) -> None:
-        profile = load_profile(
-            FileProfileSource(REPO_ROOT / "deploy" / "smoke-profile"),
-        )
-        assert set(profile.types) == set(MSG_TYPE_KEYS)
-
     def test_fixture_profile_loads(self) -> None:
         """Was ..._against_the_suite_deploy: the fixture routed nothing
         but in_app, so the suite's own deploy (externals blanked) could

@@ -24,7 +24,7 @@ from typing import Any
 # form each is checked in:
 #   DATABASE_URL        postgresql+asyncpg://comms:<pw>@host/db   userinfo
 #   REDIS_URL           redis://:<pw>@host:6379/0 (EMPTY user --
-#                       the form deploy/comms-deploy.sh writes)    userinfo
+#                       the form deploy/docker-compose.yml builds) userinfo
 #   COMMS_SERVICE_TOKEN Authorization: Bearer <t>; bare hex         header,
 #                                                                  bearer, hex
 #   TELEGRAM_BOT_TOKEN  .../bot<id>:<secret>/sendMessage inside an
@@ -35,8 +35,10 @@ from typing import Any
 #                                                                  header
 #   LLM_KEY_SETS keys   bare sk-<key chars>; Authorization: Bearer   llm,
 #                       <key> (the adapter's header)               bearer
-# Generated passwords and the service token (openssl rand -hex 24/32 in
-# comms-deploy.sh) are also caught BARE by the long-hex pattern.
+# The passwords and the service token the deploy machine mints
+# (token_urlsafe: 43 characters of [A-Za-z0-9_-]) are caught in the
+# userinfo, header and bearer forms above, and NOT bare -- see the KNOWN
+# CEILING at the long-hex pattern below.
 #
 # ORDER MATTERS, and every pattern is IDEMPOTENT on its own output --
 # the email path sanitizes the provider's text where it enters, and the
@@ -124,26 +126,30 @@ _MAILGUN_KEY_RE = re.compile(
 # characters (`sk-or-v1-<hex>`, `sk-proj-...`). A vendor key of another
 # shape is the KNOWN CEILING below.
 _LLM_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
-# KNOWN CEILING -- bare secrets the operator chose by hand.
+# KNOWN CEILING -- bare secrets in a shape no pattern here knows.
 #   1. Mechanics: this pattern catches a secret with no keyword, header
-#      or URL around it ONLY in the shape comms-deploy.sh mints (48+ hex
-#      characters). A password, token or key the operator typed in
-#      another shape, surfacing bare in an error text, passes through
-#      every pattern here unchanged.
+#      or URL around it ONLY as 48+ hex characters -- the shape the old
+#      installer minted (gone since W1-2). The secrets of an instance are
+#      now minted by Primer's deploy machine as token_urlsafe(32), 43
+#      characters of [A-Za-z0-9_-] (POSTGRES_PASSWORD, COMMS_SERVICE_TOKEN,
+#      COMMS_EVENTS_PASSWORD), and the channels' keys are asked of the
+#      operator: any of them surfacing bare in an error text passes
+#      through every pattern here unchanged. The machine cleans the
+#      values it holds out of the lines of comms' log itself (protocol
+#      9.4); a text comms stores (a delivery's error, a dead letter) is
+#      not a line of the log.
 #   2. Status: acknowledged by design.
-#   3. Task: none -- no secret outside the minted shapes exists in any
-#      deploy we know of, and the shape of a hand-typed value cannot be
-#      recognised by any pattern without also eating ordinary text.
-#   4. Unfreeze trigger: a secret appears in a deploy's configuration
-#      that was NOT written by comms-deploy.sh generate_env and is not
-#      one of the provider credentials matched above.
+#   3. Task: none -- outside the table of W1-2, which found it (the
+#      trigger below has fired: report of W1-2, observations).
+#   4. Unfreeze trigger: a secret of the instance in a text comms stores
+#      or answers -- a delivery's error, a dead letter, a response.
 #   5. Agreed fix: redact by VALUE, not by shape -- read the configured
 #      secrets from settings once and replace their literal occurrences.
 #   6. Rejected: widening the shape patterns to "any long token" (eats
 #      message ids, digests and ordinary identifiers, and still misses a
-#      short password); refusing non-hex secrets at startup (not ours to
-#      demand of a provider credential, and a red start on a valid
-#      configuration).
+#      short password); refusing secrets of another shape at startup (not
+#      ours to demand of a provider credential or of the machine, and a
+#      red start on a valid configuration).
 _LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{48,}\b")
 # The key: a credential word with any prefix joined by _ or -. LINEAR on
 # any text (REV-6): the prefix starts only where no letter, digit, _ or -

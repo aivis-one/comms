@@ -364,4 +364,7 @@ class TestTheContract:
         assert named == _token_fields()
 
     def test_the_env_template_carries_the_next_one_empty(self) -> None:
-        assert "\n# by: operator\nCOMMS_SERVICE_TOKEN_NEXT=\n" in _TEMPLATE
+        """Until W1-2 the writer was `operator`; on a box of the machine
+        nothing sets it (primer.yaml declares no key for it), so it is the
+        code's default, empty."""
+        assert "\n# by: default\nCOMMS_SERVICE_TOKEN_NEXT=\n" in _TEMPLATE

@@ -711,50 +711,6 @@ class TestExistingDeployIsUnchanged:
         assert formatter._bot_url == _GOOD_URL
 
 
-# ---------------------------------------------------------------------------
-# The installer must not mint a state the service refuses
-# ---------------------------------------------------------------------------
-
-
-class TestGeneratedEnv:
-    """`comms-deploy.sh install` writes an EMPTY telegram key set.
-
-    R-0: it used to mint a placeholder token next to an empty bot URL --
-    a partial set, which the new rule refuses. The product installer
-    delivers both keys later, so the generated file must carry the legal
-    empty state, not a half-set.
-    """
-
-    def _generate_env_body(self) -> str:
-        script = (REPO_ROOT / "deploy" / "comms-deploy.sh").read_text()
-        start = script.index("generate_env() {")
-        return script[start : script.index("\n}\n", start)]
-
-    def test_no_placeholder_and_the_keys_are_there_empty(self) -> None:
-        """The absence assertion with its pair: "no placeholder" alone
-        would also pass on a file that lost the keys entirely."""
-        body = self._generate_env_body()
-        # Absence.
-        assert "replace-with-real" not in body
-        assert "tg_placeholder" not in body
-        # Its pair: every channel key present, and present EMPTY.
-        # R-1: email joined the list -- an installer that mints a
-        # PARTIAL set of any channel writes a state the service itself
-        # refuses, and the fresh install of a product dies on it.
-        from app.core.channels import channel_env_keys
-
-        for key in channel_env_keys():
-            assert f"\n{key}=\n" in body, key
-
-    def test_service_token_is_present_and_not_empty(self) -> None:
-        """The generated env declares APP_ENV=production, where the
-        service token is required -- so the installer must mint one."""
-        body = self._generate_env_body()
-        assert "\nAPP_ENV=production\n" in body
-        assert "\nCOMMS_SERVICE_TOKEN=$service_token\n" in body
-        assert "service_token=$(openssl rand -hex 32)" in body
-
-
 class TestWorkerBuildsAtStartup:
     def test_main_builds_the_registry_before_the_loop(self) -> None:
         """The worker is the only process that delivers, so it builds

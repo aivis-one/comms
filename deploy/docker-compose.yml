@@ -1,101 +1,80 @@
-name: comms
-# The compose PROJECT name, declared rather than inferred.
-#
-# Unset, compose derives it from the directory holding this file, which is an
-# accident of the checkout layout: two stacks whose files both sit in `deploy/`
-# resolve to ONE project, and one whose file sits in a repository root becomes
-# `repo`. Same project means one label namespace -- `ps` from either directory
-# lists the other's containers, every `up -d` reports the other's as orphans,
-# and `down --remove-orphans` from either destroys the other.
-#
-# CONVENTION for every service on these servers: declare it here, first line,
-# equal to the service name. A stack that does not is one directory rename away
-# from colliding with a stack it has never heard of.
-#
-# Nothing observes this except a live docker daemon, so no test covers it.
-
 # =============================================================================
-# COMMS -- Docker Compose (deploy/, Phase 5)
+# COMMS -- Docker Compose, as Primer's deploy machine runs it (W1-2)
 # =============================================================================
 #
-# The comms stack as its OWN compose project, sitting NEXT TO the
-# product stack on one VPS (DD-1/DD-3, variant A): dedicated
-# containers, nothing shared with the product except the external
-# docker network "aivis-shared".
+# The machine runs this file as `docker compose -p comms --env-file <its
+# rendered env> -f deploy/docker-compose.yml -f <its override>`: the
+# project name, the values and the networks towards the product are the
+# machine's (contract 3, protocol 3.3-3.4). `pridem check` holds this file
+# to the machine's rules in CI (scripts/check_primer_yaml.py, job
+# `machine`); the one finding it is allowed is the profile's mount, below.
 #
-# FIVE services, THREE of them from the ONE root Dockerfile
-# (same image, different commands):
-#   comms-app      -- uvicorn API; the ONLY migrator (alembic runs
-#                     before uvicorn, so "app is healthy" implies
-#                     "schema is migrated");
+# FIVE services, THREE of them from the ONE root Dockerfile (same image,
+# different commands):
+#   comms-app      -- the API: the image's own CMD (Dockerfile), the one
+#                     source of its command; it does NOT migrate. The
+#                     schema is the machine's step `migrate` (primer.yaml
+#                     stacks.comms.migrate), run in a throwaway container
+#                     of this service before `up`, with the three
+#                     application services stopped (stop_for_migrate);
 #   comms-worker   -- delivery loop (python -m app.worker);
 #   comms-consumer -- product event stream reader (python -m
-#                     app.consumer), the integration backbone; and
-#                     the push relay back to the product (P3-1);
+#                     app.consumer) and the push relay back to the
+#                     product (P3-1);
 #   comms-postgres -- dedicated database (never the product's);
-#   comms-redis    -- DURABLE stream backbone (DD-4): AOF +
-#                     noeviction + requirepass. NOT a cache.
+#   comms-redis    -- DURABLE stream backbone (DD-4): AOF + noeviction +
+#                     requirepass. NOT a cache.
 #
-# INTERNAL SERVICE (DD-5): comms-app publishes NO host port and gets
-# no nginx route. The only way in is over "aivis-shared" from the
-# product backend, presenting the shared service token.
+# VALUES (protocol 3.4, contract 3 rules 18, 33): no env_file; every
+# value is `${KEY:?}` of a key of primer.yaml `env`, or a constant here.
+# Two settings comms reads are built here from keys of `env`:
+# DATABASE_URL from POSTGRES_PASSWORD, REDIS_URL from
+# COMMS_EVENTS_PASSWORD (tests/test_primer_yaml.py COMPOSED). A key of a
+# switched-off option holds the machine's literal, which comms never
+# reads; `:?` refuses a key that is absent or empty -- a red start.
 #
-# The network is EXTERNAL: created once, idempotently, by
-# `comms-deploy.sh install` (docker network create aivis-shared);
-# the product stack joins the same network on its side.
+# NETWORKS: none towards the product here. The machine's override puts
+# comms-app on its network `pridem` as `comms-comms-app` (COMMS_API_URL)
+# and comms-redis on the network of each pair of the point `events` as
+# `comms-comms-redis` (COMMS_EVENTS_ADDRESS); see deploy/INTEGRATION.md
+# section 1. comms-internal holds all five; the database lives only there.
+# The three application services are also on `default`: they reach the
+# channels' providers (Telegram, Mailgun, the llm gateways).
 #
-# Environment comes from ./.env (written by `install`, never
-# committed). PROFILE_DIR points at the per-instance profile
-# directory OUTSIDE the checkout (survives `update`); it is
-# bind-mounted read-only and exposed to the service as
-# TEMPLATES_DIR=/profile.
-#
-# PROFILE_OVERLAY_DIR (optional, PO-1) points at the TEXT OVERLAY:
-# {locale}.yaml files replacing single texts of the profile
-# (deploy/INTEGRATION.md section 3). Set -> mounted read-only at
-# /profile-overlay and exposed as TEMPLATES_OVERLAY_DIR=/profile-overlay.
-# Empty or absent from .env -> TEMPLATES_OVERLAY_DIR is empty and the
-# service runs on the profile alone; the mount then carries PROFILE_DIR
-# only because a bind needs an existing source, and nothing reads it.
-# A set path that does not exist must refuse the start: the long syntax
-# with create_host_path: false says so to compose, and comms-deploy.sh
-# checks it before every `up` (check_overlay_dir) because some compose
-# releases create the path anyway -- an empty directory would then pass
-# for "no overrides".
-#
-# Usage (via the CLI next to this file):
-#   comms-deploy.sh install | update | logs | db | status
+# THE PROFILE -- temporarily, until W4-1: a literal bind of a host path,
+# the one finding the machine is allowed here (KNOWN CEILING in
+# scripts/check_primer_yaml.py, the full marker). The text overlay
+# (TEMPLATES_OVERLAY_DIR) has no form here until W4-1: comms runs on the
+# profile alone.
 # =============================================================================
+
+# What every application process reads from the instance, by the keys of
+# primer.yaml `env` (tests/test_primer_yaml.py holds both ways).
+x-comms-env: &comms-env
+  TEMPLATES_DIR: /profile
+  DATABASE_URL: postgresql+asyncpg://comms:${POSTGRES_PASSWORD:?}@comms-postgres:5432/comms
+  COMMS_SERVICE_TOKEN: ${COMMS_SERVICE_TOKEN:?}
+  TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:?}
+  EMAIL_ENABLED: ${EMAIL_ENABLED:?}
+  LLM_ENABLED: ${LLM_ENABLED:?}
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?}
+  TELEGRAM_BOT_URL: ${TELEGRAM_BOT_URL:?}
+  EMAIL_MAILGUN_API_KEY: ${EMAIL_MAILGUN_API_KEY:?}
+  EMAIL_MAILGUN_DOMAIN: ${EMAIL_MAILGUN_DOMAIN:?}
+  EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:?}
+  EMAIL_MAILGUN_REGION: ${EMAIL_MAILGUN_REGION:?}
+  LLM_KEY_SETS: ${LLM_KEY_SETS:?}
 
 services:
   comms-app:
     build:
       context: ..
-    container_name: comms-app
-    env_file:
-      - ./.env
-    environment:
-      # The in-container profile mount point; the host side is
-      # PROFILE_DIR from .env (see volumes below).
-      TEMPLATES_DIR: /profile
-      TEMPLATES_OVERLAY_DIR: ${PROFILE_OVERLAY_DIR:+/profile-overlay}
-    # The ONLY migrator: schema first, then the server. `exec` hands
-    # PID 1 to uvicorn (clean signal handling). Worker/consumer gate
-    # on this container's health, so they never race the migration.
-    command: >
-      sh -c "alembic upgrade head
-      && exec uvicorn app.main:app --host 0.0.0.0 --port 8000
-      --workers 2 --proxy-headers"
-    # NO ports: section -- internal by design (DD-5). Port 8000 is
-    # reachable only inside "aivis-shared" as http://comms-app:8000.
+    # No command: the image's CMD (Dockerfile) -- uvicorn with its log
+    # config, no migration. NO ports: internal by design (DD-5); the
+    # product reaches it through the machine's network.
+    environment: *comms-env
     volumes:
-      - ${PROFILE_DIR}:/profile:ro
-      - type: bind
-        source: ${PROFILE_OVERLAY_DIR:-${PROFILE_DIR}}
-        target: /profile-overlay
-        read_only: true
-        bind:
-          create_host_path: false
+      - /srv/comms/profile:/profile:ro
     depends_on:
       comms-postgres: { condition: service_healthy }
       comms-redis: { condition: service_healthy }
@@ -109,31 +88,20 @@ services:
       start_period: 20s
     restart: unless-stopped
     networks:
-      - aivis-shared
+      - default
       - comms-internal
 
   comms-worker:
     build:
       context: ..
-    container_name: comms-worker
-    env_file:
-      - ./.env
-    environment:
-      TEMPLATES_DIR: /profile
-      TEMPLATES_OVERLAY_DIR: ${PROFILE_OVERLAY_DIR:+/profile-overlay}
+    environment: *comms-env
     command: ["python", "-m", "app.worker"]
     volumes:
-      - ${PROFILE_DIR}:/profile:ro
-      - type: bind
-        source: ${PROFILE_OVERLAY_DIR:-${PROFILE_DIR}}
-        target: /profile-overlay
-        read_only: true
-        bind:
-          create_host_path: false
+      - /srv/comms/profile:/profile:ro
     depends_on:
-      # Healthy app == migration done; the worker never touches an
-      # unmigrated schema and never runs alembic itself.
-      comms-app: { condition: service_healthy }
+      # The schema is migrated before `up` (the machine's `migrate`):
+      # the worker waits for its database only, not for the API.
+      comms-postgres: { condition: service_healthy }
     healthcheck:
       # Single-process container: the meaningful liveness signal is
       # "PID 1 is the worker". No pgrep in the slim image, so read
@@ -145,29 +113,22 @@ services:
       start_period: 10s
     restart: unless-stopped
     networks:
-      - aivis-shared
+      - default
       - comms-internal
 
   comms-consumer:
     build:
       context: ..
-    container_name: comms-consumer
-    env_file:
-      - ./.env
     environment:
-      TEMPLATES_DIR: /profile
-      TEMPLATES_OVERLAY_DIR: ${PROFILE_OVERLAY_DIR:+/profile-overlay}
+      <<: *comms-env
+      # The consumer alone reads Redis (app/transport/connection.py).
+      REDIS_URL: redis://:${COMMS_EVENTS_PASSWORD:?}@comms-redis:6379/0
     command: ["python", "-m", "app.consumer"]
     volumes:
-      - ${PROFILE_DIR}:/profile:ro
-      - type: bind
-        source: ${PROFILE_OVERLAY_DIR:-${PROFILE_DIR}}
-        target: /profile-overlay
-        read_only: true
-        bind:
-          create_host_path: false
+      - /srv/comms/profile:/profile:ro
     depends_on:
-      comms-app: { condition: service_healthy }
+      comms-postgres: { condition: service_healthy }
+      comms-redis: { condition: service_healthy }
     healthcheck:
       test: ["CMD-SHELL", "grep -q app.consumer /proc/1/cmdline"]
       interval: 30s
@@ -176,7 +137,7 @@ services:
       start_period: 10s
     restart: unless-stopped
     networks:
-      - aivis-shared
+      - default
       - comms-internal
 
   comms-postgres:
@@ -184,54 +145,50 @@ services:
     # postgres:16 resolves to whatever was pulled last on each box -- two
     # boxes were on 16.14 and 16.15 under one tag. The tag stays for the
     # reader and for Dependabot (.github/dependabot.yml, ecosystem
-    # docker-compose), which brings a new digest as a pull request into
-    # `test`. CI runs this same image (.github/workflows/ci.yml reads it
-    # from here). tests/test_image_pins.py holds the pins.
+    # docker-compose), which brings a new digest as a pull request. CI
+    # runs this same image (.github/workflows/ci.yml reads it from here).
+    # tests/test_image_pins.py holds the pins.
     image: postgres:16@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
-    container_name: comms-postgres
-    # ITS OWN VARIABLES ONLY (TX-4), not the whole .env: the database
-    # has no business holding the channel tokens and LLM keys. Compose
-    # fills them from the project's .env (the deploy/.env link).
+    # ITS OWN VARIABLES ONLY (TX-4): the database has no business holding
+    # the channel tokens and LLM keys. The user and the database are
+    # constants of comms, the password the machine's minted key.
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set in .env}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set in .env}
-      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set in .env}
-    # NO published port (unlike the product's postgres): nothing on
-    # the host needs it; the CLI's `db` subcommand goes through
-    # `docker compose exec`.
+      POSTGRES_USER: comms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: comms
+    # NO published port: nothing on the host needs it.
     # max_connections WRITTEN, not left to the image's default (H7):
     # every comms process's pool at full overflow, the worker's wake
     # listener and the connections outside any pool must fit it --
     # app/core/database.py POOLS, held against this line and the
-    # --workers of comms-app by tests/test_connection_budget.py.
+    # --workers of comms-app's command (the Dockerfile's CMD) by
+    # tests/test_connection_budget.py.
     command: ["postgres", "-c", "max_connections=100"]
     volumes:
-      - comms_postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 5
     restart: unless-stopped
-    # comms-internal ONLY (TX-4): the products never reach this
-    # database -- they speak to comms-app over aivis-shared -- so it is
-    # not in the shared network at all.
+    # comms-internal ONLY (TX-4): no product reaches this database, and
+    # it has no route out of the box.
     networks:
       - comms-internal
 
   comms-redis:
     # Pinned by digest -- see comms-postgres above.
     image: redis:7-alpine@sha256:7b1753b4c5ad8458906c272a8132b8c15f5557b000379eb115fb239706a384b7
-    container_name: comms-redis
-    # Its own variable only (TX-4), as comms-postgres.
+    # Its own variable only (TX-4), as comms-postgres: the password is
+    # the machine's minted COMMS_EVENTS_PASSWORD, the one the product
+    # gets as a seam.
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set in .env}
+      REDIS_PASSWORD: ${COMMS_EVENTS_PASSWORD:?}
     # DD-4 (extended): durable AND protected. AOF + noeviction --
     # the stream carries notification_request, eviction would mean
-    # silently dropped notifications; requirepass -- the container
-    # sits on a network shared with the product stack. The password
-    # is mandatory here (no passwordless fallback): this compose is
-    # deploy-only, and .env is generated by `install`.
+    # silently dropped notifications; requirepass -- the product reaches
+    # this server over the machine's network of the pair.
     # THE PASSWORD IS NOT AN ARGUMENT (TX-4): `--requirepass <value>`
     # stood in redis-server's argv, readable by anyone on the host with
     # `ps`. The shell writes it into a config file INSIDE the container,
@@ -252,7 +209,7 @@ services:
         --appendonly yes
         --maxmemory-policy noeviction
     volumes:
-      - comms_redis_data:/data
+      - redis_data:/data
     healthcheck:
       # REDISCLI_AUTH keeps the password out of CLI args.
       test: ["CMD-SHELL", "export REDISCLI_AUTH=$$REDIS_PASSWORD; redis-cli ping | grep -q PONG"]
@@ -260,28 +217,18 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
-    # Both: the products publish to comms' stream over aivis-shared
-    # (COMMS_REDIS_URL, handed over by comms-deploy.sh install).
     networks:
-      - aivis-shared
       - comms-internal
 
 networks:
-  aivis-shared:
-    external: true
-  # comms' own network (TX-4): comms-postgres lives only here, the
-  # application containers and comms-redis in both. internal: no way
-  # out of the box from it -- the database needs none.
+  # comms' own network (TX-4): all five services; internal -- no way out
+  # of the box from it. Its name is the machine's: <project>_comms-internal.
   comms-internal:
-    name: comms-internal
     internal: true
 
 volumes:
-  # Physical names pinned, so that they do NOT carry the project name as a
-  # prefix. Unpinned, `comms_postgres_data` under project `comms` would land on disk as
-  # `comms_comms_postgres_data` -- the service name twice -- and would move again the day
-  # the project name did. Pinned, the name on disk is the name written here.
-  comms_postgres_data:
-    name: comms_postgres_data
-  comms_redis_data:
-    name: comms_redis_data
+  # Named by the project: under the machine's `-p comms` they are
+  # comms_postgres_data and comms_redis_data on disk; primer.yaml
+  # `persistent: true` keeps them through destroy and reinstall.
+  postgres_data:
+  redis_data:

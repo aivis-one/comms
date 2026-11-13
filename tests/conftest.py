@@ -158,9 +158,8 @@ def require_test_database(database_url: str) -> str:
             f"it is not a test database (the name must end with "
             f"{TEST_DB_SUFFIX!r}). This suite DELETES ALL ROWS before "
             f"every test, so running it here would empty that database. "
-            f"Provision and target 'comms_test' -- "
-            f"`deploy/comms-deploy.sh test` does both -- or export "
-            f"DATABASE_URL yourself pointing at a *_test database."
+            f"Export DATABASE_URL pointing at a *_test database "
+            f"('comms_test', as CI does)."
         )
     return name
 

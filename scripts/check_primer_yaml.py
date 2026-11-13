@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# COMMS Service -- primer.yaml checked by the machine's own code (W2-2)
+# COMMS Service -- primer.yaml checked by the machine's own code (W2-2, W1-2)
 # =============================================================================
 # CI job `machine` (.github/workflows/ci.yml) checks out Primer's machine at
 # a pinned commit, installs it from its own lock and wheels into a venv of
@@ -8,52 +8,71 @@
 # this script with the machine on PYTHONPATH. It imports the machine; it
 # runs nowhere else.
 #
-# WHAT IS ASKED OF THE MACHINE, by the functions its steps call:
-#   1. the loader (pridem/stacks/schema.py load_primer_yaml): both layers,
-#      every field and every rule of contract 3 the file alone can break;
+# WHAT IS ASKED OF THE MACHINE, by its own code:
+#   1. `pridem check` of this repository (pridem/verbs/check.py), run as
+#      the machine's CLI runs it, in this process: primer.yaml by the
+#      loader, primer.lock, and the compose file of every stack by the
+#      machine's lists -- `docker compose config` of the file (the binary
+#      alone, no daemon), every variable `${KEY:?}` and a key of `env`,
+#      no env_file, no host path, no name of another project,
+#      stop_for_migrate against the services. Every step must be green
+#      but `compose`, whose findings must be EXACTLY the list CEILING
+#      below: a finding beyond it is a defect of the compose file, one of
+#      it missing is a ceiling gone stale -- both red, by name;
 #   2. the seams, as seams_check asks them of a box: half seams (a name of
 #      `provides` without its key of `env`), a seam under an option the
 #      product takes without it, routes of a co-located service, data the
 #      service does not accept, two pairs on one network -- against a
 #      product that takes comms with every option of comms on. The product
 #      is a stand-in, parsed by the machine's loader too; it names nothing
-#      of any real product;
-#   3. stop_for_migrate against the compose file: every service named is a
-#      service of compose, none of them one `migrate` needs (the machine's
-#      compose check, pridem/steps/compose.py forbidden).
+#      of any real product. `pridem check` reads one repository and asks
+#      no seam.
 # AND ONE THING THE MACHINE DOES NOT CHECK: `persistent: true`. No rule of
 # the machine refuses a service without it -- the machine only reads it
 # when it destroys -- so it is asserted here, on the machine's own model of
 # the file (a misspelt key never gets this far: the loader refuses any
 # unknown key).
 #
-# KNOWN CEILING (acknowledged by design -- W2-2, the compose findings):
-#   1. Mechanics: the compose check (3) reads deploy/docker-compose.yml as
-#      written, not as `docker compose config` renders it, and keeps only
-#      its findings about stop_for_migrate. The compose file is not yet the
-#      machine's form (env_file, container_name, the build context ..
-#      and more: two dozen findings), so the rest of what the machine would
-#      refuse there is not asserted, and a service named only through an
-#      interpolation would be read as written.
-#   2. Status: acknowledged by design.
-#   3. Backlog ref: W1-2 -- the compose file to the machine's rules, and
-#      `pridem check` in CI.
-#   4. Promotion trigger (observable): `pridem check .` of this repository
-#      ends with no finding of its compose step.
-#   5. Agreed fix: CI runs `pridem check .` whole; this filter goes.
-#   6. Rejected: `pridem check .` now (red until W1-2); the machine's JSON
-#      Schema (the form only -- none of the three properties above); the
-#      machine in comms' locks (another pydantic, a git dependency cannot
-#      be hash-checked).
+# KNOWN CEILING (acknowledged by design -- W1-2, the profile's mount;
+# temporary, until W4-1):
+#   1. Mechanics: comms-app, comms-worker and comms-consumer bind the
+#      product profile from a literal host path, /srv/comms/profile
+#      (deploy/docker-compose.yml). The machine allows a bind of its
+#      release only, so `pridem check` and the box's `build` refuse the
+#      compose file with exactly CEILING, and the machine installs comms
+#      nowhere. Nothing installs comms with the machine before the tag
+#      v4.0.0, which comes after W4-1. A variable in the path
+#      (${PROFILE_DIR}, as on v3) is no way out: a variable that is not a
+#      key of `env` stops the check before `docker compose config`, and
+#      every other rule of the compose file would go unchecked. The text
+#      overlay has no form in compose until then (comms runs on the
+#      profile alone).
+#   2. Status: acknowledged by design -- temporary, until W4-1.
+#   3. Backlog ref: W4-1 -- the profile as data the service takes (form
+#      G, `accepts` of primer.yaml), with the overlay and the languages.
+#   4. Promotion trigger (observable): the machine's rule for data a
+#      service takes is in the commit of the machine CI pins, and
+#      primer.yaml declares `accepts`.
+#   5. Agreed fix: the profile and its overlay mounted by the machine
+#      (form G); CEILING empty, and with it this marker.
+#   6. Rejected: PROFILE_DIR as a key of `env` (a value of the box in a
+#      service's file, and a stand-in path of the check resolves into the
+#      release: the finding would vanish, the defect would stay); a named
+#      volume (no finding, an empty profile at the start -- a ceiling the
+#      check cannot see); the profile copied into the image (a profile is
+#      the product's, never comms').
 #
-# Exit 0 = the machine finds nothing, 1 = findings (printed one per line).
+# Exit 0 = the machine finds nothing but CEILING, 1 = findings (printed one
+# per line).
 # =============================================================================
 
 from __future__ import annotations
 
+import io
+import json
 from pathlib import Path
 
-import yaml
+from pridem.cli import run
 from pridem.stacks.loader import ContractError
 from pridem.stacks.schema import (
     Product,
@@ -70,7 +89,6 @@ from pridem.stacks.seams import (
     seams_under_option,
     unaccepted,
 )
-from pridem.steps.compose import ComposeStack, forbidden
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -88,14 +106,57 @@ dependencies:
 report: {{ health: /health, ready: /ready, logs: json, junit: true }}
 """
 
-# The findings of the compose check (3) that are stop_for_migrate's
-# (pridem/steps/compose.py _stop_problems).
-_STOP_FINDINGS = ("stop_for_migrate: ", ": stopped for migrate, migrate needs it")
+# What `pridem check` may find in the compose file, and nothing else: the
+# KNOWN CEILING above, until W4-1. Sorted, as the machine sorts them.
+CEILING: tuple[str, ...] = (
+    "comms-app: volumes=/srv/comms/profile",
+    "comms-consumer: volumes=/srv/comms/profile",
+    "comms-worker: volumes=/srv/comms/profile",
+)
+# The step whose findings CEILING is; every other step must be green.
+_COMPOSE_STEP = "compose"
 
 
-def _stop_finding(finding: str) -> bool:
-    head, tail = _STOP_FINDINGS
-    return finding.startswith(head) or finding.endswith(tail)
+def machine_check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
+    """What `pridem check <root>` finds beyond CEILING, and what it ran.
+
+    The verdict's steps, by the machine's own CLI in this process: a step
+    that is not green and not the compose step is a finding with its code;
+    the compose step must have run (the pair: a check that did not run
+    finds nothing) and found exactly CEILING."""
+    out, err = io.StringIO(), io.StringIO()
+    code = run(["check", str(root), "--json"], out=out, err=err)
+    try:
+        verdict = json.loads(out.getvalue())
+    except json.JSONDecodeError:
+        return [f"pridem check: exit {code}, no verdict: {err.getvalue().strip()}"], []
+    found: list[str] = []
+    checked: list[str] = []
+    composed = False
+    for step in verdict["steps"]:
+        name, status = step["name"], step["status"]
+        reason = step.get("reason") or {}
+        if name == _COMPOSE_STEP and status in ("ok", "failed"):
+            composed = True
+            given = sorted(reason.get("found", [])) if status == "failed" else []
+            if status == "failed" and reason.get("code") != "compose:compose-forbidden":
+                found.append(f"pridem check: compose: {reason.get('code')}")
+            found += [f"pridem check: {f}" for f in given if f not in CEILING]
+            found += [
+                f"pridem check: the ceiling is stale, the machine no longer "
+                f"finds: {f}"
+                for f in CEILING if f not in given
+            ]
+            checked.append(
+                f"pridem check: compose found exactly the ceiling ({len(given)})"
+            )
+        elif status != "ok":
+            found.append(f"pridem check: {name} {status}: {reason.get('code')}")
+        else:
+            checked.append(f"pridem check: {name} ok")
+    if not composed:
+        found.append("pridem check: the compose step did not run")
+    return found, checked
 
 
 def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
@@ -143,22 +204,14 @@ def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
                 f"stacks.{entry}.stop_for_migrate is empty: nothing of comms "
                 f"may run on a schema being migrated"
             )
-        document = yaml.safe_load((root / stage.compose).read_text(encoding="utf-8"))
-        compose = ComposeStack(stack, entry, root, "check", "check")
-        found += [
-            f"compose: {finding}"
-            for finding in forbidden(compose, document)
-            if _stop_finding(finding)
-        ]
-        checked.append(
-            f"compose: stop_for_migrate {', '.join(stage.stop_for_migrate)} "
-            f"against {len(document['services'])} services of {stage.compose}"
-        )
     return found, checked
 
 
 def main() -> int:
-    found, checked = check()
+    found, checked = machine_check()
+    seams, seen = check()
+    found += seams
+    checked += seen
     for line in found:
         print(line)
     if found:

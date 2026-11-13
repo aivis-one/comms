@@ -604,8 +604,11 @@ class TestSanitizeError:
 
 
 
-# Sentinel secrets for the form tests. Each is the SHAPE the real secret
-# has (comms-deploy.sh mints hex 24/32 bytes; a telegram token is
+# Sentinel secrets for the form tests. Each is the SHAPE a real secret
+# had or has (the old installer minted hex 24/32 bytes -- the bare
+# long-hex pattern's shape; the deploy machine mints token_urlsafe, held
+# in the URL and header forms alike, see the KNOWN CEILING in
+# app/core/sanitize.py; a telegram token is
 # <id>:<35 chars>; a Mailgun key is <32hex>-<8hex>-<8hex> or
 # key-<32hex>) and none is a substring of any text a test surrounds it
 # with, so "the sentinel is absent" can only mean "it was redacted".
@@ -625,7 +628,7 @@ _BASIC = base64.b64encode(f"api:{_MG_KEY}".encode()).decode()
 # (name, text as it appears in a real error, sentinel, a piece of the
 # ordinary text around it that must SURVIVE). The texts are the shapes
 # the error actually takes: the DSN and the redis URL exactly as
-# comms-deploy.sh writes them, the telegram token inside the URL an
+# deploy/docker-compose.yml builds them, the telegram token inside the URL an
 # aiohttp error prints (aiogram wraps it as "<class>: <error>").
 _SECRET_FORMS = [
     (

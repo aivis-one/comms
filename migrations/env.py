@@ -117,9 +117,10 @@ async def run_async_migrations() -> None:
     # ACCESS EXCLUSIVE lock on a live table; queued behind a long
     # transaction, it would hold every query of that table queued behind
     # ITSELF, without a bound. With lock_timeout it fails instead (55P03),
-    # its transaction rolls back whole, comms-app does not start --
-    # `comms-deploy.sh update` says so, with the dump it made first --
-    # and the container's restart policy tries the migration again.
+    # its transaction rolls back whole, and the deploy machine's step
+    # `migrate` (primer.yaml; a throwaway container of comms-app, the
+    # worker and the consumer stopped) is red: the deploy stops there and
+    # says so. Nothing of comms migrates at its start (W1-2).
     # Set on the migration's own connection (server_settings at
     # connect), not in a transaction it could leave with.
     connectable = create_async_engine(

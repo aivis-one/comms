@@ -9,6 +9,13 @@ file is asked of the machine itself, in CI's job `machine`
 
 And the contract: the seams comms gives the product, `provides`, are the
 ones deploy/INTEGRATION.md section 15 describes -- both ways.
+
+And the hand-over (W1-2): with no env_file, a value reaches a comms
+process only through `environment:` of deploy/docker-compose.yml -- so
+every key of `env` that is a setting is passed to every process built
+from the image, and the two values compose builds (COMPOSED) are built
+from their keys. The machine checks that every reference is a key of
+`env`; it does not check that a key is referenced at all.
 """
 
 import re
@@ -40,8 +47,8 @@ _DEFAULTS: dict[str, Any] = {
 NOT_IN_ENV: dict[str, str] = {
     "DATABASE_URL": "built by compose from POSTGRES_PASSWORD (W1-2)",
     "REDIS_URL": "built by compose from COMMS_EVENTS_PASSWORD (W1-2)",
-    "TEMPLATES_DIR": "the profile's mount point, compose's (W4-1)",
-    "TEMPLATES_OVERLAY_DIR": "the overlay's mount point, compose's (W4-1)",
+    "TEMPLATES_DIR": "the profile's mount point, a constant of compose (W1-2)",
+    "TEMPLATES_OVERLAY_DIR": "no mount on a box until W4-1: empty, no overlay (W1-2)",
     "COMMS_SERVICE_TOKEN_NEXT": (
         "the machine has no change of key yet (Primer's letter of 12.11)"
     ),
@@ -50,7 +57,7 @@ NOT_IN_ENV: dict[str, str] = {
 }
 
 # The two values comms reads that compose builds from keys of `env`: the
-# key each is built from.
+# key each is built from (tests/test_primer_yaml.py TestTheHandOver).
 COMPOSED: dict[str, str] = {
     "DATABASE_URL": "POSTGRES_PASSWORD",
     "REDIS_URL": "COMMS_EVENTS_PASSWORD",
@@ -203,3 +210,55 @@ class TestTheContract:
     def test_the_rows_reader_sees_every_form(self) -> None:
         text = "| `A_B` | x |\n|---|---|\n| `C` | y |\n| not `D` | z |\n"
         assert _seam_rows(text) == ["A_B", "C"]
+
+
+# ---------------------------------------------------------------------------
+# the hand-over: deploy/docker-compose.yml passes what `env` gives (W1-2)
+# ---------------------------------------------------------------------------
+
+_COMPOSE: dict[str, Any] = yaml.safe_load(
+    (_REPO / "deploy" / "docker-compose.yml").read_text(encoding="utf-8"),
+)
+_PROCESSES = {
+    name: service for name, service in _COMPOSE["services"].items()
+    if "build" in service
+}
+# The services that read a COMPOSED value: Redis is the consumer's alone
+# (app/transport/connection.py).
+_READS_COMPOSED = {
+    "DATABASE_URL": {"comms-app", "comms-worker", "comms-consumer"},
+    "REDIS_URL": {"comms-consumer"},
+}
+
+
+class TestTheHandOver:
+    def test_every_setting_of_env_reaches_every_process(self) -> None:
+        """A key of `env` that is a setting, passed as itself, `:?`, to
+        each process built from the image. The pair: there are three
+        processes and settings among the keys."""
+        assert sorted(_PROCESSES) == ["comms-app", "comms-consumer", "comms-worker"]
+        settings = [key for key in _ENV if key in _DEFAULTS]
+        assert "COMMS_SERVICE_TOKEN" in settings and "TELEGRAM_ENABLED" in settings
+        for name, service in _PROCESSES.items():
+            environment = service["environment"]
+            missing = [k for k in settings if environment.get(k) != f"${{{k}:?}}"]
+            assert missing == [], name
+
+    def test_nothing_else_of_env_is_passed(self) -> None:
+        """The other way: a key of `env` that is no setting (a seam comms
+        gives, a variable of `comms derive`) reaches no process."""
+        others = [key for key in _ENV if key not in _DEFAULTS]
+        assert "COMMS_API_URL" in others  # the pair
+        for name, service in _PROCESSES.items():
+            assert [k for k in others if k in service["environment"]] == [], name
+
+    def test_what_compose_builds_is_built_from_its_key(self) -> None:
+        assert set(_READS_COMPOSED) == set(COMPOSED)
+        for setting, key in COMPOSED.items():
+            for name, service in _PROCESSES.items():
+                value = service["environment"].get(setting)
+                if name not in _READS_COMPOSED[setting]:
+                    assert value is None, (name, setting)
+                    continue
+                assert isinstance(value, str), (name, setting)
+                assert re.findall(r"\$\{([A-Z0-9_]+)", value) == [key], (name, value)

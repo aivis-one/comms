@@ -111,8 +111,8 @@ from app.core.lanes import Lane
 # in flight, makes the reading session READ ONLY in the database, blinds
 # the HTTP clients to the process's proxy and CA variables, logs the
 # render failure's class and not its text, describes the type record
-# whole in the contract, and runs `comms-deploy.sh test` on the image
-# with the checkout, as CI does (3.6.1 was never released; it is here).
+# whole in the contract, and runs the suite on the image with the
+# checkout, as CI does (3.6.1 was never released; it is here).
 #
 # PATCH bumps change nothing a deploy does: 3.7.1 is the suite reading
 # pg_stat_activity and pg_locks of its own database only and killing only
@@ -661,9 +661,9 @@ class Settings(BaseSettings):
     templates_dir: str = ""
     # Directory with the TEXT OVERLAY (PO-1): {locale}.yaml files of the
     # shape of templates/{locale}.yaml, each text replacing the base text
-    # at the same locale, type, channel and field. On the VPS it arrives
-    # as a bind-mount of PROFILE_OVERLAY_DIR (deploy/INTEGRATION.md
-    # section 3). Empty = no overlay, the base texts as they are; set to
+    # at the same locale, type, channel and field. On a box it has no
+    # mount until W4-1, and stays empty (deploy/INTEGRATION.md section
+    # 3). Empty = no overlay, the base texts as they are; set to
     # a directory that does not exist = the service does not start. See
     # app/profile/loader.py, THE TEXT OVERLAY.
     templates_overlay_dir: str = ""

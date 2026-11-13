@@ -1,103 +1,62 @@
 # COMMS -- product-side integration checklist
 
-This file documents how the product side is wired to the comms stack:
-what the product installer does, and what the product repo must carry
-for it to work. The comms repo never touches the product.
+This file documents how a product is wired to comms and what it may ask
+of it. The comms repo never touches the product.
 
-**None of it is a manual procedure.** Every step below is performed by
-`install_velo.sh`, which is the deliverable -- a server is a function
-of that script, and anything left for a human to finish on the box is
-a defect in it, not an instruction. This file is the reference for
-WHAT happens and WHY, and the checklist for a second product wiring
-itself up the same way.
+**None of it is a manual procedure.** comms is installed by Primer's
+deploy machine, from its `primer.yaml` (section 15) and its compose file:
+the machine renders the values, joins the networks and runs the
+migration; a product takes comms by its own `primer.yaml`. This file is
+the reference for WHAT happens and WHY. (Until W1-2 the wiring was the
+old installer's, two passes of it run by each product's installer; it is
+gone.)
 
-Scope guard: this covers **wiring only** (network + env + profile).
-The actual integration code -- the `notification_request` relay into
-the comms stream, calls to the comms HTTP API, and the user-facing
+Scope guard: the integration code -- the `notification_request` relay
+into the comms stream, calls to the comms HTTP API, and the user-facing
 proxy that sets `recipient_id`/`sender` server-side -- lives in the
 product repo and is not part of this file.
 
 ---
 
-## 1. Join the shared network (velo `docker-compose.yml`)
+## 1. How the product reaches comms
 
-The comms stack lives on the external docker network `aivis-shared`
-(created idempotently by `comms-deploy.sh install`; `docker network
-create aivis-shared` on the velo side first is equally fine -- either
-side may create it, the result is identical).
+comms' compose file declares no network towards a product: the
+machine's override joins them. `comms-app` is on the machine's network
+as `comms-comms-app` -- the seam `COMMS_API_URL` is
+`http://comms-comms-app:8000`; `comms-redis` is on the network of each
+pair of the point `events` as `comms-comms-redis` -- the seam
+`COMMS_EVENTS_ADDRESS` is `comms-comms-redis:6379`. Inside comms, its
+own network is internal: the database is on it alone, with no way out of
+the box, and no product reaches it.
 
-The product's compose carries the network and attaches the backend
-service to it (the backend is the only velo service that talks to
-comms). This is committed in the product repo, not applied by hand:
+The comms API is INTERNAL: no host port, no nginx route. Only a service
+of the product the machine pairs with comms resolves these names.
 
-```yaml
-# --- velo docker-compose.yml ---
-services:
-  app:
-    # ... existing config ...
-    networks:
-      - default        # keep intra-velo traffic as it is today
-      - aivis-shared   # NEW: reach comms-app / comms-redis by name
+## 2. The comms values the product takes
 
-networks:
-  aivis-shared:
-    external: true
-```
-
-Note: velo's other services (frontend, postgres, redis) do NOT need
-`aivis-shared`. Once any service lists an explicit `networks:` key,
-compose stops attaching it to `default` implicitly -- hence `default`
-is listed explicitly above.
-
-## 2. The comms variables reach the product `.env` (two passes)
-
-Target path (confirmed velo layout): **`/opt/velo/repo/backend/.env`**
-
-The comms deploy body is product-agnostic (DD-8), so it does not know
-this path -- it is the VALUE of the `PRODUCT_ENV_PATH` knob in the
-comms deploy env (`/opt/comms/.env`).
-
-That knob is empty on a freshly generated file, which is why the
-product installer runs `comms-deploy.sh install` **twice**, and why it
-has to:
-
-1. **pass 1** -- comms mints its secrets and writes `/opt/comms/.env`
-   (the knob empty; the hand-over only prints its block);
-2. the installer writes `PRODUCT_ENV_PATH=/opt/velo/repo/backend/.env`
-   into that file -- the CLI *sources* its env, so this value cannot
-   be handed over as a process variable, it has to be in the file;
-3. **pass 2** -- the same idempotent install runs again (secrets and
-   profile are guarded, `up -d --build` is a cached no-op) and the
-   hand-over now writes into the product `.env`.
-
-The installer then verifies all three keys are present and non-empty
-and aborts if they are not: a product that starts unlinked while the
-installer reports success is the failure this check exists to prevent.
-
-The same two-pass seam carries `PROFILE_DIR` (section 3) and the
-telegram credentials -- for the same reason, in the same place.
-
-The three variables:
+The product takes comms' seams (section 15) by name, from its own
+`primer.yaml` (`source: seam, from: comms`), and builds what it reads
+from them -- its stream URL, for one, from `COMMS_EVENTS_PASSWORD` and
+`COMMS_EVENTS_ADDRESS`:
 
 ```
-COMMS_SERVICE_TOKEN=<generated by comms install -- single source>
-COMMS_API_URL=http://comms-app:8000
-COMMS_REDIS_URL=redis://:<password>@comms-redis:6379/0
+COMMS_API_URL=http://comms-comms-app:8000
+COMMS_SERVICE_TOKEN=<minted by the machine -- single source>
+COMMS_EVENTS_ADDRESS=comms-comms-redis:6379
+COMMS_EVENTS_PASSWORD=<minted by the machine>
 ```
 
 Semantics:
 
 - `COMMS_SERVICE_TOKEN` -- the shared service token (trust seam,
-  DD-6). The velo backend presents it as `Authorization: Bearer
-  <token>` on every call to the comms API. Generated ONCE by comms
-  install; the comms config and this file carry the same value.
-- `COMMS_API_URL` -- the comms API address on `aivis-shared`. The
-  comms API is INTERNAL (no host port, no nginx route); this name
-  resolves only for containers attached to `aivis-shared`.
-- `COMMS_REDIS_URL` -- the durable comms stream backbone, credentials
-  included. The Phase 6 relay XADDs `notification_request` entries
-  here. Treat this file with the same care as the rest of your
-  secrets: the URL carries the redis password.
+  DD-6). The product backend presents it as `Authorization: Bearer
+  <token>` on every call to the comms API. Minted ONCE by the machine;
+  comms and the product carry the same value.
+- `COMMS_API_URL` -- the comms API address on the machine's network.
+- `COMMS_EVENTS_ADDRESS`, `COMMS_EVENTS_PASSWORD` -- the durable comms
+  stream backbone and its password. The relay XADDs
+  `notification_request` entries there. Treat the password with the
+  same care as the rest of your secrets.
 
 **Changing the service token without downtime.** comms accepts two
 service tokens: `COMMS_SERVICE_TOKEN`, the current one, and
@@ -127,11 +86,7 @@ notifications simply never arrive, with no failure to see on either
 side. If a deploy overrides either name, every product writing to it
 must be changed in the same step.
 
-The installer places all of this BEFORE it starts the product stack,
-so the backend comes up with the variables already in its env file and
-no restart is needed.
-
-## 3. The product profile (`PROFILE_DIR`)
+## 3. The product profile (`TEMPLATES_DIR`)
 
 comms carries no product vocabulary: the notification types and their
 templates are a per-product artifact (arch #15) that lives in the
@@ -155,7 +110,7 @@ the letter goes: the channel's `accepted` row in the job's path names
 the paths (`template_unresolved`, section 8). A type with no template
 for a field still takes the stored title or body you sent -- your own
 text, not a hole in one (see "What it can change" under
-`PROFILE_OVERLAY_DIR` below, and "What email reads from the profile" in §3a).
+`TEMPLATES_OVERLAY_DIR` below, and "What email reads from the profile" in §3a).
 
 **What a template field may not do.** The start refuses a template that
 takes an attribute of a variable (`{user.name}`, `{x.__class__}` -- use
@@ -179,25 +134,18 @@ directory); a hidden entry (`.gitkeep`, `.DS_Store`) is skipped. No
 you write them; a directory beside `types.yaml` and `templates/` is only
 logged (`profile_unknown_directory`) -- the start goes on.
 
-It is delivered by BIND, not by a copy: the product installer writes
-`PROFILE_DIR=/opt/velo/repo/comms-profile` into `/opt/comms/.env` on
-the same seam as above, and compose bind-mounts that path read-only
-into the comms processes. Consequences:
+It is delivered by BIND, not by a copy, read-only at `/profile` in the
+three comms processes (`TEMPLATES_DIR=/profile`). **Temporarily, until
+W4-1**, the bind is of the host path `/srv/comms/profile`: the machine
+refuses a host path, so comms is installed by it nowhere until W4-1
+brings the profile as data comms takes (`accepts` of `primer.yaml`).
+Consequences that hold either way:
 
 - editing a template is a commit in the product repo plus a roll-out;
   there is no second copy on the comms side to keep in step;
-- `velo update` pulls the product repo and then restarts the comms
-  application containers (`comms-deploy.sh restart`), so the templates
-  it just pulled are the ones being served;
-- the generic smoke profile shipped in `deploy/smoke-profile/` is only
-  ever used for a STANDALONE bring-up, when `PROFILE_DIR` points at an
-  empty directory. A populated one is never overwritten.
-
-Note the coupling this buys: comms validates the profile at startup
-and refuses to boot on a broken one, so a bad template commit can take
-the running comms stack down. Recovery is to revert that commit and
-roll out again; `velo update` names the profile as the likely cause
-when the restart fails.
+- comms validates the profile at startup and refuses to boot on a broken
+  one, so a bad template commit can take the running comms stack down.
+  Recovery is to revert that commit and roll out again.
 
 ### The type record -- every field
 
@@ -234,7 +182,7 @@ limit, never the letter. A letter Telegram itself refuses for the same
 reasons is `failed`, `message_rejected` on that attempt too -- never
 retried until it expires.
 
-### `PROFILE_OVERLAY_DIR` -- the text overlay
+### `TEMPLATES_OVERLAY_DIR` -- the text overlay
 
 One image and one profile can serve several installations whose
 wording differs. The difference lives in a second, optional directory:
@@ -243,13 +191,10 @@ more -- comms knows nothing of whose installation it is, and does not
 require it to cover every locale of the profile (that check is the
 product's).
 
-**Seam.** The same as `PROFILE_DIR`, on the same pass: the product
-installer writes `PROFILE_OVERLAY_DIR=<absolute host path>` into
-`/opt/comms/.env`; compose bind-mounts it read-only into the three
-comms processes as `TEMPLATES_OVERLAY_DIR=/profile-overlay`. Empty or
-absent -> no overlay, the profile's texts exactly as they are.
-`comms-deploy.sh` refuses `install`, `update`, `start` and `restart`
-when the variable is set and the path is not an existing directory.
+**Seam.** `TEMPLATES_OVERLAY_DIR` names the directory inside the
+container; empty or absent -> no overlay, the profile's texts exactly as
+they are. On a box it has no mount until W4-1, which brings it with the
+profile: until then it is empty there, and the overlay is off.
 
 **Form.** `{locale}.yaml` files directly in the directory -- no
 `types.yaml`, no `templates/` -- each of the shape of
@@ -358,7 +303,7 @@ type had then, whatever a later profile says.
 
 **Which worker takes which lane is the deploy's, not the profile's.**
 One worker image takes the lanes named in `COMMS_WORKER_LANES`
-(comma-separated, in the comms `.env`); left out, it takes all four --
+(comma-separated, in the environment of the worker); left out, it takes all four --
 nothing needs to be written for one worker. A second worker of the
 same image may take a subset, e.g. `COMMS_WORKER_LANES=critical` next
 to one with `interactive,normal,bulk`. **The worker processes of a
@@ -468,10 +413,7 @@ after a restart that switched it off.
 
 **Startup refusals are readable.** The configuration is built before
 logging is set up, so a refusal prints a message -- naming the channel
-and the keys -- and exits, rather than a traceback. When the refusal
-happens during an install, `comms-deploy.sh` prints the last lines of
-the application log where the installer output is, so the typo is
-visible without going looking for it.
+and the keys -- and exits, rather than a traceback.
 
 **What the first start tells you.** The `comms_started` log line
 carries a channel map: every channel with `live`, `not_configured` (the
@@ -1595,8 +1537,10 @@ channel.
 
 ### The key sets -- for the operator
 
-The models a deploy can reach are **named key sets** in the comms
-`.env`, one variable holding all of them as one JSON object:
+The models a deploy can reach are **named key sets** in comms'
+environment -- on a box asked of the operator by the passport under the
+option `llm` (`primer.yaml`) -- one variable holding all of them as one
+JSON object:
 
     LLM_KEY_SETS='{"llm.text": {"endpoint": "https://<gateway host>/api/v1", "key": "<key>", "model": "<vendor>/<model>", "gateway": true}, "llm.text_direct": {"endpoint": "https://<vendor host>/v1", "key": "<key>", "model": "<model>", "gateway": false}}'
 
@@ -1706,7 +1650,7 @@ to the end of the letter's `messages`:
 Nothing in your messages is read or changed: write the prompt knowing
 the audio comes last. The link never goes to the model -- the bytes do.
 
-**The operator names the store.** `LLM_BODY_HOSTS` in the comms `.env`
+**The operator names the store.** `LLM_BODY_HOSTS` in comms' environment
 is the exact `host:port` pairs a link may point at, comma separated
 (`rustfs:9000`). Empty, the default: this deploy fetches nothing, and a
 request with `llm_audio` is rejected at intake. Both only with the llm
@@ -2218,96 +2162,6 @@ output.
 A wrong token or host is a non-zero exit and one line on stderr naming
 the variable -- never the token.
 
-## Operating the comms stack
-
-What an operator needs on the box, collected here because every item
-below has already cost an hour of searching once. The script named
-below is `/opt/comms/repo/deploy/comms-deploy.sh`.
-
-**Where the environment lives.** The real file is `/opt/comms/.env`,
-outside the checkout, so `update` (a `git pull`) never touches secrets.
-`deploy/.env` is a symbolic link to it; compose reads the link. Edit
-`/opt/comms/.env` -- editing through the link edits the same file, and
-there is no second copy.
-
-**How an edited environment reaches the processes.** By recreating the
-containers, never by a signal: a container's environment is fixed when
-the container is created, and `docker compose restart` starts the same
-container again with the old one. Both lifecycle verbs of the script
-recreate:
-
-- `comms-deploy.sh restart` recreates `comms-app`, `comms-worker` and
-  `comms-consumer`, leaves `comms-postgres` and `comms-redis` untouched,
-  and waits for `comms-app` to be healthy. This is the verb for an
-  edited `.env` or profile.
-- `comms-deploy.sh update` pulls, rebuilds, and recreates the same three
-  containers; the datastores are recreated only when their own compose
-  definition changed.
-
-**Is it healthy.** The API has no host port, so health is read from the
-inside. Docker's own verdict, which is what the script waits on:
-
-    docker inspect --format '{{.State.Health.Status}}' comms-app
-
-The readiness answer itself, from inside the container:
-
-    docker exec comms-app python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/ready').read().decode())"
-
-**Why it did not start.** comms refuses to start on a broken
-configuration or profile and says why in its own log. `install`,
-`update`, `start` and `restart` print the last lines of it when a start
-fails; to read more:
-
-    docker logs --tail 40 comms-app
-
-**Where email will go.** The provider address is derived from the
-region setting, not written in the environment. Read what the running
-process actually uses:
-
-    docker exec comms-app python -c "from app.core.config import settings; print(settings.email_api_base_url)"
-
-## The protocol update window
-
-The protocol lands on a box in ONE window: comms and the product move
-together. Migration 0013 (the lifecycle and outcome taxonomy) translates
-only the rows whose meaning the row itself states; on a row it cannot
-translate without a guess it **refuses**, `comms-app` does not start,
-and `docker logs comms-app` names each kind with its count. The kinds,
-and why each cannot be translated, are in the migration's docstring
-(`migrations/versions/2026_09_24_0013_lifecycle_outcomes.py`).
-
-The window, from comms' side -- every step is a verb of
-`deploy/comms-deploy.sh`, which the product's own CLI wraps:
-
-1. **`update`** -- pulls, builds and recreates the stack. On a box with
-   old rows the migration refuses: a red start, and `update` exits 1.
-   All migrations run in one transaction, so the database stays at the
-   revision it had before (0011 on a box that ran `main`).
-2. **`drain`** -- checks. Prints the count of every kind, under the
-   names the refusal uses, and deletes nothing. The kinds overlap -- one
-   row can count in more than one -- so the sum is not the number of
-   rows. Exit **0** = nothing to delete (clean, or the schema is already
-   at or past 0013); **1** = rows to delete; **2** = it cannot check --
-   the database is down, there is no schema (not the comms database),
-   the revision is not in the image's chain, or the image has no 0013.
-   Every code 2 prints the command to run next.
-3. **`drain --apply`** -- deletes. It asks you to type `yes`, stops
-   `comms-app`, dumps the database (the path is printed before and
-   after), and deletes every kind in one transaction -- the whole
-   notifications, their deliveries by cascade. **Every active job goes,
-   not only the old ones**: in a red start the worker and the consumer
-   do not run, so the queue cannot drain by waiting. The product's
-   events wait in the stream and are read after the window; jobs the
-   product still wants, it sends again. Sent history and the inbox stay.
-   The newest **three** pre-drain dumps (`comms-predrain-*.sql`) are
-   kept; an older one is removed only after a new dump has succeeded.
-   A code 2 here prints the next command too.
-4. **`start`** -- brings the stack up: the migration passes, the
-   worker and the consumer start.
-
-What the product wraps: `update`, `drain`, `drain --apply` and `start`,
-in that order, with the operator at the terminal for step 3.
-
 ## How long comms keeps things
 
 The questions every product asks once, answered here so the answer is
@@ -2384,18 +2238,3 @@ about 25 KB at most, about 250 MB at the default `DLQ_MAXLEN`.
 | `_dlq_error` | why: comms' own refusal (it names fields and the address, never the letter), or the class and the place of the failure -- never an exception's text |
 | `_dlq_attempts` | the attempts made; `0` -- refused as it was read |
 | `_dlq_source_entry_id` | the entry's id in the stream it came from |
-
-## Compose project name
-
-This stack declares its compose project name in `deploy/docker-compose.yml`:
-`name: comms`, first line. Its volume names are pinned there too.
-
-Both matter to whoever runs it next to another stack. Compose infers the project
-from the directory holding the file when it is not declared, so two services
-whose files both live in `deploy/` become **one project**: `docker compose ps`
-from either directory lists the other's containers, `up -d` reports the other's
-as orphans, and `down --remove-orphans` from either destroys the other. The
-inferred name is also the prefix of every volume, so it decides where the data
-lands.
-
-A stack added beside this one is expected to do the same.

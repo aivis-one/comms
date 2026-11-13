@@ -1,13 +1,13 @@
 # =============================================================================
-# G2 -- hygiene: texts that lie, the type record in the contract, the
-# `test` verb on a box, statements found by their shape
+# G2 -- hygiene: texts that lie, the type record in the contract,
+# statements found by their shape
 # =============================================================================
 #
 #   1 every reference to a file -- and to a name in it -- resolves
 #   2 deploy/INTEGRATION.md section 3 holds the type record, field by
 #     field, and the loader holds the table (both ways)
-#   3 `comms-deploy.sh test` runs the suite on comms-app's image with
-#     the checkout mounted and CI's variables only
+#   3 (gone with the old installer in W1-2: its `test` verb; the suite
+#     on the image is CI's job `image` and the deploy machine's `tests`)
 #   4 no test finds a SQL statement by a substring; tests/helpers.py
 #     sql_shape is the one reader, with its own twins
 #
@@ -23,7 +23,6 @@
 #                                                           are_the_loaders
 #   M4 a row removed from the table                     -> test_the_rows_are_
 #                                                           the_record
-#   M5 cmd_test back to `exec comms-app python -m pytest` -> TestTheTestVerb
 #   M6 a test finds a statement by "ORDER BY" in s       -> test_no_test_
 #                                                           searches_sql_by_substring
 #   M7 sql_shape takes the first FROM at any depth       -> TestSqlShape
@@ -37,7 +36,6 @@
 
 import ast
 import re
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -306,117 +304,6 @@ class TestTheTypeRecordTable:
 
 
 # ---------------------------------------------------------------------------
-# Item 3 -- `comms-deploy.sh test`
-# ---------------------------------------------------------------------------
-
-_SCRIPT = _REPO / "deploy" / "comms-deploy.sh"
-
-
-def _function(name: str) -> str:
-    text = _SCRIPT.read_text(encoding="utf-8")
-    match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
-    assert match, f"{name} not found at column zero"
-    return match.group(0)
-
-
-_STUBS = r'''
-RED= GREEN= CYAN= YELLOW= NC=
-cd_compose() { :; }
-load_env() { POSTGRES_DB=comms; POSTGRES_USER=comms; }
-compose() {
-    echo "compose $*" >> "$CALLS"
-    case "$1 $2 $3" in
-        "exec -T comms-app")
-            echo "postgresql+asyncpg://comms:pw@comms-postgres:5432/comms" ;;
-        "ps -q comms-app") [ "$APP_UP" = 1 ] && echo cid-1234 ;;
-    esac
-    return 0
-}
-docker() {
-    echo "docker $*" >> "$CALLS"
-    case "$1" in
-        inspect) echo sha256:image-of-the-app ;;
-        run) shift; printf '%s\n' "$@" > "$RUN_ARGS" ;;
-    esac
-    return 0
-}
-COMPOSE_CMD=compose
-'''
-
-
-def _run_test_verb(
-    tmp_path: Path, *, app_up: bool = True, checkout: bool = True,
-) -> tuple[subprocess.CompletedProcess[str], list[str], str]:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    if checkout:
-        (repo / "pyproject.toml").write_text("")
-        (repo / "tests").mkdir()
-    calls, run_args = tmp_path / "calls", tmp_path / "run_args"
-    calls.touch()
-    program = "\n".join([
-        "set -u",
-        f"CALLS='{calls}' RUN_ARGS='{run_args}' APP_UP={int(app_up)}",
-        f"REPO_DIR='{repo}'",
-        _STUBS,
-        _function("cmd_test"),
-        "cmd_test",
-    ])
-    done = subprocess.run(
-        ["bash", "-c", program], capture_output=True, text=True, timeout=30,
-    )
-    args = run_args.read_text().splitlines() if run_args.exists() else []
-    return done, args, calls.read_text()
-
-
-class TestTheTestVerb:
-    def test_the_suite_runs_on_the_apps_image_with_the_checkout(
-        self, tmp_path: Path,
-    ) -> None:
-        """The exact `docker run`, to its last argument.
-
-        Its tail was the suite with pytest's cache plugin switched off by
-        a flag, until G3: that held while nobody owned the cache, and it
-        left the cache_dir setting of pyproject.toml without its plugin --
-        "Unknown config option" in every run. G3 removed the flag; the
-        cache goes where pyproject.toml says (TestThePytestCache), and the
-        tail is the suite as written, nothing after `-q`."""
-        done, args, calls = _run_test_verb(tmp_path)
-        assert done.returncode == 0, done.stdout + done.stderr
-        repo = tmp_path / "repo"
-        assert args[0] == "--rm"
-        assert args[1:3] == ["--network", "container:cid-1234"]
-        assert args[3:5] == ["-v", f"{repo}:/app:ro"]
-        assert [a for a in args if a.startswith(("APP_ENV=", "DATABASE_URL=",
-                                                 "COMMS_SERVICE_TOKEN="))] == [
-            "APP_ENV=ci",
-            "DATABASE_URL=postgresql+asyncpg://comms:pw@comms-postgres:5432/"
-            "comms_test",
-            "COMMS_SERVICE_TOKEN=comms-test-not-a-secret-token",
-        ]
-        # CI's variables and nothing else: three -e, no env file.
-        assert args.count("-e") == 3 and "--env-file" not in args
-        assert args[args.index("sha256:image-of-the-app"):] == [
-            "sha256:image-of-the-app", "python", "-m", "pytest", "-q",
-        ]
-        # The pair: the suite does not run inside the live app.
-        assert "compose exec -T comms-app python" not in calls
-        assert "compose exec -T comms-postgres psql" in calls
-
-    def test_no_running_app_is_refused(self, tmp_path: Path) -> None:
-        done, args, _ = _run_test_verb(tmp_path, app_up=False)
-        assert done.returncode == 1
-        assert "comms-app is not running" in done.stdout
-        assert args == []
-
-    def test_no_checkout_is_refused(self, tmp_path: Path) -> None:
-        done, args, _ = _run_test_verb(tmp_path, checkout=False)
-        assert done.returncode == 1
-        assert "no checkout at" in done.stdout
-        assert args == []
-
-
-# ---------------------------------------------------------------------------
 # G3 -- the suite runs with pytest's cache; its cache_dir has an owner
 # ---------------------------------------------------------------------------
 #
@@ -430,8 +317,8 @@ class TestTheTestVerb:
 #
 # What is read: every text file of the checkout by a walk of the file
 # system -- no `git ls-files`, the image has no git -- never through a
-# symbolic link (deploy/.env on a box points at /opt/comms/.env: broken in
-# the container, secrets outside it), and never under a path .gitignore
+# symbolic link (the old installer's deploy/.env was one, pointing outside
+# the tree at the secrets: broken in the container), and never under a path .gitignore
 # ignores: .gitignore IS the list of what is not the tree's own text.
 #
 # The needles are put together at run time, so this file does not find
@@ -536,7 +423,7 @@ class TestThePytestCache:
         root = pytestconfig.rootpath
         texts = tree_texts(root)
         read = {str(path) for path, _ in texts}
-        assert {".github/workflows/ci.yml", "deploy/comms-deploy.sh",
+        assert {".github/workflows/ci.yml", "deploy/docker-compose.yml",
                 "pyproject.toml"} <= read
         assert plugin_switched_off(texts) == []
 
@@ -657,9 +544,6 @@ NOT_A_STATEMENT_SEARCH: dict[tuple[str, str], str] = {
         "REAL 40001 (TX-1) -- the pair of the OperationalError row",
     ("tests/helpers.py", "sql_shape"):
         "the helper itself, over the clauses it has already split",
-    ("tests/test_drain_source.py",
-     "test_the_driver_reads_the_migration_not_a_copy"):
-        "the source text of a shell script, not a statement sent",
     ("tests/test_migration_0012.py", "test_round_trip_on_every_form_of_row"):
         "an index definition read from pg_indexes -- the schema's layer",
     ("tests/test_transport_consumer.py", "test_every_retry_log_is_redacted"):
@@ -799,8 +683,8 @@ class TestSqlShape:
 # FIX (3.7.0) -- the suite looks at its own database only
 # ---------------------------------------------------------------------------
 #
-# On a box `comms-deploy.sh test` runs the suite against <db>_test on
-# the server where the live comms-worker works in <db>. A query to
+# On a box of v3 the old installer's `test` verb ran the suite against
+# <db>_test on the server where the live comms-worker works in <db>. A query to
 # pg_stat_activity / pg_locks without the database sees that worker's
 # sessions: listener_pid() found the live wake listener (15 failures on
 # both boxes), and a pid taken there could be terminated. In CI no live

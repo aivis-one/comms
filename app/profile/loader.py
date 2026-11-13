@@ -139,9 +139,9 @@
 #     via app/core/constants.py (the image ships app/, not scripts/).
 #
 # THE TEXT OVERLAY (PO-1). A second, optional directory
-# (TEMPLATES_OVERLAY_DIR; PROFILE_OVERLAY_DIR on the host, see
-# deploy/INTEGRATION.md section 3) holding files of the same shape as
-# templates/{locale}.yaml, directly in its root. Each leaf of it
+# (TEMPLATES_OVERLAY_DIR, see deploy/INTEGRATION.md section 3)
+# holding files of the same shape as templates/{locale}.yaml,
+# directly in its root. Each leaf of it
 # REPLACES exactly the base leaf at the same (locale, type, channel,
 # field); every other text stays the base's. It changes wording only:
 # a type, a channel, a lane, a schedule -- any field of a type record
@@ -1608,7 +1608,7 @@ class FileOverlaySource:
         a file placed beside it would otherwise be silently ignored.
         """
         root = self._root
-        hint = "Check TEMPLATES_OVERLAY_DIR (PROFILE_OVERLAY_DIR on the host)."
+        hint = "Check TEMPLATES_OVERLAY_DIR."
         if not root.exists():
             raise ProfileError(
                 f"Text overlay directory does not exist: {root}. {hint}"

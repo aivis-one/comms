@@ -1,9 +1,11 @@
 # =============================================================================
 # COMMS Service -- CI (handoff item 5)
 # =============================================================================
-# Four jobs. Beside them all, on its own (W2-2):
-#   machine  primer.yaml checked by the deploy machine's own code, pinned
-#            to one commit of its repository (scripts/check_primer_yaml.py).
+# Four jobs. Beside them all, on its own (W2-2, W1-2):
+#   machine  the repository checked by the deploy machine's own code,
+#            pinned to one commit of its repository: `pridem check` whole
+#            -- primer.yaml and the compose file -- and the seams
+#            (scripts/check_primer_yaml.py).
 # First of the other three, alone (CI-1):
 #   checks what reads the tree and the schema and takes seconds: ruff,
 #          mypy, the two fences, `alembic upgrade head` + `alembic
@@ -208,11 +210,13 @@ jobs:
           tests/test_domain_literal_fence.py
           tests/test_product_literal_fence.py
 
-  # PRIMER.YAML AS THE MACHINE READS IT (W2-2): the deploy machine's own
-  # code, pinned to one commit of its repository -- the loader, the seams
-  # of a box and the compose check of stop_for_migrate
-  # (scripts/check_primer_yaml.py says what each is and what is not yet
-  # asked). The machine is installed from ITS lock and ITS wheels, both in
+  # THE REPOSITORY AS THE MACHINE READS IT (W2-2, W1-2): the deploy
+  # machine's own code, pinned to one commit of its repository -- `pridem
+  # check` of the repository whole (primer.yaml, and the compose file
+  # through the runner's `docker compose config`: the binary, no daemon)
+  # and the seams of a box (scripts/check_primer_yaml.py says what each is,
+  # and the one finding allowed until W4-1). The machine is installed from
+  # ITS lock and ITS wheels, both in
   # its repository at that commit, hash-checked -- into a venv of its own:
   # its pydantic is not comms' (requirements-dev.lock), and comms' locks
   # cannot carry it (a git dependency is not hash-checked). Nothing else
@@ -256,7 +260,7 @@ jobs:
           PIP_FIND_LINKS: .primer/wheels
         run: pip install --require-hashes -r .primer/requirements.lock
 
-      - name: primer.yaml by the machine
+      - name: The repository by the machine (pridem check, the seams)
         env:
           PYTHONPATH: ${{ github.workspace }}/.primer
         run: python scripts/check_primer_yaml.py

@@ -527,26 +527,25 @@ def setup_logging() -> None:
 
     KNOWN CEILING (acknowledged by design -- H8 and protocol 9.4, before
     the setup):
-      1. Mechanics: a line written before this runs -- an import error
-         of the app, uvicorn's own parent (supervisor) process under
-         --workers, which never runs the app's lifespan, and each uvicorn
-         worker's lines before its lifespan ("Started server process",
-         "Waiting for application startup.") -- goes out through
+      1. Mechanics: a line written before this runs in the worker or the
+         consumer -- an import error of the app -- goes out through
          whatever logging the process had then: unsanitized and not in
          the machine's form (no JSON, no release, no request_id); so does
-         a handler a library installs after this call.
+         a handler a library installs after this call. uvicorn's own
+         lines are not here since W1-2: the API's command passes
+         --log-config (app/core/log_config.json), and its supervisor's
+         lines and each uvicorn worker's before the lifespan leave in the
+         machine's form (app/core/log_launcher.py).
       2. Status: acknowledged by design.
       3. Backlog ref: none -- the line comes from code that runs before
-         comms does (the interpreter, uvicorn's supervisor); comms has
-         no hook there short of owning the process launcher.
+         comms does (the interpreter importing the app); comms has no
+         hook there short of owning the process launcher.
       4. Promotion trigger (observable): a secret in a comms container's
          log on a line that precedes the process's first structlog line
-         (worker_started / consumer_started / the lifespan's first), or
-         the machine refusing comms' log for a line that is not JSON.
-      5. Agreed fix: a log config file passed to uvicorn (--log-config) in
-         the command of comms-app, whose formatter is SanitizingFormatter,
-         and a sitecustomize that installs the hooks before the app is
-         imported.
+         (worker_started / consumer_started), or the machine refusing
+         comms' log for a line that is not JSON.
+      5. Agreed fix: a sitecustomize that installs the hooks before the
+         app is imported.
       6. Rejected: turning tracebacks off (they are how a failure is
          read -- H8 forbids it); a second sanitizer at the launcher (one
          implementation, app/core/sanitize.py).
