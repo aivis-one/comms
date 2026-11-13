@@ -416,8 +416,9 @@ class TestImageRuns:
         # machine's arguments, and the start (runtime) or the suite (test).
         # W2-2: the runtime two more -- the `comms` command of the working
         # image, `comms derive bot-id` of a well-formed token and of a
-        # malformed one.
-        assert sorted(stage for stage, _ in runs) == ["runtime"] * 5 + ["test"] * 3
+        # malformed one. FIX W3-1: the runtime one more -- the migration
+        # before the start (test_the_start_is_migrated_first_by_primer_yamls_command).
+        assert sorted(stage for stage, _ in runs) == ["runtime"] * 6 + ["test"] * 3
         derives = [
             stage for stage, run in runs
             if re.search(r"comms:ci\s+comms derive bot-id\b", run)
@@ -442,6 +443,24 @@ class TestImageRuns:
         mounted = ('docker run -v "$PWD:/app:ro" -e TEMPLATES_DIR=/app/tests/x '
                    "comms:ci")
         assert _unreachable(mounted, _image_paths()) == []
+
+    def test_the_start_is_migrated_first_by_primer_yamls_command(self) -> None:
+        """FIX W3-1: /ready's `db` check reads the schema's revision, and
+        the API's start migrates nothing (W1-2) -- the machine runs
+        primer.yaml's `migrate` before `up`. The start step does the same:
+        the migration, in the runtime image, with the command read from
+        primer.yaml, before the service is started."""
+        step = _CI.split("- name: The image starts (GET /ready)", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        assert "['stacks']['comms']['migrate']" in step
+        assert "open('primer.yaml')" in step
+        migrate = step.index("comms:ci $migrate")
+        start = step.index("docker run -d --name comms-app")
+        assert migrate < start
+        (run,) = [r for _, r in _image_runs(_CI) if "comms:ci $migrate" in r]
+        assert "docker run --rm" in run, "a throwaway container"
+        stacks = yaml.safe_load((ROOT / "primer.yaml").read_text(encoding="utf-8"))
+        assert stacks["stacks"]["comms"]["migrate"] == "alembic upgrade head"
 
     def test_the_start_reads_the_profile_where_a_box_does(self) -> None:
         (start,) = [r for _, r in _image_runs(_CI) if "TEMPLATES_DIR" in r]

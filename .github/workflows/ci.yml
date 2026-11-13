@@ -513,9 +513,25 @@ jobs:
       # REDIS TOO (W3-1): /ready is 200 only with every check ok, the
       # `redis` check among them -- the Redis deploy/docker-compose.yml
       # pins, without a password here (nothing but this step reaches it).
+      # MIGRATED FIRST, AS THE MACHINE DOES (FIX W3-1): the `db` check is
+      # the read of the schema's revision (protocol 9.5), and since W1-2
+      # the API's start migrates nothing -- the machine's step `migrate`
+      # does, before `up`. So the database is migrated here by the same
+      # image and the same command: `stacks.comms.migrate` of primer.yaml,
+      # read from the file, in a throwaway container of comms:ci. Its
+      # environment is the suite's below, not comms-app's whole one, as
+      # the machine gives it: the migration reads only the database's
+      # address of the settings (migrations/env.py).
       - name: The image starts (GET /ready)
         if: matrix.part == 1
         run: |
+          migrate=$(python -c "import yaml; print(yaml.safe_load(open('primer.yaml'))['stacks']['comms']['migrate'])")
+          docker run --rm --network host \
+            -e APP_ENV=ci \
+            -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
+            -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
+            -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \
+            comms:ci $migrate
           redis=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-redis']['image'])")
           docker run -d --name comms-redis --network host "$redis" redis-server --port 6379
           token="123456789:$(printf 'A%.0s' $(seq 35))"
