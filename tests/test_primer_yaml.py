@@ -7,8 +7,9 @@ the `comms` command (app/cli.py). What the machine's loader says of the
 file is asked of the machine itself, in CI's job `machine`
 (scripts/check_primer_yaml.py): the machine is not in comms' locks.
 
-And the contract: the seams comms gives the product, `provides`, are the
-ones deploy/INTEGRATION.md section 15 describes -- both ways.
+And the contract: the seams comms gives the product, `provides`, and the
+one it takes, `requires` (W4-2), are the ones deploy/INTEGRATION.md
+section 15 describes -- both ways.
 
 And the hand-over (W1-2): with no env_file, a value reaches a comms
 process only through `environment:` of deploy/docker-compose.yml -- so
@@ -35,6 +36,7 @@ _PRIMER: dict[str, Any] = yaml.safe_load(
 )
 _ENV: dict[str, dict[str, Any]] = _PRIMER["env"]
 _PROVIDES: list[str] = _PRIMER["provides"]
+_REQUIRES: list[str] = _PRIMER["requires"]
 
 # Every setting by its variable, with its default in code.
 _DEFAULTS: dict[str, Any] = {
@@ -52,7 +54,6 @@ NOT_IN_ENV: dict[str, str] = {
     "COMMS_SERVICE_TOKEN_NEXT": (
         "the machine has no change of key yet (Primer's letter of 12.11)"
     ),
-    "LLM_BODY_HOSTS": "the product's storage, a seam from the product (W4-2)",
     "COMMS_WORKER_LANES": "unset is every lane: a default, not an absence",
 }
 
@@ -186,17 +187,45 @@ def _section(number: str) -> str:
     return _DOC[start:end]
 
 
+def _block(section: str, lead: str) -> str:
+    """The paragraph of `section` that opens with `lead`, through the
+    table after it: up to the next paragraph in bold."""
+    start = section.index(lead)
+    end = section.find("\n**", start + len(lead))
+    return section[start:] if end < 0 else section[start:end]
+
+
 def _seam_rows(text: str) -> list[str]:
     """The first column of the seams table: | `NAME` | what it is |."""
     return re.findall(r"^\| `([A-Z][A-Z0-9_]*)` \|", text, flags=re.M)
 
 
+_GIVES = "**The seams: what comms gives the product.**"
+_TAKES = "**The seam comms takes from the product.**"
+
+
 class TestTheContract:
     def test_the_seams_described_are_the_seams_given(self) -> None:
-        rows = _seam_rows(_section("15"))
+        """Was read off the whole section; since W4-2 the section has a
+        second table, of the seam comms takes, so each table is read
+        under its own paragraph."""
+        rows = _seam_rows(_block(_section("15"), _GIVES))
         assert rows  # the pair: the table is read
         assert len(rows) == len(set(rows))
         assert sorted(rows) == sorted(_PROVIDES)
+
+    def test_the_seam_described_is_the_seam_taken(self) -> None:
+        rows = _seam_rows(_block(_section("15"), _TAKES))
+        assert rows == _REQUIRES == ["PRODUCT_STORAGE_ADDRESS"]
+
+    def test_the_seam_taken_is_a_seam_from_the_product(self) -> None:
+        """W4-2, both ways: every name of `requires` is a key of `env` from
+        the product, under no option -- the machine checks `requires`
+        whatever the options (its half_seams) -- and every such key of
+        `env` is in `requires`."""
+        assert _ENV["PRODUCT_STORAGE_ADDRESS"] == {"source": "seam", "from": "product"}
+        seams = sorted(key for key, value in _ENV.items() if value["source"] == "seam")
+        assert seams == sorted(_REQUIRES)
 
     def test_every_seam_is_a_key_of_env(self) -> None:
         assert _PROVIDES

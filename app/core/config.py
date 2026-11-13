@@ -41,8 +41,8 @@ from app.core.channels import (
     channel_optional_keys,
     channel_spec,
     evaluate_channels,
-    parse_llm_body_hosts,
     parse_llm_key_sets,
+    storage_address_problem,
 )
 from app.core.lanes import Lane
 
@@ -91,8 +91,8 @@ from app.core.lanes import Lane
 # 3.5.0 is phase 5 (the llm channel: a type routed to a model, named key
 # sets with transport fallback, the raw answer kept on the job for its
 # type's term and the letter gone at the outcome; and a letter's audio
-# body by signed link, fetched every attempt from a host LLM_BODY_HOSTS
-# names, never stored) with H11-H15 (the waiting probe and the portion
+# body by signed link, fetched every attempt from a host the deploy
+# allowed, never stored) with H11-H15 (the waiting probe and the portion
 # select hold their cost, an empty JSONB value is SQL NULL -- forgetting
 # a person who once had a schedule works again --, the badge's index
 # holds no waiting delivery) and the base images' newer digests and CI's
@@ -600,19 +600,30 @@ class Settings(BaseSettings):
     # (app/engine/service.py). Not a lane's: a model writes for tens of
     # seconds, and the lanes' 30 must stay what it is for email.
     llm_deliver_timeout_seconds: int = 120
-    # The exact host:port pairs a body link may point at (P5-2,
-    # app/core/channels.py); empty = this deploy fetches no body.
-    llm_body_hosts: str = ""
+
+    # -- The product's storage (W4-2, app/core/channels.py) --
+    # `<host>:<port>` of the point of the product's object store, the seam
+    # PRODUCT_STORAGE_ADDRESS the machine gives comms from the product
+    # (primer.yaml `requires`). A body link is fetched only from
+    # `http://<it>/...`. NOT a key of the llm channel: the seam is not
+    # under an option -- the machine gives it, and requires it, whatever
+    # the instance's options -- and /health answers for it with the llm
+    # channel off too (app/api/report.py). Written, it must have its form
+    # in every APP_ENV, or startup is refused; empty = this deploy has no
+    # product storage, every body link is refused, and /health says the
+    # seam is not satisfied.
+    product_storage_address: str = ""
 
     @property
-    def llm_body_host_set(self) -> frozenset[tuple[str, int]]:
-        """The allowed (host, port) pairs; empty when nothing may be
-        fetched -- the llm channel switched off included, whose keys are
-        not read. Read only off validated settings."""
-        if self.llm_enabled != "true" or self.llm_body_hosts == "":
-            return frozenset()
-        allowed, _ = parse_llm_body_hosts(self.llm_body_hosts)
-        return allowed
+    def body_link_prefix(self) -> str | None:
+        """`http://<PRODUCT_STORAGE_ADDRESS>/`: what a body link must
+        begin with (app/core/channels.py body_link_allowed); None when the
+        deploy has no product storage. Built HERE -- the one file the
+        domain-literal fence allows a scheme in. Read only off validated
+        settings: a malformed address refused startup."""
+        if self.product_storage_address == "":
+            return None
+        return f"http://{self.product_storage_address}/"
 
     @property
     def llm_sets(self) -> dict[str, LLMKeySet]:
@@ -952,6 +963,13 @@ class Settings(BaseSettings):
                 "the comms API is internal (arch decision 14) and must "
                 "not run open."
             )
+        # W4-2: a seam the machine gave in a form comms cannot read is a
+        # defect of the box -- a red start, never a deploy that refuses
+        # every voice in silence. Empty is no storage, not a defect.
+        if self.product_storage_address != "":
+            storage_problem = storage_address_problem(self.product_storage_address)
+            if storage_problem is not None:
+                problems.append(storage_problem)
         # W2-1b: the next token rides beside a current one, never alone
         # -- in development too, where an empty current token would
         # leave the API open while a token was meant to guard it.

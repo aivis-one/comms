@@ -23,10 +23,13 @@
 #      `provides` without its key of `env`), a seam under an option the
 #      product takes without it, routes of a co-located service, data the
 #      service does not accept, two pairs on one network -- against a
-#      product that takes comms with every option of comms on. The product
-#      is a stand-in, parsed by the machine's loader too; it names nothing
-#      of any real product. `pridem check` reads one repository and asks
-#      no seam.
+#      product that takes comms with every option of comms on and gives
+#      every seam comms `requires` as a point of its own (W4-2: the
+#      product's storage, a ProvideAddress); each such seam must make a
+#      pair, the network the machine puts comms on. The product is a
+#      stand-in, parsed by the machine's loader too; it names nothing of
+#      any real product. `pridem check` reads one repository and asks no
+#      seam.
 #   3. comms' /health (W3-1), as the machine reads it after `up`: the
 #      document tests/fixtures/health.json -- held to a live answer of
 #      comms by key and type in the suite (tests/test_report.py), where the
@@ -115,11 +118,16 @@ name: stand-in
 kind: product
 options: [{options}]
 stacks:
-  stand-in: {{ compose: docker-compose.yml }}
+  stand-in:
+    compose: docker-compose.yml
+    expose: {{ files: {{ service: store, port: 9000, scheme: http }} }}
 dependencies:
   {name}: {{ repo: {name}, version: ">=4.0.0,<5.0.0" }}
+provides: {{ {provides} }}
 report: {{ health: /health, ready: /ready, logs: json, junit: true }}
 """
+# One seam the stand-in gives for each name of comms' `requires`.
+_PROVIDED = "{name}: {{ stack: stand-in, endpoint: files }}"
 
 # What `pridem check` may find in the compose file, and nothing else: the
 # KNOWN CEILING above, until W4-1. Sorted, as the machine sorts them.
@@ -189,7 +197,11 @@ def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
         found.append("provides is empty: the seams below would check nothing")
 
     product = parse_primer_yaml(
-        _PRODUCT.format(options=", ".join(stack.options), name=stack.name),
+        _PRODUCT.format(
+            options=", ".join(stack.options),
+            name=stack.name,
+            provides=", ".join(_PROVIDED.format(name=n) for n in stack.requires),
+        ),
         "the stand-in product",
     )
     assert isinstance(product, Product)
@@ -197,15 +209,23 @@ def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
     services = {stack.name: stack}
     if installed(product, None, on=on) != [stack.name]:
         return [f"seams: the stand-in product does not install {stack.name}"], []
+    found_pairs = pairs(product, services, None, on=on)
     for name, findings in (
         ("half seam", half_seams(product, services, None, on=on)),
         ("seam under option", seams_under_option(product, services, None, on=on)),
         ("routes", routes_on_co_located(product, services, None, on=on)),
         ("not accepted", unaccepted(product, services, None, on=on)),
-        ("network", network_collisions(pairs(product, services, None, on=on))),
+        ("network", network_collisions(found_pairs)),
     ):
         found += [f"seams: {name}: {finding}" for finding in findings]
+    paired = sorted(p.variable for p in found_pairs if p.consumer == stack.name)
+    if paired != sorted(stack.requires):
+        found.append(
+            f"seams: requires {sorted(stack.requires)} but the pairs of "
+            f"{stack.name} are {paired}"
+        )
     checked.append(f"seams: provides {', '.join(stack.provides)}")
+    checked.append(f"seams: requires {', '.join(stack.requires)}, each a pair")
 
     for entry, stage in stack.stacks.items():
         if not stage.persistent:

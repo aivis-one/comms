@@ -404,12 +404,12 @@ The job's other channels go as usual: a job for `[in_app, email]` with
 email off is `partial_sent`, its `in_app` delivery `sent`; a job whose
 every channel is off is `failed`. It is never reported as a success. An
 llm job with the llm channel off is accepted the same way -- its
-`llm_audio` link included, which is then not checked against
-`LLM_BODY_HOSTS` and never fetched -- and its one delivery is that
-outcome. A product that cannot do without a channel guards it with its
-own `options_required`; comms does not refuse the start for it. The
-same outcome meets a job accepted while a channel was on, delivered
-after a restart that switched it off.
+`llm_audio` link included, which is then not checked against the
+product's storage (section 11) and never fetched -- and its one
+delivery is that outcome. A product that cannot do without a channel
+guards it with its own `options_required`; comms does not refuse the
+start for it. The same outcome meets a job accepted while a channel
+was on, delivered after a restart that switched it off.
 
 **Startup refusals are readable.** The configuration is built before
 logging is set up, so a refusal prints a message -- naming the channel
@@ -1641,7 +1641,7 @@ letter):
 
 | field | value |
 |---|---|
-| `url` | a signed GET link to the object on the INTERNAL address of your store (path-style), `http://` or `https://`, no credentials or fragment, at most 4096 characters; comms fetches it as it is -- the same host and port, no proxy, no redirect followed |
+| `url` | a signed GET link to the object on the point of your store comms takes as `PRODUCT_STORAGE_ADDRESS` (below), path-style: `http://<PRODUCT_STORAGE_ADDRESS>/...`, no credentials or fragment, at most 4096 characters; comms fetches it as it is -- the same host and port, no proxy, no redirect followed |
 | `format` | the audio format the model is told, 1..16 lower-case letters or digits (`wav`, `mp3`, ...) |
 
 **Where the body goes.** comms fetches the body and appends ONE message
@@ -1650,15 +1650,23 @@ to the end of the letter's `messages`:
 Nothing in your messages is read or changed: write the prompt knowing
 the audio comes last. The link never goes to the model -- the bytes do.
 
-**The operator names the store.** `LLM_BODY_HOSTS` in comms' environment
-is the exact `host:port` pairs a link may point at, comma separated
-(`rustfs:9000`). Empty, the default: this deploy fetches nothing, and a
-request with `llm_audio` is rejected at intake. Both only with the llm
-channel on: with `LLM_ENABLED=false` the list is not read, and the job
-is accepted and ends in the outcome "channel unavailable" (section 3a). A link to any other
-host -- `comms-postgres`, `comms-redis`, `comms-app`, a metadata
-address -- is rejected at intake, and refused again at the attempt if
-the list changed since.
+**The link is on your storage, and nowhere else.** comms takes the
+point of your object store as the seam `PRODUCT_STORAGE_ADDRESS`
+(section 15): `<host>:<port>`, no scheme, given by the machine from your
+`provides`. A link is accepted only when it begins with exactly
+`http://<PRODUCT_STORAGE_ADDRESS>/` -- sign it on that address, the one
+the machine gives your own app for the same point. Anything else is
+rejected at intake, the link named nowhere: `https`, another host or
+port -- `comms-postgres`, `comms-redis`, `comms-app`, a metadata
+address --, credentials, the host in another case or with a trailing
+dot, a port left to its default, an IP for a name. A deploy without the
+seam (empty) fetches nothing, and every request with `llm_audio` is
+rejected at intake. All of it only with the llm channel on: with
+`LLM_ENABLED=false` the link is not checked, and the job is accepted and
+ends in the outcome "channel unavailable" (section 3a). A link accepted
+while the seam was one address is refused at the attempt -- failure
+class `configuration`, the store not asked -- if a restart gave comms
+another one since.
 
 **Every attempt fetches the body again,** and comms keeps it only in the
 attempt's memory -- never in its database, stream or dead letters. So:
@@ -2147,6 +2155,20 @@ file is the list; this section does not repeat it.
 `TELEGRAM_BOT_ID` waits for the machine: it refuses a derived value
 shorter than 16 characters, and a bot id is 9-10 digits.
 
+**The seam comms takes from the product.** `requires` of `primer.yaml`
+-- a key of comms' `env` with `source: seam, from: product`, which the
+product gives under the same name in its `provides`:
+
+| seam | what it is |
+|---|---|
+| `PRODUCT_STORAGE_ADDRESS` | `<host>:<port>` of the point of the product's object store, no scheme -- the one place an audio link may point (section 11). The product declares it as a point of one of its stacks; the machine puts comms' three processes on that point's network. Not under an option: the machine requires it whatever the options, so a product with no such point is refused by the machine's plan |
+
+Given in another form than `<host>:<port>` -- a lower-case name or an
+IPv4 address without a trailing dot, a port from 1 to 65535 -- it
+refuses comms' start, with the llm channel on or off. Empty, comms
+starts, every audio link is rejected, and `/health` says
+`requires_satisfied: false`.
+
 **`comms derive`.** The machine runs `comms derive <name>` in a
 throwaway container of the comms image, with the instance's other
 values in its environment; the value is the command's one line of
@@ -2181,7 +2203,7 @@ no other:
 | `uptime_s` | whole seconds since this process of the API started |
 | `status` | `ok` when every check is `ok`, else `degraded` |
 | `checks` | each check: `ok` or `error` |
-| `seams` | `provides` -- exactly the `provides` of `primer.yaml`; `requires_satisfied` -- every seam comms requires is set (comms requires none) |
+| `seams` | `provides` -- exactly the `provides` of `primer.yaml`; `requires_satisfied` -- the seam comms requires, `PRODUCT_STORAGE_ADDRESS`, is given (a malformed one never gets this far: comms does not start) |
 | `limits` | `max_upload_mb` -- the largest request body comms takes, in MiB |
 | `edition` | `core` -- a service has no editions |
 | `modules` | `[]` |

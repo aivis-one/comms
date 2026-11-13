@@ -3,7 +3,8 @@
 # =============================================================================
 #
 # What the machine reads to install comms beside a product: the stack, where
-# each value of the instance comes from, and what comms gives the product.
+# each value of the instance comes from, what comms gives the product and
+# what it takes from it.
 # No value lives here (contract 3 rule 1): only sources.
 #
 # env -- ONLY the values of an instance, the ones comms reads. A setting with
@@ -65,6 +66,16 @@ env:
   # A fact of the instance's provider account, though the code has a default.
   EMAIL_MAILGUN_REGION: { source: param, when: email }
   LLM_KEY_SETS: { source: asked, when: llm }
+  # The point of the product's object store (W4-2): `<alias>:<port>`, the
+  # one place a letter's audio link may point -- `http://<it>/...` (protocol
+  # 4.7). Not under `when: llm`: the machine checks `requires` whatever the
+  # options, and /health answers for it with the llm channel off too.
+  PRODUCT_STORAGE_ADDRESS: { source: seam, from: product }
+
+# What comms takes from the product (W4-2): /health says whether it was
+# given (`seams.requires_satisfied`, app/api/report.py).
+requires:
+  - PRODUCT_STORAGE_ADDRESS
 
 provides:
   - COMMS_API_URL

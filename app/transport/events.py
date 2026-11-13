@@ -759,9 +759,10 @@ def validate_llm_audio(
 ) -> dict[str, Any]:
     """The FORM of the link to an audio body. Every refusal names a
     field, never the link: it is signed, and the reason is recorded
-    under the product's key. Whether the link's host may be fetched is
-    the deploy's (LLM_BODY_HOSTS), decided at intake against the live
-    settings (app/engine/service.py create_notification)."""
+    under the product's key. Whether the link may be fetched -- whether
+    it is on the product's storage, PRODUCT_STORAGE_ADDRESS -- is decided
+    at intake against the live settings (app/engine/service.py
+    create_notification)."""
     if not isinstance(audio, dict):
         raise ValidationError(f"{event}: llm_audio must be a JSON object")
     unknown = sorted(str(k) for k in audio if k not in LLM_AUDIO_FIELDS)

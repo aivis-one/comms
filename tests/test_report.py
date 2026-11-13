@@ -28,6 +28,7 @@
 #   M9 a failing check logged on every request  -> TestTheTurn
 #   M13 no refusal without PRIMER_COMMIT        -> TestTheCommit
 #   M14 the revision not kept after the fall    -> TestTheRevision
+#   W4-2 `requires_satisfied` always true       -> TestTheSeams
 # =============================================================================
 
 import asyncio
@@ -86,6 +87,16 @@ def _redis_down(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_module, "redis_answers", down)
 
 
+_STORAGE = "store-files:9000"
+"""A product storage's address of the form the machine gives (W4-2)."""
+
+
+def _storage_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The seam comms requires, as on a box: the golden answer is one
+    whose seams are satisfied."""
+    monkeypatch.setattr(settings, "product_storage_address", _STORAGE)
+
+
 def _shape(value: Any) -> Any:
     """The keys and the JSON types of `value`, at every depth."""
     if isinstance(value, dict):
@@ -141,6 +152,7 @@ class TestTheGolden:
         self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         redis_answering(monkeypatch)
+        _storage_given(monkeypatch)
         live = (await client.get("/health")).json()
         assert live["status"] == "ok", "the pair: the answer the golden is"
         assert _shape(live) == _shape(_GOLDEN)
@@ -160,14 +172,40 @@ class TestTheSeams:
         self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         redis_answering(monkeypatch)
+        _storage_given(monkeypatch)
         seams = (await client.get("/health")).json()["seams"]
         assert seams["provides"] == _PRIMER["provides"] == list(PROVIDES)
         assert len(PROVIDES) == 5
         assert seams["requires_satisfied"] is True
 
     def test_requires_is_primer_yamls(self) -> None:
-        """None until W4-2; the code's list is the file's."""
-        assert list(REQUIRES) == _PRIMER.get("requires", [])
+        """The code's list is the file's -- since W4-2 the product's
+        storage, the one seam whose satisfaction the answer computes.
+        Was "none until W4-2", over an empty list."""
+        assert list(REQUIRES) == _PRIMER["requires"] == ["PRODUCT_STORAGE_ADDRESS"]
+
+    @pytest.mark.parametrize(
+        ("address", "satisfied"),
+        [(_STORAGE, True), ("", False)],
+        ids=["given", "empty"],
+    )
+    async def test_satisfied_is_the_storage_given(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+        address: str, satisfied: bool,
+    ) -> None:
+        """W4-2: `requires_satisfied` is the seam of the product's
+        storage given -- read off the validated settings, where a
+        malformed one refused startup (tests/test_llm_audio.py
+        TestTheSeam) -- and false without it; the machine refuses the
+        rollout on false (`seams_verify`). The rest of the answer is the
+        same either way: still 200, still `ok`."""
+        redis_answering(monkeypatch)
+        monkeypatch.setattr(settings, "product_storage_address", address)
+        response = await client.get("/health")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["seams"]["requires_satisfied"] is satisfied
+        assert body["status"] == "ok"
 
 
 class TestTheChecks:

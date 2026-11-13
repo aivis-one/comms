@@ -37,7 +37,12 @@
 # comms-app on its network `pridem` as `comms-comms-app` (COMMS_API_URL)
 # and comms-redis on the network of each pair of the point `events` as
 # `comms-comms-redis` (COMMS_EVENTS_ADDRESS); see deploy/INTEGRATION.md
-# section 1. comms-internal holds all five; the database lives only there.
+# section 1. And the other way: every service whose environment names
+# PRODUCT_STORAGE_ADDRESS -- the three application services, through the
+# anchor below -- is put on the network of the product storage's point
+# (W4-2; comms-app answers for the seam in /health, the consumer checks a
+# body link at intake, the worker fetches it). comms-internal holds all
+# five; the database lives only there.
 # The three application services are also on `default`: they reach the
 # channels' providers (Telegram, Mailgun, the llm gateways).
 #
@@ -64,6 +69,7 @@ x-comms-env: &comms-env
   EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:?}
   EMAIL_MAILGUN_REGION: ${EMAIL_MAILGUN_REGION:?}
   LLM_KEY_SETS: ${LLM_KEY_SETS:?}
+  PRODUCT_STORAGE_ADDRESS: ${PRODUCT_STORAGE_ADDRESS:?}
 
 services:
   comms-app:

@@ -39,7 +39,8 @@ from app.api import jobs
 from app.core.channels import (
     LLM_BODY_CLIENT_TIMEOUTS,
     LLM_BODY_DOWNLOAD_TIMEOUT,
-    parse_llm_body_hosts,
+    body_link_allowed,
+    storage_address_problem,
 )
 from app.core.config import Settings, format_startup_error, settings
 from app.core.database import get_session_factory
@@ -175,7 +176,10 @@ def deploy(
     provider, store = _Provider(), _Store()
     monkeypatch.setattr(settings, "llm_enabled", "true")
     monkeypatch.setattr(settings, "llm_key_sets", json.dumps(_SETS))
-    monkeypatch.setattr(settings, "llm_body_hosts", f"{_STORE}:{_STORE_PORT}")
+    # The seam of the product's storage (W4-2), as the machine gives it.
+    monkeypatch.setattr(
+        settings, "product_storage_address", f"{_STORE}:{_STORE_PORT}",
+    )
     registry.reset()
     install_profile(load_profile(
         FileProfileSource(audio_profile_dir),
@@ -266,31 +270,86 @@ class TestTheEnvelope:
         assert _SIG not in found and _CRED not in found
 
     @pytest.mark.parametrize(
-        "host",
+        "origin",
         [
-            "comms-postgres:5432", "comms-redis:6379", "comms-app:8000",
-            "localhost:80", "127.0.0.1:9000", "169.254.169.254:80",
-            f"{_STORE}:9001",
+            # Another service of the box, a loopback, a metadata address.
+            "http://comms-postgres:5432", "http://comms-redis:6379",
+            "http://comms-app:8000", "http://localhost:80",
+            "http://169.254.169.254:80",
+            # The storage's host, but not as the seam spells it.
+            f"http://{_STORE}:9001",                  # another port
+            f"https://{_STORE}:{_STORE_PORT}",        # another scheme
+            f"http://127.0.0.1:{_STORE_PORT}",        # an IP for the name
+            f"http://Store.Internal:{_STORE_PORT}",   # another case
+            f"http://{_STORE}.:{_STORE_PORT}",        # a trailing dot
+            f"http://{_STORE}",                       # the port left out
         ],
     )
-    async def test_a_link_outside_the_list_is_rejected(
-        self, deploy: _Deploy, bare_client: AsyncClient, host: str,
+    async def test_a_link_off_the_storage_is_rejected(
+        self, deploy: _Deploy, bare_client: AsyncClient, origin: str,
     ) -> None:
+        """W4-2: only `http://<PRODUCT_STORAGE_ADDRESS>/...`. Each origin
+        passes the envelope's form check -- the refusal is the storage's,
+        and it names nothing of the link. Was: a host outside
+        LLM_BODY_HOSTS, named in the reason; the list is gone, and a link
+        that fails the prefix has no host comms could name truthfully."""
         key = _key()
-        await _send(_voice(key, _link().replace(f"{_STORE}:{_STORE_PORT}", host)))
+        link = _link().replace(f"http://{_STORE}:{_STORE_PORT}", origin)
+        assert link != _link()  # the pair: the link is another one
+        await _send(_voice(key, link))
         found = await _reason(bare_client, key)
-        assert f"{host} is not in LLM_BODY_HOSTS" in found
+        assert "the link is not on this deploy's product storage" in found
+        assert "PRODUCT_STORAGE_ADDRESS" in found
+        assert origin.split("//")[1] not in found and _STORE not in found
         assert _SIG not in found
         assert deploy.store.requests == []
 
-    async def test_an_empty_list_fetches_nothing(
+    async def test_a_link_without_a_path_is_rejected(
+        self, deploy: _Deploy, bare_client: AsyncClient,
+    ) -> None:
+        """The seam's address and the query, no `/` between: the prefix
+        ends in `/`, so an authority that only BEGINS with the address
+        never passes (the `http://<seam>` prefix alone would take it)."""
+        key = _key()
+        origin = f"http://{_STORE}:{_STORE_PORT}"
+        link = origin + _link().split(origin + "/voice/a%2Fpart.wav", 1)[1]
+        assert link.startswith(origin + "?")  # the pair: the form it has
+        await _send(_voice(key, link))
+        found = await _reason(bare_client, key)
+        assert "the link is not on this deploy's product storage" in found
+        assert deploy.store.requests == []
+
+    async def test_no_storage_fetches_nothing(
         self, deploy: _Deploy, bare_client: AsyncClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(settings, "llm_body_hosts", "")
+        """Was test_an_empty_list_fetches_nothing (the list is gone): no
+        seam, no fetch -- every link refused, the right one included."""
+        monkeypatch.setattr(settings, "product_storage_address", "")
         key = _key()
         await _send(_voice(key))
-        assert "this deploy fetches no body" in await _reason(bare_client, key)
+        found = await _reason(bare_client, key)
+        assert "this deploy has no product storage" in found
+        assert "PRODUCT_STORAGE_ADDRESS is empty" in found
+        assert deploy.store.requests == []
+
+    async def test_a_port_spelled_out_is_the_one_taken(
+        self, deploy: _Deploy, bare_client: AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A seam on port 80: the link with `:80` written out is taken,
+        the same link with the port left to its default is not -- the
+        link is compared as the seam spells it, nothing filled in."""
+        monkeypatch.setattr(settings, "product_storage_address", f"{_STORE}:80")
+        spelled = _link().replace(f":{_STORE_PORT}/", ":80/")
+        default = _link().replace(f":{_STORE_PORT}/", "/")
+        taken, refused = _key(), _key()
+        await _send(_voice(taken, spelled))
+        await _send(_voice(refused, default))
+        call = await _call((await _job(taken)).id)
+        assert call.audio is not None and call.audio["url"] == spelled
+        found = await _reason(bare_client, refused)
+        assert "the link is not on this deploy's product storage" in found
 
     async def test_a_type_for_people_takes_no_link(
         self, deploy: _Deploy, bare_client: AsyncClient,
@@ -405,50 +464,132 @@ class TestTheLinkGoesAtTheOutcome:
             await session.commit()
 
 
-class TestTheList:
-    def test_the_form(self) -> None:
-        allowed, complaints = parse_llm_body_hosts("Store.Internal:9000, s3:443")
-        assert complaints == []
-        assert allowed == {("store.internal", 9000), ("s3", 443)}
+def _production(**values: str) -> Settings:
+    return Settings(
+        _env_file=None, app_env="production",
+        database_url="postgresql+asyncpg://u:p@db/comms_unit",
+        comms_service_token="unit-test-service-token",
+        **values,
+    )
+
+
+_LLM_ON = {"llm_enabled": "true", "llm_key_sets": json.dumps(_SETS)}
+
+
+class TestTheSeam:
+    """W4-2: PRODUCT_STORAGE_ADDRESS, the one address a body link may be
+    on. Was TestTheList, over LLM_BODY_HOSTS -- a list the operator
+    wrote, read only with the llm channel on; the machine gives the seam
+    whatever the options, so it is read and checked either way."""
 
     @pytest.mark.parametrize(
-        ("value", "complaint"),
+        "value", ["store.internal:9000", "store-files:80", "10.0.0.7:65535", "s3:1"],
+    )
+    def test_the_form(self, value: str) -> None:
+        assert storage_address_problem(value) is None
+        source = _production(**_LLM_ON, product_storage_address=value)
+        assert source.body_link_prefix == f"http://{value}/"
+
+    @pytest.mark.parametrize(
+        "value",
         [
-            ("a:1,a:1", "a:1 is listed twice"),
-            ("a:1,,b:2", "entry #2 is empty"),
-            ("store", "is not host:port"),
-            ("store:0", "is not host:port"),
-            ("store:70000", "is not host:port"),
-            ("[::1]:80", "is not host:port"),
+            "store", "store:", ":9000", "store:0", "store:70000", "store:09000",
+            "store:+90", "Store.Internal:9000", "store.:9000", "-store:9000",
+            "http://store:9000", "store:9000/", "store:9000/x", "[::1]:80",
+            " store:9000", "store:9000 ", "u@store:9000", "   ",
         ],
     )
-    def test_a_broken_list_refuses_startup(self, value: str, complaint: str) -> None:
+    @pytest.mark.parametrize("llm", ["true", "false"])
+    def test_a_broken_seam_refuses_startup(self, value: str, llm: str) -> None:
+        """A red start, the llm channel on or off: the machine gives the
+        seam whatever the options, so a malformed one is a defect of the
+        box either way. The value is not echoed."""
+        values = _LLM_ON if llm == "true" else {"llm_enabled": "false"}
         with pytest.raises(ValidationError) as caught:
-            Settings(
-                _env_file=None, app_env="production",
-                database_url="postgresql+asyncpg://u:p@db/comms_unit",
-                comms_service_token="unit-test-service-token",
-                # The list is the llm channel's key: read, and refused
-                # when broken, only with the channel on (W2-1).
-                llm_enabled="true", llm_key_sets=json.dumps(_SETS),
-                llm_body_hosts=value,
-            )
+            _production(**values, product_storage_address=value)
         refusal = format_startup_error(caught.value)
-        assert "LLM_BODY_HOSTS is malformed" in refusal
-        assert complaint in refusal
+        assert "PRODUCT_STORAGE_ADDRESS is not <host>:<port>" in refusal
+        assert value.strip() == "" or value.strip() not in refusal
 
-    async def test_a_host_dropped_since_intake_is_the_deploys(
+    @pytest.mark.parametrize("llm", ["true", "false"])
+    def test_an_empty_seam_starts_with_no_storage(self, llm: str) -> None:
+        """The pair to the refusal: empty is no storage, not a defect --
+        the service starts, and nothing may be fetched."""
+        values = _LLM_ON if llm == "true" else {"llm_enabled": "false"}
+        source = _production(**values, product_storage_address="")
+        assert source.body_link_prefix is None
+        assert _production(**values).body_link_prefix is None
+
+    @pytest.mark.parametrize(
+        ("link", "allowed"),
+        [
+            ("http://store:9000/b/k?sig=1", True),
+            ("http://store:9000/", True),
+            ("http://store:9000", False),
+            ("http://store:9000?sig=1", False),
+            ("https://store:9000/b/k", False),
+            ("HTTP://store:9000/b/k", False),
+            ("http://store:90001/b/k", False),
+            ("http://store:900/b/k", False),
+            ("http://store:9001/b/k", False),
+            ("http://store/b/k", False),
+            ("http://Store:9000/b/k", False),
+            ("http://store.:9000/b/k", False),
+            ("http://store:9000@evil:9000/b/k", False),
+            ("http://u:p@store:9000/b/k", False),
+            ("http://store.evil:9000/b/k", False),
+            ("http://127.0.0.1:9000/b/k", False),
+            ("//store:9000/b/k", False),
+        ],
+    )
+    def test_the_one_test_of_a_link(self, link: str, allowed: bool) -> None:
+        """body_link_allowed, the test intake and the attempt share: the
+        link begins with `http://<seam>/`, nothing parsed or filled in.
+        Some of these never reach it -- the envelope's form refuses
+        credentials and a port out of range first -- and are here because
+        the function must not rely on that."""
+        assert body_link_allowed(link, "http://store:9000/") is allowed
+        assert body_link_allowed(link, None) is False
+
+    async def test_a_seam_changed_since_intake_is_the_deploys(
         self, deploy: _Deploy, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Was test_a_host_dropped_since_intake_is_the_deploys: the same
+        outcome, now for a restart that gave comms another seam."""
         key = _key()
         await _send(_voice(key))
-        monkeypatch.setattr(settings, "llm_body_hosts", "other.internal:9000")
+        monkeypatch.setattr(settings, "product_storage_address", "other.internal:9000")
         _rebuild(deploy.provider, deploy.store)
         await _pass()
         delivery = await _delivery((await _job(key)).id)
         assert delivery.status == DeliveryStatus.FAILED
         assert delivery.failure_class == "configuration"
         assert deploy.store.requests == []
+        assert deploy.provider.requests == []
+
+    async def test_a_seam_gone_since_intake_is_the_deploys(
+        self, deploy: _Deploy, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        key = _key()
+        await _send(_voice(key))
+        monkeypatch.setattr(settings, "product_storage_address", "")
+        _rebuild(deploy.provider, deploy.store)
+        await _pass()
+        delivery = await _delivery((await _job(key)).id)
+        assert delivery.status == DeliveryStatus.FAILED
+        assert delivery.failure_class == "configuration"
+        assert deploy.store.requests == []
+
+    async def test_the_same_seam_fetches(self, deploy: _Deploy) -> None:
+        """The pair to the two above: the seam unchanged, the link is
+        fetched and the job sent."""
+        deploy.store.on(deploy.store.body())
+        deploy.provider.on(_GW_HOST, _ok())
+        key = _key()
+        await _send(_voice(key))
+        await _pass()
+        assert len(deploy.store.requests) == 1
+        assert (await _job(key)).status == NotificationStatus.SENT
 
     def test_the_limit_is_a_field_of_the_llm_kind(self, deploy: _Deploy) -> None:
         declared = registry.explain("ask.voice", "max_audio_bytes")
@@ -782,10 +923,18 @@ class TestTheContract:
         documented = json.dumps(request["messages"][-1], separators=(", ", ": "))
         assert documented in " ".join(_section_11().split())
 
-    def test_the_operator_finds_the_list(self) -> None:
+    def test_the_product_finds_the_seam(self) -> None:
+        """Was test_the_operator_finds_the_list: the list is gone from
+        every place it was named (W4-2) -- the pair: the seam is named
+        there instead."""
         example = (_REPO / "deploy" / ".env.example").read_text()
-        assert "\nLLM_BODY_HOSTS=\n" in example
-        assert "`LLM_BODY_HOSTS`" in _section_11()
+        primer = (_REPO / "primer.yaml").read_text()
+        assert "\nPRODUCT_STORAGE_ADDRESS=\n" in example
+        flat = " ".join(_section_11().split())
+        assert "`http://<PRODUCT_STORAGE_ADDRESS>/`" in flat
+        assert "PRODUCT_STORAGE_ADDRESS" in primer
+        for text in (example, _DOC, primer):
+            assert "LLM_BODY_HOSTS" not in text
 
     def test_the_limits_numbers(self) -> None:
         """max_audio_bytes' range and default, against the code, in the

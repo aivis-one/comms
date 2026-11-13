@@ -450,70 +450,59 @@ def _llm_key_sets(value: str) -> str | None:
     return "; ".join(complaints) if complaints else None
 
 
-# -- llm: the body of a letter by link (P5-2) ---------------------------------
+# -- llm: the body of a letter by link (P5-2, W4-2) --------------------------
 #
 # A large body -- a voice recording -- does not travel in the envelope
 # (spec §5.10): the product keeps it in its own object store and puts a
 # SIGNED link to it in the envelope (`llm_audio.url`); comms fetches it
-# on every attempt over the internal network and hands the bytes to the
+# on every attempt over the box's network and hands the bytes to the
 # model. A link from a product's envelope is an address comms will GET
 # -- without a limit, a way into every internal service of the box
-# (comms-postgres, comms-redis, comms-app itself). LLM_BODY_HOSTS is the
-# limit: the exact `host:port` pairs a link may point at, comma
-# separated. Empty (the default): this deploy fetches nothing, and an
-# envelope with a link is rejected at intake. A list of what is
-# ALLOWED, never of what is forbidden -- a deny list is never complete.
+# (comms-postgres, comms-redis, comms-app itself). The limit is ONE
+# address: the point of the product's storage, which the deploy machine
+# gives comms as the seam PRODUCT_STORAGE_ADDRESS -- `<alias>:<port>`,
+# no scheme (Primer protocol 4.4) -- and a point inside the box is plain
+# http (protocol 4.7 and its additions 1.10: the consumer builds
+# `http://<address>`). A link is taken only when it BEGINS with exactly
+# `http://<address>/`: the authority of a URL ends at its first `/`, so
+# that prefix is the scheme, the host and the port, spelled as the seam
+# spells them -- another scheme, host or port, credentials before an
+# `@`, another case, a trailing dot or a port left to its default all
+# fail it, with nothing parsed. Empty: the deploy has no product
+# storage, and every link is refused. The prefix itself is built in
+# app/core/config.py, the one file allowed a scheme.
 
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\Z")
+_PORT_RE = re.compile(r"[1-9][0-9]{0,4}\Z")
 
 
-def parse_llm_body_hosts(value: str) -> tuple[frozenset[tuple[str, int]], list[str]]:
-    """LLM_BODY_HOSTS -> (the allowed (host, port) pairs; complaints).
-    Hosts compare in lower case; no default port -- written out, so the
-    list says exactly what is reached."""
-    allowed: set[tuple[str, int]] = set()
-    complaints: list[str] = []
-    for position, raw in enumerate(value.split(","), start=1):
-        entry = raw.strip()
-        if entry == "":
-            complaints.append(f"entry #{position} is empty")
-            continue
-        host, sep, port = entry.rpartition(":")
-        host = host.lower()
-        if (
-            not sep
-            or _HOST_RE.match(host) is None
-            or not port.isdigit()
-            or not 1 <= int(port) <= 65535
-        ):
-            complaints.append(
-                f"entry #{position} {entry!r} is not host:port (a name or "
-                f"an IPv4 address, a port from 1 to 65535)"
-            )
-            continue
-        pair = (host, int(port))
-        if pair in allowed:
-            complaints.append(f"{host}:{port} is listed twice")
-            continue
-        allowed.add(pair)
-    return frozenset(allowed), complaints
+def storage_address_problem(value: str) -> str | None:
+    """What is wrong with PRODUCT_STORAGE_ADDRESS, or None when it reads
+    as an address: `<host>:<port>` exactly as the machine gives it -- a
+    lower-case name (or an IPv4 address) without a trailing dot, and a
+    port from 1 to 65535 without a leading zero. Not normalized: the
+    links are compared with it as it is spelled."""
+    host, sep, port = value.rpartition(":")
+    if (
+        not sep
+        or _HOST_RE.match(host) is None
+        or _PORT_RE.match(port) is None
+        or int(port) > 65535
+    ):
+        return (
+            "PRODUCT_STORAGE_ADDRESS is not <host>:<port> -- a lower-case "
+            "name or an IPv4 address without a trailing dot, a port from 1 "
+            "to 65535, no scheme (the seam of the product's storage)"
+        )
+    return None
 
 
-def body_endpoint(url: str) -> tuple[str, int]:
-    """(host, port) of a body link, the host in lower case and the port
-    written out -- the form LLM_BODY_HOSTS lists. Only for a link whose
-    form intake accepted (app/transport/events.py validate_llm_audio)."""
-    parts = urlsplit(url)
-    if parts.hostname is None:
-        raise ValueError("a body link without a host")
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    return parts.hostname.lower(), port
-
-
-def _llm_body_hosts(value: str) -> str | None:
-    """The form validator of LLM_BODY_HOSTS: every complaint, one line."""
-    _, complaints = parse_llm_body_hosts(value)
-    return "; ".join(complaints) if complaints else None
+def body_link_allowed(url: str, prefix: str | None) -> bool:
+    """Whether a body link may be fetched: it begins with `prefix`, the
+    `http://<PRODUCT_STORAGE_ADDRESS>/` of app/core/config.py
+    (Settings.body_link_prefix); never when the deploy has no product
+    storage (None). The one test, at intake and at the attempt alike."""
+    return prefix is not None and url.startswith(prefix)
 
 
 # The client that fetches a body: its own numbers, in this one place.
@@ -581,10 +570,6 @@ CHANNEL_SPECS: tuple[ChannelSpec, ...] = (
         name="llm",
         keys=("LLM_KEY_SETS",),
         validators={"LLM_KEY_SETS": _llm_key_sets},
-        # Defaulted (empty = no body is ever fetched), so not a key the
-        # channel requires; its form is checked when the channel is on
-        # and the value is spelled out (P5-2).
-        optional_validators={"LLM_BODY_HOSTS": _llm_body_hosts},
         # One call to one set. read is the model writing its answer: a
         # long answer of a slow model takes tens of seconds, and a read
         # timeout here -- unlike a connect timeout -- may leave a paid

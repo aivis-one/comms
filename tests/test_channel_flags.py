@@ -128,7 +128,6 @@ _FULL: dict[str, dict[str, str]] = {
     },
     "llm": {
         "LLM_KEY_SETS": _LLM_SETS,
-        "LLM_BODY_HOSTS": "store.internal:9000",
     },
 }
 # A malformed value for one key of each channel, and one for a defaulted
@@ -136,7 +135,7 @@ _FULL: dict[str, dict[str, str]] = {
 _MALFORMED: dict[str, dict[str, str]] = {
     "telegram": {"TELEGRAM_BOT_TOKEN": "not-a-token"},
     "email": {"EMAIL_FROM_ADDRESS": "noreply", "EMAIL_MAILGUN_REGION": "europe"},
-    "llm": {"LLM_KEY_SETS": "{", "LLM_BODY_HOSTS": "store"},
+    "llm": {"LLM_KEY_SETS": "{"},
 }
 _FLAGGED = [spec.name for spec in CHANNEL_SPECS if spec.flag is not None]
 
@@ -244,7 +243,6 @@ class TestTheFlag:
         source = _settings(channel, "false", _FULL[channel])
         assert channel_map(source)[channel] == ChannelState.NOT_CONFIGURED
         assert source.llm_sets == {}
-        assert source.llm_body_host_set == frozenset()
         built: list[str] = []
         registry_ = build_formatters(
             source,
@@ -554,10 +552,13 @@ class TestTheDelivery:
 
     async def test_an_llm_job_with_audio_is_accepted_and_is_the_outcome(
         self, db_session: AsyncSession, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """M9: with llm off the body's host is not checked -- the list
-        that would judge it is not read -- and the job ends in the same
-        outcome, its letter and link gone with it."""
+        """M9: with llm off the body's link is not checked -- not even
+        against the product's storage, which is given (W4-2: the seam is
+        read whatever the options; until then the list that judged the
+        link was the channel's own key, not read) -- and the job ends in
+        the same outcome, its letter and link gone with it."""
         from app.profile.loader import (
             FileProfileSource,
             install_profile,
@@ -567,7 +568,8 @@ class TestTheDelivery:
         registry.reset()
         install_profile(load_profile(FileProfileSource(_profile(tmp_path / "p"))))
         assert settings.llm_enabled == "false"
-        assert settings.llm_body_host_set == frozenset()
+        monkeypatch.setattr(settings, "product_storage_address", "store.internal:9000")
+        assert settings.body_link_prefix is not None
         notification = await create_notification(
             db_session, **intake_fields(), type="ask.off",
             title=None, body=None, target_type=None, target_value=None,

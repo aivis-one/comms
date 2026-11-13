@@ -70,12 +70,6 @@ from tests.helpers import create_recipient, intake_fields
 _KEY = "key-0123456789"
 _DOMAIN = "mail.example.test"
 _SENDER = "noreply@mail.example.test"
-# One whole llm key set, for a deploy with the llm channel on.
-_LLM_SETS = json.dumps({"llm.text": {
-    "endpoint": "https://llm.example.test/v1", "key": "llm-unit-key",
-    "model": "unit-model", "gateway": False,
-}})
-
 _WITH_EMAIL: dict[str, Any] = {
     "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
@@ -375,20 +369,12 @@ class TestRegionIsDefaultedNotDeciding:
         assert getattr(_settings(**{name: ""}), name) == getattr(
             _settings(), name,
         )
-        # The pair: "the two agree" says nothing if both are "". Since
-        # P5-2 one defaulted key has "" AS its default -- LLM_BODY_HOSTS,
-        # where empty means "fetch nothing" -- so for it the pair is what
-        # the default MEANS, and that a written value is read.
-        if name == "llm_body_hosts":
-            # Read only with the llm channel on (W2-1), which then needs
-            # its key set too.
-            llm_on = {"llm_enabled": "true", "llm_key_sets": _LLM_SETS}
-            assert _settings(**llm_on).llm_body_host_set == frozenset()
-            assert _settings(
-                **llm_on, llm_body_hosts="store:9000",
-            ).llm_body_host_set == {("store", 9000)}
-        else:
-            assert getattr(_settings(), name) != ""
+        # The pair: "the two agree" says nothing if both are "". From
+        # P5-2 to W4-2 one defaulted key had "" AS its default, and the
+        # pair was what that default meant; W4-2 replaced it with the seam
+        # of the product's storage, which is no key of a channel. Every
+        # defaulted key left has a default of its own.
+        assert getattr(_settings(), name) != ""
 
     def test_an_unknown_region_is_not_read_while_email_is_off(self) -> None:
         """Was test_unknown_region_refuses_even_without_the_channel: a

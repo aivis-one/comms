@@ -87,7 +87,7 @@ from app.core.channels import (
     LLM_BODY_DOWNLOAD_TIMEOUT,
     ChannelState,
     LLMKeySet,
-    body_endpoint,
+    body_link_allowed,
     channel_spec,
     switched_off_reason,
 )
@@ -1459,14 +1459,15 @@ class LLMFormatter:
         client: Any,
         sets: Mapping[str, LLMKeySet],
         body_client: Any = None,
-        body_hosts: frozenset[tuple[str, int]] = frozenset(),
+        body_link_prefix: str | None = None,
     ) -> None:
-        """Hold the HTTP clients, this deploy's key sets and the hosts a
-        body may be fetched from (LLM_BODY_HOSTS)."""
+        """Hold the HTTP clients, this deploy's key sets and what a body
+        link must begin with (Settings.body_link_prefix; None: the deploy
+        has no product storage)."""
         self._client = client
         self._sets = dict(sets)
         self._body_client = body_client
-        self._body_hosts = body_hosts
+        self._body_link_prefix = body_link_prefix
 
     async def ask(
         self,
@@ -1521,12 +1522,13 @@ class LLMFormatter:
         """
         url: str = audio["url"]
         limit: int = audio["max_bytes"]
-        if body_endpoint(url) not in self._body_hosts:
-            # Intake checked the host; the list changed since (a restart
-            # with another .env). The deploy's, not the message's.
+        if not body_link_allowed(url, self._body_link_prefix):
+            # Intake checked the link; the product storage's address
+            # changed since, or is gone (a restart with another seam).
+            # The deploy's, not the message's.
             raise ConfigurationError(
-                "body download: the link's host is not in LLM_BODY_HOSTS "
-                "on this deploy"
+                "body download: the link is not on this deploy's product "
+                "storage (PRODUCT_STORAGE_ADDRESS)"
             )
         try:
             async with asyncio.timeout(LLM_BODY_DOWNLOAD_TIMEOUT):
@@ -1968,7 +1970,7 @@ def _build_llm(source: Settings, factories: "_Factories") -> _Built:
             client=client,
             sets=source.llm_sets,
             body_client=body_client,
-            body_hosts=source.llm_body_host_set,
+            body_link_prefix=source.body_link_prefix,
         ),
         closers=[
             ("llm_http_client", _close_client),
@@ -2157,8 +2159,8 @@ def _real_llm_body_client_factory() -> Any:
     port, over the internal network, never through a proxy the
     environment names (HTTP(S)_PROXY), and with no credentials from a
     .netrc. Redirects are not followed: a link that redirects is not the
-    object (app/core/channels.py LLM_BODY_HOSTS bounds where it may
-    point; a redirect would leave that bound). Its numbers are
+    object (app/core/channels.py: PRODUCT_STORAGE_ADDRESS bounds where it
+    may point; a redirect would leave that bound). Its numbers are
     LLM_BODY_CLIENT_TIMEOUTS.
     """
     import httpx

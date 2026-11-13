@@ -65,6 +65,7 @@ from pydantic import (
     field_validator,
 )
 
+from app.core.config import settings
 from app.core.constants import MAX_REQUEST_BODY_BYTES
 from app.core.logging import RELEASE_VARIABLE
 from app.core.sanitize import db_error_summary, pipeline_error_of
@@ -97,9 +98,10 @@ PROVIDES: tuple[str, ...] = (
 seam of the product from comms against (`seams_verify`). The runtime image
 does not carry primer.yaml; tests/test_report.py holds the two equal."""
 
-REQUIRES: tuple[str, ...] = ()
-"""`requires` of primer.yaml: none until the product's storage (W4-2).
-`requires_satisfied` is every one of them set in the environment."""
+REQUIRES: tuple[str, ...] = ("PRODUCT_STORAGE_ADDRESS",)
+"""`requires` of primer.yaml: the product's storage (W4-2), the one seam
+comms takes from the product. `requires_satisfied` is _requires_satisfied
+below; tests/test_report.py holds this list to the file."""
 
 MIB = 1024 * 1024
 MAX_UPLOAD_MB = MAX_REQUEST_BODY_BYTES // MIB
@@ -202,10 +204,18 @@ async def _within[T](call: Callable[[], Awaitable[T]]) -> T | Exception:
         return error
 
 
+def _requires_satisfied() -> bool:
+    """The product's storage is given and reads as an address: off the
+    validated settings, where a malformed one refused startup -- so a
+    seam that is written is one comms builds its body links on
+    (Settings.body_link_prefix), and an empty one is not satisfied."""
+    return settings.body_link_prefix is not None
+
+
 def _seams() -> Seams:
     return Seams(
         provides=list(PROVIDES),
-        requires_satisfied=all(os.environ.get(name) for name in REQUIRES),
+        requires_satisfied=_requires_satisfied(),
     )
 
 

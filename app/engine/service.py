@@ -74,7 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.audience.models import Recipient
 from app.audience.prefs import muted_recipient_ids
 from app.audience.schedule import recipient_deferred_until
-from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT, body_endpoint
+from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT, body_link_allowed
 from app.core.config import settings
 from app.core.constants import MAX_LLM_LETTER_CHARS
 from app.core.database import is_unique_violation_of
@@ -642,21 +642,23 @@ def _letter_by_kind(
         )
 
 
-def _check_body_host(url: str) -> None:
-    """Refuse a body link this deploy may not fetch (P5-2): its host and
-    port are not in LLM_BODY_HOSTS, or the list is empty. Names the host
-    -- never the link, which is signed."""
-    allowed = settings.llm_body_host_set
-    host, port = body_endpoint(url)
-    if not allowed:
+def _check_body_link(url: str) -> None:
+    """Refuse a body link this deploy may not fetch (P5-2, W4-2): the
+    deploy has no product storage, or the link is not on it
+    (app/core/channels.py body_link_allowed). Names neither the link,
+    which is signed, nor any part of it: a link that fails the prefix
+    has no host comms could name truthfully."""
+    prefix = settings.body_link_prefix
+    if prefix is None:
         raise ValidationError(
-            "llm_audio: this deploy fetches no body (LLM_BODY_HOSTS is "
-            "empty)"
+            "llm_audio: this deploy has no product storage "
+            "(PRODUCT_STORAGE_ADDRESS is empty)"
         )
-    if (host, port) not in allowed:
+    if not body_link_allowed(url, prefix):
         raise ValidationError(
-            f"llm_audio: {host}:{port} is not in LLM_BODY_HOSTS on this "
-            f"deploy"
+            "llm_audio: the link is not on this deploy's product storage "
+            "(scheme http, the host and port of PRODUCT_STORAGE_ADDRESS "
+            "exactly, then the path)"
         )
 
 
@@ -724,8 +726,9 @@ async def create_notification(
             and body stay required for a type delivered to people --
             they are the letter of the other channels, not of this one.
         llm_audio: The link to the letter's audio body (P5-2) -- an llm
-            type only; its host must be in LLM_BODY_HOSTS. Kept with the
-            letter, cleared with it.
+            type only; it must be on the product's storage
+            (PRODUCT_STORAGE_ADDRESS). Kept with the letter, cleared
+            with it.
         scheduled_at: "Not before" -- when the job becomes deliverable.
             Defaults to now; at most MAX_DURATION_DAYS ahead.
         expiry_at: The envelope's expiry. Wins over the profile's
@@ -756,13 +759,13 @@ async def create_notification(
         target_type=target_type, target_value=target_value,
         action_data=action_data, llm=llm, llm_audio=llm_audio,
     )
-    # The host of a body link is the llm channel's key (LLM_BODY_HOSTS):
-    # with the channel switched off it is not read, and the job is taken
-    # like any other into a switched-off channel -- its delivery ends in
-    # the outcome "channel unavailable", the body never fetched (owner's
-    # decision 05.11: an outcome, not a refusal at intake).
+    # A body link is checked only with the llm channel on: switched off,
+    # the job is taken like any other into a switched-off channel -- its
+    # delivery ends in the outcome "channel unavailable", the body never
+    # fetched (owner's decision 05.11: an outcome, not a refusal at
+    # intake).
     if llm_audio is not None and settings.llm_enabled == "true":
-        _check_body_host(llm_audio["url"])
+        _check_body_link(llm_audio["url"])
     if email is not None and DeliveryChannel.EMAIL not in record.value(
         "channels"
     ):
