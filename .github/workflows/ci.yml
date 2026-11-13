@@ -78,6 +78,11 @@ jobs:
       # here from the run -- a process of comms without it refuses to
       # start (app/core/logging.py release_from_environment).
       PRIMER_RELEASE: ${{ github.ref_name }}
+      # The commit /health names (W3-1): the API refuses to start without
+      # it (app/api/report.py commit_from_environment), and the suite
+      # answers /health -- here from the run, as the image from its
+      # build argument.
+      PRIMER_COMMIT: ${{ github.sha }}
       # The package from the checkout, as the image has it from /app
       # (Dockerfile, PYTHONPATH) -- not installed (REV-5, see below).
       PYTHONPATH: ${{ github.workspace }}
@@ -214,7 +219,8 @@ jobs:
   # machine's own code, pinned to one commit of its repository -- `pridem
   # check` of the repository whole (primer.yaml, and the compose file
   # through the runner's `docker compose config`: the binary, no daemon)
-  # and the seams of a box (scripts/check_primer_yaml.py says what each is,
+  # and the seams of a box, and comms' /health as the machine reads it
+  # after `up` (W3-1) (scripts/check_primer_yaml.py says what each is,
   # and the one finding allowed until W4-1). The machine is installed from
   # ITS lock and ITS wheels, both in
   # its repository at that commit, hash-checked -- into a venv of its own:
@@ -260,7 +266,7 @@ jobs:
           PIP_FIND_LINKS: .primer/wheels
         run: pip install --require-hashes -r .primer/requirements.lock
 
-      - name: The repository by the machine (pridem check, the seams)
+      - name: The repository by the machine (pridem check, the seams, /health)
         env:
           PYTHONPATH: ${{ github.workspace }}/.primer
         run: python scripts/check_primer_yaml.py
@@ -296,6 +302,8 @@ jobs:
       PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
       # The release every log line names, as in `checks` (W3-2).
       PRIMER_RELEASE: ${{ github.ref_name }}
+      # The commit /health names, as in `checks` (W3-1).
+      PRIMER_COMMIT: ${{ github.sha }}
       # The package from the checkout, as in `checks` (REV-5).
       PYTHONPATH: ${{ github.workspace }}
 
@@ -502,14 +510,20 @@ jobs:
       # mounted, and TEMPLATES_DIR is the compose file's).
       # Once per build is enough: in part 1 only (CI-2) -- the same image
       # is built in each part, and the start says the same of each.
+      # REDIS TOO (W3-1): /ready is 200 only with every check ok, the
+      # `redis` check among them -- the Redis deploy/docker-compose.yml
+      # pins, without a password here (nothing but this step reaches it).
       - name: The image starts (GET /ready)
         if: matrix.part == 1
         run: |
+          redis=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-redis']['image'])")
+          docker run -d --name comms-redis --network host "$redis" redis-server --port 6379
           token="123456789:$(printf 'A%.0s' $(seq 35))"
           docker run -d --name comms-app --network host \
             -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
+            -e REDIS_URL=redis://127.0.0.1:6379/0 \
             -v "$PWD/tests/fixtures/profile:/profile:ro" \
             -e TEMPLATES_DIR=/profile \
             -e TELEGRAM_ENABLED=true \
@@ -523,7 +537,7 @@ jobs:
             comms:ci
           for _ in $(seq 60); do
             if curl -sf http://127.0.0.1:8000/ready; then
-              docker rm -f comms-app
+              docker rm -f comms-app comms-redis
               exit 0
             fi
             sleep 1

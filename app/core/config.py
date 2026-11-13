@@ -49,9 +49,11 @@ from app.core.lanes import Lane
 # Single source of truth for API version.
 # Import as: from app.core.config import APP_VERSION, settings
 #
-# IT IS THE NUMBER THE DEPLOY REPORTS. /health and the startup log both
-# carry it, and the first question when an incident is opened in
-# someone else's stack is which version of comms is running there. It
+# IT IS THE NUMBER OF THE CONTRACT. The startup log carries it, and the
+# first question when an incident is opened in someone else's stack is
+# which version of comms is running there. (/health carried it until
+# W3-1; it now names what the deploy machine reads -- the release and the
+# commit the image was built from, app/api/report.py.) It
 # stood at 0.1.0 through every release up to v1.3.0, which made that
 # question unanswerable from the outside. Raise it with the tag, in the
 # same commit; pyproject carries the same number and a test pins the
@@ -480,9 +482,11 @@ class Settings(BaseSettings):
     # -- Event transport, push side (Phase 3c) --
     # The consumer process (`python -m app.consumer`) reads the
     # product's event stream via a Redis consumer group. Nobody else
-    # needs Redis (API/worker are DB-only), so an empty redis_url is
-    # validated at CONSUMER startup (app/consumer.py), not here --
-    # deliberately not coupled to any delivery channel.
+    # works with Redis -- the API only checks that it answers, for
+    # /health and /ready (W3-1, app/main.py), and an empty redis_url is
+    # that check's `error`; the worker is DB-only -- so an empty
+    # redis_url is refused at CONSUMER startup (app/consumer.py), not
+    # here -- deliberately not coupled to any delivery channel.
     # Names below are FROZEN CONTRACT surface (Phase 3c item 7): the
     # product's outbox relay XADDs into comms_events_stream; the DLQ
     # is derived as f"{comms_events_stream}:dlq" (see dlq_stream).

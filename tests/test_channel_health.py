@@ -4,7 +4,8 @@
 #
 # The second answer next to GET /health: what each channel answered in
 # the last N minutes, counted from the journal's channel rows, stored
-# nowhere, behind the service token; /health itself does not change.
+# nowhere, behind the service token; none of it reaches /health, whose
+# channel map (under `details` since W3-1) says only what a deploy has.
 #
 # MUTATIONS these tests were written against (each turns one red):
 #   M1 the subject = 'channel' filter dropped
@@ -42,6 +43,7 @@ from httpx import AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.report import Health
 from app.core.config import settings
 from app.core.constants import (
     HEALTH_WINDOW_DEFAULT_MINUTES,
@@ -203,7 +205,7 @@ class TestTheAivisInstall:
 
         shallow = await client.get("/health")
         assert shallow.status_code == 200
-        assert shallow.json()["channels"]["email"] == "live"
+        assert shallow.json()["details"]["channels"]["email"] == "live"
 
 
 # -----------------------------------------------------------------------------
@@ -325,7 +327,7 @@ class TestWhatIsCounted:
         self, client: AsyncClient,
     ) -> None:
         body = await _health(client)
-        shallow = (await client.get("/health")).json()["channels"]
+        shallow = (await client.get("/health")).json()["details"]["channels"]
         assert shallow, "the pair: the map is not empty"
         assert {n: e["state"] for n, e in body["channels"].items()} == shallow
         assert shallow == channel_map(settings)
@@ -504,7 +506,14 @@ async def _row_counts(session: AsyncSession) -> dict[str, int]:
 # done-when (4): /health keeps its form and its code
 # -----------------------------------------------------------------------------
 
-_HEALTH_KEYS = {"status", "db", "version", "channels"}
+# The form of /health is the deploy machine's since W3-1 (protocol 9.1,
+# app/api/report.py): this test held the four keys of comms' own form
+# ({status, db, version, channels}) and the whole body equal before and
+# after the failures. What it is for stays: the counts never reach
+# /health. The whole body can no longer be equal -- `uptime_s` and the
+# checks are measured anew -- so the protocol's keys and the channel map
+# are compared, the one place a count could leak into.
+_HEALTH_KEYS = set(Health.model_fields)
 
 
 class TestHealthUnchanged:
@@ -519,8 +528,8 @@ class TestHealthUnchanged:
         after = await client.get("/health")
         assert before.status_code == after.status_code == 200
         assert set(after.json()) == _HEALTH_KEYS
-        assert after.json() == before.json()
-        assert set(after.json()["channels"].values()) <= {
+        assert after.json()["details"] == before.json()["details"]
+        assert set(after.json()["details"]["channels"].values()) <= {
             "live", "not_configured", "not_implemented",
         }
 

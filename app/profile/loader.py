@@ -1952,6 +1952,23 @@ def lanes_mixing_llm(target: ProfileRegistry = registry) -> list[LaneMix]:
     ]
 
 
+def longest_llm_list(lane: str, target: ProfileRegistry = registry) -> int:
+    """The most key sets an llm type of `lane` names in the installed
+    profile; 0 when the lane has no llm type. A model's call is bounded by
+    LLM_DELIVER_TIMEOUT_SECONDS for each set of its list
+    (app/engine/service.py _deliver_single), so this is the lane's
+    longest call -- the input of the worker's liveness bound
+    (app/worker.py lane_step_bound)."""
+    longest = 0
+    for key in target.registered_types():
+        record = target.record_of(key)
+        if record is None or record.value("lane") != lane:
+            continue
+        if is_llm_route(record.value("channels")):
+            longest = max(longest, len(record.value("llm_sets")))
+    return longest
+
+
 def install_profile(
     profile: Profile,
     target: ProfileRegistry = registry,

@@ -27,6 +27,17 @@
 #      is a stand-in, parsed by the machine's loader too; it names nothing
 #      of any real product. `pridem check` reads one repository and asks
 #      no seam.
+#   3. comms' /health (W3-1), as the machine reads it after `up`: the
+#      document tests/fixtures/health.json -- held to a live answer of
+#      comms by key and type in the suite (tests/test_report.py), where the
+#      machine cannot be imported -- by the machine's conformance of a
+#      stack (check_health: the eleven fields of protocol 9.1, their
+#      types, nothing else, `details` within its limit, `service` the
+#      stack's name, `alembic_head` for a stack that migrates) and by
+#      `seams_verify`'s own reader (_seams): every name of primer.yaml
+#      `provides` among `seams.provides`, `requires_satisfied` true. The
+#      pair: the document is `ok`, so a degraded one cannot pass by its
+#      degradation.
 # AND ONE THING THE MACHINE DOES NOT CHECK: `persistent: true`. No rule of
 # the machine refuses a service without it -- the machine only reads it
 # when it destroys -- so it is asserted here, on the machine's own model of
@@ -73,6 +84,7 @@ import json
 from pathlib import Path
 
 from pridem.cli import run
+from pridem.conformance.stack import check_health
 from pridem.stacks.loader import ContractError
 from pridem.stacks.schema import (
     Product,
@@ -89,8 +101,11 @@ from pridem.stacks.seams import (
     seams_under_option,
     unaccepted,
 )
+from pridem.steps.services import _seams
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# comms' /health as the suite holds it to a live answer (check 3).
+HEALTH = Path("tests") / "fixtures" / "health.json"
 
 # The product that takes comms in check (2): a stand-in, every option of
 # comms switched on by the caller.
@@ -207,11 +222,42 @@ def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
     return found, checked
 
 
+def health_check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
+    """Check 3: comms' /health by the machine's conformance and its seams'
+    reader, against primer.yaml's `provides` (header)."""
+    stack = load_primer_yaml(root / "primer.yaml")
+    assert isinstance(stack, Service)  # check() names it otherwise
+    body = (root / HEALTH).read_bytes()
+    found = [
+        f"health: {problem.code} {problem.params}"
+        for problem in check_health(body, migrate=True, stack_name=stack.name)
+    ]
+    document = json.loads(body)
+    if document.get("status") != "ok":
+        found.append("health: the document is not ok -- it would pass degraded")
+    seams = _seams(body)
+    if seams is None:
+        found.append("health: the machine reads no seams in it")
+    else:
+        provides, satisfied = seams
+        missing = [name for name in stack.provides if name not in provides]
+        extra = [name for name in provides if name not in stack.provides]
+        if missing or extra:
+            found.append(f"health: seams.provides missing {missing}, extra {extra}")
+        if not satisfied:
+            found.append("health: requires_satisfied is not true")
+    checked = [f"health: {HEALTH} conforms, provides {len(stack.provides)} seams"]
+    return found, ([] if found else checked)
+
+
 def main() -> int:
     found, checked = machine_check()
     seams, seen = check()
     found += seams
     checked += seen
+    health, read = health_check()
+    found += health
+    checked += read
     for line in found:
         print(line)
     if found:

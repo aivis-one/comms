@@ -95,6 +95,10 @@ async def entry(monkeypatch: pytest.MonkeyPatch) -> _Entry:
     monkeypatch.setattr(worker, "dispose_engine", dispose)
     monkeypatch.setattr(worker, "listen_for_wakes", forever)
     monkeypatch.setattr(worker, "run_maintenance_pass", nothing)
+    # The pulse file (W3-1) is a global effect of _main too: a file in the
+    # host's /tmp. Replaced like the others; the pulse has its own tests
+    # (tests/test_liveness.py).
+    monkeypatch.setattr(worker.liveness, "keep_alive", forever)
     return found
 
 

@@ -10,8 +10,10 @@
 #   Consumer: python -m app.consumer
 #
 # Startup validation lives HERE, not in Settings: the consumer is the
-# only process that needs Redis (API and worker are DB-only), so an
-# empty REDIS_URL must kill the CONSUMER at boot -- and only it.
+# only process that works with Redis (the API only checks that it
+# answers, for /health and /ready -- W3-1, app/main.py; the worker is
+# DB-only), so an empty REDIS_URL must kill the CONSUMER at boot -- and
+# only it.
 #
 # TWO LOOPS, ONE PROCESS (P3-1): the stream consumer reads the product's
 # events; the push relay (app/transport/push_relay.py) publishes the
@@ -25,6 +27,11 @@
 # types against the registry (via create_notification), so a consumer
 # without a profile would dead-letter every request.
 #
+# LIVENESS (W3-1, app/core/liveness.py): both loops are watched (their
+# bounds: app/transport/consumer.py consumer_step_bound,
+# app/transport/push_relay.py relay_step_bound), and _main keeps the pulse
+# file the compose healthcheck reads.
+#
 # Handles SIGTERM/SIGINT by cancelling both loop tasks. An entry caught
 # mid-flight rolls back UNACKED (cancellation interrupts inner
 # awaits); the next start's pending drain replays it -- at-least-once
@@ -36,6 +43,7 @@ import signal
 
 import structlog
 
+from app.core import liveness
 from app.core.config import settings
 from app.core.database import ProcessRole, dispose_engine, set_process_role
 from app.core.logging import setup_logging
@@ -59,6 +67,9 @@ async def _main() -> None:
         asyncio.ensure_future(run_consumer_loop()),
         asyncio.ensure_future(run_push_relay_loop()),
     )
+    pulse = asyncio.ensure_future(
+        liveness.keep_alive(liveness.pulse_path("consumer")),
+    )
 
     def _request_shutdown() -> None:
         logger.info("consumer_shutdown_requested")
@@ -69,9 +80,10 @@ async def _main() -> None:
         loop.add_signal_handler(sig, _request_shutdown)
 
     await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in tasks:
+    for task in (*tasks, pulse):
         task.cancel()
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(pulse, return_exceptions=True)
 
     await dispose_engine()
     for name, result in zip(_LOOP_NAMES, results, strict=True):

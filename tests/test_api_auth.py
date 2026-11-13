@@ -31,6 +31,7 @@ from httpx import AsyncClient
 
 from app.api.deps import require_service_auth
 from app.core.config import settings
+from tests.helpers import redis_answering
 
 _TOKEN = "phase3b-unit-test-token"
 
@@ -121,7 +122,12 @@ class TestAuthDisabledInDevelopment:
 class TestHealthStaysOpen:
     async def test_health_and_ready_unauthenticated(
         self, client: AsyncClient, auth_enabled: None,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """/ready is 200 only with every check ok (W3-1): the suite has no
+        Redis, so its check answers here (tests/helpers.py) -- what is
+        asked is that no token is."""
+        redis_answering(monkeypatch)
         assert (await client.get("/health")).status_code == 200
         assert (await client.get("/ready")).status_code == 200
 

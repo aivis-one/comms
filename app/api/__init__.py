@@ -20,6 +20,7 @@
 #
 # Versioned under /api/v1 -- freezing a contract without a version in
 # the path would make the first breaking change a rename of every
-# route. /health and /ready stay in app/main.py, unversioned and
-# UNAUTHENTICATED (installer/docker healthchecks carry no secret).
+# route. /health and /ready stay unversioned and UNAUTHENTICATED (the
+# deploy machine and docker carry no secret): their form is
+# app/api/report.py, what they measure is wired in app/main.py.
 # =============================================================================

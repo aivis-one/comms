@@ -15,7 +15,9 @@
 #     schedule and no mute";
 #   3 a 4xx the framework raises that no class names is `bad_request`,
 #     never `internal`;
-#   4 /ready's 503 says why in the log, without the database's text;
+#   4 /ready's 503 says why in the log, without the database's text --
+#     since W3-1 as the check's turn to `error` (health_check_failed,
+#     app/api/report.py), once until it was ok again;
 #   5 claim's two refusals say which one it is.
 #
 # MUTATIONS these tests were written against (each turns one red):
@@ -70,6 +72,7 @@ from tests.helpers import (
     declare_member,
     intake_fields,
     next_api1_telegram_id,
+    redis_answering,
 )
 
 _BOUND = 10.0
@@ -491,6 +494,26 @@ def _engine_at(url: str) -> Any:
 
 
 class TestReadySaysWhy:
+    """The 503's reason, in the log (API-2). Since W3-1 the line is the
+    check's turn to `error` -- `health_check_failed`, check `db` -- and
+    not one per 503: a failing check is said when it turns, and again
+    only after it was ok between (protocol 9.5, the model's rule). What
+    the line may hold is what it held: the summary of a database error
+    (class, place, SQLSTATE), the class and place of anything else, never
+    a text. Before, the line was `ready_db_unreachable` on every 503."""
+
+    @pytest.fixture(autouse=True)
+    def _measured_afresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Every test starts with no check in `error` (a turn is per
+        # process), and with the Redis check answering: the suite has no
+        # Redis, and what is asked here is the database's line.
+        main_module.report.reset_turns()
+        redis_answering(monkeypatch)
+
+    @staticmethod
+    def _lines(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [e for e in logs if e["event"] == "health_check_failed"]
+
     async def test_a_refused_password(
         self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -508,7 +531,9 @@ class TestReadySaysWhy:
         with capture_logs() as logs:
             resp = await client.get("/ready")
         assert resp.status_code == 503
-        (line,) = [e for e in logs if e["event"] == "ready_db_unreachable"]
+        assert resp.json() == {"status": "not_ready", "failing": ["db"]}
+        (line,) = self._lines(logs)
+        assert line["check"] == "db"
         assert "SQLSTATE 28P01" in line["error"]
         # The database's own words, not the class name (InvalidPassword-
         # Error), are what must not be there.
@@ -530,18 +555,41 @@ class TestReadySaysWhy:
         with capture_logs() as logs:
             resp = await client.get("/ready")
         assert resp.status_code == 503
-        (line,) = [e for e in logs if e["event"] == "ready_db_unreachable"]
+        (line,) = self._lines(logs)
         # A refused connection is no database error: its class and place,
         # and not the OS's text, which quotes the address.
         assert " at " in line["error"]
         assert "Error" in line["error"]
         assert "127.0.0.1" not in str(line) and "Connect call" not in str(line)
 
+    async def test_said_on_the_turn_and_again_after_ok(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The turn: the second 503 in a row writes no line; after an ok
+        the next failure is a turn again."""
+        real = main_module.get_engine
+        bad = make_url(settings.database_url).set(host="127.0.0.1", port=1)
+        broken = _engine_at(bad.render_as_string(hide_password=False))
+        monkeypatch.setattr(main_module, "get_engine", broken)
+        with capture_logs() as logs:
+            assert (await client.get("/ready")).status_code == 503
+            assert (await client.get("/ready")).status_code == 503
+        assert len(self._lines(logs)) == 1
+        monkeypatch.setattr(main_module, "get_engine", real)
+        with capture_logs() as logs:
+            assert (await client.get("/ready")).status_code == 200
+        assert self._lines(logs) == []
+        monkeypatch.setattr(main_module, "get_engine", broken)
+        with capture_logs() as logs:
+            assert (await client.get("/ready")).status_code == 503
+        assert len(self._lines(logs)) == 1
+
     async def test_a_database_that_answers(self, client: AsyncClient) -> None:
         with capture_logs() as logs:
             resp = await client.get("/ready")
         assert resp.status_code == 200
-        assert [e for e in logs if e["event"] == "ready_db_unreachable"] == []
+        assert resp.json() == {"status": "ready", "failing": []}
+        assert self._lines(logs) == []
 
 
 # ---------------------------------------------------------------------------

@@ -223,11 +223,12 @@ _PROCESSES = {
     name: service for name, service in _COMPOSE["services"].items()
     if "build" in service
 }
-# The services that read a COMPOSED value: Redis is the consumer's alone
-# (app/transport/connection.py).
+# The services that read a COMPOSED value: Redis is the consumer's, and the
+# API's for the `redis` check of /health and /ready (W3-1, app/main.py);
+# never the worker's.
 _READS_COMPOSED = {
     "DATABASE_URL": {"comms-app", "comms-worker", "comms-consumer"},
-    "REDIS_URL": {"comms-consumer"},
+    "REDIS_URL": {"comms-app", "comms-consumer"},
 }
 
 

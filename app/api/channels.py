@@ -5,14 +5,15 @@
 #   GET /api/v1/channels/health?window_minutes=<1..1440, default 60>
 #
 # What each channel answered over the window, with its state from the
-# same channel map /health carries (app/engine/health.py). Behind the
+# same channel map /health carries under `details` (app/engine/health.py). Behind the
 # service token like every /api/v1 route.
 #
 # WHY NOT IN /health: /health is unauthenticated on purpose and says only
 # what a deploy has. Counts of what the channels did are operational data
-# and belong behind the token; and /health keeps its body and its status
-# code, so nothing that reads it today changes. The contract is
-# deploy/INTEGRATION.md, "Channel health".
+# and belong behind the token; and /health is the deploy machine's
+# document (protocol 9.1, app/api/report.py), its `details` read from
+# memory, never from the database. The contract is deploy/INTEGRATION.md,
+# "Channel health".
 # =============================================================================
 
 from typing import Any

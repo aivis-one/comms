@@ -5,7 +5,11 @@
 # Since R-1a the endpoint also carries the CHANNEL MAP -- the operator's
 # detector for "did this deploy get the channels its installer meant to
 # give it" (deploy/INTEGRATION.md). It is the same map the startup log
-# carries, and it is STATES ONLY: /health is unauthenticated.
+# carries, and it is STATES ONLY: /health is unauthenticated. Since W3-1
+# the map is under `details` of the deploy machine's document; the
+# document itself -- its fields, its checks, /ready -- is held by
+# tests/test_report.py, which replaced the two tests of comms' own form
+# here (`status` and `db` of /health, `db` of /ready).
 # =============================================================================
 
 from typing import Any
@@ -54,22 +58,6 @@ def _configured(**overrides: Any) -> Settings:
     return Settings(**kwargs)
 
 
-async def test_health_ok(client: AsyncClient) -> None:
-    """GET /health returns 200 with db status."""
-    response = await client.get("/health")
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["status"] == "ok"
-    assert payload["db"] == "ok"
-
-
-async def test_ready_ok(client: AsyncClient) -> None:
-    """GET /ready returns 200 when the database is reachable."""
-    response = await client.get("/ready")
-    assert response.status_code == 200
-    assert response.json()["db"] == "ok"
-
-
 async def test_health_carries_the_state_of_every_channel(
     client: AsyncClient,
 ) -> None:
@@ -82,7 +70,7 @@ async def test_health_carries_the_state_of_every_channel(
     """
     with patch("app.main.settings", _configured()):
         payload = (await client.get("/health")).json()
-    channels = payload["channels"]
+    channels = payload["details"]["channels"]
     assert set(channels) == {channel.value for channel in DeliveryChannel}
     assert set(channels.values()) <= {state.value for state in ChannelState}
     assert channels["telegram"] == ChannelState.LIVE
@@ -103,7 +91,7 @@ async def test_health_names_the_channels_a_deploy_lacks(
     were emptied)."""
     bare = _configured(telegram_enabled="false", email_enabled="false")
     with patch("app.main.settings", bare):
-        channels = (await client.get("/health")).json()["channels"]
+        channels = (await client.get("/health")).json()["details"]["channels"]
     assert set(channels) == {channel.value for channel in DeliveryChannel}
     assert channels["telegram"] == ChannelState.NOT_CONFIGURED
     assert channels["email"] == ChannelState.NOT_CONFIGURED
@@ -120,7 +108,7 @@ async def test_health_carries_no_key_value(client: AsyncClient) -> None:
     """
     with patch("app.main.settings", _configured()):
         response = await client.get("/health")
-    assert response.json()["channels"]["email"] == ChannelState.LIVE
+    assert response.json()["details"]["channels"]["email"] == ChannelState.LIVE
     body = response.text
     for value in _KEY_VALUES:
         assert value, "an empty sentinel would make the check vacuous"
@@ -133,8 +121,8 @@ async def test_health_reports_the_same_map_on_every_call(
     """Twice is the same: the map is derived from settings and from
     nothing that drifts between requests."""
     with patch("app.main.settings", _configured()):
-        first = (await client.get("/health")).json()["channels"]
-        second = (await client.get("/health")).json()["channels"]
+        first = (await client.get("/health")).json()["details"]["channels"]
+        second = (await client.get("/health")).json()["details"]["channels"]
     assert first == second
 
 

@@ -121,6 +121,7 @@ import structlog
 from sqlalchemy import ColumnElement, Select, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import liveness
 from app.core.config import settings
 from app.core.database import (
     database_answers,
@@ -247,6 +248,7 @@ async def expire_overdue_notifications(lanes: Sequence[Lane]) -> int:
                     limit=_EXPIRY_PORTION,
                 )
                 await session.commit()
+                liveness.step()
                 expired_count += portion
                 if portion < _EXPIRY_PORTION:
                     break
@@ -498,6 +500,7 @@ async def _pass(
     # the no-op "processed" count would keep the lane's loop from
     # backing off for the whole backoff window.
     await jobs.places.acquire()
+    liveness.step()
     try:
         # The jobs in work as the selection sees them, taken before it:
         # one that ends while the selection runs is still in its snapshot,
@@ -537,6 +540,11 @@ async def _pass(
     for n, notif_id in enumerate(fresh):
         if n:
             await jobs.places.acquire()
+            # A place taken is a step of the lane's loop (app/worker.py,
+            # LIVENESS): a pass waits here for an attempt to end, as many
+            # times as its batch has jobs beyond the places. It marks the
+            # loop's promise in memory, nothing else.
+            liveness.step()
         jobs.in_work.add(notif_id)
         jobs.attempts.create_task(_attempt(notif_id, jobs, tally, on_more))
     return tally
@@ -1099,6 +1107,7 @@ async def cleanup_expired_notifications() -> int:
                     session, now=now, limit=_RETENTION_BATCH_SIZE,
                 )
                 await session.commit()
+                liveness.step()
                 total += deleted
                 if deleted < _RETENTION_BATCH_SIZE:
                     break
@@ -1136,6 +1145,7 @@ async def purge_expired_llm_answers() -> int:
                     session, now=now, limit=_RETENTION_BATCH_SIZE,
                 )
                 await session.commit()
+                liveness.step()
                 total += cleared
                 if cleared < _RETENTION_BATCH_SIZE:
                     break
@@ -1244,6 +1254,7 @@ async def cleanup_terminal_notifications() -> int:
                     limit=_RETENTION_BATCH_SIZE,
                 )
                 await session.commit()
+                liveness.step()
                 total += deleted
                 if deleted < _RETENTION_BATCH_SIZE:
                     break

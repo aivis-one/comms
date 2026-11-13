@@ -2,8 +2,9 @@
 # COMMS Service -- Application Entry Point
 # =============================================================================
 #
-# FastAPI application: /health and /ready (unversioned,
-# UNAUTHENTICATED -- installer/docker healthchecks carry no secret)
+# FastAPI application: /health and /ready of protocol 9 (unversioned,
+# UNAUTHENTICATED -- the deploy machine and docker hold no secret; their
+# form and rules are app/api/report.py, what they measure is wired here)
 # plus the internal product-facing API under /api/v1 (app/api/), every
 # router guarded by the service-to-service bearer token (Phase 3b). The
 # routers are the include_router block below -- that block is the list;
@@ -13,12 +14,18 @@
 # donors, which ticked daemons in the API lifespan). It is a separate
 # process from the same image: `python -m app.worker`.
 #
-# HEALTH vs READY:
-#   /health -- always 200; reports dependency status.
-#   /ready  -- 503 when the database is unreachable.
-#
-# ORM-ONLY NOTE: the DB probe uses select(1) (a SQLAlchemy expression),
-# not a raw-SQL text("SELECT 1") string, per the no-raw-SQL house rule.
+# HEALTH vs READY (W3-1, protocol 9.1, 9.2, 9.5):
+#   /health -- always 200, the machine's document: checks `db` and
+#              `redis`, the seams, the release and the commit of the
+#              image, the channel map under `details`;
+#   /ready  -- 503 while a check is not ok.
+# The `db` check reads the database's revision (alembic_version) -- one
+# query, also `alembic_head` -- as a SQLAlchemy expression, not a raw-SQL
+# text() string, per the no-raw-SQL house rule. The `redis` check is a
+# PING of comms' own Redis (REDIS_URL, which compose gives comms-app for
+# this alone): the client is built on the first check and closed with the
+# process. An empty REDIS_URL -- a development, the suite -- is `redis:
+# error`, not a refused start.
 # =============================================================================
 
 from collections.abc import AsyncGenerator
@@ -26,8 +33,9 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import Depends, FastAPI
-from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from pydantic import JsonValue
+from redis.asyncio import Redis
+from sqlalchemy import column, select, table
 
 from app.api.body_limit import LimitRequestBody
 from app.api.changes import router as changes_router
@@ -45,6 +53,7 @@ from app.api.messaging import participants_router, sections_router
 from app.api.messaging import router as messaging_router
 from app.api.prefs import router as prefs_router
 from app.api.recipients import router as recipients_router
+from app.api.report import REDIS, Report, commit_from_environment
 from app.api.request_id import RequestId
 from app.api.service_auth import RequireServiceToken
 from app.core.config import APP_VERSION, settings
@@ -55,9 +64,9 @@ from app.core.database import (
     set_process_role,
 )
 from app.core.logging import setup_logging
-from app.core.sanitize import db_error_summary, pipeline_error_of
 from app.engine.formatters import channel_map, close_formatters, llm_set_map
 from app.profile.loader import install_profile_from_settings
+from app.transport.connection import redis_client
 
 logger = structlog.get_logger()
 
@@ -74,6 +83,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     serves: the role sizes its pool (app/core/database.py POOLS).
     """
     setup_logging()
+    # The commit /health names: without it the API refuses to start, as
+    # without its release (setup_logging) -- W3-1.
+    commit_from_environment()
     set_process_role(ProcessRole.API)
     install_profile_from_settings()
     if not settings.comms_service_token:
@@ -97,6 +109,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     yield
     await close_formatters()
+    await close_redis()
     await dispose_engine()
     logger.info("comms_stopped")
 
@@ -172,75 +185,55 @@ app.include_router(channels_router)
 app.include_router(lanes_router)
 
 
-async def _db_failure() -> Exception | None:
-    """Probe database connectivity via an ORM expression: None when it
-    answers, else what it raised -- for the caller to log or not."""
-    try:
-        engine = get_engine()
-        async with engine.connect() as conn:
-            await conn.execute(select(1))
-    except Exception as exc:
-        return exc
-    return None
+_ALEMBIC_VERSION = table("alembic_version", column("version_num"))
 
 
-async def _db_ok() -> bool:
-    """Probe database connectivity; the failure itself is not kept."""
-    return await _db_failure() is None
+async def read_revision() -> str:
+    """The `db` check: the database's revision, in one query; raises when
+    there is none to read (no alembic_version, an empty one)."""
+    engine = get_engine()
+    async with engine.connect() as conn:
+        revision = await conn.scalar(select(_ALEMBIC_VERSION.c.version_num))
+    if not isinstance(revision, str) or not revision:
+        raise LookupError("alembic_version holds no revision")
+    return revision
 
 
-@app.get("/health")
-async def health() -> JSONResponse:
-    """Health check -- always returns 200, reports DB and channels.
-
-    THE CHANNEL MAP IS HERE AS WELL AS IN THE STARTUP LOG, and it is
-    the same map (channel_map): deploy/INTEGRATION.md asks the operator
-    to compare what the deploy has against what the installer meant to
-    give it, and a detector reachable only by grepping a container's
-    log is half a detector. One map in two places, never a second
-    vocabulary for the same three states.
-
-    STATES ONLY, NEVER A KEY VALUE: this endpoint carries no
-    authentication on purpose (installer and docker healthchecks hold
-    no secret), so what it may say about a channel is that the deploy
-    has it, lacks it, or has no implementation of it -- and nothing
-    about what was configured.
-    """
-    db_ok = await _db_ok()
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "ok" if db_ok else "degraded",
-            "db": "ok" if db_ok else "error",
-            "version": APP_VERSION,
-            "channels": channel_map(settings),
-        },
-    )
+_redis: Redis | None = None
 
 
-@app.get("/ready")
-async def ready() -> JSONResponse:
-    """Readiness probe -- 503 if the database is unreachable.
+async def redis_answers() -> bool:
+    """The `redis` check: comms' own Redis answers a PING. Raises when
+    REDIS_URL is empty (the header)."""
+    global _redis
+    if not settings.redis_url:
+        raise LookupError("REDIS_URL is not set")
+    if _redis is None:
+        _redis = redis_client()
+    return bool(await _redis.ping())
 
-    A 503 SAYS WHY, IN THE LOG (API-2): the class and the place of the
-    failure as DB-1 writes them -- a database error as its summary
-    (db_error_summary: class, place, SQLSTATE), anything else (a refused
-    connection is an OSError) as its class and place alone. Never a text:
-    the database's words and an OS error's (it quotes the address) stay
-    out. The answer is unchanged; /health stays silent (its form is
-    v4.0's).
-    """
-    failure = await _db_failure()
-    db_ok = failure is None
-    if failure is not None:
-        logger.warning(
-            "ready_db_unreachable",
-            error=db_error_summary(failure) or pipeline_error_of(failure),
-        )
-    return JSONResponse(
-        status_code=200 if db_ok else 503,
-        content={
-            "status": "ok" if db_ok else "degraded",
-            "db": "ok" if db_ok else "error",
-        },
-    )
+
+async def close_redis() -> None:
+    """Close the check's client, if a check built one."""
+    global _redis
+    if _redis is not None:
+        client, _redis = _redis, None
+        await client.aclose()
+
+
+def details() -> dict[str, JsonValue]:
+    """The free object of /health: the channel map -- the same map as the
+    startup log (comms_started), so confirming what a deploy has needs a
+    request rather than a grep. STATES ONLY, never a key's value: the
+    route is unauthenticated."""
+    channels: dict[str, JsonValue] = dict(channel_map(settings))
+    return {"channels": channels}
+
+
+# Each callable looked up when it runs, so a test replaces it by name here.
+report = Report(
+    db=lambda: read_revision(),
+    checks={REDIS: lambda: redis_answers()},
+    details=lambda: details(),
+)
+app.include_router(report.router)

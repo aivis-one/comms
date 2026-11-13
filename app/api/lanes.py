@@ -7,7 +7,7 @@
 # How many jobs wait in each lane, read from the job rows now
 # (app/engine/depth.py). Behind the service token like every /api/v1
 # route; READ ONLY, one snapshot (app/api/jobs.py read_only_snapshot).
-# Not in /health, which keeps its body and its status code (P2-4); not
+# Not in /health, which reads nothing from the database (P2-4, W3-1); not
 # beside the channel health either: that one counts the journal over a
 # window, this one the queue at an instant. The contract is
 # deploy/INTEGRATION.md, "Lane depth".

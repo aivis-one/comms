@@ -72,15 +72,20 @@ services:
     # No command: the image's CMD (Dockerfile) -- uvicorn with its log
     # config, no migration. NO ports: internal by design (DD-5); the
     # product reaches it through the machine's network.
-    environment: *comms-env
+    environment:
+      <<: *comms-env
+      # Only for the `redis` check of /health and /ready (W3-1,
+      # app/main.py): the API reads no stream.
+      REDIS_URL: redis://:${COMMS_EVENTS_PASSWORD:?}@comms-redis:6379/0
     volumes:
       - /srv/comms/profile:/profile:ro
     depends_on:
       comms-postgres: { condition: service_healthy }
       comms-redis: { condition: service_healthy }
     healthcheck:
-      # /ready answers 503 while the database is unreachable; the
-      # probe runs in-container (no published port needed).
+      # /ready answers 503 while a check of protocol 9.5 is not ok --
+      # the database or Redis (app/api/report.py); the probe runs
+      # in-container (no published port needed).
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')\""]
       interval: 10s
       timeout: 5s
@@ -103,14 +108,16 @@ services:
       # the worker waits for its database only, not for the API.
       comms-postgres: { condition: service_healthy }
     healthcheck:
-      # Single-process container: the meaningful liveness signal is
-      # "PID 1 is the worker". No pgrep in the slim image, so read
-      # procfs directly.
-      test: ["CMD-SHELL", "grep -q app.worker /proc/1/cmdline"]
-      interval: 30s
+      # LIVE IS TURNING, not existing (W3-1, app/core/liveness.py): the
+      # worker touches its pulse file while every loop keeps its promise
+      # of a step; a loop stuck on an await, or an event loop a blocking
+      # call holds, lets it age, and this exits 1. start_period: the
+      # profile, the channels and the first pulse.
+      test: ["CMD", "python", "-m", "app.core.liveness", "worker"]
+      interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
     networks:
       - default
@@ -130,11 +137,12 @@ services:
       comms-postgres: { condition: service_healthy }
       comms-redis: { condition: service_healthy }
     healthcheck:
-      test: ["CMD-SHELL", "grep -q app.consumer /proc/1/cmdline"]
-      interval: 30s
+      # As comms-worker's: the consumer's and the relay's pulse.
+      test: ["CMD", "python", "-m", "app.core.liveness", "consumer"]
+      interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
     networks:
       - default

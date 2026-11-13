@@ -42,6 +42,7 @@ import structlog
 from sqlalchemy import literal, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import liveness
 from app.core.constants import (
     MSG_TYPE_PARTICIPANT_MESSAGE,
     MSG_TYPE_SUPPORT_MESSAGE,
@@ -441,6 +442,9 @@ async def consume_close_notifications(
                     continue
                 total += 1
             await session.commit()
+            # A step of the worker's maintenance loop (app/worker.py,
+            # LIVENESS): one per page of threads.
+            liveness.step()
             _, last_id, last_seen = walked[-1]
             assert last_seen is not None
             after = (last_seen, last_id)

@@ -1,10 +1,12 @@
 # =============================================================================
-# COMMS Service -- The redis client of the consumer process (H1)
+# COMMS Service -- The redis client of comms (H1)
 # =============================================================================
 #
 # ONE PLACE builds a redis client: the stream consumer
 # (app/transport/consumer.py) and the push relay
-# (app/transport/push_relay.py) both take theirs from redis_client().
+# (app/transport/push_relay.py) both take theirs from redis_client(), and
+# so does the API's `redis` check of /health and /ready (W3-1,
+# app/main.py), which bounds its PING by the check's own timeout.
 #
 # THE SOCKET TIMEOUT. Without one, a redis that accepted the connection
 # and then went silent stops the reader forever -- no error, no log

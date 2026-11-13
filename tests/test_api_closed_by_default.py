@@ -47,6 +47,7 @@ from app.core.channels import channel_flag_keys
 from app.core.config import settings
 from app.core.constants import MAX_REQUEST_BODY_BYTES
 from app.main import app
+from tests.helpers import redis_answering
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # Joined at run time: a literal shaped like a real secret blocks a push.
@@ -298,7 +299,11 @@ class TestTokenFirst:
         self,
         client: AsyncClient,
         token_set: None,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # /ready is 200 only with every check ok (W3-1); the suite has no
+        # Redis, so its check answers here (tests/helpers.py).
+        redis_answering(monkeypatch)
         assert (await client.get("/health")).status_code == 200
         assert (await client.get("/ready")).status_code == 200
 

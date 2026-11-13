@@ -124,6 +124,7 @@ from redis.exceptions import (
 )
 from redis.typing import EncodableT, FieldT
 
+from app.core import liveness
 from app.core.config import settings
 from app.core.database import (
     database_answers,
@@ -144,7 +145,7 @@ from app.core.sanitize import (
     sanitized_traceback,
 )
 from app.engine.service import stream_fingerprint
-from app.transport.connection import redis_client
+from app.transport.connection import redis_client, redis_socket_timeout
 from app.transport.events import (
     ENVELOPE_DATA_FIELD,
     ENVELOPE_EVENT_FIELD,
@@ -315,6 +316,7 @@ class StreamConsumer:
         )
         next_drain = time.monotonic() + _PENDING_REDRAIN_SECONDS
         while True:
+            liveness.step()
             if time.monotonic() >= next_drain:
                 again = await self._drain_pending()
                 next_drain = time.monotonic() + _PENDING_REDRAIN_SECONDS
@@ -385,6 +387,7 @@ class StreamConsumer:
         # after the last entry seen: a held entry is met once per pass.
         cursor: str | bytes = "0"
         while True:
+            liveness.step()
             response = await self._redis.xreadgroup(
                 groupname=self._group,
                 consumername=self._consumer,
@@ -456,6 +459,7 @@ class StreamConsumer:
         attempt = 0  # tries while the database answered
         waited = 0  # waits while it did not
         while True:
+            liveness.step()
             attempt += 1
             try:
                 async with self._session_factory() as session:
@@ -627,6 +631,7 @@ class StreamConsumer:
         failures = 0
         refusals = 0
         while True:
+            liveness.step()
             try:
                 await call()
             except Exception as exc:
@@ -906,13 +911,26 @@ def _id_str(entry_id: str | bytes) -> str:
     )
 
 
+def consumer_step_bound() -> float:
+    """The longest the consumer's loop may wait between two steps
+    (app/core/liveness.py): one wait of a retry at its ceiling
+    (_WAIT_CEILING), one operation of redis (its socket timeout) and the
+    database around them (liveness.STEP_MARGIN_SECONDS). Its steps: every
+    read of the stream, every try of an entry and every retry of an
+    operation of redis on it -- a wait for the database that does not
+    answer goes on stepping: the loop turns, the entry waits by design."""
+    return _WAIT_CEILING + redis_socket_timeout() + liveness.STEP_MARGIN_SECONDS
+
+
 async def run_consumer_loop() -> None:
-    """Build the Redis client and run the consumer until cancelled. A
-    redis that stays silent past the socket timeout raises TimeoutError
-    out of here (app/transport/connection.py)."""
+    """Build the Redis client and run the consumer until cancelled, as
+    the watched loop `consumer` (app/core/liveness.py). A redis that stays
+    silent past the socket timeout raises TimeoutError out of here
+    (app/transport/connection.py)."""
     redis: Redis = redis_client()
     consumer = StreamConsumer(redis)
     try:
-        await consumer.run()
+        with liveness.watched("consumer", consumer_step_bound()):
+            await consumer.run()
     finally:
         await redis.aclose()

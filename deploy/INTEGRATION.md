@@ -418,7 +418,7 @@ and the keys -- and exits, rather than a traceback.
 **What the first start tells you.** The `comms_started` log line
 carries a channel map: every channel with `live`, `not_configured` (the
 flag is `false`) or `not_implemented`. The same map is served by
-`GET /health` under `channels`, so confirming it later needs a request
+`GET /health` under `details.channels` (section 15), so confirming it later needs a request
 rather than a grep through a container's log. That map is the way to
 confirm that a deploy sees the channels its installer meant to give it.
 Unknown variables are ignored on purpose, so that a leftover in a
@@ -723,7 +723,7 @@ each channel answered over a recent window:
 `window_minutes` is 1..1440, default 60; outside that range it is
 **refused** (422 `validation`), not clamped. The window is measured by
 comms' database clock and closed at both ends. Behind the service token
-like every `/api/v1` route; `GET /health` itself is unchanged.
+like every `/api/v1` route; `GET /health` carries none of these counts.
 
 ```json
 {
@@ -2161,6 +2161,56 @@ output.
 
 A wrong token or host is a non-zero exit and one line on stderr naming
 the variable -- never the token.
+
+### What comms shows the machine -- `/health` and `/ready`
+
+The machine decides a deploy by these two answers of `comms-app`
+(protocol 9.1, 9.2, 9.5); `docker` asks `/ready` as the healthcheck of
+`comms-app`. Both are open: no token. Neither is a product's to parse --
+the product reads what comms did by `/api/v1`.
+
+`GET /health` answers **200 whatever the state**, with these fields and
+no other:
+
+| field | what it is |
+|---|---|
+| `service` | `comms` -- the `name` of `primer.yaml` |
+| `release` | the release the image was built for (`PRIMER_RELEASE`) |
+| `commit` | the commit the image was built from (`PRIMER_COMMIT`) |
+| `alembic_head` | the database's revision as last read; `null` before the first read |
+| `uptime_s` | whole seconds since this process of the API started |
+| `status` | `ok` when every check is `ok`, else `degraded` |
+| `checks` | each check: `ok` or `error` |
+| `seams` | `provides` -- exactly the `provides` of `primer.yaml`; `requires_satisfied` -- every seam comms requires is set (comms requires none) |
+| `limits` | `max_upload_mb` -- the largest request body comms takes, in MiB |
+| `edition` | `core` -- a service has no editions |
+| `modules` | `[]` |
+| `details` | the channel map under `channels` (section 3a); at most 8 KB, built from memory, left out if it is not |
+
+The checks -- what comms does not work without, each under 2 seconds,
+all at once:
+
+| check | `ok` when |
+|---|---|
+| `db` | the database's revision is read -- the same read is `alembic_head` |
+| `redis` | comms' own Redis answers a PING |
+
+A check that fails is `error` -- never an exception and never a 500 --
+and one log line, `health_check_failed`, names it with the class of what
+stopped it, when it turns to `error`; again only after it was `ok`
+between.
+
+`GET /ready` answers **200** `{"status": "ready", "failing": []}` when
+every check is `ok`, else **503** `{"status": "not_ready", "failing":
+[...]}` with the names of the checks that are not.
+
+**The worker and the consumer** answer no HTTP. Their healthcheck is
+`python -m app.core.liveness worker` (and `consumer`): green while every
+loop of the process keeps turning. A loop stuck longer than its bound
+(its channel calls' timeouts and a margin for the database), or a
+process that stopped running its loops, turns it red at most half a
+minute later. A long call of a channel within its timeout is not a
+stuck loop.
 
 ## How long comms keeps things
 

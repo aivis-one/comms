@@ -80,12 +80,13 @@ from redis.typing import EncodableT, FieldT
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import liveness
 from app.core.config import settings
 from app.core.constants import PUSH_RELAY_BATCH, PUSH_RELAY_INTERVAL_SECONDS
 from app.core.database import get_session_factory
 from app.core.sanitize import sanitized_traceback
 from app.engine.models import Notification, PushOutbox
-from app.transport.connection import redis_client
+from app.transport.connection import redis_client, redis_socket_timeout
 
 logger = structlog.get_logger()
 
@@ -171,6 +172,7 @@ async def run_push_relay(redis: Redis) -> None:
     -- every test -- starts healthy."""
     failed_ticks = 0
     while True:
+        liveness.step()
         try:
             progress = await relay_once(redis)
         except Exception as exc:
@@ -188,12 +190,25 @@ async def run_push_relay(redis: Redis) -> None:
             await asyncio.sleep(PUSH_RELAY_INTERVAL_SECONDS)
 
 
+def relay_step_bound() -> float:
+    """The longest the relay may wait between two ticks
+    (app/core/liveness.py): its pause, one operation of redis (its socket
+    timeout) and the database around it (liveness.STEP_MARGIN_SECONDS).
+    Every tick is a step, a failed one too: the relay turns."""
+    return (
+        PUSH_RELAY_INTERVAL_SECONDS
+        + redis_socket_timeout()
+        + liveness.STEP_MARGIN_SECONDS
+    )
+
+
 async def run_push_relay_loop() -> None:
     """Build the relay's own redis client and relay until cancelled. A
     silent redis fails a tick after the socket timeout -- logged, and
     retried on the next tick (app/transport/connection.py)."""
     redis: Redis = redis_client()
     try:
-        await run_push_relay(redis)
+        with liveness.watched("push_relay", relay_step_bound()):
+            await run_push_relay(redis)
     finally:
         await redis.aclose()

@@ -1,0 +1,31 @@
+{
+  "service": "comms",
+  "release": "v4.0.0",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "alembic_head": "0041_correlation_index",
+  "uptime_s": 0,
+  "status": "ok",
+  "checks": {"db": "ok", "redis": "ok"},
+  "seams": {
+    "provides": [
+      "COMMS_API_URL",
+      "COMMS_SERVICE_TOKEN",
+      "COMMS_EVENTS_ADDRESS",
+      "COMMS_EVENTS_PASSWORD",
+      "TELEGRAM_BOT_URL"
+    ],
+    "requires_satisfied": true
+  },
+  "limits": {"max_upload_mb": 1},
+  "edition": "core",
+  "modules": [],
+  "details": {
+    "channels": {
+      "telegram": "live",
+      "email": "live",
+      "push": "not_implemented",
+      "in_app": "live",
+      "llm": "live"
+    }
+  }
+}

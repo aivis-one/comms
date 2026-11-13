@@ -1061,3 +1061,18 @@ def service_command(service: dict[str, Any]) -> list[str]:
     if isinstance(command, str):
         return command.split()
     return [str(part) for part in command]
+
+
+def redis_answering(monkeypatch: Any) -> None:
+    """The `redis` check of /health and /ready answers (W3-1): the suite
+    runs without a Redis, and a test that asks /ready for something else
+    than its checks -- that it is open, that it says why the database
+    failed -- needs the other check ok. The check itself is held by
+    tests/test_report.py, on a Redis that answers and on one that does
+    not."""
+    from app import main as main_module
+
+    async def answers() -> bool:
+        return True
+
+    monkeypatch.setattr(main_module, "redis_answers", answers)

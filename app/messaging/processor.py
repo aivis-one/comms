@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 
+from app.core import liveness
 from app.core.config import settings
 from app.core.database import get_session_factory
 from app.messaging.status import auto_close_idle_threads_batch
@@ -113,6 +114,9 @@ async def auto_close_idle_threads(
                     limit=_AUTO_CLOSE_BATCH_SIZE,
                 )
                 await session.commit()
+                # A step of the worker's maintenance loop (app/worker.py,
+                # LIVENESS): a backlog of threads is many batches.
+                liveness.step()
                 total += closed
                 if closed < _AUTO_CLOSE_BATCH_SIZE:
                     break

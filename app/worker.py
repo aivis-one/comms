@@ -52,6 +52,16 @@
 # interval. A job that becomes due later is noticed by the poll (the
 # KNOWN CEILING in app/engine/wake.py).
 #
+# LIVENESS (W3-1, app/core/liveness.py): every loop of this process but
+# the wake listener is watched, with its bound -- a lane's longest wait
+# for a step (lane_step_bound), the maintenance loop's the longest of its
+# lanes' (its expiry waits for an attempt) -- and _main keeps the pulse
+# file the compose healthcheck reads. A pass makes a step when it starts
+# and whenever it takes a place -- the place an attempt gives back as it
+# ends (app/engine/processor.py) -- a maintenance pass at every batch it
+# commits; a sleep is a rest. A loop past its bound leaves the pulse to
+# age: the container is unhealthy.
+#
 # SHUTDOWN: SIGTERM/SIGINT cancel the loops. Cancelling a lane loop
 # cancels its task group, and with it every attempt the lane has in
 # work: each is cancelled at its current await and rolled back with its
@@ -75,6 +85,8 @@ from collections.abc import Awaitable, Callable
 
 import structlog
 
+from app.core import liveness
+from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT
 from app.core.config import settings
 from app.core.database import ProcessRole, dispose_engine, set_process_role
 from app.core.lanes import Lane
@@ -91,7 +103,11 @@ from app.engine.wake import listen_for_wakes
 from app.engine.worker import run_engine_maintenance
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
 from app.notifier import consume_close_notifications
-from app.profile.loader import install_profile_from_settings, lanes_mixing_llm
+from app.profile.loader import (
+    install_profile_from_settings,
+    lanes_mixing_llm,
+    longest_llm_list,
+)
 
 logger = structlog.get_logger()
 
@@ -190,7 +206,9 @@ async def _auto_close_pass() -> int | None:
     """The auto-close pass on its own: its count, or None when it failed.
     Its failure keeps the log line it always had -- logged here, not in
     the pass: messaging cannot import the redactor
-    (app/messaging/processor.py, AutoClosePassError)."""
+    (app/messaging/processor.py, AutoClosePassError). A step first, as
+    _isolated."""
+    liveness.step()
     try:
         return await auto_close_idle_threads()
     except AutoClosePassError as exc:
@@ -213,7 +231,9 @@ async def _isolated(
     name: str, run: Callable[[], Awaitable[int]],
 ) -> int | None:
     """Run one maintenance pass on its own: its result, or None when it
-    raised -- logged here with its class and place (TX-3)."""
+    raised -- logged here with its class and place (TX-3). Each starts
+    with a step of the maintenance loop (LIVENESS, the header)."""
+    liveness.step()
     try:
         return await run()
     except Exception as exc:
@@ -223,6 +243,44 @@ async def _isolated(
             error=pipeline_error_of(exc),
         )
         return None
+
+
+def lane_step_bound(lane: Lane) -> float:
+    """The longest a loop of `lane` may wait between two steps (LIVENESS,
+    the header): its places' attempts, one after another, each its
+    longest call and the database around it.
+
+    A pass waits for a place, and a place is given back when an attempt
+    ends; an attempt delivers one round of its lane's slots, and its calls
+    may wait for those of the lane's other jobs -- at most a round for
+    each place (app/engine/service.py delivery_portion). One call is the
+    lane's deliver timeout, or a model's: LLM_DELIVER_TIMEOUT_SECONDS for
+    each set of the longest list an llm type of the lane names, and the
+    body's download once (app/engine/service.py _deliver_single) -- taken
+    whether the llm channel is on or off, which only makes the bound
+    longer. The database's part is liveness.STEP_MARGIN_SECONDS.
+    """
+    call = float(settings.lane_deliver_timeout(lane))
+    sets = longest_llm_list(lane.value)
+    if sets:
+        call = max(
+            call,
+            settings.llm_deliver_timeout_seconds * sets
+            + LLM_BODY_DOWNLOAD_TIMEOUT,
+        )
+    return LANE_JOBS[lane] * call + liveness.STEP_MARGIN_SECONDS
+
+
+def _step_bound(log_fields: dict[str, str]) -> tuple[str, float]:
+    """The name and the bound a loop is watched by: a lane's own, or the
+    maintenance loop's -- the longest of the process's lanes, since its
+    expiry waits for an attempt of any of them."""
+    lane = log_fields.get("lane")
+    if lane is not None:
+        return lane, lane_step_bound(Lane(lane))
+    return log_fields["loop"], max(
+        lane_step_bound(each) for each in settings.worker_lanes
+    )
 
 
 async def _poll_loop(
@@ -239,29 +297,33 @@ async def _poll_loop(
     for one pass after it, and any number of wakes is one.
 
     `log_fields` name the loop in its error log (lane=..., or
-    loop=maintenance).
+    loop=maintenance) and in its liveness (_step_bound): a pass is a
+    step, the sleep after it a rest.
     """
     base_interval = settings.notification_poll_interval_seconds
     max_backoff = settings.notification_max_backoff_seconds
     interval = base_interval
-    while True:
-        wake.clear()
-        try:
-            done = await run_pass()
-            interval = (
-                base_interval if done > 0
-                else min(interval * 2, max_backoff)
-            )
-        except Exception as exc:
-            logger.error(
-                "notification_worker_error",
-                **log_fields,
-                exception=sanitized_traceback(exc),
-            )
-            interval = max_backoff
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(interval):
-                await wake.wait()
+    with liveness.watched(*_step_bound(log_fields)):
+        while True:
+            wake.clear()
+            liveness.step()
+            try:
+                done = await run_pass()
+                interval = (
+                    base_interval if done > 0
+                    else min(interval * 2, max_backoff)
+                )
+            except Exception as exc:
+                logger.error(
+                    "notification_worker_error",
+                    **log_fields,
+                    exception=sanitized_traceback(exc),
+                )
+                interval = max_backoff
+            liveness.rest(interval)
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(interval):
+                    await wake.wait()
 
 
 def _lane_pass(
@@ -413,6 +475,9 @@ async def _main() -> None:
     app/consumer.py _main."""
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(run_worker_loop())
+    pulse = asyncio.ensure_future(
+        liveness.keep_alive(liveness.pulse_path("worker")),
+    )
 
     def _request_shutdown() -> None:
         logger.info("worker_shutdown_requested")
@@ -430,6 +495,9 @@ async def _main() -> None:
         )
         raise
     finally:
+        pulse.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pulse
         # Review 1.1: close the aiogram session before dropping the
         # engine -- and drop the engine even if that close fails.
         try:
