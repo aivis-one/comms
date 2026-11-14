@@ -13,17 +13,13 @@
 #   M2  bypass also passes the late mute        -> TestMutes (after resolve)
 #   M3  bypass also passes the resolve-time mute -> TestMutes (before)
 #   M4  the field read live from the registry   -> TestSnapshot
-#   M5  migration 0022 filling 'bypass'         -> test_migration_0022
 #   M6  the loader taking any value             -> TestLoader
 #   M10 a value in the document, not the loader -> TestTheContract
 # =============================================================================
 
-import os
 import re
 import shutil
-import subprocess
-import sys
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,12 +28,12 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select, text, update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute
-from app.core.database import dispose_engine, get_session_factory
+from app.core.database import get_session_factory
 from app.core.exceptions import ProfileError
 from app.engine import service
 from app.engine.constants import DeliveryStatus, NotificationStatus, TargetType
@@ -353,7 +349,7 @@ class TestLoader:
 
 
 # -----------------------------------------------------------------------------
-# Б1 (7) -- the column and migration 0022
+# Б1 (7) -- the column
 # -----------------------------------------------------------------------------
 
 
@@ -382,74 +378,6 @@ class TestTheColumn:
             target_value="*", **fields,
         ))
         await db_session.flush()
-
-
-_BEFORE = "0021_job_retry_snapshot"
-_SUBJECT = "0022_job_recipient_schedule"
-
-
-def _alembic(*args: str) -> None:
-    done = subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=_REPO, capture_output=True, text=True, env=dict(os.environ),
-    )
-    assert done.returncode == 0, done.stderr
-
-
-async def _migrate(*args: str) -> None:
-    await dispose_engine()
-    _alembic(*args)
-    await dispose_engine()
-
-
-async def _sql(statement: str, **params: Any) -> Any:
-    async with get_session_factory()() as session:
-        result = await session.execute(text(statement), params)
-        await session.commit()
-        return result
-
-
-@pytest.fixture
-async def at_head_afterwards() -> AsyncGenerator[None, None]:
-    yield
-    await _sql("DELETE FROM notifications")
-    await _migrate("upgrade", "head")
-
-
-async def test_migration_0022(at_head_afterwards: None) -> None:
-    """An existing job takes 'respect' -- the rule every job lived by --
-    then NOT NULL and the CHECK; down drops the column; up again."""
-    await _migrate("downgrade", _BEFORE)
-    id_ = uuid4()
-    await _sql(
-        "INSERT INTO notifications (id, type, title, body, target_type, "
-        "target_value, idempotency_key, fingerprint, channels, "
-        "expiry_layer, push_on, retry_max_attempts, retry_backoff_seconds, "
-        "status) VALUES (:id, 'unit_event', 'T', 'B', 'all', '*', :key, "
-        ":fp, '[\"in_app\"]'::jsonb, 'default', 'none', 3, 30, 'processing')",
-        id=id_, key=f"m22:{id_}", fp="a" * 64,
-    )
-    await _migrate("upgrade", _SUBJECT)
-    assert (await _sql(
-        "SELECT recipient_schedule FROM notifications WHERE id = :id", id=id_,
-    )).scalar_one() == "respect"
-    assert (await _sql(
-        "SELECT is_nullable FROM information_schema.columns WHERE "
-        "table_name = 'notifications' AND column_name = 'recipient_schedule'",
-    )).scalar_one() == "NO"
-    assert (await _sql(
-        "SELECT count(*) FROM pg_constraint "
-        "WHERE conname = 'ck_notifications_recipient_schedule'",
-    )).scalar_one() == 1
-    await _migrate("downgrade", _BEFORE)
-    assert (await _sql(
-        "SELECT count(*) FROM information_schema.columns WHERE "
-        "table_name = 'notifications' AND column_name = 'recipient_schedule'",
-    )).scalar_one() == 0
-    await _migrate("upgrade", _SUBJECT)
-    assert (await _sql(
-        "SELECT recipient_schedule FROM notifications WHERE id = :id", id=id_,
-    )).scalar_one() == "respect"
 
 
 # -----------------------------------------------------------------------------

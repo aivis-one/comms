@@ -1,14 +1,16 @@
 # =============================================================================
 # COMMS Service -- Migration 0037: when a transient wait began (TX-3)
 # =============================================================================
-# upgrade -> downgrade -> upgrade through the alembic CLI, over a job that
-# existed before the column: up adds the column (NULL on old rows) and
-# its CHECKs and replaces 0015's pipeline gate; down removes exactly
-# those and puts 0015's gate back; up again restores them -- definitions
-# compared, not names.
+# The upgrade through the alembic CLI: up adds the columns and their
+# CHECKs and replaces 0015's pipeline gate -- definitions compared, not
+# names -- every constraint validated, without a pass over the table
+# under ACCESS EXCLUSIVE, and again after a run that stopped half way.
+# The suite's database is brought down to 0036 only to start from it
+# (the seed); the way down is not held: a rollout is rolled back by
+# restoring a dump, never by `alembic downgrade` (owner's decision 14.11).
 #
 # AT 0037, NOT AT HEAD (WK-2): 0038 removes what 0037 adds, so this file
-# holds 0037 at its own revision (_0037) -- up to it, down from it.
+# holds 0037 at its own revision (_0037).
 # Before 0038, head WAS 0037 and "upgrade head" said the same thing.
 # The fixture still leaves the database at head.
 # =============================================================================
@@ -84,17 +86,10 @@ async def _objects() -> dict[str, Any]:
     }
 
 
-_GATE_0015 = "CHECK (((pipeline_retry_at IS NULL) OR (pipeline_attempts > 0)))"
 _GATE_0037 = (
     "CHECK (((pipeline_retry_at IS NULL) OR (pipeline_attempts > 0) "
     "OR (pipeline_transient_since IS NOT NULL)))"
 )
-
-
-def _before(found: dict[str, Any]) -> None:
-    assert found["columns"] == 0
-    assert all(found[name] is None for name in _CHECKS)
-    assert found["gate"] == _GATE_0015
 
 
 def _after(found: dict[str, Any]) -> None:
@@ -107,19 +102,6 @@ def _after(found: dict[str, Any]) -> None:
     )
     assert "'processing'" in found["ck_notifications_transient_wait_open"]
     assert found["gate"] == _GATE_0037
-
-
-async def test_up_down_up(at_head_afterwards: None) -> None:
-    await _migrate("downgrade", _0037)
-    _after(await _objects())
-    await _migrate("downgrade", _BEFORE)
-    _before(await _objects())
-    await _migrate("upgrade", _0037)
-    _after(await _objects())
-    await _migrate("downgrade", _BEFORE)
-    _before(await _objects())
-    await _migrate("upgrade", _0037)
-    _after(await _objects())
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +156,12 @@ async def _execute(*statements: str) -> None:
 
 
 async def test_every_constraint_is_validated(at_head_afterwards: None) -> None:
-    """Added NOT VALID, then VALIDATEd: at head every one is valid."""
+    """Added NOT VALID, then VALIDATEd: at 0037 every one is valid, and
+    each is 0037's definition."""
     await _migrate("downgrade", _BEFORE)
     await _migrate("upgrade", _0037)
     assert await _validated() == dict.fromkeys(_CONSTRAINTS_0037, True)
+    _after(await _objects())
 
 
 async def test_a_half_applied_run_goes_through(at_head_afterwards: None) -> None:
@@ -198,29 +182,6 @@ async def test_a_half_applied_run_goes_through(at_head_afterwards: None) -> None
     await _migrate("upgrade", _0037)
     assert await _validated() == dict.fromkeys(_CONSTRAINTS_0037, True)
     _after(await _objects())
-
-
-async def test_down_with_an_open_wait_at_zero_attempts(
-    at_head_afterwards: None,
-) -> None:
-    """A wait at zero attempts holds a gate 0015's CHECK refuses: down
-    takes that gate away with the wait, first, and passes. (A CLOSED job
-    holding a wait's fields cannot be built: ck_notifications_transient_
-    wait_open refuses it -- so it is not a case down meets.)"""
-    await _migrate("downgrade", _0037)
-    job_id = await _job_at_0037()
-    await _execute(
-        "UPDATE notifications SET pipeline_retry_at = now(), "
-        "pipeline_transient_since = now(), pipeline_transient_step = 'rollup', "
-        "pipeline_transient_error = 'sqlalchemy.exc.DBAPIError at "
-        f"app/engine/processor.py:1' WHERE id = '{job_id}'",
-    )
-    await _migrate("downgrade", _BEFORE)
-    _before(await _objects())
-    gate = await _scalar(
-        f"SELECT pipeline_retry_at FROM notifications WHERE id = '{job_id}'"
-    )
-    assert gate is None
 
 
 _BLOATED_ROWS, _LIVE_EVERY = 460_000, 42
@@ -442,60 +403,8 @@ async def test_the_lock_does_not_grow_with_the_heap(
 
 
 # ---------------------------------------------------------------------------
-# FIX TX-3 -- the stamp and the schema agree, in both directions
+# FIX TX-3 -- a stamp left behind, and the next upgrade
 # ---------------------------------------------------------------------------
-
-_0035 = "0035_thread_revision"
-
-
-async def _state() -> tuple[str, bool, bool]:
-    """(alembic_version, the wait's columns there, 0036's email there)."""
-    version = await _scalar("SELECT version_num FROM alembic_version")
-    wait = await _scalar(
-        "SELECT count(*) FROM information_schema.columns WHERE table_name = "
-        "'notifications' AND column_name = 'pipeline_transient_since'")
-    email = await _scalar(
-        "SELECT count(*) FROM information_schema.columns WHERE table_name = "
-        "'notifications' AND column_name = 'email'")
-    return str(version), bool(wait), bool(email)
-
-
-_HEAD = ("0037_pipeline_transient_since", True, True)
-
-
-async def test_a_downgrade_that_fails_later_keeps_stamp_and_schema_together(
-    at_head_afterwards: None,
-) -> None:
-    """One downgrade through 0037 to 0035, where 0036's step fails (a view
-    depends on the column it drops): 0037's step must roll back with it,
-    so the stamp and the schema stay at head together. With an
-    autocommit_block in 0037's downgrade, its undoing was committed while
-    the stamp rolled back to 0037 -- the stamp ahead of the schema."""
-    await _migrate("downgrade", _0037)
-    await _execute("CREATE VIEW zz_holds_email AS SELECT email FROM notifications")
-    try:
-        await dispose_engine()
-        failed = _alembic("downgrade", _0035)
-        await dispose_engine()
-        assert failed.returncode != 0
-        assert await _state() == _HEAD
-    finally:
-        await _execute("DROP VIEW IF EXISTS zz_holds_email")
-    # every step, one at a time, down and back up
-    for target, expected in (
-        ("-1", ("0036_notification_email", False, True)),
-        ("-1", (_0035, False, False)),
-    ):
-        await _migrate("downgrade", target)
-        assert await _state() == expected
-    for target, expected in (
-        ("+1", ("0036_notification_email", False, True)),
-        ("+1", _HEAD),
-    ):
-        await _migrate("upgrade", target)
-        assert await _state() == expected
-    assert await _validated() == dict.fromkeys(_CONSTRAINTS_0037, True)
-
 
 def _with_a_block() -> list[Path]:
     from tests.test_migration_safety import _later_migrations, uses_a_block

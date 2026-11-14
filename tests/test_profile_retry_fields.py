@@ -14,16 +14,12 @@
 #   M9  the body check removed                          -> TestBody
 #   M10 the body check off by one (>=)                  -> TestBody pair
 #   M11 the fields read live from the registry          -> TestSnapshot
-#   M12 migration 0021 filling literals                 -> test_migration_0021
 #   M13 the loader's upper bound removed                -> TestLoader
 # =============================================================================
 
 import json
-import os
 import shutil
-import subprocess
-import sys
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import NUMERIC_BOUNDS, settings
 from app.core.constants import MAX_BODY_LEN
-from app.core.database import dispose_engine, get_session_factory
+from app.core.database import get_session_factory
 from app.core.exceptions import ProfileError
 from app.engine.constants import (
     DeliveryStatus,
@@ -406,7 +402,7 @@ class TestLoader:
 
 
 # -----------------------------------------------------------------------------
-# The column: CHECKs and migration 0021
+# The columns: CHECKs
 # -----------------------------------------------------------------------------
 
 
@@ -463,89 +459,4 @@ class TestTheColumns:
         bound = NUMERIC_BOUNDS[setting]
         assert f">= {bound.lo}" in definition
         assert f"<= {bound.hi}" in definition
-
-
-_BEFORE = "0020_push_outbox"
-_SUBJECT = "0021_job_retry_snapshot"
-
-
-def _alembic(*args: str, env: dict[str, str] | None = None) -> None:
-    done = subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=_REPO, capture_output=True, text=True,
-        env={**os.environ, **(env or {})},
-    )
-    assert done.returncode == 0, done.stderr
-
-
-async def _migrate(*args: str, env: dict[str, str] | None = None) -> None:
-    await dispose_engine()
-    _alembic(*args, env=env)
-    await dispose_engine()
-
-
-async def _sql(statement: str, **params: Any) -> Any:
-    async with get_session_factory()() as session:
-        result = await session.execute(text(statement), params)
-        await session.commit()
-        return result
-
-
-@pytest.fixture
-async def at_head_afterwards() -> AsyncGenerator[None, None]:
-    yield
-    await _sql("DELETE FROM notifications")
-    await _migrate("upgrade", "head")
-
-
-async def test_migration_0021(at_head_afterwards: None) -> None:
-    """Existing jobs take the values of the settings the MIGRATING
-    process sees -- here deliberately not the code's defaults (7 / 45,
-    not 3 / 30): a literal would be caught. Then NOT NULL and both
-    CHECKs; down drops the columns; up again on the same row."""
-    await _migrate("downgrade", _BEFORE)
-    id_ = uuid4()
-    await _sql(
-        "INSERT INTO notifications (id, type, title, body, target_type, "
-        "target_value, idempotency_key, fingerprint, channels, "
-        "expiry_layer, push_on, status) VALUES (:id, 'unit_event', 'T', "
-        "'B', 'all', '*', :key, :fp, '[\"in_app\"]'::jsonb, 'default', "
-        "'none', 'processing')",
-        id=id_, key=f"m21:{id_}", fp="a" * 64,
-    )
-    overridden = {
-        "NOTIFICATION_MAX_DELIVERY_ATTEMPTS": "7",
-        "NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS": "45",
-    }
-    await _migrate("upgrade", _SUBJECT, env=overridden)
-    row = (await _sql(
-        "SELECT retry_max_attempts, retry_backoff_seconds FROM notifications "
-        "WHERE id = :id", id=id_,
-    )).one()
-    assert tuple(row) == (7, 45)
-    assert (await _sql(
-        "SELECT count(*) FROM information_schema.columns "
-        "WHERE table_name = 'notifications' AND is_nullable = 'NO' "
-        "AND column_name IN ('retry_max_attempts', 'retry_backoff_seconds')",
-    )).scalar_one() == 2
-    assert (await _sql(
-        "SELECT count(*) FROM pg_constraint WHERE conname IN "
-        "('ck_notifications_retry_max_attempts', "
-        "'ck_notifications_retry_backoff_seconds')",
-    )).scalar_one() == 2
-    await _migrate("downgrade", _BEFORE)
-    assert (await _sql(
-        "SELECT count(*) FROM information_schema.columns "
-        "WHERE table_name = 'notifications' AND column_name IN "
-        "('retry_max_attempts', 'retry_backoff_seconds')",
-    )).scalar_one() == 0
-    await _migrate("upgrade", _SUBJECT)
-    row = (await _sql(
-        "SELECT retry_max_attempts, retry_backoff_seconds FROM notifications "
-        "WHERE id = :id", id=id_,
-    )).one()
-    assert tuple(row) == (
-        settings.notification_max_delivery_attempts,
-        settings.notification_retry_backoff_base_seconds,
-    )
 

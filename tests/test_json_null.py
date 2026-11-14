@@ -475,18 +475,6 @@ async def test_migration_0030(
         "FROM recipients WHERE id = :v", v=ids["cleared"],
     )).scalar_one()
 
-    # Down: the CHECKs go, the data stays as SQL NULL (valid before too).
-    await _migrate("downgrade", _BEFORE)
-    assert (await _sql(
-        "SELECT count(*) FROM pg_constraint WHERE conname LIKE "
-        "'%\\_not\\_json\\_null'",
-    )).scalar_one() == 0
-    assert await _is_null("notifications", "action_data", "id", ids["job_null"])
-    await _migrate("upgrade", _SUBJECT)
-    assert (await _sql(
-        "SELECT count(*) FROM pg_constraint WHERE conname LIKE "
-        "'%\\_not\\_json\\_null'",
-    )).scalar_one() == 7
 
 
 async def test_the_migration_seeds_the_stream_case(

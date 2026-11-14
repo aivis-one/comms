@@ -1,14 +1,17 @@
 # =============================================================================
 # COMMS Service -- Migration 0041: the correlation index (PERF-2)
 # =============================================================================
-# upgrade -> downgrade -> upgrade through the alembic CLI, over jobs that
-# existed before the index -- written at 0040 by explicit SQL of that
-# revision's columns, never by today's model (FIX TPL-1 #1). The index is
-# read from the catalog (pg_index), not from the model:
-#   - up builds it valid and partial; down drops it; up builds it again;
+# The upgrade through the alembic CLI, over jobs that existed before the
+# index -- written at 0040 by explicit SQL of that revision's columns,
+# never by today's model (FIX TPL-1 #1); the suite's database is brought
+# down to 0040 only to seed them. The index is read from the catalog
+# (pg_index), not from the model:
+#   - up builds it valid and partial;
 #   - a CONCURRENTLY build that failed before left an INVALID index under
 #     the name -- up drops it and builds a valid one (IF NOT EXISTS alone
 #     would have kept the invalid one).
+# The way down is not held: a rollout is rolled back by restoring a dump,
+# never by `alembic downgrade` (owner's decision 14.11).
 #
 # MUTATION: the block's DROP INDEX CONCURRENTLY taken out -> test_an_
 # invalid_leftover_is_rebuilt (the index stays invalid).
@@ -81,14 +84,10 @@ async def _jobs_at_0040() -> None:
         await session.commit()
 
 
-async def test_up_down_up(at_head_afterwards: None) -> None:
+async def test_the_index_is_built_over_old_jobs(at_head_afterwards: None) -> None:
     await _migrate("downgrade", _0040)
     assert await _index() is None
     await _jobs_at_0040()
-    await _migrate("upgrade", _0041)
-    assert await _index() == (True, False, "(correlation IS NOT NULL)")
-    await _migrate("downgrade", _0040)
-    assert await _index() is None
     await _migrate("upgrade", _0041)
     assert await _index() == (True, False, "(correlation IS NOT NULL)")
 

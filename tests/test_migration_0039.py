@@ -1,11 +1,13 @@
 # =============================================================================
 # COMMS Service -- Migration 0039: a section remembers its roster (API-1)
 # =============================================================================
-# upgrade -> downgrade -> upgrade through the alembic CLI, over sections
-# that existed before the column: up adds sections.roster_declared and
-# declares exactly the sections that have members; down removes the
-# column; up again declares them again. The column is read from the
-# catalog (information_schema), not from the model.
+# The upgrade through the alembic CLI, over sections that existed before
+# the column (the suite's database brought down to 0038 to seed them):
+# up adds sections.roster_declared and declares exactly the sections
+# that have members. The column is read from the catalog
+# (information_schema), not from the model. The way down is not held: a
+# rollout is rolled back by restoring a dump, never by `alembic
+# downgrade` (owner's decision 14.11).
 #
 # MUTATION: M6 the migration without its UPDATE -> test_the_sections_with
 # _members_are_declared (the section with a member stays undeclared).
@@ -119,23 +121,15 @@ async def _sections_at_0038() -> tuple[UUID, UUID]:
     return with_member, without
 
 
-async def test_up_down_up(at_head_afterwards: None) -> None:
-    await _migrate("upgrade", _0039)
-    assert await _column() == ("boolean", "NO", "false")
-    await _migrate("downgrade", _0038)
-    assert await _column() is None
-    await _migrate("upgrade", _0039)
-    assert await _column() == ("boolean", "NO", "false")
-
-
 async def test_the_sections_with_members_are_declared(
     at_head_afterwards: None,
 ) -> None:
-    """Members now -> declared; none -> undeclared. Twice: up, down, up."""
+    """Members now -> declared; none -> undeclared; the column NOT NULL,
+    false by default. Down to 0038 only to seed the sections."""
     await _migrate("downgrade", _0038)
+    assert await _column() is None
     with_member, without = await _sections_at_0038()
-    for _ in range(2):
-        await _migrate("upgrade", _0039)
-        assert await _declared(with_member) is True
-        assert await _declared(without) is False
-        await _migrate("downgrade", _0038)
+    await _migrate("upgrade", _0039)
+    assert await _column() == ("boolean", "NO", "false")
+    assert await _declared(with_member) is True
+    assert await _declared(without) is False

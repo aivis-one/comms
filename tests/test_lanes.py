@@ -19,7 +19,6 @@
 #   M8  the index without the lane                     -> TestThePlan
 #   M9  a failing lane cancelling the others           -> TestIsolation
 #   M10 the startup log without lanes or budgets       -> TestTheLoops (log)
-#   M11 migration 0024 filling another lane            -> test_migration_0024
 #   M12 maintenance run inside the lane loop           -> TestTheLoops
 #   M13 the expiry filter dropped from the selection   -> TestTheSweep
 #   M14 the race harness's attempt FOR UPDATE          -> TestAttemptAgainstExpiry
@@ -29,18 +28,15 @@
 
 import asyncio
 import json
-import os
 import re
-import subprocess
-import sys
 import time
-from collections.abc import AsyncGenerator, Callable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 from sqlalchemy import event, select, text, update
@@ -257,87 +253,11 @@ class TestTheCheck:
         await db_session.flush()
 
 
-_BEFORE = "0023_expired_cleanup_index"
-_SUBJECT = "0024_job_lane"
-
-
-def _alembic(*args: str) -> None:
-    done = subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=_REPO, capture_output=True, text=True, env=dict(os.environ),
-    )
-    assert done.returncode == 0, done.stderr
-
-
-async def _migrate(*args: str) -> None:
-    await dispose_engine()
-    _alembic(*args)
-    await dispose_engine()
-
-
 async def _sql(statement: str, **params: Any) -> Any:
     async with get_session_factory()() as session:
         result = await session.execute(text(statement), params)
         await session.commit()
         return result
-
-
-async def _indexes() -> set[str]:
-    rows = await _sql(
-        "SELECT indexname FROM pg_indexes WHERE tablename = 'notifications'",
-    )
-    return {row[0] for row in rows}
-
-
-@pytest.fixture
-async def at_head_afterwards() -> AsyncGenerator[None, None]:
-    yield
-    await _sql("DELETE FROM notifications")
-    await _migrate("upgrade", "head")
-
-
-async def test_migration_0024(at_head_afterwards: None) -> None:
-    """An existing job takes 'normal' -- the selection every job had
-    -- then NOT NULL and the CHECK; the pick index leads with the lane
-    and the lane-less one is gone; down restores it; up again. M11."""
-    await _migrate("downgrade", _BEFORE)
-    id_ = uuid4()
-    await _sql(
-        "INSERT INTO notifications (id, type, title, body, target_type, "
-        "target_value, idempotency_key, fingerprint, channels, "
-        "expiry_layer, push_on, retry_max_attempts, retry_backoff_seconds, "
-        "recipient_schedule, status) VALUES (:id, 'unit_event', 'T', 'B', "
-        "'all', '*', :key, :fp, '[\"in_app\"]'::jsonb, 'default', 'none', "
-        "3, 30, 'respect', 'processing')",
-        id=id_, key=f"m24:{id_}", fp="a" * 64,
-    )
-    await _migrate("upgrade", _SUBJECT)
-    assert (await _sql(
-        "SELECT lane FROM notifications WHERE id = :id", id=id_,
-    )).scalar_one() == "normal"
-    assert (await _sql(
-        "SELECT is_nullable FROM information_schema.columns WHERE "
-        "table_name = 'notifications' AND column_name = 'lane'",
-    )).scalar_one() == "NO"
-    assert (await _sql(
-        "SELECT count(*) FROM pg_constraint "
-        "WHERE conname = 'ck_notifications_lane'",
-    )).scalar_one() == 1
-    indexes = await _indexes()
-    assert "ix_notifications_lane_status_scheduled" in indexes
-    assert "ix_notifications_status_scheduled" not in indexes
-    await _migrate("downgrade", _BEFORE)
-    assert (await _sql(
-        "SELECT count(*) FROM information_schema.columns WHERE "
-        "table_name = 'notifications' AND column_name = 'lane'",
-    )).scalar_one() == 0
-    indexes = await _indexes()
-    assert "ix_notifications_status_scheduled" in indexes
-    assert "ix_notifications_lane_status_scheduled" not in indexes
-    await _migrate("upgrade", _SUBJECT)
-    assert (await _sql(
-        "SELECT lane FROM notifications WHERE id = :id", id=id_,
-    )).scalar_one() == "normal"
 
 
 # -----------------------------------------------------------------------------

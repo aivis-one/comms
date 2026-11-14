@@ -22,9 +22,6 @@
 # =============================================================================
 
 import ast
-import subprocess
-import sys
-from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from app.core.config import settings
-from app.core.database import dispose_engine, get_session_factory
+from app.core.database import get_session_factory
 from app.core.lanes import Lane
 from app.engine import processor
 from app.engine.constants import (
@@ -771,58 +768,3 @@ class TestNoRawTraceback:
 async def _zero(*_: Any, **__: Any) -> int:
     return 0
 
-
-# -- Migration 0015 -----------------------------------------------------------
-
-
-def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
-    )
-
-
-@pytest.fixture
-async def at_head_afterwards() -> AsyncGenerator[None, None]:
-    yield
-    async with get_session_factory()() as session:
-        await session.execute(text("DELETE FROM notifications"))
-        await session.commit()
-    await dispose_engine()
-    done = _alembic("upgrade", "head")
-    await dispose_engine()
-    assert done.returncode == 0, done.stderr
-
-
-class TestMigration0015:
-    async def test_downgrade_refuses_while_a_pipeline_class_exists(
-        self, db_session: AsyncSession, at_head_afterwards: None,
-    ) -> None:
-        """The old CHECK has no class for `pipeline`; picking one of the
-        four channel classes would be a guess, so the downgrade refuses
-        and names the count. The pair: with the row gone it passes."""
-        recipient = await create_recipient(db_session)
-        job = await _job(
-            db_session, recipient.id, age_minutes=1,
-            status=NotificationStatus.FAILED,
-        )
-        db_session.add(NotificationDelivery(
-            notification_id=job, recipient_id=recipient.id, channel="in_app",
-            status=DeliveryStatus.FAILED, failure_class=FailureClass.PIPELINE,
-        ))
-        await db_session.commit()
-        await db_session.close()
-
-        await dispose_engine()
-        refused = _alembic("downgrade", "0014_resources_snapshot")
-        await dispose_engine()
-        assert refused.returncode != 0
-        assert "1 deliveries carry failure_class 'pipeline'" in refused.stderr
-
-        async with get_session_factory()() as session:
-            await session.execute(text("DELETE FROM notifications"))
-            await session.commit()
-        await dispose_engine()
-        passed = _alembic("downgrade", "0014_resources_snapshot")
-        await dispose_engine()
-        assert passed.returncode == 0, passed.stderr

@@ -544,8 +544,6 @@ NOT_A_STATEMENT_SEARCH: dict[tuple[str, str], str] = {
         "REAL 40001 (TX-1) -- the pair of the OperationalError row",
     ("tests/helpers.py", "sql_shape"):
         "the helper itself, over the clauses it has already split",
-    ("tests/test_migration_0012.py", "test_round_trip_on_every_form_of_row"):
-        "an index definition read from pg_indexes -- the schema's layer",
     ("tests/test_transport_consumer.py", "test_every_retry_log_is_redacted"):
         "the text of a log entry",
 }

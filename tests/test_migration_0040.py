@@ -1,17 +1,18 @@
 # =============================================================================
-# Migration 0040 -- notification_transitions.template_unresolved, up, down
-# and up again
+# Migration 0040 -- notification_transitions.template_unresolved, up
 # =============================================================================
 #
 # The column and its CHECK (ck_transitions_template_unresolved) are there
-# at 0040, gone at 0039, there again at 0040 -- the CHECK VALIDATED (it is
-# added NOT VALID and validated in an autocommit block, FIX TX-3). A
-# journal row written at 0039 -- by an explicit INSERT of 0039's columns,
-# never the current model, which carries 0040's -- survives both ways and
-# reads NULL at 0040.
+# at 0040 -- the CHECK VALIDATED (it is added NOT VALID and validated in
+# an autocommit block, FIX TX-3). A journal row written at 0039 -- by an
+# explicit INSERT of 0039's columns, never the current model, which
+# carries 0040's -- survives the upgrade and reads NULL at 0040. The
+# suite's database is brought down to 0039 only to seed that row; the way
+# down is not held: a rollout is rolled back by restoring a dump, never by
+# `alembic downgrade` (owner's decision 14.11).
 #
-# MUTATION: the downgrade not dropping the column (or the CHECK) turns
-# test_up_down_up red.
+# MUTATION: the upgrade not adding the column (or the CHECK) turns
+# test_an_old_journal_row_reads_null red.
 # =============================================================================
 
 from collections.abc import AsyncGenerator
@@ -83,23 +84,14 @@ async def _journal_row_at_0039() -> UUID:
     return job_id
 
 
-async def test_up_down_up(at_head_afterwards: None) -> None:
+async def test_an_old_journal_row_reads_null(at_head_afterwards: None) -> None:
     await _migrate("downgrade", _0039)
     job_id = await _journal_row_at_0039()
     assert await _shape() == (None, None)
-    for _ in range(2):
-        await _migrate("upgrade", _0040)
-        assert await _shape() == ("ARRAY", True)
-        assert await _scalar(
-            "SELECT count(*) FROM notification_transitions "
-            "WHERE notification_id = :id AND template_unresolved IS NULL",
-            id=job_id,
-        ) == 1
-        await _migrate("downgrade", _0039)
-        assert await _shape() == (None, None)
-        assert await _scalar(
-            "SELECT count(*) FROM notification_transitions "
-            "WHERE notification_id = :id", id=job_id,
-        ) == 1
     await _migrate("upgrade", _0040)
     assert await _shape() == ("ARRAY", True)
+    assert await _scalar(
+        "SELECT count(*) FROM notification_transitions "
+        "WHERE notification_id = :id AND template_unresolved IS NULL",
+        id=job_id,
+    ) == 1

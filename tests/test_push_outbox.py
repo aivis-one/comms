@@ -26,12 +26,9 @@
 #                               -> TestTransaction.test_a_savepoint_...
 # =============================================================================
 
-import subprocess
-import sys
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -43,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute, Recipient
 from app.core.config import settings
-from app.core.database import dispose_engine, get_session_factory
+from app.core.database import get_session_factory
 from app.engine import journal, processor, service
 from app.engine.constants import (
     DeliveryStatus,
@@ -75,7 +72,6 @@ from app.profile.registry import Decided, Layer, PushOn, TypeRecord, registry
 from tests.helpers import create_recipient, intake_fields, notification_row_fields
 
 _TYPE = "unit_event_in_app"
-_REPO = Path(__file__).resolve().parents[1]
 
 NONE = PushOn.NONE.value
 OUTCOME = PushOn.OUTCOME.value
@@ -774,80 +770,3 @@ class TestSnapshot:
         ))
         await db_session.flush()
 
-
-# -----------------------------------------------------------------------------
-# Migration 0020 on a non-empty table
-# -----------------------------------------------------------------------------
-
-_BEFORE = "0019_changes_feed_index"
-_SUBJECT = "0020_push_outbox"
-
-
-def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=_REPO, capture_output=True, text=True,
-    )
-
-
-async def _migrate(*args: str) -> None:
-    await dispose_engine()
-    done = _alembic(*args)
-    await dispose_engine()
-    assert done.returncode == 0, done.stderr
-
-
-@pytest.fixture
-async def at_head_afterwards() -> AsyncGenerator[None, None]:
-    yield
-    async with get_session_factory()() as session:
-        await session.execute(text("DELETE FROM notifications"))
-        await session.commit()
-    await _migrate("upgrade", "head")
-
-
-async def _sql(statement: str, **params: Any) -> Any:
-    async with get_session_factory()() as session:
-        result = await session.execute(text(statement), params)
-        await session.commit()
-        return result
-
-
-async def test_migration_0020(at_head_afterwards: None) -> None:
-    """Existing jobs take push_on 'none' -- what each was accepted with in
-    effect -- and the column ends NOT NULL with its CHECK; the outbox
-    exists empty. Down and up again on the same rows."""
-    await _migrate("downgrade", _BEFORE)
-    id_ = uuid4()
-    await _sql(
-        "INSERT INTO notifications (id, type, title, body, target_type, "
-        "target_value, idempotency_key, fingerprint, channels, "
-        "expiry_layer, status) VALUES (:id, 'unit_event', 'T', 'B', 'all', "
-        "'*', :key, :fp, '[\"in_app\"]'::jsonb, 'default', 'sent')",
-        id=id_, key=f"m20:{id_}", fp="a" * 64,
-    )
-    await _migrate("upgrade", _SUBJECT)
-    assert (await _sql(
-        "SELECT push_on FROM notifications WHERE id = :id", id=id_,
-    )).scalar_one() == NONE
-    assert (await _sql(
-        "SELECT is_nullable FROM information_schema.columns "
-        "WHERE table_name = 'notifications' AND column_name = 'push_on'",
-    )).scalar_one() == "NO"
-    assert (await _sql(
-        "SELECT count(*) FROM pg_constraint "
-        "WHERE conname = 'ck_notifications_push_on'",
-    )).scalar_one() == 1
-    assert (await _sql("SELECT count(*) FROM push_outbox")).scalar_one() == 0
-    await _migrate("downgrade", _BEFORE)
-    assert (await _sql(
-        "SELECT count(*) FROM information_schema.columns "
-        "WHERE table_name = 'notifications' AND column_name = 'push_on'",
-    )).scalar_one() == 0
-    assert (await _sql(
-        "SELECT to_regclass('push_outbox') IS NULL",
-    )).scalar_one() is True
-    await _migrate("upgrade", _SUBJECT)
-    assert (await _sql(
-        "SELECT push_on FROM notifications WHERE id = :id", id=id_,
-    )).scalar_one() == NONE

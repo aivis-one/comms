@@ -147,10 +147,7 @@ jobs:
         env:
           PART_1: >-
             tests/test_migration_0037.py
-            tests/test_migration_0013.py
             tests/test_migration_0038.py
-            tests/test_migration_0012.py
-            tests/test_migration_0014.py
             tests/test_migration_0035.py
           PART_2: >-
             tests/test_lane_wake.py

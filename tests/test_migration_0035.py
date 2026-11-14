@@ -1,13 +1,12 @@
 # =============================================================================
 # COMMS Service -- Migration 0035: a thread's revision (RV-1)
 # =============================================================================
-# upgrade -> downgrade -> upgrade through the alembic CLI, over a thread
-# that existed before the column:
-#   up    -- the existing thread gets revision 1, a new one 1, a write 2;
-#            the trigger, its function and the CHECK are in the catalogs;
-#   down  -- every one of them is gone, and nothing else (the thread and
-#            ix_threads_client stay);
-#   up    -- all back, the thread at 1 again.
+# The upgrade through the alembic CLI, over a thread that existed before
+# the column (the suite's database brought down to 0034 to seed it): the
+# existing thread gets revision 1, a new one 1, a write 2; the trigger,
+# its function and the CHECK are in the catalogs, ix_threads_client left
+# alone. The way down is not held: a rollout is rolled back by restoring
+# a dump, never by `alembic downgrade` (owner's decision 14.11).
 # The trigger's shape at head: tests/test_schema_objects.py.
 # =============================================================================
 
@@ -94,7 +93,9 @@ async def _insert_thread(client: UUID) -> UUID:
     return tid
 
 
-async def test_up_down_up(at_head_afterwards: None) -> None:
+async def test_an_old_thread_gets_revision_one(
+    at_head_afterwards: None,
+) -> None:
     async with get_session_factory()() as session:
         person = uuid4()
         await create_recipient(
@@ -122,15 +123,3 @@ async def test_up_down_up(at_head_afterwards: None) -> None:
         "RETURNING id", id=old,
     )
     assert await _scalar(revision, id=old) == 2
-
-    await _migrate("downgrade", _BEFORE)
-    assert await _objects() == {
-        "column": 0, "trigger": 0, "function": 0, "check": 0,
-        "client index": 1,
-    }
-    # the rows survive the step down
-    assert await _scalar("SELECT count(*) FROM threads WHERE id IN (:a, :b)",
-                         a=old, b=new) == 2
-
-    await _migrate("upgrade", "head")
-    assert await _scalar(revision, id=old) == 1  # the column is new again

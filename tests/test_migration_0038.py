@@ -1,18 +1,19 @@
 # =============================================================================
 # COMMS Service -- Migration 0038: the in-row transient wait removed (WK-2)
 # =============================================================================
-# upgrade -> downgrade -> upgrade through the alembic CLI. Up drops 0037's
-# three columns and three CHECKs and puts 0015's gate back, validated;
-# the gate of an open wait at zero attempts goes with the wait, a counted
-# failure's gate stays. Down puts 0037's objects back in 0037's
-# definitions. A run whose stamp was left behind goes through again --
+# The upgrade through the alembic CLI, from 0037 (the suite's database
+# brought down to it to seed it -- the way down itself is not held: a
+# rollout is rolled back by restoring a dump, owner's decision 14.11).
+# Up drops 0037's three columns and three CHECKs and puts 0015's gate
+# back, validated; the gate of an open wait at zero attempts goes with
+# the wait, a counted failure's gate stays. A run whose stamp was left
+# behind goes through again --
 # tests/test_migration_0037.py
 # test_upgrade_runs_again_after_its_stamp_was_left_behind, parametrized
 # over every migration with a block, holds that for 0038 too; here, a
 # run that stopped after its columns went.
 #
 # MUTATIONS (each turns one red):
-#   G1 down without 0037's gate -> test_up_down_up
 #   G2 the UPDATE of the zero-attempt gates left out -> the open waits test
 #      (the VALIDATE fails)
 # =============================================================================
@@ -34,10 +35,6 @@ _WAIT_CHECKS = (
     "ck_notifications_transient_wait_open",
 )
 _GATE_0015 = "CHECK (((pipeline_retry_at IS NULL) OR (pipeline_attempts > 0)))"
-_GATE_0037 = (
-    "CHECK (((pipeline_retry_at IS NULL) OR (pipeline_attempts > 0) "
-    "OR (pipeline_transient_since IS NOT NULL)))"
-)
 
 
 @pytest.fixture
@@ -90,22 +87,6 @@ def _at_0038(found: dict[str, Any]) -> None:
     assert all(found[name] is None for name in _WAIT_CHECKS)
     assert found["ck_notifications_pipeline_gate"] == _GATE_0015
     assert found["gate_valid"] is True
-
-
-def _at_0037(found: dict[str, Any]) -> None:
-    assert found["wait_columns"] == 3
-    assert all(found[name] is not None for name in _WAIT_CHECKS)
-    assert "'processing'" in found["ck_notifications_transient_wait_open"]
-    assert found["ck_notifications_pipeline_gate"] == _GATE_0037
-
-
-async def test_up_down_up(at_head_afterwards: None) -> None:
-    await _migrate("upgrade", _0038)
-    _at_0038(await _objects())
-    await _migrate("downgrade", _0037)
-    _at_0037(await _objects())
-    await _migrate("upgrade", _0038)
-    _at_0038(await _objects())
 
 
 async def test_the_open_waits_and_the_counted_gates(at_head_afterwards: None) -> None:
