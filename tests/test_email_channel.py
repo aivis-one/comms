@@ -71,7 +71,6 @@ _KEY = "key-0123456789"
 _DOMAIN = "mail.example.test"
 _SENDER = "noreply@mail.example.test"
 _WITH_EMAIL: dict[str, Any] = {
-    "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
     "comms_service_token": "unit-test-service-token",
     "email_enabled": "true",
@@ -82,7 +81,7 @@ _WITH_EMAIL: dict[str, Any] = {
 
 
 def _settings(**overrides: str) -> Settings:
-    kwargs: dict[str, Any] = {"_env_file": None, **_WITH_EMAIL, **overrides}
+    kwargs: dict[str, Any] = {**_WITH_EMAIL, **overrides}
     return Settings(**kwargs)
 
 
@@ -1401,8 +1400,6 @@ class TestConsumersAreUntouched:
         channel is simply absent and nothing about its telegram
         changes."""
         source = Settings(
-            _env_file=None,  # type: ignore[call-arg]
-            app_env="production",
             database_url="postgresql+asyncpg://u:p@db/comms_unit",
             comms_service_token="unit-test-service-token",
             telegram_enabled="true",

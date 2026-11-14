@@ -2,7 +2,9 @@
 # COMMS Service -- Application Configuration
 # =============================================================================
 #
-# All settings loaded from environment variables (or .env file).
+# All settings loaded from environment variables -- on a box the deploy
+# machine gives them (primer.yaml and deploy/docker-compose.yml); there is
+# no settings file.
 # Pydantic-settings validates types and applies defaults automatically.
 #
 # DEPLOY MODEL (see Comms-Service-Architecture.md):
@@ -58,191 +60,6 @@ from app.core.channels import (
     storage_address_problem,
 )
 from app.core.lanes import Lane
-
-# Single source of truth for API version.
-# Import as: from app.core.config import APP_VERSION, settings
-#
-# IT IS THE NUMBER OF THE CONTRACT. The startup log carries it, and the
-# first question when an incident is opened in someone else's stack is
-# which version of comms is running there. (/health carried it until
-# W3-1; it now names what the deploy machine reads -- the release and the
-# commit the image was built from, app/api/report.py.) It
-# stood at 0.1.0 through every release up to v1.3.0, which made that
-# question unanswerable from the outside. Raise it with the tag, in the
-# same commit; pyproject carries the same number and a test pins the
-# two together, so neither can move alone.
-#
-# WHAT THE NUMBER PROMISES, because the products read it as an
-# instruction. A MAJOR bump means the contract changed and the caller
-# must change with it. A patch bump would have said "safe, do nothing",
-# which is the loudest kind of lie this service can tell.
-#
-# 3.0.0 is the PROTOCOL turning over (phase 1): jobs and resources speak
-# a language 2.0.0 does not -- an envelope with a required key and the
-# channel chosen by the profile, outcomes as an enumeration, one error
-# body with a class, one way to page, a versioned recipient snapshot
-# that can be forgotten, idempotency keys on the calls that create, and
-# no `priority`. A product built against 2.0.0 cannot talk to it
-# unchanged, and under one number the question "which protocol runs
-# there" would have no answer. The tag is `v3.0.0`, set by the owner on
-# the merge commit. (2.0.0 was the schedule turning over: the
-# preferences `schedule` key became a list of allowed periods.)
-#
-# MINOR bumps add and narrow nothing: 3.1.0 is D1 (bounds on every
-# number, a pipeline defect becomes an outcome, closed membership
-# events); 3.2.0 is phase 2 (the transition journal, a letter the
-# channel took is never sent twice, reading a job by its key, what
-# changed since a cursor, channel health, the address book); 3.3.0 is
-# phase 3 (the push stream: a type that declares push_on owes its
-# product the job's key, after the commit, at least once); 3.4.0 is
-# phase 4 (isolation lanes: each with its own batch, slots and deliver
-# timeout held above its channels' clients, intake waking its lane, the
-# lanes a worker takes chosen by the deploy) with H7 (row locks in one
-# order, a push outliving the expiry cleanup, one portion of deliveries
-# per attempt, connection pools by process) and H8 (comms' own errors
-# kept as class and place, every log line sanitized, the lanes' depth);
-# 3.5.0 is phase 5 (the llm channel: a type routed to a model, named key
-# sets with transport fallback, the raw answer kept on the job for its
-# type's term and the letter gone at the outcome; and a letter's audio
-# body by signed link, fetched every attempt from a host the deploy
-# allowed, never stored) with H11-H15 (the waiting probe and the portion
-# select hold their cost, an empty JSONB value is SQL NULL -- forgetting
-# a person who once had a schedule works again --, the badge's index
-# holds no waiting delivery) and the base images' newer digests and CI's
-# actions brought by Dependabot (3.4.1 was never released; it is here);
-# 3.6.0 is P5-L (a lane attempts its places of jobs at once, so a long
-# call -- a model writing for a minute -- holds one place and not the
-# lane; the lane's slots are shared by its jobs in work, and the
-# worker's pool grew with the places) and PO-1 (PROFILE_OVERLAY_DIR, a
-# text overlay replacing single texts of the profile field by field; a
-# broken overlay refuses the start);
-# 3.7.0 is hygiene (G1, G2), and a MINOR because it NARROWS three things
-# a deploy may have been doing: a profile with an in_app template sheet
-# no longer starts (delete the sheet -- the inbox shows the stored
-# title/body, so its text was never rendered), a request that gives a
-# query key twice is refused 422 instead of silently taking the last
-# value, and notification_deliveries.channel_options is dropped (nothing
-# ever wrote it). It also proves and holds forgetting against an attempt
-# in flight, makes the reading session READ ONLY in the database, blinds
-# the HTTP clients to the process's proxy and CA variables, logs the
-# render failure's class and not its text, describes the type record
-# whole in the contract, and runs the suite on the image with the
-# checkout, as CI does (3.6.1 was never released; it is here).
-#
-# PATCH bumps change nothing a deploy does: 3.7.1 is the suite reading
-# pg_stat_activity and pg_locks of its own database only and killing only
-# its own backends -- on a box `comms test` shares the server with the
-# live worker, whose wake listener the suite used to see (and could kill).
-# Only tests change.
-#
-# 3.8.0 is P5-4, the last of phase 5: a message's variant in another
-# language. The product writes two insert-only records with an
-# idempotency key -- "a variant into a locale is being made by this llm
-# job" and the variant itself (a text, "not needed", or "declined"), its
-# provider and model copied from the job's snapshot -- and the thread's
-# feed read with ?locale= carries each message's variant or one of five
-# states (ready, not_needed, preparing, impossible, not_requested). The
-# original is never touched; comms translates nothing and reads neither
-# the message nor the model's answer. Without ?locale= the feed is as it
-# was, byte for byte.
-#
-# 3.9.0 is MSG-1: GET /threads?client= -- the threads where a person is the
-# client, in the operator list's order, cursor and with_unread (counted for
-# the client); with_last_message=true puts each row's last message in both
-# lists, and with ?locale= its variant and variant_state, decided by the
-# same code as the feed. Without the new parameters the answers are as
-# they were, byte for byte. Index ix_threads_client_activity (0034).
-#
-# 3.10.0 is G3-G5, a MINOR: a dead letter keeps the envelope without the
-# letter and without llm_audio, the fingerprint of data and a reason that
-# is never an exception's text -- a narrowing for a deploy that read the
-# DLQ; an entry that is not UTF-8 is dead-lettered instead of stopping
-# the consumer; deploy/.env.example is the one template; the insert race
-# is told by SQLSTATE and the driver's constraint name; a template
-# variable the job does not carry is never printed; the suite on the
-# image runs with pytest's cache.
-#
-# 3.11.0 is TK-1 and TK-2, a MINOR: a taken section thread is handed to
-# another serving operator (POST /threads/{id}/assign) or returned to its
-# pool (/release); an operator returns a resolved or closed thread to
-# open; status calls take the thread's row; a product deletes a thread
-# with DELETE /threads/{id} (204), its messages, variants and read
-# pointers going with it, and every route naming it answers 404 -- the
-# feed and unread-count of an absent thread too, instead of an empty page.
-#
-# 3.12.0 is RV-1, a MINOR: every answer that carries a thread carries
-# revision -- 1 at birth, +1 on every write of its row (trigger
-# threads_revision, migration 0035), so a product keeps its copy only if
-# the answer's revision is greater than the one it keeps. And EM-1: a
-# notification_request may carry the product's own email -- email:
-# {subject, text, html?} -- sent to the provider exactly as it came; a
-# string the database cannot store (NUL, a lone surrogate) is refused at
-# intake, under the key for a request, to the DLQ for any other event.
-#
-# 3.13.0 is TX-1 and the fix of EM-1, a MINOR: a route that writes answers
-# only after its commit; a transient failure of the database is a 503
-# unavailable with an unknown outcome on a route and a retry in the
-# consumer, never a dead letter at once; anything no handler takes is a
-# 500 in the one error form. The data of every event is read by one
-# reader and checked once: NaN, Infinity, numbers past range, dates
-# outside a timestamp and nesting past 64 levels are refused at intake,
-# and any failure of the parse dead-letters the entry instead of stopping
-# the consumer; the subject of a ready email refuses a line break. And
-# TX-3: a transient failure of the database no longer spends a job's
-# pipeline attempts -- the job waits in its own fields (migration 0037,
-# its CHECKs added NOT VALID and validated outside the table lock); a dead
-# connection no longer takes the worker down; each maintenance pass fails
-# alone; auto-close rechecks idleness; a job comms cannot close at the
-# ceiling is left stuck, visible and no longer taken. And TX-4: update and
-# install dump a live database before migrating; db restore is honest;
-# dumps are 600; comms-postgres leaves the shared network; CI is pinned.
-# And the review's fixes: the consumer never goes down on a dead letter
-# (the entry stays pending), waits for its database while it does not
-# answer, and dead-letters an event only when the database answers;
-# update stops comms before the datastores; a hanging test is red.
-#
-# 3.14.0 is a MINOR: most of its changes are refusals of a product's own
-# wrong input, but four change what a product sees on right input -- a
-# section whose operators were all taken out serves no one (migration
-# 0039); a variable the job does not carry is printed as its
-# placeholder and marked in the journal (0040); without APP_ENV the API
-# is production, closed, not open; a scheduled letter is kept until its
-# scheduled_at plus the retention, not from its creation -- a cancelled
-# one from its creation. The refusals:
-# the API asks the service token before it reads anything of a request;
-# a string the database cannot store, a malformed cursor, query
-# parameter, schedule time or read pointer, a bool or int sent as
-# another type are a 422, a body past 1 MiB a 413, an event past 4 MiB
-# a dead letter, action data past 64 KiB refused at intake, a
-# preference write for a forgotten recipient a 409; a repeated claim
-# and the loser of a creation race under the same key answer as the
-# first call; scheduled_at past 3650 days ahead is refused under the
-# key; a profile with a blank text, Telegram markup Telegram refuses or
-# a duration past 3650 days does not load. No value from the database
-# reaches a log; the sanitizer runs in linear time, never fails on a
-# value, and hides a credential named by its field or key whole. An
-# operator acts only while the roster gives the right, taken under
-# lock. The worker takes a job only while it is still ready; a
-# transient failure of the database counts while the database answers
-# and the uncounted wait is gone (0038); the pipeline budget counts
-# failures in a row; a stop writes the channel's answer through; the
-# expiry sweep goes in portions and close notifications thread by
-# thread; the database probe is bounded as a whole. Telegram's final
-# refusals are final; email's unknown sender domain is the channel's,
-# any 2xx accepted, a 408 retried; an LLM's policy decline refuses the
-# letter, its answer read as a stream under a ceiling. The consumer
-# retries its ack and its dead letter in place, goes down to be
-# restarted on a lasting refusal of Redis, reads its own pending list
-# again while running, and bounds the dead letters in bytes.
-# Retention ages a cancelled job from its creation and keeps a job a
-# push is owed for. The reminder cancel finds its jobs by an index on
-# correlation (0041, built concurrently); the translations feed reads
-# the latest request. Across autumn's change of the clocks the
-# schedule neither defers into the past nor skips the second pass. CI
-# runs the fast checks first, the suite in three parts, and installs
-# nothing without a hash.
-# The tag goes on the merge commit, after the merge -- never ahead of it.
-APP_VERSION = "3.14.0"
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -360,13 +177,10 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # -- Application --
-    # CLOSED BY DEFAULT (REV-3): an absent APP_ENV is production -- the
-    # token is required to start, the schema endpoints are not mounted.
-    # Only an EXPLICIT APP_ENV=development runs without a token: a lost
-    # variable (an .env assembled by hand, a compose override) closes
-    # the API instead of opening it. Rejected: APP_ENV required with no
-    # default -- a box with an older .env would not start at all.
-    app_env: str = "production"
+    # ONE MODE (LEG-1): comms has no development or production of its
+    # own. The token is required to start, the schema endpoints are
+    # never mounted (app/main.py), every log line is the machine's JSON
+    # (app/core/logging.py).
     log_level: str = "INFO"
 
     # -- Database (dedicated comms database inside the product Postgres) --
@@ -419,17 +233,15 @@ class Settings(BaseSettings):
     # shared secret as "Authorization: Bearer <token>". Verified before
     # anything of the request is read (app/api/service_auth.py). NEVER
     # logged (same principle as the formatter's secret sanitizer).
-    # Empty token: startup ERROR outside an explicit development (an
-    # unauthenticated "internal" API is effectively open) -- the same
-    # axis as DATABASE_URL. In development an empty token disables auth
-    # with a loud startup warning (app/main.py).
+    # Empty token: startup ERROR (an unauthenticated "internal" API is
+    # effectively open) -- the same axis as DATABASE_URL.
     #
     # TWO TOKENS, for a change of key without downtime (Primer protocol
     # 5.4, owner's decision 01.11): the current one and the next one. A
     # request passes with either; the next one is optional ("" or unset:
     # only the current one passes) and never stands alone -- set without
-    # the current one, startup is refused in every APP_ENV, development
-    # included: an integrator who set a token must not get an open API.
+    # the current one, startup is refused: an integrator who set a
+    # token must not get an open API.
     # The next one may equal the current one (a repeated step of the
     # machine): one key, compared twice. Which tokens are in force is
     # said in ONE place, service_tokens below.
@@ -495,7 +307,7 @@ class Settings(BaseSettings):
     # under an option -- the machine gives it, and requires it, whatever
     # the instance's options -- and /health answers for it with the llm
     # channel off too (app/api/report.py). Written, it must have its form
-    # in every APP_ENV, or startup is refused; empty = this deploy has no
+    # always, or startup is refused; empty = this deploy has no
     # product storage, every body link is refused, and /health says the
     # seam is not satisfied.
     product_storage_address: str = ""
@@ -560,9 +372,9 @@ class Settings(BaseSettings):
     # On a box the machine gives it: the product's directory, copied and
     # bound read-only, its path under this variable (form D, primer.yaml
     # `accepts.profile`); tests point it at the fixture directory in
-    # this repo. Empty is tolerated ONLY in
-    # development (the Phase 1 stub-profile behavior for tests) --
-    # see app/profile/loader.py: install_profile_from_settings.
+    # this repo. Empty refuses the start of every process that reads
+    # the profile -- see app/profile/loader.py:
+    # install_profile_from_settings.
     templates_dir: str = ""
     # Directory with the TEXT OVERLAY (PO-1): {locale}.yaml files of the
     # shape of templates/{locale}.yaml, each text replacing the base text
@@ -599,7 +411,7 @@ class Settings(BaseSettings):
     # Written but empty, an empty item, an unknown lane or a repeated
     # one refuses startup (worker_lane_problem). Validated here, with
     # every other knob only the worker reads: every entrypoint refuses
-    # alike on one .env.
+    # alike on one environment.
     comms_worker_lanes: str | None = None
 
     # Jobs one pass of each lane selects, oldest due first; the tail is
@@ -711,11 +523,6 @@ class Settings(BaseSettings):
     # -- Computed properties --
 
     @property
-    def is_dev(self) -> bool:
-        """True only under an explicit APP_ENV=development."""
-        return self.app_env == "development"
-
-    @property
     def service_tokens(self) -> tuple[str, ...]:
         """The service tokens a request may present: the current one,
         then the next one when set. An empty value is not a token and
@@ -801,23 +608,10 @@ class Settings(BaseSettings):
         return normalized
 
     @model_validator(mode="after")
-    def _apply_env_defaults_and_validate(self) -> "Settings":
-        """Apply development defaults and validate values.
-
-        Development: provides a working local DATABASE_URL so the
-        service starts without a .env. Any other env requires an
-        explicit DATABASE_URL.
-        """
+    def _validate(self) -> "Settings":
+        """Validate values; DATABASE_URL first, which has no default."""
         if not self.database_url:
-            if self.is_dev:
-                self.database_url = (
-                    "postgresql+asyncpg://comms:comms@localhost:5432/comms"
-                )
-            else:
-                raise ValueError(
-                    "DATABASE_URL is required outside development. "
-                    "Set it in the .env file."
-                )
+            raise ValueError("DATABASE_URL is required.")
 
         if self.log_level.upper() not in _VALID_LOG_LEVELS:
             raise ValueError(
@@ -852,11 +646,11 @@ class Settings(BaseSettings):
             problems.append(lane_problem)
 
         # Phase 3b item 1: an "internal" API without its shared secret
-        # is effectively open -- required outside development, the same
-        # axis as DATABASE_URL above.
-        if not self.is_dev and not self.comms_service_token:
+        # is effectively open -- required, the same axis as DATABASE_URL
+        # above.
+        if not self.comms_service_token:
             problems.append(
-                "COMMS_SERVICE_TOKEN is required outside development: "
+                "COMMS_SERVICE_TOKEN is required: "
                 "the comms API is internal (arch decision 14) and must "
                 "not run open."
             )
@@ -868,8 +662,7 @@ class Settings(BaseSettings):
             if storage_problem is not None:
                 problems.append(storage_problem)
         # W2-1b: the next token rides beside a current one, never alone
-        # -- in development too, where an empty current token would
-        # leave the API open while a token was meant to guard it.
+        # -- named on its own line, beside the missing current one.
         if self.comms_service_token_next and not self.comms_service_token:
             problems.append(
                 "COMMS_SERVICE_TOKEN_NEXT is set without COMMS_SERVICE_TOKEN: "
@@ -925,21 +718,20 @@ class Settings(BaseSettings):
         return self
 
     def _free_route_problems(self) -> list[str]:
-        """No free model route outside development (spec §12.1, the
-        third gateway condition: no free routes in production, debugging
-        included). A gateway marks a free route by the suffix `:free`
-        of the model id. Read only off well-formed sets: a malformed
-        value is refused by the channel rule already, naming its set;
-        and never off a switched-off channel, whose key is not read."""
-        if self.is_dev or self.llm_enabled != "true":
+        """No free model route (spec §12.1, the third gateway condition:
+        no free routes, debugging included). A gateway marks a free
+        route by the suffix `:free` of the model id. Read only off
+        well-formed sets: a malformed value is refused by the channel
+        rule already, naming its set; and never off a switched-off
+        channel, whose key is not read."""
+        if self.llm_enabled != "true":
             return []
         if self.llm_key_sets == "":
             return []
         sets, _ = parse_llm_key_sets(self.llm_key_sets)
         return [
             f"LLM_KEY_SETS: set {name!r} names a free route (a model id "
-            f"ending in ':free'); free routes are refused outside "
-            f"development (APP_ENV={self.app_env})"
+            f"ending in ':free'); free routes are refused"
             for name, key_set in sets.items()
             if key_set.model.endswith(":free")
         ]
@@ -950,11 +742,10 @@ class Settings(BaseSettings):
     # refuse startup. A misspelt channel variable is still caught: a
     # misspelt flag is an absent flag, and a misspelt key of a
     # switched-on channel is a missing key -- both refuse startup.
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    # No env_file (LEG-1): the environment is the one source -- on a box
+    # the machine's, in CI the job's; a file of settings beside it would
+    # be a second, read only where one happens to lie.
+    model_config = SettingsConfigDict(extra="ignore")
 
 
 def channel_values(source: Settings) -> dict[str, str | None]:
@@ -1082,7 +873,7 @@ def format_startup_error(exc: ValidationError) -> str:
     return (
         "comms: startup refused -- the configuration is invalid.\n"
         f"{body}\n"
-        "Fix the .env of this deploy and start again."
+        "Fix the variables named above and start again."
     )
 
 

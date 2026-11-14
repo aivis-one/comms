@@ -520,9 +520,9 @@ def auth_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestAuth:
     async def test_no_token_is_401(
-        self, client: AsyncClient, auth_enabled: None,
+        self, anonymous_client: AsyncClient, auth_enabled: None,
     ) -> None:
-        response = await client.get(_URL)
+        response = await anonymous_client.get(_URL)
         assert response.status_code == 401
         assert response.json()["error"]["class"] == "unauthorized"
 

@@ -37,13 +37,9 @@
 #     is a constant string, nothing from the request is echoed back;
 #   - an auth failure is logged WITHOUT the presented value.
 #
-# EMPTY TOKEN:
-#   - outside an explicit development (an absent APP_ENV is production)
-#     -> unreachable here: startup validation in app/core/config.py
-#     refuses to boot without the token;
-#   - development -> auth is DISABLED (local dev without the bearer
-#     ceremony); app/main.py logs a loud warning at startup so an open
-#     API is visible, not silent.
+# EMPTY TOKEN: unreachable here -- startup validation in
+#   app/core/config.py refuses to boot without the token (LEG-1: comms
+#   has one mode, and in it the API is always closed).
 #
 # A REPEATED QUERY PARAMETER IS REFUSED (G1), on every route
 # (refuse_repeated_query, an application-level dependency in
@@ -104,16 +100,10 @@ async def require_service_auth(authorization: str | None) -> None:
     Raises HTTP 401 when the Authorization header is missing, is not
     a Bearer scheme (in any case: `bearer`, `BEARER`), or carries a
     token that matches none of the tokens in force -- COMMS_SERVICE_TOKEN
-    and, when set, COMMS_SERVICE_TOKEN_NEXT. No-op when the current
-    token is unset (an explicit development only -- any other APP_ENV,
-    an absent one included, refuses to start without it, and the next
-    token alone refuses everywhere). Asked by app/api/service_auth.py
-    RequireServiceToken for every request.
+    and, when set, COMMS_SERVICE_TOKEN_NEXT. Never a pass-through: with
+    no token in force (a state startup refuses) nothing matches. Asked
+    by app/api/service_auth.py RequireServiceToken for every request.
     """
-    if not settings.comms_service_token:
-        # Development with auth disabled (warned at startup).
-        return
-
     scheme, separator, presented = (authorization or "").partition(" ")
     if not separator or scheme.lower() != _BEARER_SCHEME:
         logger.warning("service_auth_failed", reason="missing_or_not_bearer")

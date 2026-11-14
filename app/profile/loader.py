@@ -2212,10 +2212,8 @@ def install_profile_from_settings() -> bool:
     the text overlay from TEMPLATES_OVERLAY_DIR when it is set.
 
     Returns True when a profile was installed. An empty TEMPLATES_DIR
-    is tolerated ONLY in development (mirrors the DATABASE_URL
-    policy): the service starts with an empty registry and tests /
-    local experiments register what they need. Anywhere else a
-    missing profile is a deploy error -> ProfileError. An overlay
+    is a deploy error -> ProfileError, in every environment (LEG-1:
+    comms has one mode; mirrors the DATABASE_URL policy). An overlay
     without a base is refused everywhere: it replaces base texts, and
     there are none. llm routes are cross-checked against this deploy's
     key sets when the llm channel is switched on; a route into a
@@ -2231,14 +2229,8 @@ def install_profile_from_settings() -> bool:
             "is no base profile."
         )
     if not settings.templates_dir:
-        if settings.is_dev:
-            logger.warning(
-                "profile_not_configured",
-                hint="TEMPLATES_DIR is empty; registry stays empty",
-            )
-            return False
         raise ProfileError(
-            "TEMPLATES_DIR is required outside development. "
+            "TEMPLATES_DIR is required. "
             "Point it at the product profile directory."
         )
     profile = load_profile(

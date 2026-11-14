@@ -258,9 +258,9 @@ class TestSnapshotDiscipline:
 
 class TestAuth:
     async def test_missing_token_is_rejected(
-        self, client: AsyncClient, auth_enabled: None
+        self, anonymous_client: AsyncClient, auth_enabled: None
     ) -> None:
-        response = await client.put(_url(uuid4()), json=_snapshot())
+        response = await anonymous_client.put(_url(uuid4()), json=_snapshot())
         assert response.status_code == 401
         assert response.headers["WWW-Authenticate"] == "Bearer"
 

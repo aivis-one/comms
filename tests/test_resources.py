@@ -791,6 +791,7 @@ class TestOneErrorBody:
     async def test_every_source_has_the_one_form(
         self,
         client: AsyncClient,
+        anonymous_client: AsyncClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         self._assert_form(await client.get("/api/v1/nowhere"), 404, "not_found")
@@ -811,7 +812,9 @@ class TestOneErrorBody:
         self._assert_form(invalid, 422, "validation")
         assert invalid.json()["error"]["fields"]
         monkeypatch.setattr(settings, "comms_service_token", "secret-token-x")
-        unauthorized = await client.get(f"/api/v1/threads?operator={uuid4()}")
+        unauthorized = await anonymous_client.get(
+            f"/api/v1/threads?operator={uuid4()}",
+        )
         self._assert_form(unauthorized, 401, "unauthorized")
         assert "secret-token-x" not in unauthorized.text
 

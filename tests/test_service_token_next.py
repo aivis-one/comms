@@ -12,11 +12,14 @@
 #           optional and never alone; every token compared, always
 #   item 2  no token in a log line -- not the refusal's, not startup's,
 #           not the settings' repr; nothing says which token passed
-#   item 3  deploy/.env.example says so. deploy/INTEGRATION.md said so
-#           too, held here both ways, until DOC-1 took the paragraph out:
-#           the machine changes no key, and the product presents the
-#           value its seam gave it -- the change of key is the
-#           operator's, not the product's
+#   item 3  deploy/.env.example said so until LEG-1 took the template
+#           out (the next token's default, empty, is the code's: on a box
+#           primer.yaml declares no key for it, tests/test_primer_yaml.py
+#           NOT_IN_ENV). deploy/INTEGRATION.md said so too, held here
+#           both ways, until DOC-1 took the paragraph out: the machine
+#           changes no key, and the product presents the value its seam
+#           gave it -- the change of key is the operator's, not the
+#           product's
 #
 # THREE DOUBLE AXES. REPEAT: both tokens pass; the next equal to the
 # current. EMPTY: an empty presented token, the next set to "". SHORTFALL:
@@ -30,11 +33,9 @@
 #   M5 a token in the refusal's log line     -> TestNoTokenInTheLog
 #   M6 an accepted request says which token  -> test_nothing_says_which_...
 #   M7 repr=True on the next token           -> test_the_repr_carries_...
-#   M8 the next token's line taken out of the template -> TestTheContract
 # =============================================================================
 
 import secrets
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -48,9 +49,6 @@ from app import main
 from app.api.deps import require_service_auth
 from app.core.config import Settings, format_startup_error, settings
 from tests.conftest import FIXTURE_PROFILE_DIR
-
-_REPO = Path(__file__).resolve().parents[1]
-_TEMPLATE = (_REPO / "deploy" / ".env.example").read_text(encoding="utf-8")
 
 # Assembled at run time, fresh per run: no literal of a token's shape.
 _CURRENT = "-".join(("w21b", "current", uuid4().hex))
@@ -78,7 +76,6 @@ def current_only(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _settings(**fields: Any) -> Settings:
     return Settings(
-        _env_file=None,  # type: ignore[call-arg]
         database_url="postgresql+asyncpg://u:p@db/comms_unit",
         **fields,
     )
@@ -162,7 +159,6 @@ class TestTheTokensInForce:
         """REPEAT: a repeated step of the machine -- one key, in force,
         compared twice."""
         source = _settings(
-            app_env="production",
             comms_service_token=_CURRENT, comms_service_token_next=_CURRENT,
         )
         assert source.service_tokens == (_CURRENT, _CURRENT)
@@ -170,31 +166,23 @@ class TestTheTokensInForce:
 
 class TestStartup:
     def test_the_next_without_the_current_refuses_naming_both(self) -> None:
-        """M3, outside development: the current one is required, and the
-        next one alone is said by its own name."""
+        """M3: the current one is required, and the next one alone is
+        said by its own name."""
         refusal = _refusal(
-            app_env="production", comms_service_token="",
+            comms_service_token="",
             comms_service_token_next=_NEXT,
         )
         assert "COMMS_SERVICE_TOKEN is required" in refusal
         assert "COMMS_SERVICE_TOKEN_NEXT is set without COMMS_SERVICE_TOKEN" in refusal
         assert _NEXT not in refusal
 
-    def test_the_next_without_the_current_refuses_in_development_too(
-        self,
-    ) -> None:
-        """Development with an empty current token runs open; a next
-        token set there means a token was meant -- a red start."""
-        refusal = _refusal(
-            app_env="development", comms_service_token="",
-            comms_service_token_next=_NEXT,
-        )
-        assert "COMMS_SERVICE_TOKEN_NEXT is set without COMMS_SERVICE_TOKEN" in refusal
-        assert "COMMS_SERVICE_TOKEN is required" not in refusal
-
-    def test_the_pair_development_without_either_starts(self) -> None:
-        source = _settings(app_env="development", comms_service_token="")
-        assert source.service_tokens == ()
+    def test_the_pair_the_current_alone_starts(self) -> None:
+        """Was test_the_pair_development_without_either_starts: without
+        either token development started open; LEG-1 took the mode out
+        (tests/test_api_closed_by_default.py TestOneMode). The pair of
+        the refusal above: the current one alone starts."""
+        source = _settings(comms_service_token=_CURRENT)
+        assert source.service_tokens == (_CURRENT,)
 
 
 # -----------------------------------------------------------------------------
@@ -333,16 +321,3 @@ class TestNoTokenInTheLog:
         text = repr(source)
         assert "database_url=" in text
         assert _CURRENT not in text and _NEXT not in text
-
-
-# -----------------------------------------------------------------------------
-# item 3 -- the contract
-# -----------------------------------------------------------------------------
-
-
-class TestTheContract:
-    def test_the_env_template_carries_the_next_one_empty(self) -> None:
-        """Until W1-2 the writer was `operator`; on a box of the machine
-        nothing sets it (primer.yaml declares no key for it), so it is the
-        code's default, empty."""
-        assert "\n# by: default\nCOMMS_SERVICE_TOKEN_NEXT=\n" in _TEMPLATE

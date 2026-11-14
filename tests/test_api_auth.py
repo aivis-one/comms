@@ -8,7 +8,8 @@
 #   - no header / wrong scheme / wrong token -> 401, and the response
 #     never echoes anything the client sent;
 #   - the right token -> through;
-#   - empty configured token (development) -> auth disabled;
+#   - no mode opens it (LEG-1): the suite's own client passes only by
+#     presenting the suite's token -- without one, 401;
 #   - /health and /ready stay open regardless (installer/docker
 #     healthchecks carry no secret);
 #   - the scheme name in any case (API-1, RFC 9110 §11.1), one space;
@@ -20,6 +21,8 @@
 #      TestEveryRefusalIsItsOwn test_the_traceback_does_not_grow
 #   M9 the scheme compared case-sensitively (startswith("Bearer ")) ->
 #      TestTheSchemeInAnyCase test_the_right_token_passes[bearer|BEARER]
+#   (LEG-1) an empty token passing again, the suite's token blanked ->
+#      TestNoModeOpensIt test_without_a_token_the_suite_is_refused
 # =============================================================================
 
 from types import TracebackType
@@ -48,9 +51,9 @@ def _inbox_url() -> str:
 
 class TestAuthRequired:
     async def test_missing_header_is_401(
-        self, client: AsyncClient, auth_enabled: None,
+        self, anonymous_client: AsyncClient, auth_enabled: None,
     ) -> None:
-        response = await client.get(_inbox_url())
+        response = await anonymous_client.get(_inbox_url())
         assert response.status_code == 401
         assert response.headers["WWW-Authenticate"] == "Bearer"
 
@@ -86,50 +89,54 @@ class TestAuthRequired:
         assert response.status_code == 200
 
     async def test_prefs_router_also_guarded(
-        self, client: AsyncClient, auth_enabled: None,
+        self, anonymous_client: AsyncClient, auth_enabled: None,
     ) -> None:
-        response = await client.get(
+        response = await anonymous_client.get(
             f"/api/v1/recipients/{uuid4()}/preferences",
         )
         assert response.status_code == 401
 
     async def test_messaging_router_also_guarded(
-        self, client: AsyncClient, auth_enabled: None,
+        self, anonymous_client: AsyncClient, auth_enabled: None,
     ) -> None:
-        response = await client.get(
+        response = await anonymous_client.get(
             f"/api/v1/threads/{uuid4()}/messages",
         )
         assert response.status_code == 401
 
 
-class TestAuthDisabledInDevelopment:
-    async def test_empty_token_disables_auth(
+class TestNoModeOpensIt:
+    """Was TestAuthDisabledInDevelopment: an empty token opened the API in
+    an explicit development, and the suite ran every test that way. LEG-1
+    took the mode out -- startup refuses an empty token everywhere
+    (tests/test_api_closed_by_default.py) -- so the suite runs closed:
+    its token in force, its client presenting it."""
+
+    async def test_without_a_token_the_suite_is_refused(
+        self, anonymous_client: AsyncClient,
+    ) -> None:
+        response = await anonymous_client.get(_inbox_url())
+        assert response.status_code == 401
+
+    async def test_the_pair_the_suite_passes_with_its_token(
         self, client: AsyncClient,
     ) -> None:
-        """Default test config: no token -> the API is open.
-
-        R-0: the class was named for the stub mode of the removed global
-        channel switch, under which an empty token was legal. That state
-        is now reachable in development only (any other APP_ENV refuses
-        to start without the token, see test_config_validation); the
-        suite reproduces it with the autouse api_auth_disabled fixture.
-        """
-        assert settings.comms_service_token == ""
+        assert settings.comms_service_token != ""
         response = await client.get(_inbox_url())
         assert response.status_code == 200
 
 
 class TestHealthStaysOpen:
     async def test_health_and_ready_unauthenticated(
-        self, client: AsyncClient, auth_enabled: None,
+        self, anonymous_client: AsyncClient, auth_enabled: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """/ready is 200 only with every check ok (W3-1): the suite has no
         Redis, so its check answers here (tests/helpers.py) -- what is
         asked is that no token is."""
         redis_answering(monkeypatch)
-        assert (await client.get("/health")).status_code == 200
-        assert (await client.get("/ready")).status_code == 200
+        assert (await anonymous_client.get("/health")).status_code == 200
+        assert (await anonymous_client.get("/ready")).status_code == 200
 
 
 def _depth(tb: TracebackType | None) -> int:

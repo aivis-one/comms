@@ -24,8 +24,8 @@
 # text() string, per the no-raw-SQL house rule. The `redis` check is a
 # PING of comms' own Redis (REDIS_URL, which compose gives comms-app for
 # this alone): the client is built on the first check and closed with the
-# process. An empty REDIS_URL -- a development, the suite -- is `redis:
-# error`, not a refused start.
+# process. An empty REDIS_URL -- the suite -- is `redis: error`, not a
+# refused start.
 # =============================================================================
 
 from collections.abc import AsyncGenerator
@@ -56,7 +56,7 @@ from app.api.recipients import router as recipients_router
 from app.api.report import REDIS, Report, commit_from_environment
 from app.api.request_id import RequestId
 from app.api.service_auth import RequireServiceToken
-from app.core.config import APP_VERSION, settings
+from app.core.config import settings
 from app.core.database import (
     ProcessRole,
     dispose_engine,
@@ -93,22 +93,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # The database's limits wait for an attempt as long as it may hold
     # its job's row -- read off the profile, so after it (W5-3).
     set_attempt_hold(longest_attempt_hold())
-    if not settings.comms_service_token:
-        # Only reachable in development: any other APP_ENV refuses to
-        # start without the token (app/core/config.py). Loud on purpose
-        # -- an open "internal" API must be a visible choice, not a
-        # silent default.
-        logger.warning(
-            "service_auth_disabled",
-            reason="COMMS_SERVICE_TOKEN is empty",
-            env=settings.app_env,
-        )
     # The channel map is the operator's view of the channel rule
     # (app/core/channels.py): live / not_configured / not_implemented.
     logger.info(
         "comms_started",
-        version=APP_VERSION,
-        env=settings.app_env,
         channels=channel_map(settings),
         llm_sets=llm_set_map(settings),
     )
@@ -119,44 +107,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("comms_stopped")
 
 
-# THE INTERACTIVE SCHEMA IS A DEVELOPMENT TOOL, NOT A PRODUCT SURFACE.
-# FastAPI serves /docs, /redoc and /openapi.json as routes of their own
-# (behind the service token like every path, when one is set), and what
-# they publish is every route's docstring. Those docstrings
-# are written for us: they carry KNOWN CEILING blocks, release markers
-# and, on one route, the sentence describing a read-authz bypass --
-# text for the next developer, published to anyone who asks.
+# THE INTERACTIVE SCHEMA IS NOT A PRODUCT SURFACE. FastAPI serves
+# /docs, /redoc and /openapi.json as routes of their own, and what they
+# publish is every route's docstring. Those docstrings are written for
+# us: they carry KNOWN CEILING blocks, release markers and, on one route,
+# the sentence describing a read-authz bypass -- text for the next
+# developer, published to anyone who asks.
 #
 # An integrator does not need them: deploy/INTEGRATION.md is the
-# contract, and it is written for that reader. So outside an explicit
-# development (an absent APP_ENV is production) the three endpoints do
-# not exist at all -- openapi_url=None also
-# removes /docs and /redoc, and the explicit Nones say so to the next
-# reader rather than leaving it to be discovered.
-def docs_urls(is_dev: bool) -> dict[str, str | None]:
-    """The schema endpoints FastAPI should mount, or None for each.
-
-    A function rather than three inline conditionals so that both
-    branches can be asserted without re-importing this module under
-    patched settings: the closed case is checked against the running
-    app, the open one against this.
-    """
-    return {
-        "openapi_url": "/openapi.json" if is_dev else None,
-        "docs_url": "/docs" if is_dev else None,
-        "redoc_url": "/redoc" if is_dev else None,
-    }
-
-
-_DOCS = docs_urls(settings.is_dev)
-
+# contract, and it is written for that reader. So the three endpoints do
+# not exist at all, ever (LEG-1: comms has one mode) -- openapi_url=None
+# also removes /docs and /redoc, and the explicit Nones say so to the
+# next reader rather than leaving it to be discovered. No version is
+# given either: with no schema it is published nowhere, and every log
+# line names the release (app/core/logging.py).
 app = FastAPI(
     title="COMMS Service",
-    version=APP_VERSION,
     lifespan=lifespan,
-    openapi_url=_DOCS["openapi_url"],
-    docs_url=_DOCS["docs_url"],
-    redoc_url=_DOCS["redoc_url"],
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
     # Before every route: a key given twice is refused, not read as its
     # last value; a query or body string the database cannot store is a
     # 422, not the driver's 500 (app/api/deps.py).

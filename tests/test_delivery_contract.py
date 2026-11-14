@@ -2,8 +2,8 @@
 # COMMS Service -- what the delivery promises outside the code
 # =============================================================================
 #
-# Three facts that live in files nobody imports -- the version number, the
-# dependency lock, the environment templates -- and that an integrator or an
+# Facts that live in files nobody imports -- the dependency lock, the
+# stream names of the seams -- and that an integrator or an
 # on-call engineer reads before they ever read a module. Each of them is a
 # claim made in one place and consumed in another, which is the shape that
 # rots silently: nothing fails when they drift, the failure arrives later
@@ -19,7 +19,6 @@ from typing import Any
 import pytest
 
 from app.api.prefs import PeriodIn, PreferencesPatch
-from app.core.config import APP_VERSION
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PYPROJECT_TEXT = (_ROOT / "pyproject.toml").read_text()
@@ -114,29 +113,6 @@ def _recorded_command(text: str) -> str:
     block = text.split("# REGENERATE", 1)[1].split("\n#\n", 2)[1]
     lines = [line.lstrip("#").strip() for line in block.splitlines()]
     return " ".join(" ".join(lines).replace("\\", " ").split())
-
-
-class TestTheVersionIsOneNumber:
-    """The number an incident is opened against.
-
-    It stood at 0.1.0 through every release up to v1.3.0, so "which
-    version of comms is deployed" had no answer from outside the box --
-    /health reported the same string on every one of them.
-    """
-
-    def test_the_two_sources_agree(self) -> None:
-        """Two files carry it, so they are pinned to each other: raising
-        one alone is exactly the mistake that produced 0.1.0-forever."""
-        assert _PYPROJECT["project"]["version"] == APP_VERSION
-
-    def test_the_version_is_not_the_placeholder(self) -> None:
-        """The pair to the agreement above: two sources agreeing on
-        0.1.0 would satisfy it and mean nothing. A released version has
-        a major, and 0.1.0 is what the template shipped with.
-        """
-        assert APP_VERSION != "0.1.0"
-        assert re.fullmatch(r"\d+\.\d+\.\d+", APP_VERSION)
-        assert int(APP_VERSION.split(".")[0]) >= 1
 
 
 _EVERY_DECLARED = [
@@ -278,7 +254,7 @@ class TestTheTwoLocksAreOneResolution:
         )
 
 
-class TestTheTemplatesCarryTheContract:
+class TestTheSeamsNameTheStreams:
     """The stream and the group are half of an agreement.
 
     A relay pointing at a name nobody reads is not an error on either
@@ -288,49 +264,50 @@ class TestTheTemplatesCarryTheContract:
     written down, or the other side has to read our source to learn
     what to match.
 
-    Until G4 the names were asserted in two templates, the deploy's and
-    the root .env.example; G4 left one (the root copy had drifted from
-    the deploy's and is gone), so the parameter has one value. Every
-    other variable of the deploy is held by tests/test_env_template.py.
+    Was TestTheTemplatesCarryTheContract: the names were held in the
+    deploy's template of the environment, until LEG-1 took the template
+    out. The product reads them in INTEGRATION.md section 15 (the seams,
+    "The stream names are fixed"), held here to the code both ways: each
+    name the paragraph gives is the setting's default, and each default
+    is in the paragraph.
     """
 
-    @pytest.mark.parametrize("template", ["deploy/.env.example"])
+    @staticmethod
+    def _paragraph() -> str:
+        text = (_ROOT / "deploy" / "INTEGRATION.md").read_text()
+        section = text[text.index("## 15. The seams"):]
+        start = section.index("**The stream names are fixed.**")
+        return " ".join(section[start:section.index("\n\n", start)].split())
+
     @pytest.mark.parametrize(
-        "key", ["COMMS_EVENTS_STREAM", "COMMS_CONSUMER_GROUP"],
+        ("phrase", "field"),
+        [
+            ("XADDs into the stream `{}`", "comms_events_stream"),
+            ("as its consumer group `{}`", "comms_consumer_group"),
+        ],
     )
-    def test_the_stream_contract_is_in_the_template(
-        self, template: str, key: str
+    def test_the_paragraph_names_the_default(
+        self, phrase: str, field: str,
     ) -> None:
-        text = (_ROOT / template).read_text()
-        assert re.search(rf"^{key}=", text, re.M), (
-            f"{key} is not a key line in {template} -- an integrator "
-            f"cannot match a name that is only in our source"
-        )
-
-    def test_the_deploy_template_carries_the_credentials_too(self) -> None:
-        """The pair: the contract names are useless in a template that
-        cannot bring the service up at all. This is the half a review
-        reported as missing -- it is present, and this test is what
-        keeps the report true next time."""
-        text = (_ROOT / "deploy/.env.example").read_text()
-        for key in ("COMMS_SERVICE_TOKEN", "REDIS_URL", "DATABASE_URL"):
-            assert re.search(rf"^{key}=", text, re.M), key
-
-    def test_the_documented_names_are_the_defaults(self) -> None:
-        """The template and the code must say the same thing. A
-        template that documents a name the service does not default to
-        would send every integrator to a stream we do not read."""
         from app.core.config import Settings
 
-        defaults = Settings.model_fields
-        text = (_ROOT / "deploy/.env.example").read_text()
-        for key, field in (
-            ("COMMS_EVENTS_STREAM", "comms_events_stream"),
-            ("COMMS_CONSUMER_GROUP", "comms_consumer_group"),
-        ):
-            documented = re.search(rf"^{key}=(.*)$", text, re.M)
-            assert documented is not None
-            assert documented.group(1).strip() == defaults[field].default
+        default = Settings.model_fields[field].default
+        assert default  # the pair: there is a name to match
+        paragraph = self._paragraph()
+        assert phrase.format(default) in paragraph, (field, paragraph)
+
+    def test_the_paragraph_names_nothing_else(self) -> None:
+        """The other way: every name in backticks in the paragraph is
+        one of the two defaults -- a name the code does not default to
+        would send an integrator to a stream nobody reads."""
+        from app.core.config import Settings
+
+        defaults = {
+            Settings.model_fields[field].default
+            for field in ("comms_events_stream", "comms_consumer_group")
+        }
+        named = set(re.findall(r"`([^`]+)`", self._paragraph()))
+        assert named == defaults
 
 
 # -----------------------------------------------------------------------------

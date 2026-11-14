@@ -7,6 +7,8 @@
 #       -> test_startup_installs_the_profile
 #   M21 a private name imported between modules again
 #       -> test_no_private_name_is_imported_between_app_modules
+#   LEG-1 a version or the mode back on comms_started
+#       -> test_the_start_line_names_the_channels_not_a_version
 # =============================================================================
 
 import ast
@@ -61,31 +63,35 @@ class TestLifespan:
             assert spies == ["setup_logging"]
         assert spies == ["setup_logging", "close_formatters", "dispose_engine"]
 
-    async def test_a_missing_profile_outside_development_refuses_to_start(
+    async def test_a_missing_profile_refuses_to_start(
         self, monkeypatch: pytest.MonkeyPatch, spies: list[str],
     ) -> None:
         """The state the grid names: no profile on a deploy is a red
         start, before any traffic -- and nothing is shut down that was
         never started."""
         monkeypatch.setattr(settings, "templates_dir", "")
-        monkeypatch.setattr(settings, "app_env", "production")
         with pytest.raises(ProfileError, match="TEMPLATES_DIR"):
             async with main.lifespan(main.app):
                 pass  # pragma: no cover -- startup must not get here
         assert spies == ["setup_logging"]
 
-    async def test_an_empty_token_is_said_out_loud(
+    async def test_the_start_line_names_the_channels_not_a_version(
         self, monkeypatch: pytest.MonkeyPatch, spies: list[str],
     ) -> None:
+        """LEG-1: comms_started carried the code's version number and the
+        mode; both are gone -- every line names the release
+        (PRIMER_RELEASE, app/core/logging.py), and there is one mode.
+        The pair: the line is there, with the channel map it is for."""
         from structlog.testing import capture_logs
 
         configure_every_channel(monkeypatch)
         monkeypatch.setattr(settings, "templates_dir", str(FIXTURE_PROFILE_DIR))
-        monkeypatch.setattr(settings, "comms_service_token", "")
         with capture_logs() as logs:
             async with main.lifespan(main.app):
                 pass
-        assert [log for log in logs if log["event"] == "service_auth_disabled"]
+        (started,) = [log for log in logs if log["event"] == "comms_started"]
+        assert started["channels"]
+        assert "version" not in started and "env" not in started
 
 
 def _private_imports(source: str, name: str) -> list[str]:

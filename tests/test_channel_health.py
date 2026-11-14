@@ -599,9 +599,9 @@ def auth_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestAuth:
     async def test_no_token_is_401(
-        self, client: AsyncClient, auth_enabled: None,
+        self, anonymous_client: AsyncClient, auth_enabled: None,
     ) -> None:
-        response = await client.get(_URL)
+        response = await anonymous_client.get(_URL)
         assert response.status_code == 401
         assert response.json()["error"]["class"] == "unauthorized"
 
@@ -623,9 +623,9 @@ class TestAuth:
         assert response.json()["channels"], "the pair: a real answer"
 
     async def test_health_itself_stays_open(
-        self, client: AsyncClient, auth_enabled: None,
+        self, anonymous_client: AsyncClient, auth_enabled: None,
     ) -> None:
-        assert (await client.get("/health")).status_code == 200
+        assert (await anonymous_client.get("/health")).status_code == 200
 
 
 # The read model is imported so a rename of the module fails here first.

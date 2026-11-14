@@ -25,6 +25,8 @@
 #   M15 .env out of .dockerignore         -> TestImage (W1-1)
 #   W1-2: the Redis password from a key that is not the seam's
 #         -> TestCompose
+#   LEG-1: the deploy's template of the environment back
+#         -> TestTheDeployTree
 # =============================================================================
 
 import asyncio
@@ -160,6 +162,20 @@ def _jobs_without_a_limit(data: dict[str, Any]) -> list[str]:
     ]
 
 
+class TestTheDeployTree:
+    """LEG-1: deploy/ holds what a box of the machine reads (the compose
+    file), what a product reads (INTEGRATION.md) and the ignore of a
+    local secret -- and nothing else. The template of comms' environment
+    (.env.example) went: under the machine comms' environment is
+    primer.yaml with the compose file, and its description is Settings
+    (app/core/config.py); a template beside them was a second copy every
+    change had to keep."""
+
+    def test_deploy_holds_three_files(self) -> None:
+        found = sorted(path.name for path in (ROOT / "deploy").iterdir())
+        assert found == [".gitignore", "INTEGRATION.md", "docker-compose.yml"]
+
+
 class TestCi:
     @pytest.mark.parametrize("workflow", _WORKFLOWS, ids=lambda p: p.name)
     def test_every_job_has_its_permissions(self, workflow: Path) -> None:
@@ -272,7 +288,7 @@ class TestImage:
     def test_the_guard_sees_an_ignored_file(self) -> None:
         assert _in("tests/conftest.py", ["tests/"])
         assert _in("deploy/.env", ["**/.env"])
-        assert not _in("deploy/.env.example", ["**/.env", ".env.*"])
+        assert not _in("deploy/.env.local", ["**/.env", ".env.*"])
         assert _in("deploy/INTEGRATION.md", ["*.md"]) is False
         assert _in("README.md", ["*.md"])
 

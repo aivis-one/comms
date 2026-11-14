@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+import yaml
 from httpx import AsyncClient
 from pydantic import ValidationError
 from sqlalchemy import select, text, update
@@ -426,8 +427,6 @@ class TestKeySets:
 
 def _settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = {
-        "_env_file": None,
-        "app_env": "production",
         "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
         "comms_service_token": "unit-test-service-token",
         # The llm channel switched on (W2-1): its key is read only then.
@@ -468,15 +467,18 @@ class TestRedStart:
         assert "channel 'llm' is misconfigured" in refusal
         assert "missing: LLM_KEY_SETS" in refusal
 
-    def test_a_free_route_refuses_outside_development(self) -> None:
+    def test_a_free_route_refuses(self) -> None:
+        """Was test_a_free_route_refuses_outside_development, its pair
+        "development may": LEG-1 took the mode out, and a free route is
+        refused everywhere (tests/test_api_closed_by_default.py
+        TestOneMode). The pair now: the same sets with the model not
+        free start."""
         sets = json.loads(json.dumps(_SETS))
         sets["llm.gw"]["model"] = "vendor/cheap:free"
         refusal = _refusal(llm_key_sets=json.dumps(sets))
         assert "set 'llm.gw' names a free route" in refusal
-        # The pair: development may.
-        assert "llm.gw" in _settings(
-            app_env="development", llm_key_sets=json.dumps(sets),
-        ).llm_sets
+        sets["llm.gw"]["model"] = "vendor/cheap"
+        assert "llm.gw" in _settings(llm_key_sets=json.dumps(sets)).llm_sets
 
 
 def _profile_refusal(root: Path, extra: str, sets: tuple[str, ...]) -> str:
@@ -1558,10 +1560,14 @@ class TestTheContract:
             "allow_fallbacks": False, "data_collection": "deny",
         }
 
-    def test_the_env_example_and_the_generated_env_carry_the_key(self) -> None:
-        example = (_REPO / "deploy" / ".env.example").read_text()
-        assert "\nLLM_KEY_SETS=\n" in example
-        assert "#LLM_DELIVER_TIMEOUT_SECONDS=120\n" in example
+    def test_the_passport_carries_the_key(self) -> None:
+        """Was test_the_env_example_and_the_generated_env_carry_the_key:
+        the deploy's template held the key and the timeout's default,
+        until LEG-1 took the template out. The key is asked of the
+        operator by primer.yaml when llm is on; the default is the
+        setting's own."""
+        env = yaml.safe_load((_REPO / "primer.yaml").read_text())["env"]
+        assert env["LLM_KEY_SETS"] == {"source": "asked", "when": "llm"}
         assert Settings.model_fields["llm_deliver_timeout_seconds"].default == 120
 
 

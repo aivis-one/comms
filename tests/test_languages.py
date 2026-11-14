@@ -64,7 +64,7 @@ class TestTheStart:
         monkeypatch.delenv("LANGUAGES", raising=False)
         monkeypatch.delenv("DEFAULT_LANGUAGE", raising=False)
         with pytest.raises(ValidationError) as caught:
-            Settings(_env_file=None)
+            Settings()
         message = format_startup_error(caught.value)
         assert "LANGUAGES is not set" in message
         assert "DEFAULT_LANGUAGE is not set" in message
@@ -74,7 +74,7 @@ class TestTheStart:
     ) -> None:
         monkeypatch.setenv("LANGUAGES", "en,ru,uk")
         monkeypatch.setenv("DEFAULT_LANGUAGE", "uk")
-        built = Settings(_env_file=None)
+        built = Settings()
         assert (built.languages, built.default_language) == ("en,ru,uk", "uk")
 
     def test_no_default_in_code(self) -> None:
@@ -154,7 +154,6 @@ class TestDefaultLocaleIsGone:
             if path.is_file() and path.suffix in {".py", ".md", ".yml", ".yaml", ""}
         ]
         files += [_REPO / "primer.yaml", _REPO / ".github" / "workflows" / "ci.yml"]
-        files += [_REPO / "deploy" / ".env.example"]
         assert len(files) > 100  # the pair: the walk read the tree
         found = [
             str(path.relative_to(_REPO)) for path in files

@@ -626,12 +626,15 @@ class TestNoLetter:
 
 class TestAuth:
     async def test_the_service_token_guards_every_route(
-        self, bare_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+        self, bare_client: AsyncClient, anonymous_client: AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         token = "tok-" + "e" * 12  # glued at runtime
         monkeypatch.setattr(settings, "comms_service_token", token)
         for tail in ("", "/deliveries", "/path"):
-            refused = await bare_client.get(f"{_BASE}{tail}", params={"key": "k"})
+            refused = await anonymous_client.get(
+                f"{_BASE}{tail}", params={"key": "k"},
+            )
             assert refused.status_code == 401
             assert refused.json()["error"]["class"] == "unauthorized"
             allowed = await bare_client.get(

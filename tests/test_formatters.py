@@ -154,7 +154,6 @@ class TestLocalByDefault:
             return _FakeBot()
 
         full = Settings(
-            _env_file=None,  # type: ignore[call-arg]
             telegram_enabled="true",
             telegram_bot_token="123456:unit-test-token",
             telegram_bot_url=BOT_URL,

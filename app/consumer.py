@@ -118,7 +118,7 @@ def main() -> None:
         # a no-op pretending to be a process.
         raise RuntimeError(
             "REDIS_URL is required to run the consumer: it reads the "
-            "product's event stream. Set it in the .env file."
+            "product's event stream."
         )
     install_profile_from_settings()
     # The database's limits wait for an attempt as long as it may hold

@@ -5,9 +5,9 @@
 # Drives the /api/v1 inbox surface through the ASGI transport. Seeds
 # COMMIT (the request handler opens its own session -- an uncommitted
 # seed would be invisible to it); the autouse clean_db fixture wipes
-# rows between tests. Auth is disabled by default test config (empty
-# token, the conftest api_auth_disabled fixture) -- guarded separately
-# in test_api_auth.py.
+# rows between tests. The client presents the suite's token (the
+# conftest suite_token fixture) -- auth is guarded separately in
+# test_api_auth.py.
 #
 # telegram_ids come from the Phase 3b band 84000-84999.
 # =============================================================================

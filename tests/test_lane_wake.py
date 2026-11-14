@@ -216,7 +216,7 @@ _OTHER = "unit_event_in_app"
 def test_the_boundary_is_the_default_base_interval() -> None:
     """The bound these tests call "at once" is the poll interval a
     deploy runs with when it sets none."""
-    assert Settings(_env_file=None).notification_poll_interval_seconds == _BASE
+    assert Settings().notification_poll_interval_seconds == _BASE
 
 
 def _declare(type_key: str, lane: Lane) -> None:

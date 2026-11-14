@@ -630,7 +630,7 @@ class TestTheBudgets:
 
     def test_zero_is_not_off(self) -> None:
         with pytest.raises(ValueError) as caught:
-            Settings(_env_file=None, notification_lane_bulk_batch_size=0)
+            Settings(notification_lane_bulk_batch_size=0)
         message = str(caught.value)
         assert "NOTIFICATION_LANE_BULK_BATCH_SIZE=0 is outside" in message
         assert "leaving the lane out of COMMS_WORKER_LANES" in message
@@ -643,7 +643,7 @@ class TestTheBudgets:
 
 class TestTheSetting:
     def test_unset_takes_every_lane_in_lane_order(self) -> None:
-        assert Settings(_env_file=None).worker_lanes == tuple(Lane)
+        assert Settings().worker_lanes == tuple(Lane)
 
     @pytest.mark.parametrize(("value", "lanes"), [
         ("critical", (Lane.CRITICAL,)),
@@ -653,7 +653,7 @@ class TestTheSetting:
     def test_a_set_takes_exactly_its_lanes(
         self, value: str, lanes: tuple[Lane, ...],
     ) -> None:
-        assert Settings(_env_file=None, comms_worker_lanes=value).worker_lanes == lanes
+        assert Settings(comms_worker_lanes=value).worker_lanes == lanes
 
     @pytest.mark.parametrize(("value", "says"), [
         ("", "names no lane"),
@@ -667,7 +667,7 @@ class TestTheSetting:
         self, value: str, says: str,
     ) -> None:
         with pytest.raises(ValueError) as caught:
-            Settings(_env_file=None, comms_worker_lanes=value)
+            Settings(comms_worker_lanes=value)
         message = str(caught.value)
         assert f"COMMS_WORKER_LANES={value!r}" in message
         assert says in message
@@ -679,9 +679,9 @@ class TestTheSetting:
         refuses; the pair, absent, takes all four."""
         monkeypatch.setenv("COMMS_WORKER_LANES", "")
         with pytest.raises(ValueError, match="COMMS_WORKER_LANES=''"):
-            Settings(_env_file=None)
+            Settings()
         monkeypatch.delenv("COMMS_WORKER_LANES")
-        assert Settings(_env_file=None).worker_lanes == tuple(Lane)
+        assert Settings().worker_lanes == tuple(Lane)
 
 
 # -----------------------------------------------------------------------------

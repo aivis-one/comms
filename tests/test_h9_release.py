@@ -1,6 +1,8 @@
 # =============================================================================
 # H9 -- the package graph, the fold without a full read, a partial lane
-# set said aloud, the number 3.4.0
+# set said aloud. The number 3.4.0 and its line were held here too, until
+# LEG-1 took the number out of the code: the release names a process
+# (PRIMER_RELEASE, app/core/logging.py)
 # =============================================================================
 #
 # MUTATIONS these tests were written against (each turns one red):
@@ -19,9 +21,7 @@
 
 import ast
 import asyncio
-import inspect
 import json
-import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -33,7 +33,6 @@ import pytest
 from sqlalchemy import event, text
 from structlog.testing import capture_logs
 
-import app.core.config as config_module
 import app.worker as worker
 from app.core.config import settings
 from app.core.database import get_engine, get_session_factory
@@ -537,23 +536,3 @@ class TestPartialLanes:
     ) -> None:
         assert await _started(monkeypatch, value) == []
 
-
-# -----------------------------------------------------------------------------
-# 4 -- the number
-# -----------------------------------------------------------------------------
-
-
-def test_the_number_and_its_line() -> None:
-    """The number in code says what it is, like 3.1.0-3.4.0; 3.4.0 stays
-    described as phase 4. This test once pinned APP_VERSION == "3.4.0" --
-    true for that release, and false for every release after it: a pin on
-    the number itself is replaced by the rule it stood for -- the comment
-    above the number names the CURRENT number.
-    (APP_VERSION == pyproject's version: tests/test_delivery_contract.py.)"""
-    version = config_module.APP_VERSION
-    source = inspect.getsource(config_module)
-    comment = source[: source.index(f'APP_VERSION = "{version}"')]
-    assert f"{version} is" in comment
-    assert re.search(r"3\.4\.0 is\s+#?\s*phase 4", comment)
-    for part in ("lanes", "H7", "H8"):
-        assert part in comment.rsplit("3.4.0 is", 1)[1]

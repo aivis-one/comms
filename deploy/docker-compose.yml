@@ -61,8 +61,8 @@
 #      commit CI's job `machine` pins). comms-worker and comms-consumer
 #      read the profile too (install_profile_from_settings in
 #      app/worker.py and app/consumer.py), get no TEMPLATES_DIR, and
-#      refuse to start outside development: comms-app comes up, the two
-#      do not, and the machine installs comms nowhere yet.
+#      refuse to start: comms-app comes up, the two do not, and the
+#      machine installs comms nowhere yet.
 #   2. Status: acknowledged by design.
 #   3. Backlog ref: none in comms -- the machine's: a letter to Primer
 #      (gate W4-1) that a kind of data is bound on every application

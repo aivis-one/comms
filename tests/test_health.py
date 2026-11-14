@@ -19,9 +19,9 @@ import pytest
 from httpx import AsyncClient
 
 from app.core.channels import ChannelState
-from app.core.config import Settings, settings
+from app.core.config import Settings
 from app.engine.constants import DeliveryChannel
-from app.main import docs_urls
+from app.main import app
 
 # A deploy with both external channels fully configured. Every value is
 # a SENTINEL, and every one of them is non-empty on purpose: the suite
@@ -41,8 +41,6 @@ _KEY_VALUES = (_TOKEN, _BOT_URL, _API_KEY, _MAIL_DOMAIN, _SENDER, _REGION)
 def _configured(**overrides: Any) -> Settings:
     """Settings of a deploy that has both external channels."""
     kwargs: dict[str, Any] = {
-        "_env_file": None,
-        "app_env": "production",
         "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
         "comms_service_token": "health-test-service-token",
         "telegram_enabled": "true",
@@ -127,14 +125,13 @@ async def test_health_reports_the_same_map_on_every_call(
 
 
 class TestTheSchemaIsNotPublic:
-    """The interactive schema is a development tool (R-4).
+    """The interactive schema is not a product surface (R-4, LEG-1).
 
     FastAPI serves /docs, /redoc and /openapi.json as routes of their
-    own -- behind the service token like every path when one is set,
-    open in a development without one -- and what they publish is every
-    route's docstring. Ours are written for us: KNOWN CEILING blocks, release
-    markers, and on one route the sentence describing a read-authz
-    bypass. Five of twenty-one operations carried such text.
+    own, and what they publish is every route's docstring. Ours are
+    written for us: KNOWN CEILING blocks, release markers, and on one
+    route the sentence describing a read-authz bypass. Five of
+    twenty-one operations carried such text.
     """
 
     @pytest.mark.parametrize(
@@ -143,27 +140,18 @@ class TestTheSchemaIsNotPublic:
     async def test_the_schema_endpoints_do_not_exist_here(
         self, client: AsyncClient, path: str
     ) -> None:
-        """The suite runs outside development (APP_ENV=ci), which is
-        the state every deploy is in except a developer's laptop."""
-        assert not settings.is_dev
+        """Asked with the token: past it, the paths are not there."""
         response = await client.get(path)
         assert response.status_code == 404, response.text
 
-    def test_development_still_gets_them(self) -> None:
-        """THE PAIR, and the reason the decision is a function rather
-        than three inline conditionals: closing the schema everywhere
-        would also satisfy the test above, and a developer would find
-        out by losing a tool with no explanation."""
-        assert docs_urls(is_dev=True) == {
-            "openapi_url": "/openapi.json",
-            "docs_url": "/docs",
-            "redoc_url": "/redoc",
-        }
-        assert docs_urls(is_dev=False) == {
-            "openapi_url": None,
-            "docs_url": None,
-            "redoc_url": None,
-        }
+    def test_the_application_declares_none(self) -> None:
+        """Was test_development_still_gets_them: until LEG-1 an explicit
+        development mounted the three (docs_urls), and the pair held that
+        branch. The mode is gone: the application declares none, in
+        every environment (tests/test_api_closed_by_default.py
+        TestOneMode); the pair of the 404s is the test below -- a closed
+        schema is not a closed service."""
+        assert (app.openapi_url, app.docs_url, app.redoc_url) == (None, None, None)
 
     async def test_the_service_still_answers_where_it_should(
         self, client: AsyncClient

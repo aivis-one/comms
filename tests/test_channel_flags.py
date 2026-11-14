@@ -14,10 +14,13 @@
 #   item 3  its delivery there is the outcome "channel unavailable"
 #           (failed, configuration), the job's other channels going on --
 #           on the real database, through the existing path
-#   item 4  deploy/INTEGRATION.md and deploy/.env.example say so, held
-#           to the code: the outcome's text in the document, every flag
-#           in the template. The document's table of the flags, their
-#           values and every flag it named were held here both ways
+#   item 4  deploy/INTEGRATION.md says so, held to the code: the
+#           outcome's text in the document. Every flag in
+#           deploy/.env.example was held here too, until LEG-1 took the
+#           template out: the flag is a key of primer.yaml `env`
+#           (tests/test_primer_yaml.py TestChannels). The document's
+#           table of the flags, their values and every flag it named
+#           were held here both ways
 #           until DOC-1, which took them out of the document: the flags
 #           are the instance's values, read by the operator and the
 #           machine (primer.yaml), not by the product
@@ -52,7 +55,6 @@
 # =============================================================================
 
 import json
-import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -103,7 +105,6 @@ from tests.helpers import configure_every_channel, create_recipient, intake_fiel
 _REPO = Path(__file__).resolve().parents[1]
 _FIXTURE = _REPO / "tests" / "fixtures" / "profile"
 _DOC = (_REPO / "deploy" / "INTEGRATION.md").read_text(encoding="utf-8")
-_TEMPLATE = (_REPO / "deploy" / ".env.example").read_text(encoding="utf-8")
 
 # What the machine writes into the keys of a switched-off option
 # (Primer protocol 5.2.3). Here only as INPUT: comms never names it.
@@ -156,8 +157,6 @@ def _settings(
     flags: dict[str, Any] = dict.fromkeys(channel_flag_keys(), "false")
     flags[channel_spec(channel).flag or ""] = flag
     return Settings(
-        _env_file=None,  # type: ignore[call-arg]
-        app_env="production",
         database_url="postgresql+asyncpg://u:p@db/comms_unit",
         comms_service_token="unit-test-service-token",
         **_kwargs(flags),
@@ -295,8 +294,6 @@ class TestEveryFlag:
         """REPEAT: all of them, one pass."""
         with pytest.raises(ValidationError) as caught:
             Settings(
-                _env_file=None,  # type: ignore[call-arg]
-                app_env="production",
                 database_url="postgresql+asyncpg://u:p@db/comms_unit",
                 comms_service_token="unit-test-service-token",
                 telegram_enabled=None, email_enabled="yes", llm_enabled="",
@@ -312,7 +309,6 @@ class TestEveryFlag:
     ) -> None:
         """The process's own path: the variable as it is written."""
         base: dict[str, Any] = {
-            "_env_file": None, "app_env": "production",
             "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
             "comms_service_token": "unit-test-service-token",
         }
@@ -615,16 +611,6 @@ class TestTheContract:
                 None,  # type: ignore[arg-type]
             )
         assert f"\n    {caught.value}\n" in _DOC
-
-    def test_the_env_template_carries_every_flag(self) -> None:
-        """Until W1-2 the writer was "a product installer" (its second
-        pass); the flag is now the passport's option, a key of
-        primer.yaml `env` (tests/test_primer_yaml.py TestChannels)."""
-        for flag in channel_flag_keys():
-            assert re.search(
-                rf"^# by: primer.yaml\n{flag}=(true|false)$",
-                _TEMPLATE, re.M,
-            ), flag
 
     def test_the_code_never_names_the_literal(self) -> None:
         """The protocol: code learns of an option only by the flag. The

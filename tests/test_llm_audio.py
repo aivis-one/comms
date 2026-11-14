@@ -466,7 +466,6 @@ class TestTheLinkGoesAtTheOutcome:
 
 def _production(**values: str) -> Settings:
     return Settings(
-        _env_file=None, app_env="production",
         database_url="postgresql+asyncpg://u:p@db/comms_unit",
         comms_service_token="unit-test-service-token",
         **values,
@@ -926,14 +925,13 @@ class TestTheContract:
     def test_the_product_finds_the_seam(self) -> None:
         """Was test_the_operator_finds_the_list: the list is gone from
         every place it was named (W4-2) -- the pair: the seam is named
-        there instead."""
-        example = (_REPO / "deploy" / ".env.example").read_text()
+        there instead. The deploy's template named it too, until LEG-1
+        took the template out: primer.yaml is where a box gets it."""
         primer = (_REPO / "primer.yaml").read_text()
-        assert "\nPRODUCT_STORAGE_ADDRESS=\n" in example
         flat = " ".join(_section_11().split())
         assert "`http://<PRODUCT_STORAGE_ADDRESS>/`" in flat
         assert "PRODUCT_STORAGE_ADDRESS" in primer
-        for text in (example, _DOC, primer):
+        for text in (_DOC, primer):
             assert "LLM_BODY_HOSTS" not in text
 
     def test_the_limits_numbers(self) -> None:

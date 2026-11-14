@@ -571,8 +571,6 @@ class TestRoutes:
         since W2-1 with the flag on, which the test now says."""
         with pytest.raises(ValueError, match="channel 'telegram' is misconfigured"):
             Settings(
-                _env_file=None,
-                app_env="production",
                 database_url="postgresql+asyncpg://u:p@db/comms_unit",
                 comms_service_token="unit-test-service-token",
                 telegram_enabled="true",

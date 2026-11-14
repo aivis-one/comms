@@ -184,10 +184,11 @@ class TestReadOnlyAndAuth:
         assert (body["mode"], body["level"]) == ("on", "repeatable read")
 
     async def test_no_token_401_the_token_200(
-        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+        self, client: AsyncClient, anonymous_client: AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(settings, "comms_service_token", _TOKEN)
-        assert (await client.get(_URL)).status_code == 401
+        assert (await anonymous_client.get(_URL)).status_code == 401
         response = await client.get(_URL, headers={"Authorization": f"Bearer {_TOKEN}"})
         assert response.status_code == 200
         assert response.json()["lanes"]

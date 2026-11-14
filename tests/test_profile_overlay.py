@@ -47,7 +47,6 @@
 # there is one; the code cannot reach that state.
 # =============================================================================
 
-import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -789,17 +788,15 @@ class TestTheDeployForms:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("TEMPLATES_OVERLAY_DIR", "/profile-overlay")
-        assert Settings(_env_file=None).templates_overlay_dir == "/profile-overlay"
+        assert Settings().templates_overlay_dir == "/profile-overlay"
 
-    def test_the_template_carries_the_variable_empty(self) -> None:
-        """Until W1-2 the template carried the host's PROFILE_OVERLAY_DIR
-        and PROFILE_DIR (the old installer's variables) and not this one,
-        which compose set. Compose sets it no more, so the setting is a
-        line of the reference -- empty, the code's default -- and the
-        host's variables are gone."""
-        deploy_env = (_DEPLOY / ".env.example").read_text()
-        assert "\n# by: default\nTEMPLATES_OVERLAY_DIR=\n" in deploy_env
-        assert not re.search(r"^#?PROFILE(_OVERLAY)?_DIR=", deploy_env, re.M)
+    def test_the_setting_defaults_to_no_overlay(self) -> None:
+        """Was test_the_template_carries_the_variable_empty: the deploy's
+        template held the line empty, the code's default, until LEG-1
+        took the template out. The default itself is what stays: no
+        overlay unless one is named (on a box nothing names one --
+        tests/test_primer_yaml.py NOT_IN_ENV)."""
+        assert Settings.model_fields["templates_overlay_dir"].default == ""
 
     def test_integration_names_what_the_code_does(
         self, base_dir: Path, overlay_dir: Path,

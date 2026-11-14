@@ -64,7 +64,6 @@ jobs:
       part3: ${{ steps.parts.outputs.part3 }}
 
     env:
-      APP_ENV: ci
       DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
       # Every channel's flag is required at every start (W2-1,
@@ -294,11 +293,10 @@ jobs:
       contents: read
 
     env:
-      APP_ENV: ci
       DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
-      # Required outside development; `alembic upgrade head` below
-      # builds the settings before the suite's own fence runs. A test
-      # value -- the suite replaces it anyway (tests/conftest.py).
+      # Required to start; `alembic upgrade head` below builds the
+      # settings before the suite's own fence runs. A test value -- the
+      # suite replaces it anyway (tests/conftest.py).
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
       # The channel flags, as in `checks` (W2-1).
       TELEGRAM_ENABLED: "false"
@@ -536,7 +534,6 @@ jobs:
         run: |
           migrate=$(python -c "import yaml; print(yaml.safe_load(open('primer.yaml'))['stacks']['comms']['migrate'])")
           docker run --rm --network host \
-            -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \
@@ -546,7 +543,6 @@ jobs:
           docker run -d --name comms-redis --network host "$redis" redis-server --port 6379
           token="123456789:$(printf 'A%.0s' $(seq 35))"
           docker run -d --name comms-app --network host \
-            -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e REDIS_URL=redis://127.0.0.1:6379/0 \
@@ -617,7 +613,6 @@ jobs:
       - name: The suite inside the image
         run: |
           docker run --rm --network host \
-            -e APP_ENV=ci \
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \

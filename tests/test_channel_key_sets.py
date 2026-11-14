@@ -80,7 +80,6 @@ _GOOD_URL = "https://t.me/unit_test_bot"
 # A production deploy that has telegram. Tests knock single keys out.
 # Every flag is written: the suite's environment must not decide them.
 _WITH_TELEGRAM: dict[str, Any] = {
-    "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
     "comms_service_token": "unit-test-service-token",
     "telegram_enabled": "true",
@@ -94,7 +93,7 @@ _WITH_TELEGRAM: dict[str, Any] = {
 def _settings(**overrides: str) -> Settings:
     """Settings built from explicit kwargs -- never from a stray .env."""
     kwargs: dict[str, Any] = {
-        "_env_file": None, **_WITH_TELEGRAM, **overrides,
+        **_WITH_TELEGRAM, **overrides,
     }
     return Settings(**kwargs)
 
@@ -324,7 +323,6 @@ class TestStartupRefusal:
             cwd=REPO_ROOT,
             env={
                 "PATH": "/usr/bin:/bin",
-                "APP_ENV": "production",
                 "DATABASE_URL": "postgresql+asyncpg://u:p@db/comms_unit",
                 "COMMS_SERVICE_TOKEN": "unit-test-service-token",
                 "TELEGRAM_ENABLED": "true",
@@ -697,8 +695,6 @@ class TestExistingDeployIsUnchanged:
         from app.engine.formatters import TelegramFormatter
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
-            app_env="production",
             database_url="postgresql+asyncpg://u:p@db/comms_unit",
             comms_service_token="unit-test-service-token",
             telegram_enabled="true",

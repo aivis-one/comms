@@ -1,4 +1,4 @@
-# A local env file carries secrets and must never land in the repo;
-# .env.example is the committed reference (on a box the deploy machine
-# renders the values, W1-2).
+# A local env file carries secrets and must never land in the repo; on a
+# box the deploy machine renders the values (W1-2), and comms reads no
+# file of settings (app/core/config.py, LEG-1).
 .env

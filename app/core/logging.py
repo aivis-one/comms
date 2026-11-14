@@ -2,10 +2,9 @@
 # COMMS Service -- Structured Logging
 # =============================================================================
 #
-# Ported from the cbshome backend (canonical base). structlog with two
-# renderers:
-#   production  -> the deploy machine's line (protocol 9.4, below)
-#   development -> ConsoleRenderer (colored, human-readable)
+# Ported from the cbshome backend (canonical base). structlog with one
+# renderer, in every process and every environment (LEG-1): the deploy
+# machine's line (protocol 9.4, below).
 #
 # THE MACHINE'S LINE (W3-2, protocol 9.4): every line of every process --
 # structlog's and the standard library's (uvicorn, sqlalchemy, asyncio),
@@ -201,7 +200,7 @@ _TRACE_KEYS = ("exception", "stack")
 
 
 class MachineRenderer:
-    """structlog's last processor outside development: the event as the
+    """structlog's last processor: the event as the
     machine's line (_line). Runs after sanitize_event -- every value it
     takes is already through the one sanitizer."""
 
@@ -554,15 +553,8 @@ def setup_logging() -> None:
     level_name = settings.log_level.upper()
     level = getattr(logging, level_name, logging.INFO)
 
-    if settings.is_dev:
-        renderer: structlog.types.Processor = structlog.dev.ConsoleRenderer(
-            colors=True,
-        )
-    else:
-        renderer = MachineRenderer()
-
     structlog.configure(
-        processors=processors(renderer),
+        processors=processors(MachineRenderer()),
         context_class=dict,
         wrapper_class=structlog.make_filtering_bound_logger(level),
         logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),

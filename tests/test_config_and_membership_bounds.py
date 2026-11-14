@@ -27,7 +27,6 @@ from app.transport.events import (
 )
 
 _FULL_OK = {
-    "app_env": "production",
     "database_url": "postgresql+asyncpg://u:p@db/comms_unit",
     "telegram_enabled": "true",
     "telegram_bot_token": "123456:test-token",
@@ -54,7 +53,7 @@ _PARTNER_AT = {
 
 
 def _settings(**overrides: Any) -> Settings:
-    kwargs: dict[str, Any] = {"_env_file": None, **_FULL_OK, **overrides}
+    kwargs: dict[str, Any] = {**_FULL_OK, **overrides}
     return Settings(**kwargs)
 
 

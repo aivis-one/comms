@@ -165,31 +165,15 @@ class TestStartupEntryPoint:
         assert registry.is_registered("unit_event")
         assert registry.category_of("unit_rem_1h") == "unit_reminder"
 
-    def test_empty_dir_tolerated_in_development(
+    def test_empty_dir_is_fatal(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Dev without TEMPLATES_DIR starts with an empty registry.
-
-        app_env is pinned explicitly: CI exports APP_ENV=ci, and this
-        test asserts DEVELOPMENT behavior regardless of the runner env
-        (mirrors the sibling test pinning app_env="ci").
-        """
-        monkeypatch.setattr(settings, "app_env", "development")
+        """A missing profile is a deploy error, everywhere: until LEG-1
+        a development started with an empty registry (its test is gone
+        with the mode, tests/test_api_closed_by_default.py TestOneMode).
+        The pair is the test above: the fixture directory installs."""
         monkeypatch.setattr(settings, "templates_dir", "")
-        registry.reset()
-        with capture_logs() as logs:
-            assert install_profile_from_settings() is False
-        assert any(
-            log["event"] == "profile_not_configured" for log in logs
-        )
-
-    def test_empty_dir_fatal_outside_development(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Anywhere but dev a missing profile is a deploy error."""
-        monkeypatch.setattr(settings, "templates_dir", "")
-        monkeypatch.setattr(settings, "app_env", "ci")
-        with pytest.raises(ProfileError, match="TEMPLATES_DIR"):
+        with pytest.raises(ProfileError, match="TEMPLATES_DIR is required"):
             install_profile_from_settings()
 
     def test_missing_directory_is_fatal(self, tmp_path: Path) -> None:

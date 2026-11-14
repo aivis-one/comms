@@ -28,12 +28,12 @@ _LITERAL = "https://t.me/" + "velo" + "_testbot"
 
 def _tree(tmp_path: Path, root_line: str) -> Path:
     """A minimal repository: one file in app/, one in deploy/, and a
-    .env.example at the root holding `root_line`."""
+    settings.cfg at the root holding `root_line`."""
     (tmp_path / "app").mkdir()
     (tmp_path / "app" / "x.py").write_text("X = 1\n")
     (tmp_path / "deploy").mkdir()
     (tmp_path / "deploy" / "compose.yml").write_text("name: comms\n")
-    (tmp_path / ".env.example").write_text(root_line + "\n")
+    (tmp_path / "settings.cfg").write_text(root_line + "\n")
     return tmp_path
 
 
@@ -42,7 +42,7 @@ class TestTheRoot:
         """done-when (1)."""
         root = _tree(tmp_path, f"TELEGRAM_BOT_URL={_LITERAL}")
         (finding,) = fence.scan_root_files(root)
-        assert finding.startswith(".env.example:1:")
+        assert finding.startswith("settings.cfg:1:")
 
     def test_a_literal_in_a_full_line_comment_is_not(self, tmp_path: Path) -> None:
         """By design (D1 gate, R9): the root's comments carry heritage
@@ -58,7 +58,7 @@ class TestTheRoot:
         (root / "scripts").mkdir()
         (root / "scripts" / "tool.sh").write_text(f"URL={_LITERAL}\n")
         assert fence.scan_root_files(root) == []
-        assert [p.name for p in fence.root_files(root)] == [".env.example"]
+        assert [p.name for p in fence.root_files(root)] == ["settings.cfg"]
 
     def test_documentation_at_the_root_is_not_scanned(self, tmp_path: Path) -> None:
         root = _tree(tmp_path, "OK=1")
@@ -92,10 +92,10 @@ class TestTheGateOnItself:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     ) -> None:
         monkeypatch.setattr(
-            fence, "scan_root_files", lambda: [".env.example:1: line 'x'"],
+            fence, "scan_root_files", lambda: ["settings.cfg:1: line 'x'"],
         )
         assert fence.main() == 1
-        assert ".env.example:1:" in capsys.readouterr().out
+        assert "settings.cfg:1:" in capsys.readouterr().out
 
     def test_main_passes_on_the_real_tree(
         self, capsys: pytest.CaptureFixture[str],

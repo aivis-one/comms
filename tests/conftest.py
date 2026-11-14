@@ -55,9 +55,8 @@
 #   sits in the environment (the deployed container carries the real
 #   bot token). So the fence lives HERE, not in whoever invokes pytest:
 #   before the settings object is built, every channel's flag is set to
-#   false and every declared key blanked -- environment variables beat
-#   the .env file -- and every external channel reads as not
-#   configured. The keys are blanked as well, so a test that switches a
+#   false and every declared key blanked, and every external channel
+#   reads as not configured. The keys are blanked as well, so a test that switches a
 #   channel on gets exactly the keys it passes and never the
 #   environment's. The flags and keys come from the channel spec, so a
 #   channel added later is fenced without anyone remembering. A test
@@ -71,12 +70,14 @@
 #   about plain HTTP: an email double that forgot to inject a fake
 #   client would have walked straight out to the provider.
 #
-#   COMMS_SERVICE_TOKEN is required outside development, and the suite
-#   runs with APP_ENV=ci -- so the fence also supplies a suite token,
-#   replacing whatever the environment holds (the suite never needs a
-#   real one). The autouse `api_auth_disabled` fixture then runs every
-#   test with auth off, as a development deploy runs; auth itself is
-#   exercised explicitly in test_api_auth / test_api_recipients.
+#   COMMS_SERVICE_TOKEN is required to start (LEG-1: comms has one mode,
+#   and the API is always closed) -- so the fence also supplies the
+#   suite's token, replacing whatever the environment holds (the suite
+#   never needs a real one). The autouse `suite_token` fixture keeps it
+#   the token in force for every test, and `client` / `bare_client`
+#   present it; a request without a token goes through
+#   `anonymous_client`. Auth itself is exercised explicitly in
+#   test_api_auth / test_api_recipients.
 # =============================================================================
 
 # ruff: noqa: E402 -- the fence below must run before any settings import.
@@ -91,7 +92,10 @@ for _key in channel_flag_keys():
     os.environ[_key] = "false"
 for _key in channel_env_keys():
     os.environ[_key] = ""
-os.environ["COMMS_SERVICE_TOKEN"] = "suite-service-token"
+# The suite's service token: in force for every test (`suite_token`),
+# presented by `client` and `bare_client`. Not of a real key's shape.
+SUITE_SERVICE_TOKEN = "suite-service-token"
+os.environ["COMMS_SERVICE_TOKEN"] = SUITE_SERVICE_TOKEN
 
 import subprocess
 import sys
@@ -573,16 +577,17 @@ def fresh_formatters() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def api_auth_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run the API with auth off, as a development deploy runs it.
-
-    The fence above supplies a token only so that settings can be built
-    under APP_ENV=ci; tests that exercise auth set their own token. The
-    next token too (W2-1b), so that no environment the suite runs in
-    hands a test one it did not set.
-    """
-    monkeypatch.setattr(settings, "comms_service_token", "")
+def suite_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite's token is the one in force, and no next one (W2-1b),
+    so that no environment the suite runs in hands a test a token it
+    did not set. Tests that exercise auth set their own token."""
+    monkeypatch.setattr(settings, "comms_service_token", SUITE_SERVICE_TOKEN)
     monkeypatch.setattr(settings, "comms_service_token_next", "")
+
+
+# The header `client` and `bare_client` send by default; a header the
+# test passes itself replaces it.
+_SUITE_AUTHORIZATION = {"Authorization": f"Bearer {SUITE_SERVICE_TOKEN}"}
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +623,7 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport, base_url="http://testserver",
+        headers=_SUITE_AUTHORIZATION,
         event_hooks={"request": [_fresh_key]},
     ) as ac:
         yield ac
@@ -625,7 +631,24 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
 
 @pytest.fixture
 async def bare_client() -> AsyncGenerator[AsyncClient, None]:
-    """The same client with no header added -- for the key's own tests."""
+    """The same client with no Idempotency-Key added -- for the key's
+    own tests. It presents the suite's token, as `client` does."""
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://testserver",
+        headers=_SUITE_AUTHORIZATION,
+    ) as ac:
+        yield ac
+
+
+@pytest.fixture
+async def anonymous_client() -> AsyncGenerator[AsyncClient, None]:
+    """A client that sends no Authorization header at all -- for the
+    tests of a request without a token (401, and /health, /ready open).
+    Not `client` with a token the test does not set: that would ask
+    about a wrong token, not a missing one."""
     from app.main import app
 
     transport = ASGITransport(app=app)
