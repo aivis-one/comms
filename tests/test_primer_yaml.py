@@ -99,8 +99,13 @@ class TestEnvIsWhatCommsReads:
             if key in _DEFAULTS and not _unset_default(_DEFAULTS[key])
         }
         assert defaulted == set(DEFAULTED_IN_ENV)
-        # The pair: the rule sees defaults -- most settings have one.
-        assert sum(not _unset_default(v) for v in _DEFAULTS.values()) > 30
+        # The pair: the rule sees defaults -- most settings have one. Held
+        # as a share, not a count: until LEG-1 it was `> 30`, and taking
+        # one defaulted setting out (app_env) made it 30 -- a count breaks
+        # on every subtraction, the claim "most" does not.
+        assert len(_DEFAULTS) > 0
+        defaults = sum(not _unset_default(v) for v in _DEFAULTS.values())
+        assert defaults * 2 > len(_DEFAULTS), (defaults, len(_DEFAULTS))
 
     def test_every_value_comms_needs_is_in_env_or_said_why(self) -> None:
         needed = {key for key, value in _DEFAULTS.items() if _unset_default(value)}
