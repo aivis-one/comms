@@ -38,7 +38,11 @@
 # limit -- tests/test_db_limits.py holds the two together, not one
 # source: this module imports nothing of comms (THE CHECK). A step of the
 # database longer than the margin is red -- a hang, which is what this is
-# for.
+# for. The one statement past those limits by design, a wait for an
+# attempt's row (app/core/database.py wait_for_attempts, lifted to the
+# attempt's hold), steps before it waits, and a loop that makes it
+# carries it in its bound (app/transport/consumer.py consumer_step_bound,
+# W6-2a).
 #
 # Not watched: the worker's wake listener (app/engine/wake.py). It waits
 # for notifications for as long as there are none, by design; a lost wake

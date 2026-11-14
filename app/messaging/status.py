@@ -59,11 +59,12 @@
 # the FKs of what it writes (assignee, sender), before or after the
 # thread row -- it does not matter, because no path holds a recipients
 # row and then asks for a threads row: the recipient writers
-# (app/audience/sync.py, app/forgetting.py) take recipients FOR UPDATE
-# and never write threads. Forgetting deletes a person's read pointers
-# across threads while a deletion deletes one thread's pointers across
-# people: the two sets share at most one row, (that thread, that
-# person), and a cycle needs two -- one waits for the other
+# (app/audience/sync.py, app/forgetting.py) take recipients FOR UPDATE or
+# FOR NO KEY UPDATE and never write threads. Forgetting deletes a
+# person's read pointers across threads while a deletion deletes one
+# thread's pointers across people: the two sets share at most one row,
+# (that thread, that person), and a cycle needs two -- one waits for the
+# other
 # (tests/test_thread_delete.py, both orders).
 # The two passes that take MANY threads rows take disjoint sets --
 # auto-close below takes threads that are not closed, the close-notice

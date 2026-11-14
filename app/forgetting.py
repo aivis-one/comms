@@ -33,7 +33,9 @@
 #     foreign key takes FOR KEY SHARE on the recipient row until the
 #     attempt commits. The tombstone takes that row FOR UPDATE
 #     (sync._tombstone_once), which conflicts with KEY SHARE: forgetting
-#     waits, the letter goes while the person is still known, and
+#     waits -- as long as the attempt's hold, the wait lifted by
+#     sync.tombstone (wait_for_attempts, W6-2a) -- the letter goes while
+#     the person is still known, and
 #     withdraw_recipient then sees the committed deliveries and clears
 #     what they carry. withdraw_recipient on its own would not wait --
 #     it sees no committed delivery and returns 0; the tombstone is what

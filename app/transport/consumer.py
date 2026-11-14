@@ -66,20 +66,36 @@
 #              the whole stream behind one defect; the ERROR line is the
 #              defect's trace.
 #
-# HELD BY SUBJECT (W5-1). A held entry is handled again at the next
-# pass, after the newer entries read meanwhile -- so no newer entry of
-# its subject may be applied before it. Every parsed event names its
-# SUBJECTS (subjects_of): the person a sync event is about, the
-# correlation a request carries and a reminder_cancel cancels by, the
-# person a request is addressed to, the request's key. self._blocked
-# holds the subjects of the entries left pending: an entry with one of
-# them is not handled, it is left pending too (event_held_behind) and
-# its own subjects join the set -- a chain A{p}, B{p,q}, C{q} keeps C
-# behind B. Each pass over the pending list starts with the set empty
-# and goes in the stream's order from "0", so the held entry comes
-# first, then the entries behind it, each once; the set is rebuilt from
-# what stays pending. Invariant: the set holds the subjects of every
-# entry left pending. The events of every other subject flow.
+# HELD BY SUBJECT (W5-1, W6-2a). A held entry is handled again at the
+# next pass, after the newer entries read meanwhile -- so no newer entry
+# that its order matters to may be applied before it. Every parsed event
+# names the subjects it WRITES and the subjects it READS (subjects_of):
+#   writes  a sync event: the person it is about; a reminder_cancel: the
+#           correlation it cancels by; a request: its key;
+#   reads   a request: its correlation (a reminder_cancel finds its jobs
+#           by it) and the person it is addressed to.
+# Two of them need an order: a write and anything else of one subject
+# (two writes of a person, a request and the cancel of its
+# correlation); two reads do not (two requests to one person or under
+# one correlation). self._held_writes and self._held_reads hold what
+# the entries left pending write and read; an entry is left pending too
+# (event_held_behind) when anything it writes or reads is a held write,
+# or anything it writes is a held read. A held entry holds all it
+# writes and reads. An entry held BEHIND one holds what it writes and the
+# correlation it reads, not the person (review of 4.0.0, A1): a request
+# to a person does not read the person at intake (create_notification
+# resolves nobody), so its order against that person's events matters
+# only as the promise a held entry keeps (W5-1: no event of its person
+# overtakes it); carried along behind, it froze every event of that
+# person and of each person it met in turn -- one held entry, six sound
+# ones stopped. A chain A{p} -> B{p reads, c reads} -> C{c writes}
+# keeps C behind B. Each pass over the pending list starts with both
+# sets empty and goes in the stream's order from "0", so the held entry
+# comes first, then the entries behind it, each once; the sets are
+# rebuilt from what stays pending. Invariant: the sets hold, for every
+# entry left pending, what it writes and the correlation it reads -- and
+# the person, for one held by its own failure. The events of every other
+# subject flow.
 #
 # DURABILITY OF INTAKE -- the order is COMMIT, THEN XACK, and it must
 # never be swapped (spec §5.4: a receipt without a record is a promise
@@ -122,8 +138,9 @@
 # KNOWN CEILING -- a subject held for good (W5-1).
 # Mechanics: an entry whose handling fails every time -- a defect of
 # comms on that entry, a transient failure that outlasts every budget --
-# stays pending and keeps its subjects in self._blocked: every later
-# event of that person, correlation or key is held behind it, and the
+# stays pending and keeps its subjects held (self._held_writes,
+# self._held_reads): every later event that its order matters to is held
+# behind it, and the
 # entry is handled again at every pass (_PENDING_REDRAIN_SECONDS), a
 # transient one with its inline budget (BL-4) each time. Said once per
 # entry and start (event_held, event_held_behind), not at every pass.
@@ -166,6 +183,7 @@ from app.core.database import (
     database_answers,
     get_session_factory,
     is_transient_db_error,
+    waiting_statement_seconds,
 )
 from app.core.exceptions import (
     ConflictError,
@@ -265,10 +283,11 @@ class StreamConsumer:
         self._group = settings.comms_consumer_group
         self._consumer = settings.comms_consumer_name
         self._session_factory = get_session_factory()
-        # The subjects of the entries left pending (HELD BY SUBJECT, the
+        # What the entries left pending write and read (HELD BY SUBJECT, the
         # header): emptied at the start of every pass over the pending
-        # list, which rebuilds it.
-        self._blocked: set[str] = set()
+        # list, which rebuilds them.
+        self._held_writes: set[str] = set()
+        self._held_reads: set[str] = set()
         # The entries whose hold is said: one line per entry, not one per
         # pass (event_held, event_held_behind, event_left_pending); an
         # entry leaves the set with its ack.
@@ -393,7 +412,8 @@ class StreamConsumer:
         behind it -- so the pass rebuilds the set from what stays
         pending, and a subject whose held entry goes out now lets the
         entries behind it go out after it, in this same pass."""
-        self._blocked.clear()
+        self._held_writes.clear()
+        self._held_reads.clear()
         drained = 0
         # A CURSOR, not "0" every time (FIX review 3.13.0): a held entry
         # stays in the pending list, and reading from "0" again would meet
@@ -427,12 +447,13 @@ class StreamConsumer:
         module header). An ack that fails is retried in place until it is
         written (_ack_until_done): the next entry waits.
 
-        An entry one of whose subjects is held is not handled: it is left
-        pending behind the held one, and its own subjects are held too
-        (HELD BY SUBJECT, the module header). An entry whose handling
-        fails in comms (_apply returns the failure) is held: left pending,
-        its subjects held, said once (event_held). An exception out of
-        the handling holds the subjects too, and the last line
+        An entry whose order a held one matters to is not handled: it is
+        left pending behind it, and what it writes and the correlation it
+        reads are held too (HELD BY SUBJECT, the module header). An entry
+        whose handling fails in comms (_apply returns the failure) is
+        held: left pending, all it writes and reads held, said once
+        (event_held). An exception out of the handling holds them too,
+        and the last line
         (_process_guarded) says it."""
         try:
             event = parse_event(fields)
@@ -450,9 +471,13 @@ class StreamConsumer:
             await self._drop(entry_id, fields, stage="parse", exc=exc, loud=True)
             return
 
-        subjects = subjects_of(event)
-        if subjects & self._blocked:
-            self._blocked |= subjects
+        writes, reads = subjects_of(event)
+        if (writes | reads) & self._held_writes or writes & self._held_reads:
+            self._held_writes |= writes
+            # Behind: the correlation it reads, never the person.
+            self._held_reads |= {
+                r for r in reads if r.startswith("correlation:")
+            }
             self._say_once(
                 entry_id, logger.info, "event_held_behind",
                 entry_id=_id_str(entry_id),
@@ -462,12 +487,12 @@ class StreamConsumer:
         try:
             held = await self._apply(entry_id, fields, event)
         except Exception:
-            self._blocked |= subjects  # left pending by the last line
+            self._hold(writes, reads)  # left pending by the last line
             raise
         if held is None:
             return
         failure, attempts = held
-        self._blocked |= subjects
+        self._hold(writes, reads)
         # Not logger.exception(): the renderer would print the chain raw
         # -- a database error's text is its SQL and bound parameters. The
         # `exception` key, redacted (app/core/sanitize.py).
@@ -618,6 +643,12 @@ class StreamConsumer:
             data_bytes=None if data is None else len(data),
         )
         await self._ack_until_done(entry_id)
+
+    def _hold(self, writes: frozenset[str], reads: frozenset[str]) -> None:
+        """An entry held by its own failure holds all it writes and reads
+        (HELD BY SUBJECT, the module header)."""
+        self._held_writes |= writes
+        self._held_reads |= reads
 
     def _say_once(
         self,
@@ -782,34 +813,35 @@ def _wait_delay(n: int) -> float:
 
 
 
-def subjects_of(event: ParsedEvent) -> frozenset[str]:
-    """The subjects whose events keep their order behind a held entry
-    (HELD BY SUBJECT, the module header) -- read from the envelope only,
-    never from the letter.
+def subjects_of(event: ParsedEvent) -> tuple[frozenset[str], frozenset[str]]:
+    """What the event WRITES and what it READS, the subjects whose order
+    a held entry keeps (HELD BY SUBJECT, the module header) -- read from
+    the envelope only, never from the letter.
 
-    A sync event: the person it is about (an operator is a person of the
-    address book, set_membership checks it as one). A notification
-    request: its key (a second request under the same key is decided by
-    the first), its correlation (a reminder_cancel finds its jobs by it)
-    and the person it is addressed to, when it is one. A reminder_cancel:
-    its correlation. A request refused at its parse: its key. A person's
-    id is written in one form -- the UUID's -- whatever case the request
-    sent it in."""
+    Writes: a sync event, the person it is about (an operator is a person
+    of the address book, set_membership checks it as one); a
+    reminder_cancel, its correlation; a notification request, its key (a
+    second request under the same key is decided by the first), and so
+    does a request refused at its parse. Reads: a request, its
+    correlation (a reminder_cancel finds its jobs by it) and the person
+    it is addressed to, when it is one. A person's id is written in one
+    form -- the UUID's -- whatever case the request sent it in."""
+    none: frozenset[str] = frozenset()
     if isinstance(event, UserUpserted | UserDeleted | GroupChanged):
-        return frozenset({f"person:{event.recipient_id}"})
+        return frozenset({f"person:{event.recipient_id}"}), none
     if isinstance(event, SectionMembershipChanged):
-        return frozenset({f"person:{event.operator_id}"})
+        return frozenset({f"person:{event.operator_id}"}), none
     if isinstance(event, ReminderCancel):
-        return frozenset({f"correlation:{event.correlation}"})
+        return frozenset({f"correlation:{event.correlation}"}), none
     if isinstance(event, RejectedNotificationRequest):
-        return frozenset({f"key:{event.idempotency_key}"})
+        return frozenset({f"key:{event.idempotency_key}"}), none
     assert isinstance(event, NotificationRequest)
-    subjects = {f"key:{event.idempotency_key}"}
+    reads = set()
     if event.correlation is not None:
-        subjects.add(f"correlation:{event.correlation}")
+        reads.add(f"correlation:{event.correlation}")
     if event.target_type == TargetType.USER and event.target_value is not None:
-        subjects.add(f"person:{UUID(event.target_value)}")
-    return frozenset(subjects)
+        reads.add(f"person:{UUID(event.target_value)}")
+    return frozenset({f"key:{event.idempotency_key}"}), frozenset(reads)
 
 
 def _kind_of(fields: dict[Any, Any]) -> str:
@@ -857,12 +889,26 @@ def _id_str(entry_id: str | bytes) -> str:
 def consumer_step_bound() -> float:
     """The longest the consumer's loop may wait between two steps
     (app/core/liveness.py): one wait of a retry at its ceiling
-    (_WAIT_CEILING), one operation of redis (its socket timeout) and the
-    database around them (liveness.STEP_MARGIN_SECONDS). Its steps: every
-    read of the stream, every try of an entry and every retry of an
-    operation of redis on it -- a wait for the database that does not
-    answer goes on stepping: the loop turns, the entry waits by design."""
-    return _WAIT_CEILING + redis_socket_timeout() + liveness.STEP_MARGIN_SECONDS
+    (_WAIT_CEILING), one operation of redis (its socket timeout), ONE
+    statement that waits for an attempt's row (app/core/database.py
+    waiting_statement_seconds -- the attempt's hold and the margins) and
+    the database around them (liveness.STEP_MARGIN_SECONDS). Its steps:
+    every read of the stream, every try of an entry, every retry of an
+    operation of redis on it, and every wait for an attempt's row
+    (wait_for_attempts steps before its lock: a try that waits twice --
+    forgetting: the tombstone, then the jobs -- steps twice). A wait for
+    the database that does not answer goes on stepping: the loop turns,
+    the entry waits by design.
+
+    Until W6-2a the bound had no wait for an attempt in it (105 s), and a
+    consumer waiting by design -- withdraw_recipient, close_notifications,
+    since W6-2a the tombstone -- for an attempt's hold of 150 s and more
+    was taken for a hung one (review of 4.0.0, B2). Called after the
+    entry point named the hold (app/consumer.py main)."""
+    return (
+        _WAIT_CEILING + redis_socket_timeout() + waiting_statement_seconds()
+        + liveness.STEP_MARGIN_SECONDS
+    )
 
 
 async def run_consumer_loop() -> None:

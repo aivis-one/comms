@@ -27,12 +27,22 @@
 #      TestTheRefusalUnderTheKey
 #   M5 the held subjects not asked before handling -> TestHeldBySubject::
 #      test_the_held_one_is_not_overtaken
-#   M6 an entry held behind does not hold its own subjects ->
+#   M6 an entry held behind holds nothing it writes or reads ->
 #      TestHeldBySubject::test_a_chain_of_subjects
 #   M7 the held subjects not emptied at a pass -> TestHeldBySubject
 #      (the entries behind never go out)
 #   M8 one subject for every event -> TestHeldBySubject (the other
 #      person does not flow)
+#   W6-2a (writes and reads, review of 4.0.0, A1):
+#   C1 an entry behind holds all it writes and reads, as one set, as
+#      until W6-2a -> test_the_reviewers_case,
+#      test_a_request_behind_does_not_hold_its_person
+#   C3 a write not asked against the held reads ->
+#      test_a_chain_of_subjects (the cancel overtakes the request)
+#   C4 the reads not asked against the held writes ->
+#      test_a_held_cancel_holds_the_requests_it_would_cancel
+#   C5 a request held by its failure does not hold its person ->
+#      test_the_reviewers_case (user_deleted(p) overtakes it)
 #   M9 a person never told about held instead of dropped ->
 #      TestTheLineOfADrop::test_a_person_never_told_about
 #   M10 a transient failure past the budget dropped instead of held ->
@@ -349,14 +359,18 @@ class TestHeldBySubject:
 
     def test_the_subjects(self) -> None:
         person, other = uuid4(), uuid4()
+        # (writes, reads) since W6-2a; until it one set of subjects.
+        writes_person = ({f"person:{person}"}, set())
         assert subjects_of(UserUpserted(person, 1, None, None, None, None, True)) \
-            == {f"person:{person}"}
-        assert subjects_of(UserDeleted(person, 1)) == {f"person:{person}"}
-        assert subjects_of(GroupChanged("g", person, True)) == {f"person:{person}"}
+            == writes_person
+        assert subjects_of(UserDeleted(person, 1)) == writes_person
+        assert subjects_of(GroupChanged("g", person, True)) == writes_person
         assert subjects_of(SectionMembershipChanged("s", "S", person, True)) \
-            == {f"person:{person}"}
-        assert subjects_of(ReminderCancel(["t"], "c", None, None)) == {"correlation:c"}
-        assert subjects_of(RejectedNotificationRequest("k", "f", "r")) == {"key:k"}
+            == writes_person
+        assert subjects_of(ReminderCancel(["t"], "c", None, None)) \
+            == ({"correlation:c"}, set())
+        assert subjects_of(RejectedNotificationRequest("k", "f", "r")) \
+            == ({"key:k"}, set())
         request = NotificationRequest(
             idempotency_key="k", fingerprint="f", type="t", target_type="user",
             target_value=str(other).upper(), scheduled_at=None, expiry_at=None,
@@ -364,14 +378,16 @@ class TestHeldBySubject:
             email=None, llm_audio=None,
         )
         # One form of a person's id, whatever case the request sent.
-        assert subjects_of(request) == {"key:k", "correlation:c", f"person:{other}"}
+        assert subjects_of(request) == (
+            {"key:k"}, {"correlation:c", f"person:{other}"},
+        )
         group = NotificationRequest(
             idempotency_key="k", fingerprint="f", type="t", target_type="group",
             target_value="g", scheduled_at=None, expiry_at=None, correlation=None,
             title=None, body=None, action_data=None, llm=None, email=None,
             llm_audio=None,
         )
-        assert subjects_of(group) == {"key:k"}
+        assert subjects_of(group) == ({"key:k"}, set())
 
     async def test_the_held_one_is_not_overtaken(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
@@ -468,6 +484,162 @@ class TestHeldBySubject:
             status = await s.scalar(select(Notification.status).where(
                 Notification.idempotency_key == reminder["idempotency_key"]))
         assert status == NotificationStatus.CANCELLED
+
+    async def _in_one_run(
+        self, redis: fakeaioredis.FakeRedis, stream: str,
+        held: Any, broken: list[bool], *, behind: int,
+    ) -> list[dict[str, Any]]:
+        """Run the consumer until `behind` entries are left pending and
+        everything else is read; check `held` (a sync check of the state
+        while held); mend; run until nothing is pending. The log lines."""
+        task = asyncio.ensure_future(StreamConsumer(redis).run())
+        try:
+            with capture_logs() as logs:
+                deadline = asyncio.get_event_loop().time() + 5
+                total = await redis.xlen(stream)
+                while not (
+                    await _pending(redis, stream) == behind
+                    and len(_lines(logs, "event_processed"))
+                    + len(_lines(logs, "event_held"))
+                    + len(_lines(logs, "event_held_behind")) >= total
+                ):
+                    assert asyncio.get_event_loop().time() < deadline, (
+                        f"pending {await _pending(redis, stream)}, "
+                        f"expected {behind} held"
+                    )
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(self._INTERVAL * 3)  # passes go by
+                held()
+                broken[0] = False
+                while not await _no_pending(redis, stream):
+                    assert asyncio.get_event_loop().time() < deadline
+                    await asyncio.sleep(0.02)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        return logs
+
+    async def test_the_reviewers_case(
+        self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One request held (to p, under lesson-1); behind it requests to
+        q and r under lesson-1 and lesson-2, user_upserted(q),
+        user_deleted(r), user_deleted(p). Until W6-2a the held subjects
+        spread from entry to entry: pending 7, applied 0 (review of
+        4.0.0, A1). Now only user_deleted(p) waits -- the held request's
+        own person -- and everything else is applied; mended, the held
+        request goes out, then user_deleted(p)."""
+        p, q, r = uuid4(), uuid4(), uuid4()
+        key = f"held-{uuid4().hex}"
+        broken, applied = _failing(
+            monkeypatch,
+            lambda e: getattr(e, "idempotency_key", None) == key,
+            RuntimeError("a defect of comms"),
+        )
+
+        def request(person: UUID, correlation: str) -> dict[str, Any]:
+            return _request_data(idempotency_key=f"k-{uuid4().hex}",
+                                 target_value=str(person), correlation=correlation)
+
+        await _xadd(fake_redis, a_stream, "notification_request", {
+            **request(p, "lesson-1"), "idempotency_key": key,
+        })
+        for person, correlation in ((q, "lesson-1"), (r, "lesson-1"),
+                                    (q, "lesson-2")):
+            await _xadd(fake_redis, a_stream, "notification_request",
+                        request(person, correlation))
+        await _xadd(fake_redis, a_stream, "user_upserted", _user_upserted_data(q))
+        await _xadd(fake_redis, a_stream, "user_deleted",
+                    {"v": 1, "recipient_id": str(r), "version": 2})
+        await _xadd(fake_redis, a_stream, "user_deleted",
+                    {"v": 1, "recipient_id": str(p), "version": 2})
+
+        def while_held() -> None:
+            kinds = [type(e).__name__ for e in applied]
+            assert sorted(kinds) == sorted([
+                "NotificationRequest", "NotificationRequest",
+                "NotificationRequest", "UserUpserted", "UserDeleted",
+            ])
+            # The one deletion applied is r's: p's waits.
+            (deleted,) = [e for e in applied if isinstance(e, UserDeleted)]
+            assert deleted.recipient_id == r
+
+        logs = await self._in_one_run(fake_redis, a_stream, while_held, broken,
+                                      behind=2)
+        assert len(_lines(logs, "event_held_behind")) == 1
+        tail = applied[-2:]
+        assert isinstance(tail[0], NotificationRequest)
+        assert tail[0].idempotency_key == key
+        assert isinstance(tail[1], UserDeleted) and tail[1].recipient_id == p
+
+    async def test_a_held_cancel_holds_the_requests_it_would_cancel(
+        self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """reminder_cancel(c) held; a request under c behind it waits --
+        applied first, the cancel would cancel a request sent after it;
+        a request under another correlation flows."""
+        from tests.test_transport_consumer import TestReminderCancel
+        c, other = f"c-{uuid4().hex}", f"c-{uuid4().hex}"
+        broken, applied = _failing(
+            monkeypatch, lambda e: isinstance(e, ReminderCancel),
+            RuntimeError("a defect of comms"),
+        )
+        await _xadd(fake_redis, a_stream, "reminder_cancel", {
+            "v": 1, "types": ["unit_rem_1h"], "correlation": c,
+        })
+        after = {**TestReminderCancel._reminder_request(c),
+                 "idempotency_key": f"k-{uuid4().hex}"}
+        await _xadd(fake_redis, a_stream, "notification_request", after)
+        elsewhere = {**TestReminderCancel._reminder_request(other),
+                     "idempotency_key": f"k-{uuid4().hex}"}
+        await _xadd(fake_redis, a_stream, "notification_request", elsewhere)
+
+        def while_held() -> None:
+            assert [e.correlation for e in applied] == [other]
+
+        await self._in_one_run(fake_redis, a_stream, while_held, broken, behind=2)
+        assert [type(e).__name__ for e in applied[1:]] == [
+            "ReminderCancel", "NotificationRequest",
+        ]
+        async with get_session_factory()() as s:
+            status = await s.scalar(select(Notification.status).where(
+                Notification.idempotency_key == after["idempotency_key"]))
+        # Sent after the cancel, it was not cancelled by it.
+        assert status != NotificationStatus.CANCELLED
+
+    async def test_a_request_behind_does_not_hold_its_person(
+        self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """reminder_cancel(c) held; a request to p under c waits behind
+        it; user_deleted(p) does not wait behind the request -- a request
+        held behind holds its correlation, not its person."""
+        from tests.test_transport_consumer import TestReminderCancel
+        c, p = f"c-{uuid4().hex}", uuid4()
+        broken, applied = _failing(
+            monkeypatch, lambda e: isinstance(e, ReminderCancel),
+            RuntimeError("a defect of comms"),
+        )
+        await _xadd(fake_redis, a_stream, "reminder_cancel", {
+            "v": 1, "types": ["unit_rem_1h"], "correlation": c,
+        })
+        await _xadd(fake_redis, a_stream, "notification_request", {
+            **TestReminderCancel._reminder_request(c),
+            "idempotency_key": f"k-{uuid4().hex}", "target_value": str(p),
+        })
+        await _xadd(fake_redis, a_stream, "user_deleted",
+                    {"v": 1, "recipient_id": str(p), "version": 2})
+
+        def while_held() -> None:
+            assert [type(e).__name__ for e in applied] == ["UserDeleted"]
+
+        await self._in_one_run(fake_redis, a_stream, while_held, broken, behind=2)
+        assert [type(e).__name__ for e in applied[1:]] == [
+            "ReminderCancel", "NotificationRequest",
+        ]
 
     async def test_said_once_per_entry(
         self, fake_redis: fakeaioredis.FakeRedis, a_stream: str,

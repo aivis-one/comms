@@ -39,6 +39,22 @@
 # unknown but non-blank timezone is still stored as-is with a loud
 # warning here (early signal) and degrades to DEFAULT_TIMEZONE at
 # computation time (app/audience/schedule.py).
+#
+# THE RECIPIENT'S ROW AND A FIRST ATTEMPT (W6-2a). A job's first attempt
+# inserts its deliveries; their foreign key takes FOR KEY SHARE on each
+# recipient's row until the attempt commits -- through the channel's
+# call. The two writers here take the row by what they write (the lock
+# rule of app/engine/processor.py, the strength by the write):
+#   - a snapshot writes no key: FOR NO KEY UPDATE, which KEY SHARE does
+#     not block -- it passes at once, the attempt standing. Two snapshots
+#     of one person, and a snapshot and a tombstone, still queue on the
+#     row (NO KEY UPDATE conflicts with itself and with FOR UPDATE);
+#   - a tombstone takes the row FOR UPDATE, which KEY SHARE blocks: the
+#     order forgetting stands on (app/forgetting.py WHAT HOLDS THE WINDOW).
+#     It WAITS for the attempt as a wait for a job's row does, as long as
+#     the attempt's hold (app/core/database.py wait_for_attempts) -- under
+#     the role's own lock_timeout it failed, 55P03: the API's DELETE 500,
+#     the consumer's user_deleted held (review of 4.0.0, A2).
 # =============================================================================
 
 import hashlib
@@ -53,7 +69,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
 from app.core.config import settings
-from app.core.database import once_more_on_insert_race
+from app.core.database import once_more_on_insert_race, wait_for_attempts
 from app.core.exceptions import (
     NotFoundError,
     RecipientDeletedError,
@@ -200,9 +216,11 @@ async def _apply_snapshot_once(
     parameter on purpose: the transport maps "absent" to None
     explicitly (snapshot discipline), never through a default.
 
-    The row is read FOR UPDATE, so two writers of one recipient (the
-    PUT route and the consumer) compare against the same stored version
-    one after the other, never both against the old one.
+    The row is TAKEN FOR NO KEY UPDATE, so two writers of one recipient
+    (the PUT route and the consumer) compare against the same stored
+    version one after the other, never both against the old one -- and a
+    first attempt's KEY SHARE on the row does not hold it (THE
+    RECIPIENT'S ROW AND A FIRST ATTEMPT, the module header).
     """
     if type(version) is not int or version < 1:
         raise ValidationError(
@@ -215,7 +233,9 @@ async def _apply_snapshot_once(
         timezone=timezone, active=active,
     )
 
-    recipient = await session.get(Recipient, recipient_id, with_for_update=True)
+    recipient = await session.get(
+        Recipient, recipient_id, with_for_update={"key_share": True},
+    )
     if recipient is None:
         recipient = Recipient(
             id=recipient_id,
@@ -440,7 +460,12 @@ async def tombstone(
     session: AsyncSession, *, recipient_id: UUID, version: int,
 ) -> tuple[Recipient, bool]:
     """Tombstone a recipient (_tombstone_once), surviving the insert
-    race -- a deletion of an id comms never saw inserts its tombstone."""
+    race -- a deletion of an id comms never saw inserts its tombstone.
+
+    The row's FOR UPDATE waits for a first attempt in flight, as long as
+    its hold (THE RECIPIENT'S ROW AND A FIRST ATTEMPT, the module header):
+    lifted here, before the SAVEPOINT, for the transaction."""
+    await wait_for_attempts(session)
     return await once_more_on_insert_race(
         session,
         lambda: _tombstone_once(

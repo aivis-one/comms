@@ -15,6 +15,10 @@
 #                                   -> tests/test_report.py TestTheContract
 #   M12 no step when a lane's pass takes a place
 #                                   -> TestTheLaneLoop.test_a_long_call_...
+#   L1 (W6-2a) the consumer's bound without the wait for an attempt, 105 s
+#                                   -> TestTheBounds.test_the_consumer_...
+#   L2 (W6-2a) no step in wait_for_attempts
+#                                   -> TestTheWaitSteps
 # =============================================================================
 
 import asyncio
@@ -28,7 +32,7 @@ from fakeredis import aioredis as fakeaioredis
 from structlog.testing import capture_logs
 
 from app import worker
-from app.core import liveness
+from app.core import database, liveness
 from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT
 from app.core.config import settings
 from app.core.lanes import Lane
@@ -175,8 +179,12 @@ class TestTheBounds:
         assert bound == max(worker.lane_step_bound(lane) for lane in Lane)
 
     def test_the_consumer_and_the_relay(self) -> None:
+        """The consumer's bound carries one wait for an attempt's row
+        (W6-2a; until it, the retry's ceiling, redis and the margin
+        alone -- 105 s, below the consumer's own wait by design)."""
         assert consumer_module.consumer_step_bound() == (
             consumer_module._WAIT_CEILING + redis_socket_timeout()
+            + database.waiting_statement_seconds()
             + liveness.STEP_MARGIN_SECONDS
         )
         assert push_relay.relay_step_bound() == (
@@ -326,3 +334,33 @@ class TestTheConsumerSide:
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+class TestTheWaitSteps:
+    """The consumer waits by design for an attempt's row longer than any
+    other statement of its process (app/core/database.py wait_for_attempts:
+    the hold and the margins). Its bound holds that wait, and the wait
+    opens a promise of its own -- a try that waits twice (forgetting: the
+    tombstone, then the jobs) is alive through both."""
+
+    def test_the_bound_holds_the_consumers_longest_wait(self) -> None:
+        """The relation, on the suite's own hold (the installed profile's,
+        app/engine/service.py longest_attempt_hold): one waiting
+        statement and the database around it fit the bound."""
+        assert database.waiting_statement_seconds() > 105.0  # the pair
+        assert consumer_module.consumer_step_bound() >= (
+            database.waiting_statement_seconds() + liveness.STEP_MARGIN_SECONDS
+        )
+
+    async def test_a_wait_for_an_attempt_steps(self) -> None:
+        """A watched loop whose promise already ran out is alive again
+        once a wait for an attempt's row begins."""
+        from app.core.database import get_session_factory
+
+        with liveness.watched("waits", 100.0):
+            liveness._WATCHES["waits"].deadline = time.monotonic() - 1
+            assert liveness.late(time.monotonic()) == ["waits"]  # the pair
+            async with get_session_factory()() as session:
+                await database.wait_for_attempts(session)
+                await session.rollback()
+            assert liveness.late(time.monotonic()) == []

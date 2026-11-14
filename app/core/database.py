@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool
 
+from app.core import liveness
 from app.core.config import settings
 
 logger = structlog.get_logger()
@@ -302,6 +303,15 @@ async def wait_for_attempts(session: AsyncSession) -> None:
     LOCAL: the transaction's, gone at its end; never a session's SET,
     which would outlive it in the pool.
 
+    A STEP OF THE PULSE (W6-2a, app/core/liveness.py): the wait that
+    follows is longer than any other statement of the process, so it
+    opens a promise of its own -- step() here, the bound of a watched
+    loop that waits (app/transport/consumer.py consumer_step_bound) one
+    waiting statement and its loop's own part. Every wait is one call of
+    this function before its lock, so a transaction that waits twice
+    (forgetting: the tombstone, then the jobs) steps twice. Outside a
+    watched loop the step does nothing.
+
     KNOWN CEILING (W5-3) -- A WAIT FOR SEVERAL ATTEMPTS IN ONE STATEMENT.
       1. Mechanics: each wait for a lock is bounded by one attempt's hold
          and the margin (lock_timeout); the statement by that and the
@@ -327,6 +337,7 @@ async def wait_for_attempts(session: AsyncSession) -> None:
          forgotten holder would hang them again -- the reason for W5-3);
          lock_timeout alone (it bounds one lock, not the statement).
     """
+    liveness.step()
     statement = _ms(waiting_statement_seconds())
     await session.execute(text(f"SET LOCAL statement_timeout = '{statement}'"))
     await session.execute(text(f"SET LOCAL lock_timeout = '{_ms(wait_seconds())}'"))

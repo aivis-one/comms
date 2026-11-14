@@ -1017,12 +1017,20 @@ answer at all, comms waits -- without a limit, the delay growing to 30 s
 event keeps meeting a transient failure past a short bounded series of
 retries -- or its handling fails in comms in any other way -- comms
 holds the event: it is handled again at every pass over comms' pending
-entries, about once a minute, until it is taken. **The order of one
-subject is kept**: no later event about the same person (the
-`recipient_id` of a sync event, the `operator_id` of a section's
-roster, the person a request is addressed to), the same `correlation`
-or the same `idempotency_key` is applied before the held one -- they
-wait behind it and go after it, in their order. Events about everyone
+entries, about once a minute, until it is taken. **The order that
+matters is kept**: a later event is not applied before the held one
+when the two share a subject and one of them changes it. A sync event
+changes its person (the `recipient_id`, the `operator_id` of a
+section's roster), a `reminder_cancel` its `correlation`, a
+`notification_request` its `idempotency_key`; a request reads its
+`correlation` and the person it is addressed to. So a held sync event
+keeps that person's later sync events and the requests to them behind
+it; a held `reminder_cancel` keeps the later requests under its
+`correlation`; a held request keeps its person's later sync events,
+the later `reminder_cancel` of its `correlation` and the later requests
+under its key. What waits behind goes after it, in its order. Two
+requests to one person, or under one `correlation`, need no order
+between them and do not wait for each other; events about everyone
 else are not held.
 
 - `user_upserted` for a new user precedes `group_changed` for them; a

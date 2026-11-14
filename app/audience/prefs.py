@@ -43,8 +43,8 @@
 # then deletes the mutes and clears the schedule. ONE strength for every
 # write, though a mute alone would need only KEY SHARE: one PATCH writes
 # mutes AND the schedule in one transaction, and a KEY SHARE raised to
-# NO KEY UPDATE behind a queued FOR UPDATE (the tombstone, a snapshot)
-# is the upgrade that deadlocks. The price: two PATCHes of one recipient
+# NO KEY UPDATE behind a queued FOR UPDATE (the tombstone) is the
+# upgrade that deadlocks. The price: two PATCHes of one recipient
 # run one after the other. A read (get_preferences) takes nothing.
 # =============================================================================
 
