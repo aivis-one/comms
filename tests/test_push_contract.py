@@ -95,15 +95,21 @@ class TestWhatPushes:
 
 class TestTheStream:
     def test_the_name_is_the_derived_one(self) -> None:
+        """The name the product reads, as comms derives it from the event
+        stream's default. Until DOC-1 the section also gave the form
+        `<COMMS_EVENTS_STREAM>:changes`; no key of primer.yaml `env` sets
+        that setting on a box, so the document gives the name alone."""
         defaults = _defaults()
-        assert "`<COMMS_EVENTS_STREAM>:changes`" in _PUSH
-        assert f"`{defaults['comms_events_stream']}:changes`" in _PUSH
+        name = f"{defaults['comms_events_stream']}:changes"
+        assert Settings.model_construct().changes_stream == name
+        assert f"**The stream.** `{name}`." in _PUSH
 
     def test_the_cap_is_the_setting_and_its_default(self) -> None:
+        """By its default number (by its name too until DOC-1, which left
+        the document the number: no key of primer.yaml `env` sets it)."""
         assert "changes_stream_maxlen" in NUMERIC_BOUNDS
-        assert "`CHANGES_STREAM_MAXLEN`" in _PUSH
         default = _defaults()["changes_stream_maxlen"]
-        assert f"default {default}" in _PUSH
+        assert f"capped at {default} entries by default" in _PUSH
         assert default == 100_000
 
 
@@ -121,7 +127,7 @@ class TestTheListener:
         recipe = self._recipe()
         for field in PUSH_FIELDS:
             assert f'b"{field}"' in recipe
-        assert ':changes"' in recipe
+        assert f'STREAM = "{_defaults()["comms_events_stream"]}:changes"' in recipe
         assert f'b"{PUSH_FORMAT_VERSION}"' in recipe
 
     def test_the_recipe_reads_before_it_acknowledges(self) -> None:

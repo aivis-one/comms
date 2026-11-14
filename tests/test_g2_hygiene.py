@@ -41,7 +41,7 @@ from typing import Any
 
 import pytest
 
-from app.core.config import NUMERIC_BOUNDS
+from app.core.config import NUMERIC_BOUNDS, Settings
 from app.core.constants import MAX_BODY_LEN, MAX_CATEGORY_LEN, MSG_TYPE_KEYS
 from app.core.exceptions import ProfileError
 from app.profile import loader
@@ -233,13 +233,19 @@ class TestTheTypeRecordTable:
 
     def test_the_defaults_are_the_loaders(self) -> None:
         """'when not declared' is what the loader hands out: the value,
-        or the setting it reads it from."""
+        or -- for one it reads from a setting -- that setting's default.
+
+        Until DOC-1 the cell named the setting; no such setting is a key
+        of primer.yaml `env`, so nobody sets it on a box, and the cell
+        gives the number the product gets."""
         rows = _record_rows()
         for name in RECORD_FIELDS:
             value, source = loader._FIELDS[name].default()
             cell = rows[name][2]
             if source.startswith("settings: "):
-                assert f"`{source.removeprefix('settings: ')}`" in cell, name
+                field = source.removeprefix("settings: ").lower()
+                default = Settings.model_fields[field].default
+                assert cell == f"`{default}` by default", name
             elif value in (None, ()):
                 assert cell == "none", name
             elif isinstance(value, tuple):

@@ -15,7 +15,12 @@
 #           (failed, configuration), the job's other channels going on --
 #           on the real database, through the existing path
 #   item 4  deploy/INTEGRATION.md and deploy/.env.example say so, held
-#           to the code both ways
+#           to the code: the outcome's text in the document, every flag
+#           in the template. The document's table of the flags, their
+#           values and every flag it named were held here both ways
+#           until DOC-1, which took them out of the document: the flags
+#           are the instance's values, read by the operator and the
+#           machine (primer.yaml), not by the product
 #
 # THREE DOUBLE AXES. REPEAT: every channel, every broken flag in one
 # refusal, two types into one switched-off channel. EMPTY: the flag
@@ -41,8 +46,7 @@
 #   M9 the body host checked with llm off -> test_an_llm_job_with_audio_...
 #   M10 _free_route_problems without the guard
 #                                         -> test_a_free_route_is_not_...
-#   M11 a flag renamed in the document; the reason text changed in the
-#       code                              -> TestTheContract
+#   M11 the reason text changed in the code -> TestTheContract
 #   M12 a key holding the literal read as empty with the flag on
 #                                         -> test_true_with_the_literal_...
 # =============================================================================
@@ -593,37 +597,11 @@ class TestTheDelivery:
 
 
 # -----------------------------------------------------------------------------
-# item 4 -- the contract, both ways
+# item 4 -- the contract
 # -----------------------------------------------------------------------------
 
 
-def _flag_table() -> dict[str, str]:
-    """channel -> flag, as deploy/INTEGRATION.md's table lists them."""
-    start = _DOC.index("| channel | flag |\n")
-    table = _DOC[start:_DOC.index("\n\n", start)]
-    return dict(re.findall(r"^\| `([a-z_]+)` \| `([A-Z_]+)` \|$", table, re.M))
-
-
 class TestTheContract:
-    def test_the_table_is_the_specs(self) -> None:
-        """M11, both ways: every flag of the code in the table under its
-        channel, and nothing else there."""
-        table = _flag_table()
-        assert table, "the pair: the table is read"
-        assert table == {
-            spec.name: spec.flag for spec in CHANNEL_SPECS if spec.flag
-        }
-        assert "`in_app` has no flag" in " ".join(_DOC.split())
-
-    def test_every_flag_the_document_names_is_one(self) -> None:
-        named = set(re.findall(r"\b([A-Z]+_ENABLED)\b", _DOC))
-        assert named == set(channel_flag_keys())
-
-    def test_the_values_are_the_codes(self) -> None:
-        line = _DOC[_DOC.index("The value is exactly"):]
-        line = line[:line.index(".")]
-        assert tuple(re.findall(r"`([a-z]+)`", line)) == FLAG_VALUES
-
     async def test_the_outcome_text_is_the_built_one(self) -> None:
         """Read by a person, so held by the value the code builds: the
         refusal the switched-off email actually raises."""

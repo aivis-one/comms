@@ -57,9 +57,6 @@ from tests.conftest import FIXTURE_PROFILE_DIR
 _REPO = Path(__file__).resolve().parents[1]
 _LAUNCHER = _REPO / "bin" / "comms"
 _PRIMER = yaml.safe_load((_REPO / "primer.yaml").read_text(encoding="utf-8"))
-# Where the machine puts the copy of a kind in the container (its
-# CONTAINER_DATA, protocol 4.5).
-_MACHINE_PATH = "/primer/data/profile"
 
 
 def _copy(tmp_path: Path) -> Path:
@@ -256,33 +253,25 @@ class TestTheContract:
     """V7: deploy/INTEGRATION.md section 3 against the code."""
 
     def test_the_kind_and_its_command_are_primer_yamls(self) -> None:
+        """What the product writes and what checks it: the dependency's
+        data in the product's primer.yaml, and comms' validator, the
+        command of comms' own `accepts.profile`.
+
+        Until DOC-1 the section also quoted comms' `accepts` line and the
+        path the machine binds the copy at; both are the machine's, read
+        by it from primer.yaml, and left the document."""
         accepted = _PRIMER["accepts"]["profile"]
-        assert (
-            f'profile: {{ validate: "{accepted["validate"]}", '
-            f'env: {accepted["env"]} }}'
-        ) in _SECTION_3
+        assert accepted["validate"].startswith("comms validate --profile ")
+        assert "`comms validate --profile`" in " ".join(_SECTION_3.split())
         assert "dependencies.comms.data:\n{profile:" in _SECTION_3
-        assert f"`{_MACHINE_PATH}`" in _SECTION_3
 
-    def test_the_ceiling_it_names_is_in_the_compose_file(self) -> None:
-        compose = (_REPO / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
-        assert (
-            "KNOWN CEILING (acknowledged by design -- the profile on comms-app alone)"
-            in compose
-        )
-        assert "the KNOWN CEILING in comms' `deploy/docker-compose.yml`" in _SECTION_3
-
-    def test_the_languages_are_the_settings(self) -> None:
+    def test_how_a_letter_finds_its_language_is_said(self) -> None:
+        """Was test_the_languages_are_the_settings, which also held the
+        table of the two settings' forms against the code; DOC-1 took the
+        table out (the languages are the passport's values, the
+        operator's), and the rule the product writes against stays."""
         section = _INTEGRATION[
-            _INTEGRATION.index("### Languages -- `LANGUAGES` and `DEFAULT_LANGUAGE`"):
+            _INTEGRATION.index("### Languages\n"):
             _INTEGRATION.index("### The type record -- every field")
         ]
-        rows = [
-            line.split("|")[1].strip().strip("`")
-            for line in section.splitlines()
-            if line.startswith("| `")
-        ]
-        assert rows == ["LANGUAGES", "DEFAULT_LANGUAGE"]
-        for name in rows:
-            assert hasattr(settings, name.lower()), name
         assert "byte for byte" in section and "`en-GB` and `EN` are no `en`" in section

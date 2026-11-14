@@ -35,7 +35,6 @@ from structlog.testing import capture_logs
 
 from app.api import jobs
 from app.core.channels import (
-    LLM_SET_FIELDS,
     LLMKeySet,
     parse_llm_key_sets,
 )
@@ -1491,9 +1490,6 @@ def _table(heading: str) -> list[str]:
 
 
 class TestTheContract:
-    def test_a_key_set_is_its_fields(self) -> None:
-        assert _table("`key_set`") == list(LLM_SET_FIELDS)
-
     def test_the_letter_is_its_fields(self) -> None:
         assert set(_table("`llm`")) == LLM_LETTER_FIELDS
 

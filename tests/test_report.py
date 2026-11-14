@@ -14,7 +14,9 @@
 #     otherwise.
 # And the rules of the model on comms: every check under its timeout,
 # the revision kept, a failing check said on its turn, the commit a
-# refusal at start, the contract in deploy/INTEGRATION.md both ways.
+# refusal at start. (The contract in deploy/INTEGRATION.md was held here
+# both ways until DOC-1 took /health and /ready out of the document: the
+# machine reads them, the product never does.)
 #
 # MUTATIONS these tests were written against (each turns one red):
 #   M1 `version` instead of `release`          -> TestTheForm
@@ -33,7 +35,6 @@
 
 import asyncio
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -489,32 +490,19 @@ class TestTheCommit:
                 pass
 
 
-class TestTheContract:
-    """deploy/INTEGRATION.md section 15, "What comms shows the machine",
-    against the code, both ways."""
+class TestTheWiring:
+    """The checks /ready and /health ask, and the healthcheck compose
+    runs for the worker and the consumer.
 
-    _SECTION = (_REPO / "deploy" / "INTEGRATION.md").read_text(
-        encoding="utf-8",
-    ).split("### What comms shows the machine", 1)[1].split("\n## ", 1)[0]
+    Was TestTheContract, which held deploy/INTEGRATION.md section 15
+    ("What comms shows the machine") against the code both ways; DOC-1
+    took that text out of the document (its reader is the machine, not
+    the product), so the halves that read it are gone and the halves
+    that read the code stay."""
 
-    @staticmethod
-    def _table(section: str, header: str) -> list[str]:
-        block = section.split(header, 1)[1].split("\n\n", 1)[0]
-        return re.findall(r"^\| `([a-z_]+)` \|", block, re.MULTILINE)
-
-    def test_the_fields_are_the_codes(self) -> None:
-        documented = self._table(self._SECTION, "| field | what it is |")
-        assert documented, "the pair: the table is found"
-        assert set(documented) == set(Health.model_fields)
-
-    def test_the_checks_are_the_codes(self) -> None:
-        documented = self._table(self._SECTION, "| check | `ok` when |")
+    def test_the_checks_are_db_and_redis(self) -> None:
         wired = [DB, *main_module.report._checks]
-        assert documented == wired == [DB, REDIS]
-
-    def test_ready_is_written_as_it_answers(self) -> None:
-        assert '`{"status": "ready", "failing": []}`' in self._SECTION
-        assert '"not_ready"' in self._SECTION
+        assert wired == [DB, REDIS]
 
     def test_the_liveness_commands_are_the_compose_files(self) -> None:
         compose = yaml.safe_load(
@@ -523,5 +511,3 @@ class TestTheContract:
         for role in ("worker", "consumer"):
             command = compose["services"][f"comms-{role}"]["healthcheck"]["test"]
             assert command[1:] == ["python", "-m", "app.core.liveness", role]
-        assert "`python -m app.core.liveness worker`" in self._SECTION
-        assert "`consumer`" in self._SECTION

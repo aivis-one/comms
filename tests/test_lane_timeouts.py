@@ -647,11 +647,16 @@ class TestTheContract:
         assert int(written.group(1)) == default == 30
 
     def test_integration_says_the_rule(self) -> None:
+        """The bound of one channel call in a lane, as the product reads
+        it: the number, held to every lane's default. Until DOC-1 the
+        section named the variable, its log field and its startup refusal
+        too -- the operator's, and no key of primer.yaml `env`, so nobody
+        sets it on a box; they left the document."""
         start = _DOC.index("### `lane`")
         section = _DOC[start:_DOC.index("\n### ", start)]
         flat = " ".join(section.split())
-        assert "`NOTIFICATION_LANE_<LANE>_DELIVER_TIMEOUT_SECONDS`" in flat
-        assert "in `lane_budgets` as `deliver_timeout`" in flat
-        assert "above the client timeout of every channel live on the deploy" in flat
-        assert "refuses startup, naming the variable and the channel" in flat
+        assert "Each lane bounds one channel call: 30 seconds by default" in flat
+        for lane in Lane:
+            field = lane_deliver_timeout_variable(lane).lower()
+            assert Settings.model_fields[field].default == 30, lane
 

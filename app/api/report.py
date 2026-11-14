@@ -10,8 +10,9 @@
 #   else 503 {status: not_ready, failing: [names]} (protocol 9.2). The
 #   compose healthcheck of comms-app reads it.
 # Both are open: the machine and docker hold no token
-# (app/api/service_auth.py OPEN_PATHS). deploy/INTEGRATION.md section 15
-# is the contract.
+# (app/api/service_auth.py OPEN_PATHS). The contract is the machine's
+# (protocol 9.1, 9.2, 9.5): tests/fixtures/health.json is the form CI hands
+# to its own check (scripts/check_primer_yaml.py). No product reads them.
 #
 # THE MODEL is primer-blank's primer_report/health.py (754f856), written
 # here rather than taken: it is a directory of that repository, not a

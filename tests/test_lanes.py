@@ -994,14 +994,3 @@ class TestTheContract:
         section = self._section()
         assert "It is not a priority" in section
         assert "It passes no gate" in section
-
-    def test_the_deploy_covers_every_lane(self) -> None:
-        """правка 3: the union of the workers' lanes is the deploy's
-        duty, the cost of missing one is said, and the startup log
-        fields named are the ones the worker writes (TestTheLoops)."""
-        section = self._section()
-        assert "`COMMS_WORKER_LANES`" in section
-        assert "together must take all four lanes" in section
-        assert "neither delivered nor expired" in section
-        for field in ("`notification_worker_started`", "`lanes`", "`lane_budgets`"):
-            assert field in section

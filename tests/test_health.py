@@ -4,7 +4,7 @@
 #
 # Since R-1a the endpoint also carries the CHANNEL MAP -- the operator's
 # detector for "did this deploy get the channels its installer meant to
-# give it" (deploy/INTEGRATION.md). It is the same map the startup log
+# give it". It is the same map the startup log
 # carries, and it is STATES ONLY: /health is unauthenticated. Since W3-1
 # the map is under `details` of the deploy machine's document; the
 # document itself -- its fields, its checks, /ready -- is held by

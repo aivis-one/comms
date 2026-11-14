@@ -80,11 +80,10 @@ class TestTheContract:
     def test_the_document_names_the_unsubscribe_footer_as_the_domain_s(
         self,
     ) -> None:
-        """What a request cannot switch off is said, with the reading
-        command the product runs to check its domain."""
+        """What a request cannot switch off is said. Until DOC-1 the
+        document also gave the command reading the domain's setting on
+        a box -- `docker exec comms-app ...`, the operator's, not the
+        product's -- and this test held it; it left with the command."""
         paragraph = self._paragraph()
         assert "unsubscribe" in paragraph
         assert "DOMAIN" in paragraph
-        assert "/tracking" in _DOC
-        assert "['unsubscribe']['active']" in _DOC
-        assert "It must print `False`." in _DOC

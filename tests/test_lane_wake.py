@@ -773,7 +773,9 @@ class TestTheContract:
         assert "picked up as soon as it is accepted, in every lane" in section
         assert "falls back to the poll" in section
         assert "never loses the job" in section
-        assert "`NOTIFICATION_MAX_BACKOFF_SECONDS`" in section
-        # The name it gives is a setting the worker reads.
-        assert "notification_max_backoff_seconds" in Settings.model_fields
+        # The bound it gives is the default of the setting the worker
+        # reads (by name until DOC-1, which left the document the number:
+        # no key of primer.yaml `env` sets it on a box).
+        assert "up to a minute later by default" in section
+        assert Settings.model_fields["notification_max_backoff_seconds"].default == 60
         assert "becomes due later" in section

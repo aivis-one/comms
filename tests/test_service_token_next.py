@@ -12,8 +12,11 @@
 #           optional and never alone; every token compared, always
 #   item 2  no token in a log line -- not the refusal's, not startup's,
 #           not the settings' repr; nothing says which token passed
-#   item 3  deploy/INTEGRATION.md and deploy/.env.example say so, held to
-#           the code both ways
+#   item 3  deploy/.env.example says so. deploy/INTEGRATION.md said so
+#           too, held here both ways, until DOC-1 took the paragraph out:
+#           the machine changes no key, and the product presents the
+#           value its seam gave it -- the change of key is the
+#           operator's, not the product's
 #
 # THREE DOUBLE AXES. REPEAT: both tokens pass; the next equal to the
 # current. EMPTY: an empty presented token, the next set to "". SHORTFALL:
@@ -27,11 +30,9 @@
 #   M5 a token in the refusal's log line     -> TestNoTokenInTheLog
 #   M6 an accepted request says which token  -> test_nothing_says_which_...
 #   M7 repr=True on the next token           -> test_the_repr_carries_...
-#   M8 a variable renamed in the document or a field in the code
-#                                            -> TestTheContract
+#   M8 the next token's line taken out of the template -> TestTheContract
 # =============================================================================
 
-import re
 import secrets
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,6 @@ from app.core.config import Settings, format_startup_error, settings
 from tests.conftest import FIXTURE_PROFILE_DIR
 
 _REPO = Path(__file__).resolve().parents[1]
-_DOC = (_REPO / "deploy" / "INTEGRATION.md").read_text(encoding="utf-8")
 _TEMPLATE = (_REPO / "deploy" / ".env.example").read_text(encoding="utf-8")
 
 # Assembled at run time, fresh per run: no literal of a token's shape.
@@ -336,33 +336,11 @@ class TestNoTokenInTheLog:
 
 
 # -----------------------------------------------------------------------------
-# item 3 -- the contract, both ways
+# item 3 -- the contract
 # -----------------------------------------------------------------------------
 
 
-def _token_fields() -> set[str]:
-    return {
-        name.upper() for name in Settings.model_fields
-        if name.startswith("comms_service_token")
-    }
-
-
 class TestTheContract:
-    def test_the_paragraph_names_the_fields(self) -> None:
-        """M8, both ways: the paragraph names every token variable the
-        code reads, and no other."""
-        start = _DOC.index("**Changing the service token without downtime.**")
-        paragraph = _DOC[start:_DOC.index("\n\n", start)]
-        named = set(re.findall(r"`(COMMS_SERVICE_TOKEN\w*)`", paragraph))
-        assert named == _token_fields() == {
-            "COMMS_SERVICE_TOKEN", "COMMS_SERVICE_TOKEN_NEXT",
-        }
-        assert "Primer protocol 5.4" in paragraph
-
-    def test_every_token_variable_the_document_names_is_a_field(self) -> None:
-        named = set(re.findall(r"\b(COMMS_SERVICE_TOKEN\w*)\b", _DOC))
-        assert named == _token_fields()
-
     def test_the_env_template_carries_the_next_one_empty(self) -> None:
         """Until W1-2 the writer was `operator`; on a box of the machine
         nothing sets it (primer.yaml declares no key for it), so it is the

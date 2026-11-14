@@ -1,15 +1,15 @@
 # COMMS -- product-side integration checklist
 
-This file documents how a product is wired to comms and what it may ask
-of it. The comms repo never touches the product.
+This file is the contract a product is written against: comms' API
+and its answers, the events and their frame, the outcomes, the profile,
+the channels as options of an instance, the seams the product takes and
+gives, and how long comms keeps things. The comms repo never touches
+the product.
 
-**None of it is a manual procedure.** comms is installed by Primer's
-deploy machine, from its `primer.yaml` (section 15) and its compose file:
-the machine renders the values, joins the networks and runs the
-migration; a product takes comms by its own `primer.yaml`. This file is
-the reference for WHAT happens and WHY. (Until W1-2 the wiring was the
-old installer's, two passes of it run by each product's installer; it is
-gone.)
+How comms itself is installed -- its networks, its environment, what
+the deploy machine reads and checks -- is not here: that is comms'
+`primer.yaml` and `deploy/docker-compose.yml`, read by Primer's deploy
+machine.
 
 Scope guard: the integration code -- the `notification_request` relay
 into the comms stream, calls to the comms HTTP API, and the user-facing
@@ -18,75 +18,7 @@ product repo and is not part of this file.
 
 ---
 
-## 1. How the product reaches comms
-
-comms' compose file declares no network towards a product: the
-machine's override joins them. `comms-app` is on the machine's network
-as `comms-comms-app` -- the seam `COMMS_API_URL` is
-`http://comms-comms-app:8000`; `comms-redis` is on the network of each
-pair of the point `events` as `comms-comms-redis` -- the seam
-`COMMS_EVENTS_ADDRESS` is `comms-comms-redis:6379`. Inside comms, its
-own network is internal: the database is on it alone, with no way out of
-the box, and no product reaches it.
-
-The comms API is INTERNAL: no host port, no nginx route. Only a service
-of the product the machine pairs with comms resolves these names.
-
-## 2. The comms values the product takes
-
-The product takes comms' seams (section 15) by name, from its own
-`primer.yaml` (`source: seam, from: comms`), and builds what it reads
-from them -- its stream URL, for one, from `COMMS_EVENTS_PASSWORD` and
-`COMMS_EVENTS_ADDRESS`:
-
-```
-COMMS_API_URL=http://comms-comms-app:8000
-COMMS_SERVICE_TOKEN=<minted by the machine -- single source>
-COMMS_EVENTS_ADDRESS=comms-comms-redis:6379
-COMMS_EVENTS_PASSWORD=<minted by the machine>
-```
-
-Semantics:
-
-- `COMMS_SERVICE_TOKEN` -- the shared service token (trust seam,
-  DD-6). The product backend presents it as `Authorization: Bearer
-  <token>` on every call to the comms API. Minted ONCE by the machine;
-  comms and the product carry the same value.
-- `COMMS_API_URL` -- the comms API address on the machine's network.
-- `COMMS_EVENTS_ADDRESS`, `COMMS_EVENTS_PASSWORD` -- the durable comms
-  stream backbone and its password. The relay XADDs
-  `notification_request` entries there. Treat the password with the
-  same care as the rest of your secrets.
-
-**Changing the service token without downtime.** comms accepts two
-service tokens: `COMMS_SERVICE_TOKEN`, the current one, and
-`COMMS_SERVICE_TOKEN_NEXT`, the next one. A request passes with either;
-any other token is the `401`. comms is ready for a change of key in
-three steps (Primer protocol 5.4): the next token is handed to comms
-beside the current one, and comms, restarted, accepts both; the product
-is moved onto the next token; the next token becomes the current one
-and the next is emptied, and comms, restarted, accepts it alone. Primer's
-machine does not change the key yet: its `primer.yaml` declares no
-`COMMS_SERVICE_TOKEN_NEXT` (section 15), so on a box of the machine the
-current token is the only one in force. The next token
-is optional -- unset or empty, only the current one passes -- and never
-stands alone: set without `COMMS_SERVICE_TOKEN`, comms refuses to start,
-in development too. It may equal the current one. Neither token is ever
-written to a log, and nothing comms logs says which of the two a
-request passed with.
-
-**The stream and group names are half of an agreement, so they are
-written down on both sides.** The relay XADDs into the stream
-`comms:events`; comms reads it as the consumer group `comms`. Both are
-the defaults on the comms side (`COMMS_EVENTS_STREAM`,
-`COMMS_CONSUMER_GROUP` in `deploy/.env.example`), so a deploy that
-names neither works -- but a relay pointing at a different stream is
-not an error anywhere: it writes where nobody reads, and the
-notifications simply never arrive, with no failure to see on either
-side. If a deploy overrides either name, every product writing to it
-must be changed in the same step.
-
-## 3. The product profile (`TEMPLATES_DIR`)
+## 3. The product profile
 
 comms carries no product vocabulary: the notification types and their
 templates are a per-product artifact (arch #15) that lives in the
@@ -123,7 +55,7 @@ instead, and the letter takes your own title and body (the default label
 for a button). A telegram title and body whose HTML Telegram would not
 parse, checked together as they are sent, for a recipient of every
 locale of the profile -- each field by the chain the send walks (the
-recipient's locale, then `DEFAULT_LANGUAGE`), and a variable standing as a
+recipient's locale, then the instance's default language), and a variable standing as a
 value with a link's characters -- a tag Telegram does not support
 (`<div>`, `<br>`), one left open or closed out of order, a raw `<`
 (write `&lt;`), a variable in an unquoted attribute (`<a href={link}>`
@@ -138,27 +70,18 @@ logged (`profile_unknown_directory`) -- the start goes on.
 sheet in one language of the profile has a sheet in each: a text falls
 back to the instance's default language, and the profile cannot know
 which of its languages that is. And at the start, with the instance
-known: a profile that has templates but none in `DEFAULT_LANGUAGE`
-(section "Languages" below). The variables of a type are not held across
+known: a profile that has templates but none in the instance's
+default language (section "Languages" below). The variables of a type are not held across
 the languages: a language may have a variable of its own
 (`{topic_line_en}` beside `{topic_line_ru}`).
 
 **How it is delivered: data comms takes.** Your `primer.yaml` names the
 directory under the dependency on comms -- `dependencies.comms.data:
-{profile: <its path in your repository>}` -- and comms' `primer.yaml`
-takes that kind of data:
-
-    accepts:
-      profile: { validate: "comms validate --profile <dir>", env: TEMPLATES_DIR }
-
-On a rollout the machine copies the directory, runs `comms validate
---profile <dir>` on the copy in a throwaway container of the new comms
-image -- no network, nothing of the instance but the path -- **before**
-the migration, and only then binds the copy read-only at
-`/primer/data/profile` with `TEMPLATES_DIR` naming it. A profile the
-validator refuses stops the rollout there: comms stays on its old image
-and its old profile. Without `data: {profile: ...}` comms gets no
-profile, and its start is refused.
+{profile: <its path in your repository>}`. On a rollout the copy of the
+directory is checked by `comms validate --profile` with the new comms
+image **before** the migration; a profile it refuses stops the rollout
+there: comms stays on its old image and its old profile. Without
+`data: {profile: ...}` comms gets no profile, and its start is refused.
 
 **`comms validate --profile <dir>`** is the loader of comms' start. Exit
 0: the profile is good, one line on stdout. Otherwise exit 1, and every
@@ -167,14 +90,9 @@ first alone; a templates file that is not YAML is one problem, and the
 other files are checked on (a `types.yaml` that is not YAML, or of
 another schema version, is reported alone). It knows no instance: each
 language of the profile is checked as the default an instance may have,
-and that `DEFAULT_LANGUAGE` has templates is the start's to say. Run it
+and that the instance's default language has templates is the
+start's to say. Run it
 in your own CI on your profile with the comms image you pin.
-
-**On comms-app alone, for now.** The machine binds the data a service
-takes on that service's `app` only -- comms-app; `comms-worker` and
-`comms-consumer` read the profile too and get no `TEMPLATES_DIR`, so
-they do not start (the KNOWN CEILING in comms' `deploy/docker-compose.yml`).
-The end of it is the machine's.
 
 Consequences:
 
@@ -184,28 +102,19 @@ Consequences:
   the start refuses what only the instance can say (its default
   language), recovery is to revert that commit and roll out again.
 
-### Languages -- `LANGUAGES` and `DEFAULT_LANGUAGE`
+### Languages
 
-comms has no languages of its own: they are its product's, from the
-instance's passport (`primer.yaml` `env`, source `passport`, keys
-`languages` and `default_language`).
-
-| variable | form |
-|---|---|
-| `LANGUAGES` | codes joined by commas, no spaces -- `en,ru,uk`; each two or three lower-case letters, no region; at least one, each once |
-| `DEFAULT_LANGUAGE` | one code, among `LANGUAGES` |
-
-Both are required: a start without either, or with one of another form,
-is refused naming it.
+comms has no languages of its own: they are its product's, set for each
+instance by its passport -- the instance's languages and, among them,
+its default language.
 
 **Which language a letter is in.** The recipient's `locale` (section 7,
 `user_upserted`) as you wrote it, compared byte for byte with the
 languages of the profile -- `en-GB` and `EN` are no `en`. Each field is
-looked up in that language, then in `DEFAULT_LANGUAGE`, then the stored
-`title`/`body` you sent. A recipient with no `locale`, or one the profile
-has no texts in -- `uk` of a profile in `en` and `ru` -- gets the
-default's. `LANGUAGES` decides nothing of it: it is read at the start
-only, to hold `DEFAULT_LANGUAGE` to it.
+looked up in that language, then in the instance's default language,
+then the stored `title`/`body` you sent. A recipient with no `locale`,
+or one the profile has no texts in -- `uk` of a profile in `en` and
+`ru` -- gets the default's. The instance's other languages decide nothing of it.
 
 ### The type record -- every field
 
@@ -224,11 +133,11 @@ fields further, and do not repeat them.
 | `push_on` | one of `outcome`, `outcome_and_deferral`, `none` | `none` | what comes back on the push stream (section 10) |
 | `recipient_schedule` | one of `respect`, `bypass` (not on an llm type) | `respect` | whether its deliveries wait for the recipient's allowed periods (`recipient_schedule`, below) |
 | `expires_after` | a duration: a whole number and `s`, `m`, `h` or `d` -- `30s`, `15m`, `24h`, `7d`; at most `3650d` | none | how long a request of the type stays deliverable; a request's own `expiry_at` wins (section 7) |
-| `retry_max_attempts` | an integer, 1..100 | the deploy's `NOTIFICATION_MAX_DELIVERY_ATTEMPTS` | how many times one delivery is attempted -- a number, never a condition |
-| `retry_backoff_seconds` | an integer, 0..86400, not above the deploy's `NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS` | the deploy's `NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS` | the first wait between attempts, in seconds (0 = none); the waits grow from it up to that cap |
+| `retry_max_attempts` | an integer, 1..100 | `3` by default | how many times one delivery is attempted -- a number, never a condition |
+| `retry_backoff_seconds` | an integer, 0..86400, not above the cap of the waits -- `600` by default | `30` by default | the first wait between attempts, in seconds (0 = none); the waits grow from it up to that cap |
 | `max_body_chars` | an integer, 1..5000 (not on an llm type) | `5000` | the longest body a request of the type may carry; a longer one is refused at intake |
-| `llm_sets` | a list of key set names defined in `LLM_KEY_SETS` (the llm kind only, required there) | none | the key sets the model call goes through, in order (section 11) |
-| `answer_keep` | a duration, as `expires_after`, not longer than `NOTIFICATION_RETENTION_DAYS` (the llm kind only) | `24h` | how long the model's answer is kept after it came (section 11) |
+| `llm_sets` | a list of names of the key sets the instance defines (the llm kind only, required there) | none | the key sets the model call goes through, in order (section 11) |
+| `answer_keep` | a duration, as `expires_after`, not longer than the notification history -- `90d` by default ("How long comms keeps things") (the llm kind only) | `24h` | how long the model's answer is kept after it came (section 11) |
 | `max_audio_bytes` | an integer, 1..20971520 (the llm kind only) | `2097152` | the largest audio body a job may link to, in bytes as fetched (section 11) |
 
 **A telegram letter has Telegram's limits.** `max_body_chars` bounds the
@@ -353,7 +262,7 @@ A job is picked up as soon as it is accepted, in every lane: accepting
 it wakes the loop of its lane in each worker that takes that lane, so an
 idle worker does not hold it for its poll interval. The wake only speeds
 things up: a lost one (the worker's listening connection down) falls
-back to the poll -- up to `NOTIFICATION_MAX_BACKOFF_SECONDS` later -- and
+back to the poll -- up to a minute later by default -- and
 never loses the job. A job that becomes due later (a `scheduled_at` in
 the future, a retry) is picked up by the poll once due.
 
@@ -361,26 +270,8 @@ A lane outside the four refuses startup, like every other field. The
 value is taken when the request is accepted: a job keeps the lane its
 type had then, whatever a later profile says.
 
-**Which worker takes which lane is the deploy's, not the profile's.**
-One worker image takes the lanes named in `COMMS_WORKER_LANES`
-(comma-separated, in the environment of the worker); left out, it takes all four --
-nothing needs to be written for one worker. A second worker of the
-same image may take a subset, e.g. `COMMS_WORKER_LANES=critical` next
-to one with `interactive,normal,bulk`. **The worker processes of a
-deploy together must take all four lanes:** a lane no process takes is
-neither delivered nor expired -- its jobs stay pending. Nothing fails
-on it: a worker that takes a subset starts, and says so in one warning
-line, `worker_lanes_partial` (`lanes_not_taken`); the lanes' backlog
-shows in `GET /api/v1/lanes/depth`. Each worker names its lanes and
-their budgets in its startup log line, `notification_worker_started`
-(`lanes`, `lane_budgets`). Written but empty, an unknown lane or a lane listed
-twice refuses startup, naming the variable.
-
-Each lane also has its own timeout for one channel call,
-`NOTIFICATION_LANE_<LANE>_DELIVER_TIMEOUT_SECONDS` (30 by default, in
-`lane_budgets` as `deliver_timeout`); it must be above the client
-timeout of every channel live on the deploy, and a lane at or below
-one refuses startup, naming the variable and the channel.
+Each lane bounds one channel call: 30 seconds by default (the llm
+channel has its own bound, section 11).
 
 ### `recipient_schedule` -- a type that does not wait for the schedule
 
@@ -412,39 +303,13 @@ Every product has a different set of delivery channels, and a channel
 it does not have is not a failure -- it is a design decision. One rule
 expresses that, and it is the only mechanism:
 
-**A channel is decided by its flag, and by nothing else.** Under the
-Primer's machine a channel is an option of the instance: the passport
-switches it on or off, and comms learns of it only by the flag. A
-channel exists on a deploy when it has an implementation in this
-service and its flag is `true`:
-
-| the channel's flag | what it means | what happens |
-|---|---|---|
-| **`false`** | this product has no such channel on this instance, by design | the service starts; the channel is absent; its keys are **not read and not checked**, whatever they hold |
-| **`true`**, every key set and well formed | the product has the channel | the channel is live |
-| **`true`**, a key missing or malformed | an integrator typo | **the service refuses to start**, naming the channel and every such key |
-| absent, or anything but `true` / `false` | an integrator typo | **the service refuses to start**, naming the flag |
-
-### The channel flags
-
-| channel | flag |
-|---|---|
-| `telegram` | `TELEGRAM_ENABLED` |
-| `email` | `EMAIL_ENABLED` |
-| `llm` | `LLM_ENABLED` |
-
-The value is exactly `true` or `false`. Not `True`, not `1`, not `yes`;
-and a flag has no default: an env without it does not start. `in_app`
-has no flag: it is always on -- its delivery is the row the inbox reads,
-nothing leaves the process, and there is nothing to configure or to
-switch. A channel with no implementation in this service is absent on
-every deploy, whatever the environment says. Under the machine the flag
-comes from the passport (`options.<channel>`); the value the machine
-writes into the keys of a switched-off option is never read.
-
-The declared keys of every implemented channel live in one place,
-`app/core/channels.py`. That file is the answer to "which keys does
-this channel need"; this document does not duplicate the list.
+**A channel is an option of the instance, and nothing else decides
+it.** The instance's passport switches it on or off. A channel exists
+on a deploy when comms implements it and its option is on; a channel
+comms does not implement is absent everywhere. `in_app` is no option:
+it is always on -- its delivery is the row the inbox reads, nothing
+leaves the process. What an instance has, comms says per channel in
+`GET /api/v1/channels/health` (`state`, section 5).
 
 **A request never names a channel.** The profile routes each type to
 its channels (`types.<type>.channels`). A request that still carries
@@ -471,64 +336,16 @@ guards it with its own `options_required`; comms does not refuse the
 start for it. The same outcome meets a job accepted while a channel
 was on, delivered after a restart that switched it off.
 
-**Startup refusals are readable.** The configuration is built before
-logging is set up, so a refusal prints a message -- naming the channel
-and the keys -- and exits, rather than a traceback.
-
-**What the first start tells you.** The `comms_started` log line
-carries a channel map: every channel with `live`, `not_configured` (the
-flag is `false`) or `not_implemented`. The same map is served by
-`GET /health` under `details.channels` (section 15), so confirming it later needs a request
-rather than a grep through a container's log. That map is the way to
-confirm that a deploy sees the channels its installer meant to give it.
-Unknown variables are ignored on purpose, so that a leftover in a
-shared env file cannot refuse a working deploy -- and a misspelt channel
-variable is still caught: a misspelt flag is an absent flag, and a
-misspelt key of a switched-on channel is a missing key, both refusals.
-The map says what a deploy HAS; what its channels DID is the second
-answer, "Channel health" in section 5.
-
-**The llm channel, concretely,** is one key, `LLM_KEY_SETS`, holding
-named key sets: section 11.
-
-**Email, concretely.** The channel is decided by its flag like any
-other, and its keys are declared in `app/core/channels.py`. With
-`EMAIL_ENABLED=true` three of them are required -- the provider API
-key, the provider domain, and the sender address. The sender has no default because it is a product fact; a
-default would make an incomplete set look complete. It accepts either a
-bare address or the display form `Name <address>`, since a signed
-sender delivers better -- in the env file the display form only in
-quotes (`EMAIL_FROM_ADDRESS="Comms <noreply@example.com>"`): the file is
-read by `source`, and an unquoted `<` is a redirection there. A value
-carrying a line break is refused at startup.
-
-The provider region is different in kind: it has a default, so
-"unset" and "set to the default" cannot be told apart, and it is
-therefore never a missing key. Its VALUE is still checked whenever it is
-spelled out with email on, against a closed set of the provider's
-regions: a plausible-looking `eu-west` refuses startup instead of
-failing every send later.
-
-**What the key set cannot check.** A syntactically perfect set with a
-wrong API key, or with a domain that is not verified with the provider,
-starts cleanly and fails on every message. That is by construction: a
-network check at startup would make the service's boot depend on the
-provider being reachable. The loudness therefore sits at send time --
-the first refusal the provider attributes to configuration rather than
-to the message is logged as `email_channel_not_viable`, once, naming
-the channel; the messages after it are ordinary per-message lines, so a
-dead channel is a signal instead of a thousand identical entries.
-
 **What the provider's answer means.** For each email, by the provider's
 status: any `2xx` is its acceptance -- the delivery is `sent` (accepted is
 not delivered; what happens after is the provider's). `401`, `402`, `403`,
 and a `400` or `404` whose JSON message names the sender -- a domain the
 provider does not have (`404`, "Domain not found"), one not verified, a
-sender outside it -- are the channel: `failed`, `configuration`, logged as
-above. `429` waits the provider's `Retry-After`, or is retried without
-one; `408` and `5xx` are retried. A redirect (`3xx`) is the channel too:
-`EMAIL_API_BASE_URL` is not the provider's API. Every other answer -- a
-`400` on the recipient, a `404` that names no sender -- is this email:
+sender outside it -- are the channel: `failed`, `configuration`. `429`
+waits the provider's `Retry-After`, or is retried without one; `408` and
+`5xx` are retried. A redirect (`3xx`) is the channel too: the address
+comms sends to is not the provider's API. Every other answer -- a `400`
+on the recipient, a `404` that names no sender -- is this email:
 `failed`, `message_rejected`.
 
 **What email reads from the profile.** Its own fields under its own
@@ -576,13 +393,7 @@ the domain's own tracking settings say, so links arrive as the product
 wrote them. One thing a request cannot switch off: the unsubscribe
 footer is a setting of the product's mail DOMAIN at the provider, with
 no per-message option -- keep it off, or a footer with an unsubscribe
-link lands in every message, a login code's included. Read the domain's
-tracking settings as the running process sees them (nothing is
-changed):
-
-    docker exec comms-app python -c "import httpx; from app.core.config import settings as s; print(httpx.get(f'{s.email_api_base_url}/v3/domains/{s.email_mailgun_domain}/tracking', auth=('api', s.email_mailgun_api_key)).json()['tracking']['unsubscribe']['active'])"
-
-It must print `False`.
+link lands in every message, a login code's included.
 
 **Time.** A product that mails short-lived codes should set `expiry_at`
 on the notification to the life of the code. Delivery is retried on
@@ -590,32 +401,6 @@ transient failures, and when the provider asks to be retried later the
 service honours the wait it names -- which can exceed the life of a
 code by a wide margin. `expiry_at` is what stops a delivery that has
 outlived its point; without it the service has no way to know.
-
-**Scope of this rule: sending channels only.** A future inbound side
-(receiving bot updates) is a separate capability with its own keys and
-its own switch, and is not a channel of this registry. One bot has
-exactly one update receiver, so a receiver switched on by the mere
-presence of a sending token would start at a deploy that only asked to
-send.
-
-## 4. What the integration code does with all this
-
-Consumers of the variables above are the integration track in the
-product repo:
-
-- outbox relay: velo -> `notification_request` into the comms stream
-  (`COMMS_REDIS_URL`);
-- server-to-server calls to the comms HTTP API (`COMMS_API_URL` +
-  token);
-- the user-facing proxy that sets `recipient_id`/`sender`
-  **server-side** (comms authenticates the PRODUCT, not the user --
-  the proxy owns user-level authorization);
-- the push-stream listener (section 10), if the product wants to learn
-  about a result without polling -- comms never calls the product back.
-
-None of that is wired here; this file only accounts for the network
-path, the credentials and the profile being in place before that code
-runs.
 
 ## 5. The resource protocol (F1.4)
 
@@ -768,17 +553,17 @@ still does. Send the membership before the job when the order matters.
 
 ### Channel health
 
-`GET /health` says what a deploy has -- a channel's keys are set -- and
-that is not the same as working: at one install it said `email: live`
-while every letter died on a provider `401`. The second answer is what
-each channel answered over a recent window:
+A channel's `state` says what a deploy has -- the channel is on and its
+keys are set -- and that is not the same as working: at one install it
+said `email: live` while every letter died on a provider `401`. The
+second answer is what each channel answered over a recent window:
 
     GET /api/v1/channels/health?window_minutes=60
 
 `window_minutes` is 1..1440, default 60; outside that range it is
 **refused** (422 `validation`), not clamped. The window is measured by
 comms' database clock and closed at both ends. Behind the service token
-like every `/api/v1` route; `GET /health` carries none of these counts.
+like every `/api/v1` route.
 
 ```json
 {
@@ -801,7 +586,7 @@ means zero.
 
 | field | meaning |
 |---|---|
-| `state` | the same channel map as `GET /health`: `live` / `not_configured` / `not_implemented` |
+| `state` | what the deploy has: `live` -- the channel is on (section 3a); `not_configured` -- it is off on this instance; `not_implemented` -- comms has no such channel |
 | `answers` | every answer the channel gave in the window -- one per call, so the retries of one letter count once each |
 | `by_outcome` | the answers by what the channel said: took it, refused it, asked to wait (429), failed transiently, did not answer in time, or comms itself failed around the call |
 | `refused_by_class` | the refusals by class: `configuration` -- the channel is dead on this deploy, fix the deploy; `message_rejected` -- this letter will not arrive, others go; `no_address` -- the recipient has no address in this channel, fix the sync |
@@ -816,13 +601,12 @@ nothing is stored as "health", and comms acts on none of it.
 ### Lane depth
 
 How many jobs wait in each lane right now -- the backlog of a lane no
-worker takes (`COMMS_WORKER_LANES` without it) grows here and nowhere
-else:
+worker takes grows here and nowhere else:
 
     GET /api/v1/lanes/depth
 
 Behind the service token like every `/api/v1` route; read only, one
-snapshot; `GET /health` is unchanged.
+snapshot.
 
 ```json
 {
@@ -1358,7 +1142,7 @@ job's outcome, within `keep_until`.
 
 | field | value |
 |---|---|
-| `set` | the key set the call went through (`LLM_KEY_SETS`) |
+| `set` | the key set the call went through -- one of the type's `llm_sets` |
 | `provider` | the provider as the response names it (a gateway's `provider` field), or `null` when it does not |
 | `model` | the model as the response names it, or `null` -- never the requested one |
 
@@ -1366,18 +1150,16 @@ job's outcome, within `keep_until`.
 
 | field | value |
 |---|---|
-| `attempts` | failed pipeline attempts **in a row**; 0 when none. An attempt that succeeds ends the run: `attempts` goes back to 0, `step` and `error` to `null` -- every failure stays in the job's path (`by-key/path`). The ceiling (`NOTIFICATION_MAX_PIPELINE_ATTEMPTS`) is of failures in a row: a long send in portions is not closed by a few failures spread over it. A transient failure of comms' own database (a deadlock, a lost connection, a restart) counts while that database answers; while it does not answer, nothing is counted or written |
+| `attempts` | failed pipeline attempts **in a row**; 0 when none. An attempt that succeeds ends the run: `attempts` goes back to 0, `step` and `error` to `null` -- every failure stays in the job's path (`by-key/path`). The ceiling (`3` by default) is of failures in a row: a long send in portions is not closed by a few failures spread over it. A transient failure of comms' own database (a deadlock, a lost connection, a restart) counts while that database answers; while it does not answer, nothing is counted or written |
 | `step` | the step of the last failure of the current run: `lock`, `resolve`, `deliver`, `rollup`, `commit`; or `null` |
 | `error` | the class and the place of the last failure of the current run, or `null` |
 | `retry_at` | when the job is tried again after its last counted failure, or `null`; never with `attempts` 0 |
 
 **A job STUCK at the ceiling.** A job whose `attempts` equal comms' ceiling
-(`NOTIFICATION_MAX_PIPELINE_ATTEMPTS`) while its `status` is not an
+(`3` by default) while its `status` is not an
 outcome is stuck: comms failed at the ceiling to close it. That is a
 defect of comms, not of your request -- its `error` names the class and
-the place, and comms says it once in its log. No worker takes it again;
-raising the ceiling in comms' settings makes it selectable once more, on
-purpose.
+the place, and comms says it once in its log. No worker takes it again.
 
 ### `delivery_count`
 
@@ -1520,13 +1302,13 @@ A push says "this job changed -- go read it". It is a hint: the read by
 key (section 8) is the truth, and a product that never listens loses
 nothing but speed -- it reads by key and by the changes feed (section
 9). comms never calls the product: it writes pushes into its own redis
-(`COMMS_REDIS_URL`), and the product listens, the way comms listens to
-the product's events.
+(the seams `COMMS_EVENTS_ADDRESS` and `COMMS_EVENTS_PASSWORD`, section
+15), and the product listens, the way comms listens to the product's
+events.
 
-**The stream.** `<COMMS_EVENTS_STREAM>:changes` -- with the default
-event stream, `comms:events:changes`. comms creates it with its first
-push. It is capped at `CHANGES_STREAM_MAXLEN` entries (default 100000,
-approximate trimming): the oldest pushes are dropped, never the jobs.
+**The stream.** `comms:events:changes`. comms creates it with its first
+push. It is capped at 100000 entries by default (approximate trimming):
+the oldest pushes are dropped, never the jobs.
 
 **An entry.** Plain stream fields, nothing else:
 
@@ -1566,11 +1348,12 @@ the changes feed from its kept cursor (section 9), then follows the
 stream; that is the whole recovery, and it covers a trimmed stream too.
 
 **A listener**, whole -- `redis` is an asyncio client on
-`COMMS_REDIS_URL`; `read_job` is your read by key (section 8) and your
+`COMMS_EVENTS_ADDRESS` with `COMMS_EVENTS_PASSWORD`; `read_job` is your
+read by key (section 8) and your
 own update from it; `reconcile` is the recovery of section 9:
 
 ```python
-STREAM = f"{COMMS_EVENTS_STREAM}:changes"
+STREAM = "comms:events:changes"
 GROUP, NAME = "product", "listener-1"   # your group; a stable name
 
 
@@ -1607,49 +1390,22 @@ the letter and reading the answer are the product's: comms never reads
 either. A translation, a summary, a transcript: different letters, one
 channel.
 
-### The key sets -- for the operator
+### The key sets
 
-The models a deploy can reach are **named key sets** in comms'
-environment -- on a box asked of the operator by the passport under the
-option `llm` (`primer.yaml`) -- one variable holding all of them as one
-JSON object:
+The models a deploy can reach are **named key sets** of the instance,
+under its option `llm`; a type names the sets it goes through, in
+order (`llm_sets`). A set name is lower-case words joined by dots
+(`llm.text`), at most 64 characters. A set reaches either a gateway
+that aggregates providers or the vendor itself. **A gateway set carries
+the gateway's conditions in every request:** the gateway does not
+silently fall back to another provider, and only providers that do not
+collect the data are used. Zero data retention is not asked for.
 
-    LLM_KEY_SETS='{"llm.text": {"endpoint": "https://<gateway host>/api/v1", "key": "<key>", "model": "<vendor>/<model>", "gateway": true}, "llm.text_direct": {"endpoint": "https://<vendor host>/v1", "key": "<key>", "model": "<model>", "gateway": false}}'
-
-It is read only with `LLM_ENABLED=true` (section 3a); with `false` the
-deploy has no llm, the variable is not read, and the rest of comms works
-as before. With `true` it is required, and every set must be whole, or
-comms refuses to start, naming the set and the field -- never the
-value. A set name is lower-case words joined
-by dots (`llm.text`), at most 64 characters; a name written twice is a
-refusal.
-
-### `key_set` -- one set
-
-| field | value |
-|---|---|
-| `endpoint` | the provider's OpenAI-compatible base address, `https://`, no credentials, query or fragment; comms appends `/chat/completions` |
-| `gateway` | `true` -- the address is an aggregating gateway; `false` -- it is the vendor itself. No default |
-| `key` | the provider's key; sent as `Authorization: Bearer`, never written anywhere else |
-| `model` | the model id the request names; one ending in `:free` (a free route) refuses the start outside development |
-
-**A gateway set carries the gateway's conditions in every request:**
-`"provider": {"allow_fallbacks": false, "data_collection": "deny"}` --
-the gateway does not silently fall back to another provider, and only
-providers that do not collect the data are used. A vendor set
-(`gateway: false`) never carries the block: a vendor refuses a
-parameter it does not know. Zero data retention is not asked for: check
-the gateway's terms for the chosen model before production.
-
-**The cost is the key's.** comms counts no tokens and keeps no budget:
-put a credit limit on the key at the provider. A key out of credit is a
-`configuration` failure -- the set is dead, fix the deploy.
-
-**A call to one set may take `LLM_DELIVER_TIMEOUT_SECONDS`** (default
-120; above the channel's client, 114 s, or the start is refused). A
-job's call over its list may take that many times the number of its
-sets, and 35 s more when it fetches an audio body first. It is the channel's own bound, not a lane's: the lanes' 30 s stay
-what they are for email and telegram.
+**A call to one set may take up to 120 seconds by default.** A job's
+call over its list may take that many times the number of its sets, and
+35 s more when it fetches an audio body first. It is the channel's own
+bound, not a lane's: the lanes' 30 s stay what they are for email and
+telegram.
 
 ### The type -- for the product's profile
 
@@ -1733,8 +1489,8 @@ port -- `comms-postgres`, `comms-redis`, `comms-app`, a metadata
 address --, credentials, the host in another case or with a trailing
 dot, a port left to its default, an IP for a name. A deploy without the
 seam (empty) fetches nothing, and every request with `llm_audio` is
-rejected at intake. All of it only with the llm channel on: with
-`LLM_ENABLED=false` the link is not checked, and the job is accepted and
+rejected at intake. All of it only with the llm channel on: with the
+channel off the link is not checked, and the job is accepted and
 ends in the outcome "channel unavailable" (section 3a). A link accepted
 while the seam was one address is refused at the attempt -- failure
 class `configuration`, the store not asked -- if a restart gave comms
@@ -1847,7 +1603,7 @@ queue another and request again; the feed reads the latest. The same
 job for the same language twice under another key is 409 `conflict`.
 
 **A request is tied to the job its key named when it was written.**
-Retention deletes a job (`NOTIFICATION_RETENTION_DAYS`) and frees its
+Retention deletes a job ("How long comms keeps things") and frees its
 key: a later job under the same key is another job, and it does **not**
 change the request -- whose own job is gone, so it reads `impossible`.
 Want the new job to count? Write a new request for it.
@@ -2113,12 +1869,12 @@ a thread that is open again. A notice issued before the reopen is
 delivered like any other. A DM is never announced.
 
 **Returning a thread to `open` does not restart its idle clock.**
-Auto-close (`THREAD_AUTO_CLOSE_DAYS`) measures silence from the last
-message, and a manual reopen writes no message. With auto-close on, a
-thread that has been silent longer than that and is reopened by hand is
-closed again by the next auto-close pass -- a section thread with a new
-notice to its client. Keep `THREAD_AUTO_CLOSE_DAYS=0` if your operators
-reopen idle conversations, or write into the thread when reopening it.
+Auto-close ("How long comms keeps things") measures silence from the
+last message, and a manual reopen writes no message. A thread that has
+been silent longer than that and is reopened by hand is closed again by
+the next auto-close pass -- a section thread with a new notice to its
+client. If your operators reopen idle conversations, write into the
+thread when reopening it.
 
 ### The thread's revision
 
@@ -2200,37 +1956,35 @@ messages -- a conversation belongs to both sides. Deleting a thread
 removes the messages of both sides in it. The two do not conflict: the
 first is about a person, the second about a conversation.
 
-## 15. Under Primer's machine -- `primer.yaml` and the seams
+## 15. The seams
 
-Under Primer's deploy machine comms is a service: a repository, the
-file `primer.yaml` at its root, and a tag. The file holds no value --
-only where each value of the instance comes from: minted by the machine
-(the database and Redis passwords, the service token), asked of the
-operator (the channels' secrets), a parameter of the instance (the mail
-domain, the sender, the region, the host of Telegram links), the
-passport (the channel flags, `options.<channel>`), the machine's
-addresses, or derived by comms itself. A key of a switched-off channel
-holds the machine's literal, which comms never reads (section 3a). The
-file is the list; this section does not repeat it.
+The seams are the values comms and the product hand each other by name,
+each through its own `primer.yaml` (`source: seam`).
 
-**The seams: what comms gives the product.** Each is a key of comms'
-`env`, and the product takes it by the same name as a seam from comms:
+**The seams: what comms gives the product.** The product takes each by
+the same name, as a seam from comms (`source: seam, from: comms`):
 
 | seam | what it is |
 |---|---|
-| `COMMS_API_URL` | the address of `comms-app` on the machine's network -- the comms HTTP API |
-| `COMMS_SERVICE_TOKEN` | the shared secret the product presents as `Authorization: Bearer <token>`; minted |
-| `COMMS_EVENTS_ADDRESS` | `<host>:<port>` of comms' Redis, the point `events` -- where the relay writes `notification_request` and the push stream is read (sections 7, 10); no scheme |
+| `COMMS_API_URL` | the address of the comms HTTP API. Internal: no host port, no route from outside -- only the product's services paired with comms reach it |
+| `COMMS_SERVICE_TOKEN` | the shared secret the product presents as `Authorization: Bearer <token>` on every call to the comms API; minted once, comms and the product carry the same value |
+| `COMMS_EVENTS_ADDRESS` | `<host>:<port>` of comms' Redis, the point `events` -- where the relay writes `notification_request` into the stream `comms:events` and the push stream `comms:events:changes` is read (sections 7, 10); no scheme |
 | `COMMS_EVENTS_PASSWORD` | the password of that Redis; minted |
-| `TELEGRAM_BOT_URL` | `https://<host>/<bot username>`, derived by `comms derive bot-url` (below); only with the `telegram` option |
+| `TELEGRAM_BOT_URL` | `https://<host>/<bot username>` of the bot comms sends through, derived by comms from the bot's token and the instance's link host; only with the `telegram` option |
 | `TELEGRAM_BOT_TOKEN` | the token of the bot comms sends through, asked of the operator once; only with the `telegram` option. For the transition: the product checks Mini App sign-in with it until it checks it by Telegram's public key, and then the seam is removed (the KNOWN CEILING at this name in `primer.yaml`) |
+
+**The stream names are fixed.** The relay XADDs into the stream
+`comms:events`; comms reads it as its consumer group `comms`. A relay
+pointing at another stream is not an error anywhere: it writes where
+nobody reads, and the notifications simply never arrive, with no
+failure to see on either side.
 
 `TELEGRAM_BOT_ID` waits for the machine: it refuses a derived value
 shorter than 16 characters, and a bot id is 9-10 digits.
 
-**The seam comms takes from the product.** `requires` of `primer.yaml`
--- a key of comms' `env` with `source: seam, from: product`, which the
-product gives under the same name in its `provides`:
+**The seam comms takes from the product.** The product gives it under
+the same name in its `provides`; comms takes it with `source: seam,
+from: product`:
 
 | seam | what it is |
 |---|---|
@@ -2239,92 +1993,24 @@ product gives under the same name in its `provides`:
 Given in another form than `<host>:<port>` -- a lower-case name or an
 IPv4 address without a trailing dot, a port from 1 to 65535 -- it
 refuses comms' start, with the llm channel on or off. Empty, comms
-starts, every audio link is rejected, and `/health` says
-`requires_satisfied: false`.
-
-**`comms derive`.** The machine runs `comms derive <name>` in a
-throwaway container of the comms image, with the instance's other
-values in its environment; the value is the command's one line of
-output.
-
-- `bot-id` -- the digits before the colon of `TELEGRAM_BOT_TOKEN`, the
-  bot's id. No network.
-- `bot-url` -- `https://<TELEGRAM_LINK_HOST>/<username>`, the username
-  asked of Telegram (getMe, bounded by the telegram channel's client
-  timeout). The host is a parameter of the instance, never a literal of
-  code: the link host has changed before.
-
-A wrong token or host is a non-zero exit and one line on stderr naming
-the variable -- never the token.
-
-### What comms shows the machine -- `/health` and `/ready`
-
-The machine decides a deploy by these two answers of `comms-app`
-(protocol 9.1, 9.2, 9.5); `docker` asks `/ready` as the healthcheck of
-`comms-app`. Both are open: no token. Neither is a product's to parse --
-the product reads what comms did by `/api/v1`.
-
-`GET /health` answers **200 whatever the state**, with these fields and
-no other:
-
-| field | what it is |
-|---|---|
-| `service` | `comms` -- the `name` of `primer.yaml` |
-| `release` | the release the image was built for (`PRIMER_RELEASE`) |
-| `commit` | the commit the image was built from (`PRIMER_COMMIT`) |
-| `alembic_head` | the database's revision as last read; `null` before the first read |
-| `uptime_s` | whole seconds since this process of the API started |
-| `status` | `ok` when every check is `ok`, else `degraded` |
-| `checks` | each check: `ok` or `error` |
-| `seams` | `provides` -- exactly the `provides` of `primer.yaml`; `requires_satisfied` -- the seam comms requires, `PRODUCT_STORAGE_ADDRESS`, is given (a malformed one never gets this far: comms does not start) |
-| `limits` | `max_upload_mb` -- the largest request body comms takes, in MiB |
-| `edition` | `core` -- a service has no editions |
-| `modules` | `[]` |
-| `details` | the channel map under `channels` (section 3a); at most 8 KB, built from memory, left out if it is not |
-
-The checks -- what comms does not work without, each under 2 seconds,
-all at once:
-
-| check | `ok` when |
-|---|---|
-| `db` | the database's revision is read -- the same read is `alembic_head` |
-| `redis` | comms' own Redis answers a PING |
-
-A check that fails is `error` -- never an exception and never a 500 --
-and one log line, `health_check_failed`, names it with the class of what
-stopped it, when it turns to `error`; again only after it was `ok`
-between.
-
-`GET /ready` answers **200** `{"status": "ready", "failing": []}` when
-every check is `ok`, else **503** `{"status": "not_ready", "failing":
-[...]}` with the names of the checks that are not.
-
-**The worker and the consumer** answer no HTTP. Their healthcheck is
-`python -m app.core.liveness worker` (and `consumer`): green while every
-loop of the process keeps turning. A loop stuck longer than its bound
-(its channel calls' timeouts and a margin for the database), or a
-process that stopped running its loops, turns it red at most half a
-minute later. A long call of a channel within its timeout is not a
-stuck loop.
+starts, and every audio link is rejected.
 
 ## How long comms keeps things
 
 The questions every product asks once, answered here so the answer is
-not a trip through our source. The history and the threads are
-deploy-side settings with defaults; both are days-granular, and both
-treat zero as "never" (a negative value refuses the start, naming the
-variable). A model's answer is kept by its type.
+not a trip through our source. The numbers are the defaults; a model's
+answer is kept by its type.
 
-- **Notification history**: `NOTIFICATION_RETENTION_DAYS`, default
-  **90**. A notification in a terminal state (and its deliveries) is
-  removed by the worker's retention pass after that many days, counted
-  from the later of its creation and its `scheduled_at` -- a job sent
-  late lives its days from when it was due -- except a `cancelled` one,
-  counted from its creation: a cancel is the one outcome a job can
-  reach before it is due, and a reminder cancelled years ahead is not
-  kept for those years. Nothing is removed while a delivery is still
-  pending, nor while a push of the job (section 10) is still owed --
-  it goes once comms has published it.
+- **Notification history**: **90 days** by default. A notification in
+  a terminal state (and its deliveries) is removed by the worker's
+  retention pass after that many days, counted from the later of its
+  creation and its `scheduled_at` -- a job sent late lives its days
+  from when it was due -- except a `cancelled` one, counted from its
+  creation: a cancel is the one outcome a job can reach before it is
+  due, and a reminder cancelled years ahead is not kept for those
+  years. Nothing is removed while a delivery is still pending, nor
+  while a push of the job (section 10) is still owed -- it goes once
+  comms has published it.
 - **A model's answer** (section 11): the type's `answer_keep`, default
   **24h**, counted from the answer; the letter it answered, and the
   link to its audio body, are deleted at the job's outcome; the body
@@ -2333,8 +2019,8 @@ variable). A model's answer is kept by its type.
   (section 14) removes it with its messages, their variants and
   variant requests, and the read pointers. comms deletes no thread by
   itself, on no schedule.
-- **Threads closing themselves**: `THREAD_AUTO_CLOSE_DAYS`, default
-  **30**. A thread with no activity for that long is closed by the
+- **Threads closing themselves**: after **30 days** with no activity
+  by default. A thread silent for that long is closed by the
   same worker. Closing is a status change -- the thread, its messages
   and the participants' read pointers stay.
 - **A message's variants** (section 12): as long as the message, which
@@ -2346,6 +2032,5 @@ variable). A model's answer is kept by its type.
   address without its letter; nothing is replayed -- once the cause is
   fixed, your outbox sends the event again.
 
-A deploy that wants either behaviour off sets the value to 0. A
-product that needs history kept longer than comms keeps it should
+A product that needs history kept longer than comms keeps it should
 retain its own copy: comms is the delivery service, not the archive.

@@ -36,8 +36,8 @@
 # NETWORKS: none towards the product here. The machine's override puts
 # comms-app on its network `pridem` as `comms-comms-app` (COMMS_API_URL)
 # and comms-redis on the network of each pair of the point `events` as
-# `comms-comms-redis` (COMMS_EVENTS_ADDRESS); see deploy/INTEGRATION.md
-# section 1. And the other way: every service whose environment names
+# `comms-comms-redis` (COMMS_EVENTS_ADDRESS) -- the seams of primer.yaml
+# `provides`. And the other way: every service whose environment names
 # PRODUCT_STORAGE_ADDRESS -- the three application services, through the
 # anchor below -- is put on the network of the product storage's point
 # (W4-2; comms-app answers for the seam in /health, the consumer checks a
@@ -71,8 +71,7 @@
 #      job `machine` pins, puts the bind and the variable of an accepted
 #      kind on comms-worker and comms-consumer as on comms-app.
 #   5. Agreed fix: nothing in this file -- the machine's override carries
-#      it; the ref of the job `machine` raised, this marker removed, and
-#      with it the pointer to it in deploy/INTEGRATION.md section 3.
+#      it; the ref of the job `machine` raised, this marker removed.
 #   6. Rejected: a host path, or a named volume comms-app fills for the
 #      other two (the machine refuses a host path; a volume is a second
 #      copy, empty at their start); `volumes_from` (not a key a service
