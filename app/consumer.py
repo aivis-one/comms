@@ -45,9 +45,15 @@ import structlog
 
 from app.core import liveness
 from app.core.config import settings
-from app.core.database import ProcessRole, dispose_engine, set_process_role
+from app.core.database import (
+    ProcessRole,
+    dispose_engine,
+    set_attempt_hold,
+    set_process_role,
+)
 from app.core.logging import setup_logging
 from app.core.sanitize import sanitized_traceback
+from app.engine.service import longest_attempt_hold
 from app.profile.loader import install_profile_from_settings
 from app.transport.consumer import run_consumer_loop
 from app.transport.push_relay import run_push_relay_loop
@@ -115,6 +121,9 @@ def main() -> None:
             "product's event stream. Set it in the .env file."
         )
     install_profile_from_settings()
+    # The database's limits wait for an attempt as long as it may hold
+    # its job's row -- read off the profile, so after it (W5-3).
+    set_attempt_hold(longest_attempt_hold())
     asyncio.run(_main())
 
 
