@@ -56,12 +56,19 @@ from typing import Any
 #      "password=[redacted]" -- up to the boundary, the pair's own rule;
 #   3. bearer on its own (a token with no header name in front);
 #   4. userinfo in a URL/DSN, EMPTY user allowed, the password running
-#      to the LAST @ before any ? or # -- a raw @ or / in a password
-#      (base64 has /), or both ("p@ss/w"), leaves no tail (REV-6; REV-4b
-#      stopped at the first @ followed by a host, and "p@ss/w@db" kept
-#      "ss/w"). THE PRICE: an @ in the PATH takes the authority with it
-#      -- "https://u:p@host/a@b" -> "p@host/a", "https://host:443/a@b"
-#      -> "443/a" -- text cleaned that need not be, never a secret left;
+#      to the LAST @ before a space -- any other character in a password
+#      leaves no tail: a raw @ or / (base64 has /), or both ("p@ss/w";
+#      REV-6; REV-4b stopped at the first @ followed by a host, and
+#      "p@ss/w@db" kept "ss/w"), and a raw ? or # (W6-2b: REV-6 stopped
+#      the rest at them, and "comms:Zx9?Qw#7@db" kept its password whole
+#      -- a regression against 3.14.0). THE PRICE: an @ anywhere after
+#      the authority -- in the path, the query or the fragment -- takes
+#      the authority with it: "https://u:p@host/a@b" ->
+#      "https://u:[redacted]@b", "https://u:p@host/p?e=a@b.c" ->
+#      "https://u:[redacted]@b.c", "https://host:443/a@b" ->
+#      "https://host:[redacted]@b" -- text cleaned that
+#      need not be, never a secret left (owner, 14.11: a hidden tail of
+#      an address is safer than a tail of a password left);
 #   5. token-shaped values with no keyword next to them.
 #   Pattern 2 in detail, in two passes -- a query parameter first, then
 #   every other form:
@@ -101,13 +108,14 @@ _AUTH_HEADER_RE = re.compile(
 )
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
 # The userinfo: "://", a user, ":", and the rest of the URL up to a
-# space, "?" or "#" -- the password is that rest up to its LAST "@",
-# found by _userinfo_redacted, not by the expression: REV-6 wrote the
-# "@" and a look-ahead into it, and "://a:" repeated made it try every
-# "@" from every start -- quadratic, 91 s on 200 000 characters (REV-9).
-# The same "@": past the last one there is no other before the space,
-# "?" or "#", which is all the look-ahead asked.
-_URL_USERINFO_RE = re.compile(r"(://[^/\s:@]*:)([^\s?#]*)")
+# space -- the password is that rest up to its LAST "@", found by
+# _userinfo_redacted, not by the expression: REV-6 wrote the "@" and a
+# look-ahead into it, and "://a:" repeated made it try every "@" from
+# every start -- quadratic, 91 s on 200 000 characters (REV-9). The same
+# "@": past the last one there is no other before the space, which is
+# all the look-ahead asked. The rest is not cut at "?" or "#" (W6-2b,
+# pattern 4 above): a password may hold them.
+_URL_USERINFO_RE = re.compile(r"(://[^/\s:@]*:)(\S*)")
 # A Cookie or Set-Cookie HEADER: its value is every cookie up to the end
 # of the line, not the first pair (REV-9) -- "Cookie: a=b; c=d" kept
 # "c=d" under the pair's boundary. The header form only, the colon; a

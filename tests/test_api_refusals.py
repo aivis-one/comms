@@ -53,6 +53,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 from structlog.testing import capture_logs
 
+import app.core.schema as schema_module
 import app.main as main_module
 from app.audience.models import CategoryMute, Recipient
 from app.audience.prefs import set_category_muted, set_schedule
@@ -500,7 +501,11 @@ class TestReadySaysWhy:
     only after it was ok between (protocol 9.5, the model's rule). What
     the line may hold is what it held: the summary of a database error
     (class, place, SQLSTATE), the class and place of anything else, never
-    a text. Before, the line was `ready_db_unreachable` on every 503."""
+    a text. Before, the line was `ready_db_unreachable` on every 503.
+
+    The engine is replaced where the revision is read: app/core/schema.py
+    since W6-2b, which moved the read out of app/main.py so the worker
+    and the consumer read it too -- the tests replaced app.main's before."""
 
     @pytest.fixture(autouse=True)
     def _measured_afresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -525,7 +530,7 @@ class TestReadySaysWhy:
         bad = real.set(password="not-it")
         assert bad.password != real.password
         monkeypatch.setattr(
-            main_module, "get_engine",
+            schema_module, "get_engine",
             _engine_at(bad.render_as_string(hide_password=False)),
         )
         with capture_logs() as logs:
@@ -549,7 +554,7 @@ class TestReadySaysWhy:
         bad = real.set(host="127.0.0.1", port=1)
         assert bad.port == 1 and bad.port != real.port
         monkeypatch.setattr(
-            main_module, "get_engine",
+            schema_module, "get_engine",
             _engine_at(bad.render_as_string(hide_password=False)),
         )
         with capture_logs() as logs:
@@ -567,19 +572,19 @@ class TestReadySaysWhy:
     ) -> None:
         """The turn: the second 503 in a row writes no line; after an ok
         the next failure is a turn again."""
-        real = main_module.get_engine
+        real = schema_module.get_engine
         bad = make_url(settings.database_url).set(host="127.0.0.1", port=1)
         broken = _engine_at(bad.render_as_string(hide_password=False))
-        monkeypatch.setattr(main_module, "get_engine", broken)
+        monkeypatch.setattr(schema_module, "get_engine", broken)
         with capture_logs() as logs:
             assert (await client.get("/ready")).status_code == 503
             assert (await client.get("/ready")).status_code == 503
         assert len(self._lines(logs)) == 1
-        monkeypatch.setattr(main_module, "get_engine", real)
+        monkeypatch.setattr(schema_module, "get_engine", real)
         with capture_logs() as logs:
             assert (await client.get("/ready")).status_code == 200
         assert self._lines(logs) == []
-        monkeypatch.setattr(main_module, "get_engine", broken)
+        monkeypatch.setattr(schema_module, "get_engine", broken)
         with capture_logs() as logs:
             assert (await client.get("/ready")).status_code == 503
         assert len(self._lines(logs)) == 1

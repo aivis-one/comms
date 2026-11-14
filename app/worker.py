@@ -62,6 +62,10 @@
 # commits; a sleep is a rest. A loop past its bound leaves the pulse to
 # age: the container is unhealthy.
 #
+# THE SCHEMA (W6-2b): _main starts nothing on a schema that is not the
+# head of the image's migrations -- it ends the process naming both
+# (app/core/schema.py refuse_foreign_schema).
+#
 # SHUTDOWN: SIGTERM/SIGINT cancel the loops. Cancelling a lane loop
 # cancels its task group, and with it every attempt the lane has in
 # work: each is cancelled at its current await and rolled back with its
@@ -96,6 +100,7 @@ from app.core.database import (
 from app.core.lanes import Lane
 from app.core.logging import setup_logging
 from app.core.sanitize import pipeline_error_of, sanitized_traceback
+from app.core.schema import refuse_foreign_schema
 from app.engine.formatters import close_formatters, init_formatters
 from app.engine.processor import (
     LaneJobs,
@@ -464,7 +469,19 @@ async def _main() -> None:
     loop that raised left the bot's session and the connections open).
     A loop's error is said and raised on, after the closes: the process
     ends with it and the restart policy brings it back -- the form of
-    app/consumer.py _main."""
+    app/consumer.py _main.
+
+    First of all, before any loop, signal or pulse: a schema that is not
+    the code's head refuses the start (app/core/schema.py, W6-2b)."""
+    try:
+        await refuse_foreign_schema()
+    except BaseException:
+        # Nothing started: what main() built is closed, as below.
+        try:
+            await close_formatters()
+        finally:
+            await dispose_engine()
+        raise
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(run_worker_loop())
     pulse = asyncio.ensure_future(

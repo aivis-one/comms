@@ -27,10 +27,15 @@
 #         -> TestCompose
 #   LEG-1: the deploy's template of the environment back
 #         -> TestTheDeployTree
+#   W6-2b: pg_isready on the socket again (no -h 127.0.0.1)
+#         -> TestCompose.test_postgres_is_asked_over_tcp
+#   W6-2b: no stop_grace_period on comms-worker, or one under the stop's
+#         bound -> TestCompose.test_the_worker_s_stop_outlasts_its_bound
 # =============================================================================
 
 import asyncio
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -45,6 +50,7 @@ from packaging.version import Version
 from sqlalchemy import text
 
 from app.core.database import dispose_engine, get_engine
+from app.engine import journal
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "deploy" / "docker-compose.yml"
@@ -56,6 +62,21 @@ COMPOSE = ROOT / "deploy" / "docker-compose.yml"
 
 def _compose() -> dict[str, Any]:
     return yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+
+
+_STOP_ROOM_SECONDS = 5.0
+"""Room above the stop's bound for the attempts' rollbacks, the
+formatters' close and the engine's dispose (app/worker.py _main)."""
+
+_DURATION = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)")
+_UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def _seconds(duration: str) -> float:
+    """A compose duration ("15s", "1m30s") in seconds."""
+    parts = _DURATION.findall(duration)
+    assert parts and "".join(n + u for n, u in parts) == duration, duration
+    return sum(float(n) * _UNIT_SECONDS[u] for n, u in parts)
 
 
 class TestCompose:
@@ -99,6 +120,30 @@ class TestCompose:
             "comms-worker",
         ]
         assert [name for name, body in services.items() if "env_file" in body] == []
+
+    def test_postgres_is_asked_over_tcp(self) -> None:
+        """W6-2b (B14a): the healthcheck asks the server at 127.0.0.1 over
+        TCP -- during initdb the image's temporary server listens on the
+        socket only, so a socket answer can be the server that goes."""
+        test = _compose()["services"]["comms-postgres"]["healthcheck"]["test"]
+        assert test[0] == "CMD-SHELL"
+        words = shlex.split(test[1])
+        assert words[0] == "pg_isready"
+        assert words[words.index("-h") + 1] == "127.0.0.1"
+
+    def test_the_worker_s_stop_outlasts_its_bound(self) -> None:
+        """W6-2b (B14b): a stop cancels every attempt and waits only for an
+        answer already given to be written -- _RECORD_ON_STOP_SECONDS, then
+        _CUT_UNWIND_SECONDS (app/engine/journal.py) -- and for the closes
+        after it; comms-worker's grace is that bound with room
+        (_STOP_ROOM_SECONDS). The consumer has no grace of its own: an
+        entry in flight rolls back unacked and is replayed."""
+        services = _compose()["services"]
+        grace = _seconds(services["comms-worker"]["stop_grace_period"])
+        bound = journal._RECORD_ON_STOP_SECONDS + journal._CUT_UNWIND_SECONDS
+        assert bound > 0, "the pair: a bound, not zero any grace is above"
+        assert grace >= bound + _STOP_ROOM_SECONDS, (grace, bound)
+        assert "stop_grace_period" not in services["comms-consumer"]
 
     def test_postgres_is_on_comms_network_only(self) -> None:
         """No network towards the product in the file (the machine's

@@ -132,14 +132,18 @@ class TestNoTail:
 
 
 class TestNewForms:
-    """Item 3. S4, S5."""
+    """Item 3. S4, S5. The URL with an @ in its query was held cleaned
+    to its host ("...@host/path?e=a@b.c"): right while the password
+    stopped at "?", which left a password with "?" or "#" whole; W6-2b
+    runs it to the last @ before a space, and the query's @ takes the
+    authority with it (app/core/sanitize.py, pattern 4's price)."""
 
     @pytest.mark.parametrize(("text", "cleaned"), [
         ("postgresql://comms:a/b+" + _SECRET + "==@db/comms",
          "postgresql://comms:[redacted]@db/comms"),
         ("redis://:p@" + _SECRET + "@h:6379/0", "redis://:[redacted]@h:6379/0"),
         ("https://u:" + _SECRET + "@host/path?e=a@b.c",
-         "https://u:[redacted]@host/path?e=a@b.c"),
+         "https://u:[redacted]@b.c"),
         ("secret_key=" + _SECRET, "secret_key=[redacted]"),
         ("aws_secret_key=" + _SECRET, "aws_secret_key=[redacted]"),
         ("private_key: " + _SECRET, "private_key: [redacted]"),

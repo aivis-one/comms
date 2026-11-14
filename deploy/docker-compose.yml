@@ -117,8 +117,9 @@ services:
       comms-redis: { condition: service_healthy }
     healthcheck:
       # /ready answers 503 while a check of protocol 9.5 is not ok --
-      # the database or Redis (app/api/report.py); the probe runs
-      # in-container (no published port needed).
+      # the database (a schema not at the image's head among it) or
+      # Redis (app/api/report.py); the probe runs in-container (no
+      # published port needed).
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')\""]
       interval: 10s
       timeout: 5s
@@ -134,9 +135,20 @@ services:
       context: ..
     environment: *comms-env
     command: ["python", "-m", "app.worker"]
+    # A stop cancels every attempt; an answer a channel already gave is
+    # written first, within _RECORD_ON_STOP_SECONDS and the unwind after
+    # it (app/engine/journal.py), then the formatters and the engine are
+    # closed (app/worker.py _main). This is the time between SIGTERM and
+    # SIGKILL for all of that, with room above the bound -- not Docker's
+    # unwritten 10 s; tests/test_deploy_hardening.py holds it to the two
+    # constants. The consumer has none of its own: an entry in flight
+    # rolls back unacked and is replayed (app/consumer.py).
+    stop_grace_period: 15s
     depends_on:
       # The schema is migrated before `up` (the machine's `migrate`):
-      # the worker waits for its database only, not for the API.
+      # the worker waits for its database only, not for the API, and
+      # refuses to start on a schema not at its image's head
+      # (app/core/schema.py).
       comms-postgres: { condition: service_healthy }
     healthcheck:
       # LIVE IS TURNING, not existing (W3-1, app/core/liveness.py): the
@@ -204,7 +216,13 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # Over TCP to 127.0.0.1, not the socket (W6-2b): on a first install
+      # the image's initdb runs a temporary server that listens on the
+      # socket only -- a socket answer could be that server, a TCP answer
+      # is the one that stays (.github/workflows/ci.yml asks the same).
+      test:
+        - CMD-SHELL
+        - pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}
       interval: 5s
       timeout: 3s
       retries: 5

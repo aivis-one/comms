@@ -20,8 +20,9 @@
 #              image, the channel map under `details`;
 #   /ready  -- 503 while a check is not ok.
 # The `db` check reads the database's revision (alembic_version) -- one
-# query, also `alembic_head` -- as a SQLAlchemy expression, not a raw-SQL
-# text() string, per the no-raw-SQL house rule. The `redis` check is a
+# query, also `alembic_head` -- and is ok only when it is the head of the
+# image's migrations (app/core/schema.py, W6-2b): the API serves on a
+# foreign schema, not ready. The `redis` check is a
 # PING of comms' own Redis (REDIS_URL, which compose gives comms-app for
 # this alone): the client is built on the first check and closed with the
 # process. An empty REDIS_URL -- the suite -- is `redis: error`, not a
@@ -35,7 +36,6 @@ import structlog
 from fastapi import Depends, FastAPI
 from pydantic import JsonValue
 from redis.asyncio import Redis
-from sqlalchemy import column, select, table
 
 from app.api.body_limit import LimitRequestBody
 from app.api.changes import router as changes_router
@@ -60,11 +60,11 @@ from app.core.config import settings
 from app.core.database import (
     ProcessRole,
     dispose_engine,
-    get_engine,
     set_attempt_hold,
     set_process_role,
 )
 from app.core.logging import setup_logging
+from app.core.schema import code_head, read_revision
 from app.engine.formatters import channel_map, close_formatters, llm_set_map
 from app.engine.service import longest_attempt_hold
 from app.profile.loader import install_profile_from_settings
@@ -88,6 +88,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # The commit /health names: without it the API refuses to start, as
     # without its release (setup_logging) -- W3-1.
     commit_from_environment()
+    # The head the `db` check compares with: migrations that hold no one
+    # head refuse the start here, not on the first request (W6-2b).
+    code_head()
     set_process_role(ProcessRole.API)
     install_profile_from_settings()
     # The database's limits wait for an attempt as long as it may hold
@@ -160,20 +163,6 @@ app.include_router(channels_router)
 app.include_router(lanes_router)
 
 
-_ALEMBIC_VERSION = table("alembic_version", column("version_num"))
-
-
-async def read_revision() -> str:
-    """The `db` check: the database's revision, in one query; raises when
-    there is none to read (no alembic_version, an empty one)."""
-    engine = get_engine()
-    async with engine.connect() as conn:
-        revision = await conn.scalar(select(_ALEMBIC_VERSION.c.version_num))
-    if not isinstance(revision, str) or not revision:
-        raise LookupError("alembic_version holds no revision")
-    return revision
-
-
 _redis: Redis | None = None
 
 
@@ -208,6 +197,7 @@ def details() -> dict[str, JsonValue]:
 # Each callable looked up when it runs, so a test replaces it by name here.
 report = Report(
     db=lambda: read_revision(),
+    head=lambda: code_head(),
     checks={REDIS: lambda: redis_answers()},
     details=lambda: details(),
 )

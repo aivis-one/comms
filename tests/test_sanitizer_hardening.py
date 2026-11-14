@@ -52,6 +52,9 @@
 #   N8  a pattern with no inputs                    -> TestEveryPattern
 # TEST-1 -- one measure of time in the file:
 #   T1  an O(n^2) step in is_secret_name alone      -> TestLinearTime
+# W6-2b -- a DSN's password with "?" or "#" in it:
+#   Q1  the rest of the URL cut at "?" and "#" again (REV-6's
+#       expression) -> TestQueryMarksInAPassword
 # =============================================================================
 
 import decimal
@@ -181,10 +184,16 @@ class TestForms:
         (f"postgresql://comms:a/b+{_SECRET}==@db/comms",
          "postgresql://comms:[redacted]@db/comms"),
         (f"https://u:{_SECRET}@host/path?e=a@b.c",
-         "https://u:[redacted]@host/path?e=a@b.c"),
+         "https://u:[redacted]@b.c"),
         (f"redis://:p@{_SECRET}@h:6379/0", "redis://:[redacted]@h:6379/0"),
     ])
     def test_a_dsn(self, text: str, cleaned: str) -> None:
+        """The URL with an @ in its query was held cleaned to its host
+        ("...@host/path?e=a@b.c"): right while the password stopped at
+        "?" -- and so left a password with "?" or "#" whole. W6-2b runs
+        the password to the last @ before a space; the query's @ takes
+        the authority with it (app/core/sanitize.py, pattern 4's price),
+        the secret is gone either way."""
         assert sanitize_text(text) == cleaned
         assert sanitize_text(cleaned) == cleaned
 
@@ -373,13 +382,52 @@ class TestEveryPattern:
         (f"postgresql://comms:p@{_SECRET}/w@db/comms",
          "postgresql://comms:[redacted]@db/comms"),
         (f"https://u:{_SECRET}@host/path?e=a@b.c",
-         "https://u:[redacted]@host/path?e=a@b.c"),
+         "https://u:[redacted]@b.c"),
         ("redis://:@h:6379/0 down", "redis://:[redacted]@h:6379/0 down"),
         ("https://host:443/path", "https://host:443/path"),
     ])
     def test_the_last_at_as_before(self, text: str, cleaned: str) -> None:
+        """The query's @ case was held cleaned to its host: right while
+        the password stopped at "?" (REV-9); W6-2b took that stop away,
+        so the last @ before a space is the query's (test_a_dsn says
+        why)."""
         assert sanitize_text(text) == cleaned
         assert sanitize_text(cleaned) == cleaned
+
+
+class TestQueryMarksInAPassword:
+    """W6-2b, the review's B6: a password holds "?" and "#" as any other
+    character -- 3.14.0 cleaned them, REV-6 stopped the rest of the URL
+    at them and left such a password whole. Q1."""
+
+    @pytest.mark.parametrize("password", [
+        "Zx9?Qw#7", "a#b", "?a", "a@b?c", "a?b#c/d@e",
+    ])
+    @pytest.mark.parametrize(("head", "tail"), [
+        ("postgresql+asyncpg://comms:", "@db/comms"),
+        ("redis://:", "@comms-redis:6379/0"),
+        ("x postgresql://comms:", "@db/comms?ssl=1 next"),
+    ])
+    def test_the_password_goes_whole(
+        self, head: str, password: str, tail: str,
+    ) -> None:
+        text = head + password + tail
+        cleaned = sanitize_text(text)
+        assert cleaned == head + "[redacted]" + tail
+        assert sanitize_text(cleaned) == cleaned
+
+    def test_the_reviewer_s_dsn(self) -> None:
+        # Joined at runtime: a literal DSN with a password reads as a
+        # credential to a push scanner.
+        dsn = "postgresql+asyncpg://comms:" + "Zx9?" + "Qw#7" + "@db/comms"
+        assert sanitize_text(dsn) == "postgresql+asyncpg://comms:[redacted]@db/comms"
+
+    @pytest.mark.parametrize("text", [
+        "https://host:443/a?b#c", "see ://a:b?c#d", "https://host/p?q=a:b",
+    ])
+    def test_the_pair_no_at_no_userinfo(self, text: str) -> None:
+        """No @ after the colon: no userinfo, the text as it is."""
+        assert sanitize_text(text) == text
 
 
 class TestCookieHeader:

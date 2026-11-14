@@ -31,13 +31,17 @@
 #   - `checks` hold what comms does not work without: the database and
 #     Redis. The database check IS the read of its revision -- one query,
 #     whose answer is also `alembic_head`; no revision read, `db: error`;
+#     a revision that is not the code's head (app/core/schema.py, W6-2b)
+#     is `db: error` too, its `alembic_head` the database's still -- the
+#     machine's `migrate` compares that with the image's head;
 #   - the last revision read is kept between requests: a database that
 #     falls after it was measured reports `db: error` with that revision;
 #     before the first read `alembic_head` is null;
 #   - a check that turns to `error` is logged once (`health_check_failed`:
 #     the check, and the class and place of what stopped it -- a database
-#     error's SQLSTATE too, never a text), and again only after it was
-#     `ok` in between;
+#     error's SQLSTATE too, never a text; a foreign schema, the database's
+#     revision and the code's head), and again only after it was `ok` in
+#     between;
 #   - `details` is built from memory on every /health; one that is not a
 #     JSON object or is over DETAILS_LIMIT bytes is left out of the answer
 #     and named in the log (`health_details_refused`).
@@ -70,6 +74,7 @@ from app.core.config import settings
 from app.core.constants import MAX_REQUEST_BODY_BYTES
 from app.core.logging import RELEASE_VARIABLE
 from app.core.sanitize import db_error_summary, pipeline_error_of
+from app.core.schema import ForeignSchemaError
 
 logger = structlog.get_logger()
 
@@ -225,7 +230,8 @@ class Report:
     """The two routes of protocol 9 over comms' checks.
 
     `db` reads the database's revision in one query and raises when there
-    is none to read; `checks` are the other checks, each a coroutine
+    is none to read; `head` is the code's head, which that revision must
+    be for `db` to be ok; `checks` are the other checks, each a coroutine
     answering True when its dependency answers. `details` builds the free
     object of /health from memory -- no database, no network. A check is a
     coroutine that can be cancelled: one that blocks the event loop is not
@@ -236,12 +242,14 @@ class Report:
         self,
         *,
         db: Callable[[], Awaitable[str]],
+        head: Callable[[], str],
         checks: Mapping[str, Callable[[], Awaitable[bool]]],
         details: Callable[[], Mapping[str, JsonValue]],
     ) -> None:
         if DB in checks:
             raise ValueError(f"{DB!r} is the revision's check, not another")
         self._db = db
+        self._head = head
         self._checks = dict(checks)
         self._details = details
         self._last_head: str | None = None
@@ -286,7 +294,10 @@ class Report:
         results: dict[str, bool | Exception | None] = {}
         if isinstance(revision, str) and revision:
             self._last_head = revision
-            results[DB] = True
+            head = self._head()
+            results[DB] = (
+                True if revision == head else ForeignSchemaError(revision, head)
+            )
         else:
             results[DB] = revision if isinstance(revision, Exception) else None
         for name, outcome in zip(self._checks, outcomes, strict=True):
@@ -302,6 +313,11 @@ class Report:
             return "ok"
         if name not in self._failed:
             self._failed.add(name)
+            schema = (
+                {"schema": outcome.revision, "expects": outcome.head}
+                if isinstance(outcome, ForeignSchemaError)
+                else {}
+            )
             logger.warning(
                 "health_check_failed",
                 check=name,
@@ -310,6 +326,7 @@ class Report:
                     if isinstance(outcome, Exception)
                     else None
                 ),
+                **schema,
             )
         return "error"
 

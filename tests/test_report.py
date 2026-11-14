@@ -355,6 +355,9 @@ class TestTheTurn:
 
 class TestTheRevision:
     async def test_null_before_the_first_read_and_kept_after_the_fall(self) -> None:
+        """The Report takes the code's head since W6-2b (its revision must
+        be that head for `db` to be ok): this one is given the revision it
+        reads, which is all the test asked of it before."""
         reads: list[str | Exception] = [
             ConnectionRefusedError("down"), "0041_head", ConnectionRefusedError("down"),
         ]
@@ -368,7 +371,10 @@ class TestTheRevision:
         async def answers() -> bool:
             return True
 
-        report = Report(db=revision, checks={REDIS: answers}, details=lambda: {})
+        report = Report(
+            db=revision, head=lambda: "0041_head",
+            checks={REDIS: answers}, details=lambda: {},
+        )
         first = json.loads((await report.health()).body)
         assert first["alembic_head"] is None and first["checks"][DB] == "error"
         second = json.loads((await report.health()).body)

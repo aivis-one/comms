@@ -32,6 +32,10 @@
 # app/transport/push_relay.py relay_step_bound), and _main keeps the pulse
 # file the compose healthcheck reads.
 #
+# THE SCHEMA (W6-2b): _main starts neither loop on a schema that is not
+# the head of the image's migrations -- it ends the process naming both
+# (app/core/schema.py refuse_foreign_schema).
+#
 # Handles SIGTERM/SIGINT by cancelling both loop tasks. An entry caught
 # mid-flight rolls back UNACKED (cancellation interrupts inner
 # awaits); the next start's pending drain replays it -- at-least-once
@@ -53,6 +57,7 @@ from app.core.database import (
 )
 from app.core.logging import setup_logging
 from app.core.sanitize import sanitized_traceback
+from app.core.schema import refuse_foreign_schema
 from app.engine.service import longest_attempt_hold
 from app.profile.loader import install_profile_from_settings
 from app.transport.consumer import run_consumer_loop
@@ -67,7 +72,16 @@ _LOOP_NAMES = ("consumer", "push_relay")
 async def _main() -> None:
     """Run the consumer loop and the push relay with graceful shutdown
     on signals; the first loop to end ends both, and its exception is
-    raised once the other is cancelled and the engine disposed."""
+    raised once the other is cancelled and the engine disposed.
+
+    First of all, before either loop, a signal or the pulse: a schema
+    that is not the code's head refuses the start (app/core/schema.py,
+    W6-2b)."""
+    try:
+        await refuse_foreign_schema()
+    except BaseException:
+        await dispose_engine()
+        raise
     loop = asyncio.get_running_loop()
     tasks = (
         asyncio.ensure_future(run_consumer_loop()),

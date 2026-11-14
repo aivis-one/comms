@@ -366,10 +366,11 @@ def answer_text(answer: Answer, exc: Exception) -> str:
 
 
 # How long a STOP of the worker waits for a channel's answer to be
-# written (WK-3, record_channel_answer): under the 10 s Docker gives a
-# container between SIGTERM and SIGKILL, with the rest left for the
-# attempts' rollbacks, the formatters' close and the engine's dispose
-# (app/worker.py _main).
+# written (WK-3, record_channel_answer): under comms-worker's
+# stop_grace_period between SIGTERM and SIGKILL (deploy/docker-compose.yml,
+# held above this and _CUT_UNWIND_SECONDS by tests/test_deploy_hardening.py),
+# with the rest left for the attempts' rollbacks, the formatters' close
+# and the engine's dispose (app/worker.py _main).
 _RECORD_ON_STOP_SECONDS = 5.0
 
 # How long a write cut at that bound is given to unwind (its session
