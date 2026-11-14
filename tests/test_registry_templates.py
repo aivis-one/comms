@@ -81,7 +81,7 @@ class TestTemplateEngine:
         )
         assert text == "RU: privet"
 
-    def test_render_falls_back_to_default_locale(self) -> None:
+    def test_render_falls_back_to_default_language(self) -> None:
         """Locale without templates falls back to the deploy default (en)."""
         text = render(
             notification_type="unit_event",

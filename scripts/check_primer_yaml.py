@@ -15,18 +15,20 @@
 #      machine's lists -- `docker compose config` of the file (the binary
 #      alone, no daemon), every variable `${KEY:?}` and a key of `env`,
 #      no env_file, no host path, no name of another project,
-#      stop_for_migrate against the services. Every step must be green
-#      but `compose`, whose findings must be EXACTLY the list CEILING
-#      below: a finding beyond it is a defect of the compose file, one of
-#      it missing is a ceiling gone stale -- both red, by name;
+#      stop_for_migrate against the services. Every step must be green,
+#      `compose` among them, and must have run (W4-1: the profile's bind of
+#      a host path, the one finding allowed until then, is gone -- the
+#      profile is data comms takes, primer.yaml `accepts.profile`);
 #   2. the seams, as seams_check asks them of a box: half seams (a name of
 #      `provides` without its key of `env`), a seam under an option the
 #      product takes without it, routes of a co-located service, data the
 #      service does not accept, two pairs on one network -- against a
 #      product that takes comms with every option of comms on and gives
 #      every seam comms `requires` as a point of its own (W4-2: the
-#      product's storage, a ProvideAddress); each such seam must make a
-#      pair, the network the machine puts comms on. The product is a
+#      product's storage, a ProvideAddress) and every kind of data comms
+#      `accepts` (W4-1: the profile); each such seam must make a pair, the
+#      network the machine puts comms on, and each kind be taken. The
+#      product is a
 #      stand-in, parsed by the machine's loader too; it names nothing of
 #      any real product. `pridem check` reads one repository and asks no
 #      seam.
@@ -47,37 +49,7 @@
 # the file (a misspelt key never gets this far: the loader refuses any
 # unknown key).
 #
-# KNOWN CEILING (acknowledged by design -- W1-2, the profile's mount;
-# temporary, until W4-1):
-#   1. Mechanics: comms-app, comms-worker and comms-consumer bind the
-#      product profile from a literal host path, /srv/comms/profile
-#      (deploy/docker-compose.yml). The machine allows a bind of its
-#      release only, so `pridem check` and the box's `build` refuse the
-#      compose file with exactly CEILING, and the machine installs comms
-#      nowhere. Nothing installs comms with the machine before the tag
-#      v4.0.0, which comes after W4-1. A variable in the path
-#      (${PROFILE_DIR}, as on v3) is no way out: a variable that is not a
-#      key of `env` stops the check before `docker compose config`, and
-#      every other rule of the compose file would go unchecked. The text
-#      overlay has no form in compose until then (comms runs on the
-#      profile alone).
-#   2. Status: acknowledged by design -- temporary, until W4-1.
-#   3. Backlog ref: W4-1 -- the profile as data the service takes (form
-#      G, `accepts` of primer.yaml), with the overlay and the languages.
-#   4. Promotion trigger (observable): the machine's rule for data a
-#      service takes is in the commit of the machine CI pins, and
-#      primer.yaml declares `accepts`.
-#   5. Agreed fix: the profile and its overlay mounted by the machine
-#      (form G); CEILING empty, and with it this marker.
-#   6. Rejected: PROFILE_DIR as a key of `env` (a value of the box in a
-#      service's file, and a stand-in path of the check resolves into the
-#      release: the finding would vanish, the defect would stay); a named
-#      volume (no finding, an empty profile at the start -- a ceiling the
-#      check cannot see); the profile copied into the image (a profile is
-#      the product's, never comms').
-#
-# Exit 0 = the machine finds nothing but CEILING, 1 = findings (printed one
-# per line).
+# Exit 0 = the machine finds nothing, 1 = findings (printed one per line).
 # =============================================================================
 
 from __future__ import annotations
@@ -122,31 +94,26 @@ stacks:
     compose: docker-compose.yml
     expose: {{ files: {{ service: store, port: 9000, scheme: http }} }}
 dependencies:
-  {name}: {{ repo: {name}, version: ">=4.0.0,<5.0.0" }}
+  {name}: {{ repo: {name}, version: ">=4.0.0,<5.0.0", data: {{ {data} }} }}
 provides: {{ {provides} }}
 report: {{ health: /health, ready: /ready, logs: json, junit: true }}
 """
 # One seam the stand-in gives for each name of comms' `requires`.
 _PROVIDED = "{name}: {{ stack: stand-in, endpoint: files }}"
+# One directory of the stand-in's for each kind comms `accepts`.
+_GIVEN = "{kind}: comms-{kind}"
 
-# What `pridem check` may find in the compose file, and nothing else: the
-# KNOWN CEILING above, until W4-1. Sorted, as the machine sorts them.
-CEILING: tuple[str, ...] = (
-    "comms-app: volumes=/srv/comms/profile",
-    "comms-consumer: volumes=/srv/comms/profile",
-    "comms-worker: volumes=/srv/comms/profile",
-)
-# The step whose findings CEILING is; every other step must be green.
+# The step that reads the compose file: it must have run, and be green.
 _COMPOSE_STEP = "compose"
 
 
 def machine_check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
-    """What `pridem check <root>` finds beyond CEILING, and what it ran.
+    """What `pridem check <root>` finds, and what it ran.
 
     The verdict's steps, by the machine's own CLI in this process: a step
-    that is not green and not the compose step is a finding with its code;
-    the compose step must have run (the pair: a check that did not run
-    finds nothing) and found exactly CEILING."""
+    that is not green is a finding with its code, the compose step's with
+    every finding it names; the compose step must have run (the pair: a
+    check that did not run finds nothing)."""
     out, err = io.StringIO(), io.StringIO()
     code = run(["check", str(root), "--json"], out=out, err=err)
     try:
@@ -161,18 +128,11 @@ def machine_check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
         reason = step.get("reason") or {}
         if name == _COMPOSE_STEP and status in ("ok", "failed"):
             composed = True
-            given = sorted(reason.get("found", [])) if status == "failed" else []
-            if status == "failed" and reason.get("code") != "compose:compose-forbidden":
-                found.append(f"pridem check: compose: {reason.get('code')}")
-            found += [f"pridem check: {f}" for f in given if f not in CEILING]
+        if name == _COMPOSE_STEP and status == "failed":
+            found.append(f"pridem check: compose: {reason.get('code')}")
             found += [
-                f"pridem check: the ceiling is stale, the machine no longer "
-                f"finds: {f}"
-                for f in CEILING if f not in given
+                f"pridem check: {f}" for f in sorted(reason.get("found", []))
             ]
-            checked.append(
-                f"pridem check: compose found exactly the ceiling ({len(given)})"
-            )
         elif status != "ok":
             found.append(f"pridem check: {name} {status}: {reason.get('code')}")
         else:
@@ -201,6 +161,7 @@ def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
             options=", ".join(stack.options),
             name=stack.name,
             provides=", ".join(_PROVIDED.format(name=n) for n in stack.requires),
+            data=", ".join(_GIVEN.format(kind=kind) for kind in stack.accepts),
         ),
         "the stand-in product",
     )
@@ -226,6 +187,9 @@ def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
         )
     checked.append(f"seams: provides {', '.join(stack.provides)}")
     checked.append(f"seams: requires {', '.join(stack.requires)}, each a pair")
+    if not stack.accepts:
+        found.append("accepts is empty: comms takes the product's profile as data")
+    checked.append(f"seams: accepts {', '.join(stack.accepts)}, each taken")
 
     for entry, stage in stack.stacks.items():
         if not stage.persistent:

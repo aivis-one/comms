@@ -330,6 +330,10 @@ class TestStartupRefusal:
                 "TELEGRAM_ENABLED": "true",
                 "EMAIL_ENABLED": "false",
                 "LLM_ENABLED": "false",
+                # Required at every start since W4-1; not what this
+                # class is about.
+                "LANGUAGES": "en",
+                "DEFAULT_LANGUAGE": "en",
                 **env,
             },
             capture_output=True,

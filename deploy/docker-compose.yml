@@ -7,7 +7,7 @@
 # project name, the values and the networks towards the product are the
 # machine's (contract 3, protocol 3.3-3.4). `pridem check` holds this file
 # to the machine's rules in CI (scripts/check_primer_yaml.py, job
-# `machine`); the one finding it is allowed is the profile's mount, below.
+# `machine`), with no finding allowed.
 #
 # FIVE services, THREE of them from the ONE root Dockerfile (same image,
 # different commands):
@@ -46,17 +46,45 @@
 # The three application services are also on `default`: they reach the
 # channels' providers (Telegram, Mailgun, the llm gateways).
 #
-# THE PROFILE -- temporarily, until W4-1: a literal bind of a host path,
-# the one finding the machine is allowed here (KNOWN CEILING in
-# scripts/check_primer_yaml.py, the full marker). The text overlay
-# (TEMPLATES_OVERLAY_DIR) has no form here until W4-1: comms runs on the
-# profile alone.
+# THE PROFILE is not in this file (W4-1): it is data comms takes from
+# the product (primer.yaml `accepts.profile`, form D of protocol 4.5).
+# The machine copies the product's directory, runs `comms validate
+# --profile <dir>` on it in a throwaway container of the new image, and
+# its own override binds the copy read-only and sets TEMPLATES_DIR to it.
+# The text overlay (TEMPLATES_OVERLAY_DIR) has no form here: the machine
+# has no kind of data for it, and comms runs on the profile alone.
+#
+# KNOWN CEILING (acknowledged by design -- the profile on comms-app alone):
+#   1. Mechanics: the machine binds the data a service takes, and sets its
+#      variable, on the service's `app` only -- comms-app (pridem
+#      steps/build.py: data_binds on the entry's app service, at the
+#      commit CI's job `machine` pins). comms-worker and comms-consumer
+#      read the profile too (install_profile_from_settings in
+#      app/worker.py and app/consumer.py), get no TEMPLATES_DIR, and
+#      refuse to start outside development: comms-app comes up, the two
+#      do not, and the machine installs comms nowhere yet.
+#   2. Status: acknowledged by design.
+#   3. Backlog ref: none in comms -- the machine's: a letter to Primer
+#      (gate W4-1) that a kind of data is bound on every application
+#      service of the entry, not on `app` alone.
+#   4. Promotion trigger (observable): the machine, at the commit CI's
+#      job `machine` pins, puts the bind and the variable of an accepted
+#      kind on comms-worker and comms-consumer as on comms-app.
+#   5. Agreed fix: nothing in this file -- the machine's override carries
+#      it; the ref of the job `machine` raised, this marker removed, and
+#      with it the pointer to it in deploy/INTEGRATION.md section 3.
+#   6. Rejected: a host path, or a named volume comms-app fills for the
+#      other two (the machine refuses a host path; a volume is a second
+#      copy, empty at their start); `volumes_from` (not a key a service
+#      may have, the machine's SERVICE_KEYS); the profile served by
+#      comms-app or kept in the database (a second way to read one
+#      profile, and the worker made to wait on the API); the profile
+#      copied into the image (a profile is the product's, never comms').
 # =============================================================================
 
 # What every application process reads from the instance, by the keys of
 # primer.yaml `env` (tests/test_primer_yaml.py holds both ways).
 x-comms-env: &comms-env
-  TEMPLATES_DIR: /profile
   DATABASE_URL: postgresql+asyncpg://comms:${POSTGRES_PASSWORD:?}@comms-postgres:5432/comms
   COMMS_SERVICE_TOKEN: ${COMMS_SERVICE_TOKEN:?}
   TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:?}
@@ -70,6 +98,8 @@ x-comms-env: &comms-env
   EMAIL_MAILGUN_REGION: ${EMAIL_MAILGUN_REGION:?}
   LLM_KEY_SETS: ${LLM_KEY_SETS:?}
   PRODUCT_STORAGE_ADDRESS: ${PRODUCT_STORAGE_ADDRESS:?}
+  LANGUAGES: ${LANGUAGES:?}
+  DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:?}
 
 services:
   comms-app:
@@ -83,8 +113,6 @@ services:
       # Only for the `redis` check of /health and /ready (W3-1,
       # app/main.py): the API reads no stream.
       REDIS_URL: redis://:${COMMS_EVENTS_PASSWORD:?}@comms-redis:6379/0
-    volumes:
-      - /srv/comms/profile:/profile:ro
     depends_on:
       comms-postgres: { condition: service_healthy }
       comms-redis: { condition: service_healthy }
@@ -107,8 +135,6 @@ services:
       context: ..
     environment: *comms-env
     command: ["python", "-m", "app.worker"]
-    volumes:
-      - /srv/comms/profile:/profile:ro
     depends_on:
       # The schema is migrated before `up` (the machine's `migrate`):
       # the worker waits for its database only, not for the API.
@@ -137,8 +163,6 @@ services:
       # The consumer alone reads Redis (app/transport/connection.py).
       REDIS_URL: redis://:${COMMS_EVENTS_PASSWORD:?}@comms-redis:6379/0
     command: ["python", "-m", "app.consumer"]
-    volumes:
-      - /srv/comms/profile:/profile:ro
     depends_on:
       comms-postgres: { condition: service_healthy }
       comms-redis: { condition: service_healthy }

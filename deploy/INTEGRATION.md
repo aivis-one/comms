@@ -123,7 +123,7 @@ instead, and the letter takes your own title and body (the default label
 for a button). A telegram title and body whose HTML Telegram would not
 parse, checked together as they are sent, for a recipient of every
 locale of the profile -- each field by the chain the send walks (the
-recipient's locale, then `DEFAULT_LOCALE`), and a variable standing as a
+recipient's locale, then `DEFAULT_LANGUAGE`), and a variable standing as a
 value with a link's characters -- a tag Telegram does not support
 (`<div>`, `<br>`), one left open or closed out of order, a raw `<`
 (write `&lt;`), a variable in an unquoted attribute (`<a href={link}>`
@@ -134,18 +134,78 @@ directory); a hidden entry (`.gitkeep`, `.DS_Store`) is skipped. No
 you write them; a directory beside `types.yaml` and `templates/` is only
 logged (`profile_unknown_directory`) -- the start goes on.
 
-It is delivered by BIND, not by a copy, read-only at `/profile` in the
-three comms processes (`TEMPLATES_DIR=/profile`). **Temporarily, until
-W4-1**, the bind is of the host path `/srv/comms/profile`: the machine
-refuses a host path, so comms is installed by it nowhere until W4-1
-brings the profile as data comms takes (`accepts` of `primer.yaml`).
-Consequences that hold either way:
+**What else the start refuses across the languages.** A type with a
+sheet in one language of the profile has a sheet in each: a text falls
+back to the instance's default language, and the profile cannot know
+which of its languages that is. And at the start, with the instance
+known: a profile that has templates but none in `DEFAULT_LANGUAGE`
+(section "Languages" below). The variables of a type are not held across
+the languages: a language may have a variable of its own
+(`{topic_line_en}` beside `{topic_line_ru}`).
+
+**How it is delivered: data comms takes.** Your `primer.yaml` names the
+directory under the dependency on comms -- `dependencies.comms.data:
+{profile: <its path in your repository>}` -- and comms' `primer.yaml`
+takes that kind of data:
+
+    accepts:
+      profile: { validate: "comms validate --profile <dir>", env: TEMPLATES_DIR }
+
+On a rollout the machine copies the directory, runs `comms validate
+--profile <dir>` on the copy in a throwaway container of the new comms
+image -- no network, nothing of the instance but the path -- **before**
+the migration, and only then binds the copy read-only at
+`/primer/data/profile` with `TEMPLATES_DIR` naming it. A profile the
+validator refuses stops the rollout there: comms stays on its old image
+and its old profile. Without `data: {profile: ...}` comms gets no
+profile, and its start is refused.
+
+**`comms validate --profile <dir>`** is the loader of comms' start. Exit
+0: the profile is good, one line on stdout. Otherwise exit 1, and every
+problem on its own line on stderr -- the file, the type, why -- not the
+first alone; a templates file that is not YAML is one problem, and the
+other files are checked on (a `types.yaml` that is not YAML, or of
+another schema version, is reported alone). It knows no instance: each
+language of the profile is checked as the default an instance may have,
+and that `DEFAULT_LANGUAGE` has templates is the start's to say. Run it
+in your own CI on your profile with the comms image you pin.
+
+**On comms-app alone, for now.** The machine binds the data a service
+takes on that service's `app` only -- comms-app; `comms-worker` and
+`comms-consumer` read the profile too and get no `TEMPLATES_DIR`, so
+they do not start (the KNOWN CEILING in comms' `deploy/docker-compose.yml`).
+The end of it is the machine's.
+
+Consequences:
 
 - editing a template is a commit in the product repo plus a roll-out;
   there is no second copy on the comms side to keep in step;
-- comms validates the profile at startup and refuses to boot on a broken
-  one, so a bad template commit can take the running comms stack down.
-  Recovery is to revert that commit and roll out again.
+- a bad template commit is refused before the rollout touches comms; if
+  the start refuses what only the instance can say (its default
+  language), recovery is to revert that commit and roll out again.
+
+### Languages -- `LANGUAGES` and `DEFAULT_LANGUAGE`
+
+comms has no languages of its own: they are its product's, from the
+instance's passport (`primer.yaml` `env`, source `passport`, keys
+`languages` and `default_language`).
+
+| variable | form |
+|---|---|
+| `LANGUAGES` | codes joined by commas, no spaces -- `en,ru,uk`; each two or three lower-case letters, no region; at least one, each once |
+| `DEFAULT_LANGUAGE` | one code, among `LANGUAGES` |
+
+Both are required: a start without either, or with one of another form,
+is refused naming it.
+
+**Which language a letter is in.** The recipient's `locale` (section 7,
+`user_upserted`) as you wrote it, compared byte for byte with the
+languages of the profile -- `en-GB` and `EN` are no `en`. Each field is
+looked up in that language, then in `DEFAULT_LANGUAGE`, then the stored
+`title`/`body` you sent. A recipient with no `locale`, or one the profile
+has no texts in -- `uk` of a profile in `en` and `ru` -- gets the
+default's. `LANGUAGES` decides nothing of it: it is read at the start
+only, to hold `DEFAULT_LANGUAGE` to it.
 
 ### The type record -- every field
 
@@ -193,8 +253,8 @@ product's).
 
 **Seam.** `TEMPLATES_OVERLAY_DIR` names the directory inside the
 container; empty or absent -> no overlay, the profile's texts exactly as
-they are. On a box it has no mount until W4-1, which brings it with the
-profile: until then it is empty there, and the overlay is off.
+they are. On a box it has no mount -- the machine has no kind of data for
+it -- so it is empty there, and the overlay is off.
 
 **Form.** `{locale}.yaml` files directly in the directory -- no
 `types.yaml`, no `templates/` -- each of the shape of

@@ -73,6 +73,10 @@ jobs:
       TELEGRAM_ENABLED: "false"
       EMAIL_ENABLED: "false"
       LLM_ENABLED: "false"
+      # The instance's languages (W4-1), required at every start, as the
+      # passport gives them on a box: a start without them is refused.
+      LANGUAGES: en,ru
+      DEFAULT_LANGUAGE: en
       # The release every log line names (W3-2, protocol 9.4): what the
       # image carries from the machine's build argument (job `image`),
       # here from the run -- a process of comms without it refuses to
@@ -299,6 +303,9 @@ jobs:
       TELEGRAM_ENABLED: "false"
       EMAIL_ENABLED: "false"
       LLM_ENABLED: "false"
+      # The instance's languages, as in `checks` (W4-1).
+      LANGUAGES: en,ru
+      DEFAULT_LANGUAGE: en
       PART_ARGS: ${{ needs.checks.outputs[format('part{0}', matrix.part)] }}
       # The release every log line names, as in `checks` (W3-2).
       PRIMER_RELEASE: ${{ github.ref_name }}
@@ -504,10 +511,11 @@ jobs:
       # secret scanning), llm switched off -- its key not read.
       # THE PROFILE IS MOUNTED, AS ON A BOX (TX-4 FIX): the image carries
       # app/ and migrations/, not tests/ -- so the test profile is mounted
-      # read-only on /profile and TEMPLATES_DIR names it, the same path
-      # deploy/docker-compose.yml gives comms-app (tests/test_deploy_hardening.py
+      # read-only on /primer/data/profile and TEMPLATES_DIR names it, the
+      # path the machine gives comms-app the profile at (W4-1: primer.yaml
+      # `accepts.profile`, /primer/data/<kind>; tests/test_deploy_hardening.py
       # holds both: every /app path of this step is in the image or
-      # mounted, and TEMPLATES_DIR is the compose file's).
+      # mounted, and TEMPLATES_DIR is the machine's path of the kind).
       # Once per build is enough: in part 1 only (CI-2) -- the same image
       # is built in each part, and the start says the same of each.
       # REDIS TOO (W3-1): /ready is 200 only with every check ok, the
@@ -531,6 +539,7 @@ jobs:
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \
+            -e LANGUAGES=en,ru -e DEFAULT_LANGUAGE=en \
             comms:ci $migrate
           redis=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-redis']['image'])")
           docker run -d --name comms-redis --network host "$redis" redis-server --port 6379
@@ -540,11 +549,12 @@ jobs:
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e REDIS_URL=redis://127.0.0.1:6379/0 \
-            -v "$PWD/tests/fixtures/profile:/profile:ro" \
-            -e TEMPLATES_DIR=/profile \
+            -v "$PWD/tests/fixtures/profile:/primer/data/profile:ro" \
+            -e TEMPLATES_DIR=/primer/data/profile \
             -e TELEGRAM_ENABLED=true \
             -e EMAIL_ENABLED=true \
             -e LLM_ENABLED=false \
+            -e LANGUAGES=en,ru -e DEFAULT_LANGUAGE=en \
             -e TELEGRAM_BOT_TOKEN="$token" \
             -e TELEGRAM_BOT_URL=https://t.me/comms_ci_bot \
             -e EMAIL_MAILGUN_API_KEY=ci-not-a-provider-key \
@@ -589,6 +599,15 @@ jobs:
             exit 1
           fi
           echo "comms derive bot-id: $id"
+          # W4-1: the profile's validator, as the machine runs it -- the
+          # command of primer.yaml `accepts.profile`, <dir> the copy's
+          # path, in a throwaway container with no network and nothing of
+          # the instance but that path.
+          validate=$(python -c "import yaml; print(yaml.safe_load(open('primer.yaml'))['accepts']['profile']['validate'])")
+          docker run --rm --network none --cap-drop ALL \
+            -v "$PWD/tests/fixtures/profile:/primer/data/profile:ro" \
+            -e TEMPLATES_DIR=/primer/data/profile \
+            comms:ci ${validate//<dir>//primer/data/profile}
 
       # In the test stage, as the deploy machine runs it (W1-1): its
       # Python, Debian and packages, and its own copy of the tree --
@@ -601,4 +620,5 @@ jobs:
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \
+            -e LANGUAGES=en,ru -e DEFAULT_LANGUAGE=en \
             comms:test sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50 $PART_ARGS"

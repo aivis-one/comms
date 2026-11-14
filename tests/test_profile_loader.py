@@ -355,7 +355,7 @@ class TestLocaleFallbackChain:
             locale="ru", variables={"body": "B"},
         ) == "RU: B"
 
-    def test_step2_default_locale_fallback(self) -> None:
+    def test_step2_default_language_fallback(self) -> None:
         """A field missing in `ru` falls back to the `en` template."""
         assert render(
             "unit_event", "telegram", "title",

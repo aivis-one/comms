@@ -593,7 +593,7 @@ class TelegramFormatter:
         locale = (
             recipient.locale
             if recipient.locale is not None
-            else settings.default_locale
+            else settings.default_language
         )
 
         # A placeholder (TPL-1) enters ParseMode.HTML too: escaped like a
@@ -939,7 +939,7 @@ class EmailFormatter:
         locale = (
             recipient.locale
             if recipient.locale is not None
-            else settings.default_locale
+            else settings.default_language
         )
 
         rendered_subject = render_field(

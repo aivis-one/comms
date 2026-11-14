@@ -119,10 +119,22 @@ unit_event_email:
   email:
     subject: "Static subject"
 """
+# The ru base has a sheet for every type the en base has (W4-1: the
+# loader refuses a type missing in a language of the profile) -- its own
+# body only for unit_event, the rest the en texts as they are.
 _BASE_RU = """
 unit_event:
   telegram:
     body: "RU: {body}"
+unit_presented:
+  telegram:
+    title: "{title}"
+unit_event_in_app:
+  telegram:
+    title: "{title}"
+unit_event_email:
+  email:
+    subject: "Static subject"
 """
 
 
@@ -747,25 +759,31 @@ _APP_SERVICES = ("comms-app", "comms-worker", "comms-consumer")
 
 
 class TestTheDeployForms:
-    def test_compose_gives_the_overlay_nothing_until_w4_1(self) -> None:
+    def test_compose_gives_the_overlay_nothing(self) -> None:
         """M11. Until W1-2 compose handed every process the overlay as
         TEMPLATES_OVERLAY_DIR=${PROFILE_OVERLAY_DIR:+/profile-overlay}
         with a bind of PROFILE_OVERLAY_DIR, a host variable of the old
         installer. The machine takes no variable that is not a key of
-        primer.yaml `env`, and the overlay's form on a box is W4-1's: so
-        no process gets the variable or a mount at /profile-overlay -- the
-        overlay is off, the setting's default. The pair: the profile
-        itself is handed over, at the setting's own name."""
+        primer.yaml `env`, and has no kind of data for the overlay: so no
+        process gets the variable or a mount -- the overlay is off, the
+        setting's default. The pair: the profile itself is handed over,
+        at the setting's own name -- since W4-1 by the machine (primer.yaml
+        `accepts.profile`), no longer by compose: was "compose sets
+        TEMPLATES_DIR=/profile and binds /srv/comms/profile", a host path
+        the machine refuses."""
         compose = yaml.safe_load((_DEPLOY / "docker-compose.yml").read_text())
+        primer = yaml.safe_load((_REPO / "primer.yaml").read_text())
         name = "templates_overlay_dir".upper()
         assert "templates_overlay_dir" in Settings.model_fields
         assert Settings.model_fields["templates_overlay_dir"].default == ""
         for service in _APP_SERVICES:
             spec = compose["services"][service]
             assert name not in spec["environment"], service
-            assert not [v for v in spec["volumes"] if "/profile-overlay" in str(v)]
-            assert spec["environment"]["TEMPLATES_DIR"] == "/profile", service
-            assert "/srv/comms/profile:/profile:ro" in spec["volumes"], service
+            assert "volumes" not in spec, service
+            assert "TEMPLATES_DIR" not in spec["environment"], service
+        assert primer["accepts"]["profile"]["env"] == "TEMPLATES_DIR"
+        assert "templates_dir" in Settings.model_fields
+        assert [a["env"] for a in primer["accepts"].values()] == ["TEMPLATES_DIR"]
 
     def test_the_env_name_reaches_the_setting(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -788,11 +806,13 @@ class TestTheDeployForms:
     ) -> None:
         """The contract in INTEGRATION.md against the code: the names,
         the mount, the info line, the core variables, the in_app line,
-        and the refusal a reader is told to expect."""
+        and the refusal a reader is told to expect. The mount was "none
+        until W4-1"; W4-1 brought the profile as data and none for the
+        overlay -- the machine has no kind of data for it."""
         text = (_DEPLOY / "INTEGRATION.md").read_text()
         section = text[text.index("### `TEMPLATES_OVERLAY_DIR`"):
                        text.index("### `lane`")]
-        for name in ("TEMPLATES_OVERLAY_DIR", "W4-1",
+        for name in ("TEMPLATES_OVERLAY_DIR", "the machine has no kind of data for",
                      "in_app", "overrides=0", "`{locale}.yaml`"):
             assert name in section, name
         for variable in CORE_VARIABLES:

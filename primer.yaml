@@ -55,6 +55,11 @@ env:
   TELEGRAM_ENABLED: { source: passport, key: options.telegram }
   EMAIL_ENABLED: { source: passport, key: options.email }
   LLM_ENABLED: { source: passport, key: options.llm }
+  # The instance's languages and its default (protocol 5.2.2): comms has
+  # none of its own -- its product's, from the passport (W4-1). A text
+  # falls back to DEFAULT_LANGUAGE (app/engine/template_engine.py).
+  LANGUAGES: { source: passport, key: languages }
+  DEFAULT_LANGUAGE: { source: passport, key: default_language }
   TELEGRAM_BOT_TOKEN: { source: asked, when: telegram }
   # The host deep links are built on (decision 13: a domain lives in the
   # environment, never in code); read by `comms derive bot-url` only.
@@ -71,6 +76,17 @@ env:
   # 4.7). Not under `when: llm`: the machine checks `requires` whatever the
   # options, and /health answers for it with the llm channel off too.
   PRODUCT_STORAGE_ADDRESS: { source: seam, from: product }
+
+# The data comms takes from the product (W4-1, form D of protocol 4.5):
+# the product's profile -- its directory named in the product's
+# `dependencies.comms.data.profile`. The machine copies it, runs
+# `validate` with <dir> the copy's path in a throwaway container of the
+# new image (no network, nothing of the instance but that path) before
+# the migration, and gives the path under `env` -- TEMPLATES_DIR, the
+# variable comms reads; it is not a key of `env` above (S.accepts-env).
+# The validator is the loader of comms' start (app/cli.py validate).
+accepts:
+  profile: { validate: "comms validate --profile <dir>", env: TEMPLATES_DIR }
 
 # What comms takes from the product (W4-2): /health says whether it was
 # given (`seams.requires_satisfied`, app/api/report.py).

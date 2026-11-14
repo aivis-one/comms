@@ -52,6 +52,21 @@
 #   SQLAlchemy cannot parse is quoted whole, its password with it.
 #   BOUNDED: COUNT_CONNECT_TIMEOUT for the connection, COUNT_TIMEOUT for the
 #   whole count -- a database that does not answer is a refusal, not a hang.
+#
+# `comms validate --profile <dir>` (W4-1) checks a product profile with
+# the loader of comms' start (app/profile/loader.py validate_profile), for
+# the machine's `validate` of primer.yaml `accepts.profile`: before a
+# rollout, in a throwaway container of the new image with no network and
+# nothing of the instance but the profile's path. Exit 0: the profile is
+# good, one line on stdout. Otherwise exit 1 and EVERY problem, one line
+# each on stderr -- the file, the type, why -- never the first alone.
+#   NO SETTINGS: the loader reads none at import, and the checks that
+#   read the deploy take the numbers of every box and no instance
+#   (INSTANCE_NOT_KNOWN): each language of the profile is checked as the
+#   default an instance may have. What only the instance can say -- that
+#   its DEFAULT_LANGUAGE has templates -- the start checks.
+#   A failure of the check itself, not of the profile: by its class alone,
+#   exit 1, as the commands above.
 # =============================================================================
 
 import argparse
@@ -60,6 +75,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlunsplit
 
@@ -286,7 +302,42 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "count", help="print how many threads and messages the database holds",
     )
+    validate = commands.add_parser(
+        "validate", help="check a product profile as comms' start checks it",
+    )
+    validate.add_argument(
+        "--profile", required=True, help="the profile's directory",
+    )
     return parser
+
+
+def validate_profile_at(profile: str) -> tuple[str, ...]:
+    """Every problem of the profile at `profile`, one line each: empty
+    when it is good. The loader is imported here, not at the top: `derive`
+    and `count` do not need it."""
+    from app.profile.loader import validate_profile
+
+    return tuple(
+        " ".join(line.strip() for line in finding.splitlines() if line.strip())
+        for finding in validate_profile(Path(profile))
+    )
+
+
+def _validate(profile: str) -> int:
+    """`comms validate --profile <dir>`: 0 and one line on stdout, or 1
+    and every problem, one line each on stderr."""
+    label = "comms validate"
+    try:
+        findings = validate_profile_at(profile)
+    except Exception as error:
+        print(f"{label}: failed ({type(error).__name__})", file=sys.stderr)
+        return 1
+    for finding in findings:
+        print(f"{label}: {finding}", file=sys.stderr)
+    if findings:
+        return 1
+    print(f"{label}: the profile at {profile} is good")
+    return 0
 
 
 def main(
@@ -294,8 +345,11 @@ def main(
     environ: Mapping[str, str] | None = None,
 ) -> int:
     """`comms derive <name>` / `comms count`: the value on stdout and 0,
-    or one line on stderr and 1 (2: a wrong command line)."""
+    or one line on stderr and 1 (2: a wrong command line). `comms
+    validate --profile <dir>`: _validate."""
     args = _parser().parse_args(argv)
+    if args.command == "validate":
+        return _validate(args.profile)
     source = os.environ if environ is None else environ
     produce: Callable[[Mapping[str, str]], str]
     if args.command == "count":

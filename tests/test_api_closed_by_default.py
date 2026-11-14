@@ -67,11 +67,13 @@ def _settings_in_a_fresh_process(
     **env: str,
 ) -> subprocess.CompletedProcess[str]:
     """Build the settings as a deploy does: a fresh process, an
-    environment holding exactly `env` -- no APP_ENV unless given."""
+    environment holding exactly `env` -- no APP_ENV unless given -- and
+    the instance's languages, which every start requires (W4-1): these
+    tests are about APP_ENV and the token, not the languages."""
     return subprocess.run(
         [sys.executable, "-c", program],
         cwd=REPO_ROOT,
-        env={"PATH": "/usr/bin:/bin", **env},
+        env={"PATH": "/usr/bin:/bin", **_LANGUAGES, **env},
         capture_output=True,
         text=True,
         timeout=120,
@@ -83,6 +85,8 @@ _DATABASE = {"DATABASE_URL": "postgresql+asyncpg://u:p@db/comms_unit"}
 # Every channel's flag, written (W2-1: required at every start): these
 # tests are about APP_ENV and the token, not the channels.
 _CHANNELS_OFF = dict.fromkeys(channel_flag_keys(), "false")
+# The instance's languages, required at every start since W4-1.
+_LANGUAGES = {"LANGUAGES": "en", "DEFAULT_LANGUAGE": "en"}
 _READ = "from app.core.config import settings; print(settings.app_env, settings.is_dev)"
 
 

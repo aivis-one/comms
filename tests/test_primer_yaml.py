@@ -37,6 +37,10 @@ _PRIMER: dict[str, Any] = yaml.safe_load(
 _ENV: dict[str, dict[str, Any]] = _PRIMER["env"]
 _PROVIDES: list[str] = _PRIMER["provides"]
 _REQUIRES: list[str] = _PRIMER["requires"]
+_ACCEPTS: dict[str, dict[str, str]] = _PRIMER["accepts"]
+# The variable of each kind of data comms takes: the machine's, never a
+# key of `env` (S.accepts-env, W4-1).
+_ACCEPTED_ENV: set[str] = {kind["env"] for kind in _ACCEPTS.values()}
 
 # Every setting by its variable, with its default in code.
 _DEFAULTS: dict[str, Any] = {
@@ -49,8 +53,9 @@ _DEFAULTS: dict[str, Any] = {
 NOT_IN_ENV: dict[str, str] = {
     "DATABASE_URL": "built by compose from POSTGRES_PASSWORD (W1-2)",
     "REDIS_URL": "built by compose from COMMS_EVENTS_PASSWORD (W1-2)",
-    "TEMPLATES_DIR": "the profile's mount point, a constant of compose (W1-2)",
-    "TEMPLATES_OVERLAY_DIR": "no mount on a box until W4-1: empty, no overlay (W1-2)",
+    "TEMPLATES_OVERLAY_DIR": (
+        "the machine has no kind of data for the overlay: empty, no overlay"
+    ),
     "COMMS_SERVICE_TOKEN_NEXT": (
         "the machine has no change of key yet (Primer's letter of 12.11)"
     ),
@@ -100,7 +105,9 @@ class TestEnvIsWhatCommsReads:
     def test_every_value_comms_needs_is_in_env_or_said_why(self) -> None:
         needed = {key for key, value in _DEFAULTS.items() if _unset_default(value)}
         assert "TELEGRAM_ENABLED" in needed  # the pair: the flags are among them
-        assert sorted(needed - set(_ENV) - set(NOT_IN_ENV)) == []
+        assert sorted(
+            needed - set(_ENV) - set(NOT_IN_ENV) - _ACCEPTED_ENV,
+        ) == []
 
     def test_the_exceptions_are_still_exceptions(self) -> None:
         """A row of NOT_IN_ENV is a setting with no default of its own and
@@ -118,6 +125,44 @@ class TestEnvIsWhatCommsReads:
 
 
 _CHANNELS = [spec for spec in CHANNEL_SPECS if spec.flag is not None]
+
+
+class TestTheProfileIsData:
+    """W4-1: the profile comes as data comms takes (form D of protocol
+    4.5): `accepts.profile`, checked by `comms validate --profile <dir>`
+    and given under TEMPLATES_DIR, the setting comms reads -- never a key
+    of `env`, which the machine refuses (S.accepts-env). Mutations: the
+    kind removed, TEMPLATES_DIR back in `env` or among NOT_IN_ENV."""
+
+    def test_the_profile_is_accepted_under_the_setting_comms_reads(self) -> None:
+        assert set(_ACCEPTS) == {"profile"}
+        assert _ACCEPTS["profile"]["env"] == "TEMPLATES_DIR"
+        assert "templates_dir" in Settings.model_fields
+        assert _unset_default(_DEFAULTS["TEMPLATES_DIR"])
+
+    def test_the_path_is_not_a_key_of_env(self) -> None:
+        assert _ACCEPTED_ENV  # the pair: there is a variable to keep out
+        assert _ACCEPTED_ENV.isdisjoint(_ENV)
+        assert _ACCEPTED_ENV.isdisjoint(NOT_IN_ENV)
+
+    def test_the_validator_is_the_comms_command(self) -> None:
+        """The command the machine runs, <dir> its copy's path, is the
+        `comms` command of the image (bin/comms -> app/cli.py main), and
+        its parser takes it as written."""
+        words = _ACCEPTS["profile"]["validate"].split()
+        assert words[:2] == ["comms", "validate"]
+        assert "<dir>" in words
+        parsed = cli._parser().parse_args(
+            [w.replace("<dir>", "/primer/data/profile") for w in words[1:]],
+        )
+        assert (parsed.command, parsed.profile) == ("validate", "/primer/data/profile")
+
+    def test_the_languages_come_from_the_passport(self) -> None:
+        """W4-1: comms has no languages of its own (protocol 5.2.2)."""
+        assert _ENV["LANGUAGES"] == {"source": "passport", "key": "languages"}
+        assert _ENV["DEFAULT_LANGUAGE"] == {
+            "source": "passport", "key": "default_language",
+        }
 
 
 class TestChannels:

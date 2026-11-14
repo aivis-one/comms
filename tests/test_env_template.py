@@ -23,7 +23,9 @@
 #   writers  the `# by:` line above each variable: `primer.yaml` are
 #            exactly the names compose substitutes, each a key of
 #            primer.yaml `env`; `compose` are exactly the names compose
-#            sets. Until W1-2 the writers were the old installer's, held
+#            sets; `machine` are exactly the variables of the kinds of
+#            data primer.yaml `accepts` (W4-1), which the machine's own
+#            override sets. Until W1-2 the writers were the old installer's, held
 #            to its generate_env, and compose's own values were left out
 #            of the file; the installer is gone, and a value compose sets
 #            is written as compose sets it, held here.
@@ -53,7 +55,7 @@ _COMPOSE = (_REPO / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
 _PRIMER = yaml.safe_load((_REPO / "primer.yaml").read_text(encoding="utf-8"))
 
 _LINE = re.compile(r"^(#?)([A-Z][A-Z0-9_]+)=(.*)$")
-_WRITERS = {"primer.yaml", "compose", "default"}
+_WRITERS = {"primer.yaml", "compose", "machine", "default"}
 
 # Variables of the template that are not settings: keys of primer.yaml
 # `env` the compose file reads to build a setting or to give a datastore
@@ -143,10 +145,12 @@ def _code_lines(text: str) -> str:
 class TestBothWays:
     def test_compose_sets_what_it_builds(self) -> None:
         """The pair of the compose rows: compose sets values, the two URLs
-        it builds and the profile's mount point among them, all of them
-        settings."""
+        it builds among them, all of them settings. Until W4-1 the
+        profile's mount point was one of them; the machine sets it now
+        (TestWriters.test_the_machines_own_are_the_accepted_kinds)."""
         set_here = _compose_environment(_COMPOSE)
-        assert {"TEMPLATES_DIR", "DATABASE_URL", "REDIS_URL"} <= set_here
+        assert {"DATABASE_URL", "REDIS_URL"} <= set_here
+        assert "TEMPLATES_DIR" not in set_here
         assert set_here <= _settings()
 
     def test_a_name_in_a_compose_comment_is_not_set(self) -> None:
@@ -178,8 +182,9 @@ class TestBothWays:
         assert _settings() - written == set()
         # The pair: the walk compared settings, the knobs a review named
         # among them. 50 since W1-2 (48 written before, and the two URLs);
-        # 49 since W5-1, DLQ_MAXLEN gone with the dead letters.
-        assert len(_settings()) == 49
+        # 49 since W5-1, DLQ_MAXLEN gone with the dead letters; 50 since
+        # W4-1, the default-locale setting gone, LANGUAGES and DEFAULT_LANGUAGE new.
+        assert len(_settings()) == 50
         assert {
             "NOTIFICATION_RETENTION_DAYS",
             "CONSUMER_BATCH_SIZE",
@@ -244,8 +249,9 @@ class TestBothWays:
         # variables gone, DATABASE_URL and REDIS_URL kept, the two URLs'
         # keys (POSTGRES_PASSWORD kept, COMMS_EVENTS_PASSWORD new), the
         # two template directories written; 51 since W5-1, DLQ_MAXLEN gone
-        # with the dead letters.
-        assert len(names) == len(set(names)) == 51
+        # with the dead letters; 52 since W4-1, the default-locale setting gone,
+        # LANGUAGES and DEFAULT_LANGUAGE new.
+        assert len(names) == len(set(names)) == 52
 
 
 class TestValues:
@@ -285,3 +291,18 @@ class TestWriters:
         assert marked == _compose_substituted(_code_lines(_COMPOSE))
         assert marked <= set(_PRIMER["env"])
         assert len(marked) > 10
+
+    def test_the_machines_own_are_the_accepted_kinds(self) -> None:
+        """`machine` lines (W4-1): exactly the variables of the kinds of
+        data comms takes, each set by the machine to the copy's path
+        /primer/data/<kind> (protocol 4.5) -- a setting, and neither a
+        key of `env` nor set by compose."""
+        accepted = {
+            kind["env"]: f"/primer/data/{name}"
+            for name, kind in _PRIMER["accepts"].items()
+        }
+        assert accepted  # the pair: comms takes data
+        assert _by("machine") == accepted
+        assert set(accepted) <= _settings()
+        assert set(accepted).isdisjoint(_PRIMER["env"])
+        assert set(accepted).isdisjoint(_compose_environment(_COMPOSE))

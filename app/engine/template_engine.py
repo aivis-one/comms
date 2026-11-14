@@ -31,7 +31,12 @@
 # (render -> None): that is the product's own text, not a hole in one.
 #   - {type}.{channel}.{field} addressing granularity (cbshome base --
 #     richer than velo's per-type title/body, supports email subject).
-#   - Locale fallback chain: requested -> deploy default locale.
+#   - Locale fallback chain: requested -> the instance's default
+#     language (DEFAULT_LANGUAGE, W4-1). The requested language is the
+#     recipient's as the product wrote it, compared byte for byte with
+#     the profile's languages: `en-GB` or `EN` is no `en`, and a language
+#     the profile has no texts in takes the default's (owner's decision
+#     of 7.11).
 #
 # TEXT OVERLAY (PO-1): the registry may hold texts of the base profile
 # and texts of the overlay that replaced single leaves of it. render()
@@ -128,13 +133,14 @@ class _LetterFormatter(Formatter):
 
 def _locale_chain(locale: str | None) -> tuple[str, ...]:
     """The locales a field is looked up in, in order: the requested
-    one, then the deploy default. One copy for render, resolve_flag and
-    explain_texts, so the explanation cannot walk another chain than
-    the delivery does."""
-    requested = locale or settings.default_locale
-    if requested == settings.default_locale:
+    one, exactly as written, then the instance's default language. One
+    copy for render, resolve_flag and explain_texts, so the explanation
+    cannot walk another chain than the delivery does."""
+    default = settings.default_language
+    requested = locale or default
+    if requested == default:
         return (requested,)
-    return (requested, settings.default_locale)
+    return (requested, default)
 
 
 def render_field(
@@ -150,7 +156,7 @@ def render_field(
 
     Lookup order:
       1. Requested locale
-      2. Fallback to the deploy default locale
+      2. Fallback to the default language (DEFAULT_LANGUAGE)
       3. None -- caller falls back to the stored title/body
 
     A FIELD THAT DOES NOT RESOLVE PRINTS ITS PLACEHOLDER (TPL-1):
@@ -175,7 +181,7 @@ def render_field(
         notification_type: Registered type key (e.g. "unit_event").
         channel: DeliveryChannel value (e.g. "telegram", "email").
         field: Template field (e.g. "body", "title", "subject").
-        locale: Recipient locale; None means deploy default.
+        locale: Recipient locale; None means the default language.
         variables: Dict of variables for substitution.
         escape: What a placeholder goes through for the channel's markup.
 
@@ -183,7 +189,7 @@ def render_field(
         The rendered field and its unresolved paths, or None when no
         template is registered or it does not render.
     """
-    requested = locale or settings.default_locale
+    requested = locale or settings.default_language
 
     template_str = None
     for step in _locale_chain(locale):
@@ -261,9 +267,9 @@ def resolve_flag(
     """Resolve a presentation flag (Phase 3a item 1).
 
     Same per-field locale fallback as render(): requested locale ->
-    deploy default locale -> None (the caller applies the channel
+    default language -> None (the caller applies the channel
     default). Per-field on purpose: a locale file may override the
-    texts and leave the flags to the default locale -- each field
+    texts and leave the flags to the default language -- each field
     walks the chain independently, exactly like the text fields do.
 
     No third step: flags have no "stored" counterpart on the

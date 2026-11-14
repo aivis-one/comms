@@ -5,8 +5,10 @@
 # Loads the per-deploy PRODUCT PROFILE (notification type records +
 # templates) from disk into the ProfileRegistry at startup.
 #
-# LAYOUT (root = TEMPLATES_DIR, bind-mounted from the product repo's
-# comms-profile/ on the VPS; the fixture directory in tests):
+# LAYOUT (root = TEMPLATES_DIR: on a box the machine's copy of the
+# product repo's comms-profile/, given as data comms takes -- primer.yaml
+# `accepts.profile`, form D of protocol 4.5; the fixture directory in
+# tests):
 #
 #   types.yaml  -- {version: 2, types: {type_key: {field: value}}}.
 #                  Top-level keys are exactly `version` and `types`,
@@ -87,9 +89,18 @@
 # purpose: a missing or wrong schema VERSION is reported alone. The
 # rest of such a document was written against another schema, and
 # judging it by this one would bury the one real problem in noise.
-# Unparseable YAML is reported alone for the same reason; keys
-# declared twice in one mapping (YAML would silently keep the last
-# one) are collected over every file and reported together.
+# Unparseable YAML in types.yaml is reported alone for the same reason;
+# a templates file that is not YAML is one problem of its own, and the
+# other files are checked on (W4-1). Keys declared twice in one mapping
+# (YAML would silently keep the last one) are collected over every file
+# and reported with the rest.
+#
+# THE SAME CHECKS, WITHOUT AN INSTANCE: `comms validate --profile <dir>`
+# (app/cli.py, W4-1) is this loader, run by the machine before a rollout
+# in a container that has the profile's path and nothing else of the
+# instance. So nothing here reads the settings at import: what of the
+# deploy a check reads comes through ProfileDeploy -- this process's
+# settings at the start, INSTANCE_NOT_KNOWN under `validate`.
 #
 # TEMPLATES ARE A SUBSTITUTION LANGUAGE AND MUST STAY ONE. The template
 # language is str.format_map. It can navigate into a value
@@ -136,7 +147,14 @@
 #     domain literal anywhere in types.yaml or in a template string
 #     fails the startup -- domains live in env, URLs are assembled at
 #     the edge. Patterns are shared with scripts/check_domain_literals.py
-#     via app/core/constants.py (the image ships app/, not scripts/).
+#     via app/core/constants.py (the image ships app/, not scripts/);
+#   - the LANGUAGES of the profile (W4-1): a type with a sheet in one
+#     language has one in each (_language_problems); at the start, the
+#     instance's DEFAULT_LANGUAGE has templates when the profile has any.
+#     The variables of a type are NOT held across languages: a product
+#     may give a language its own variable ({topic_line_en} beside
+#     {topic_line_ru}), and a type declares no variable list to check a
+#     typo against.
 #
 # THE TEXT OVERLAY (PO-1). A second, optional directory
 # (TEMPLATES_OVERLAY_DIR, see deploy/INTEGRATION.md section 3)
@@ -182,7 +200,9 @@
 
 import re
 import string
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -191,8 +211,14 @@ from typing import Any, Protocol
 import structlog
 import yaml
 
+from app.core.bounds import (
+    NOTIFICATION_MAX_DELIVERY_ATTEMPTS,
+    NOTIFICATION_RETENTION_DAYS,
+    NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS,
+    NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS,
+    NUMERIC_BOUNDS,
+)
 from app.core.channels import CHANNEL_SPECS
-from app.core.config import NUMERIC_BOUNDS, settings
 from app.core.constants import (
     DOMAIN_LITERAL_PATTERNS,
     MAX_BODY_LEN,
@@ -328,6 +354,78 @@ _MAX_DURATION_SECONDS = MAX_DURATION_DAYS * 86400
 
 
 # -----------------------------------------------------------------------------
+# The deploy a profile is checked against (W4-1)
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProfileDeploy:
+    """What of the deploy the checks of a profile read: the settings a
+    type's defaults are a reference to (retry), the terms a declared
+    value is held to (retention, the backoff cap), and the language a
+    text falls back to.
+
+    `default_language` None is an instance not known: `comms validate
+    --profile`, run by the machine with the profile's path and nothing
+    else (protocol 4.5). Then every language of the profile is checked
+    as the default an instance may have (the telegram text), and the
+    default's own templates are not asked for -- the start asks for
+    them (_language_problems).
+    """
+
+    default_language: str | None
+    max_delivery_attempts: int
+    backoff_base_seconds: int
+    backoff_max_seconds: int
+    retention_days: int
+
+
+# The deploy `comms validate --profile` checks against: no instance, and
+# the numbers of every box -- none of the four is a key of primer.yaml
+# `env`, so on a box each is its default (app/core/bounds.py).
+INSTANCE_NOT_KNOWN = ProfileDeploy(
+    default_language=None,
+    max_delivery_attempts=NOTIFICATION_MAX_DELIVERY_ATTEMPTS,
+    backoff_base_seconds=NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS,
+    backoff_max_seconds=NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS,
+    retention_days=NOTIFICATION_RETENTION_DAYS,
+)
+
+# Set only around a check against another deploy than this process's
+# (checked_against); unset, the checks read this process's settings.
+_DEPLOY: ContextVar[ProfileDeploy | None] = ContextVar("profile_deploy", default=None)
+
+
+def _deploy() -> ProfileDeploy:
+    """The deploy the profile is checked against now: the one set by
+    checked_against, or this process's own settings, read at the call --
+    imported here, not at the top: app/core/config.py refuses a process
+    with no instance at its import, and `comms validate` is one."""
+    given = _DEPLOY.get()
+    if given is not None:
+        return given
+    from app.core.config import settings
+
+    return ProfileDeploy(
+        default_language=settings.default_language,
+        max_delivery_attempts=settings.notification_max_delivery_attempts,
+        backoff_base_seconds=settings.notification_retry_backoff_base_seconds,
+        backoff_max_seconds=settings.notification_retry_backoff_max_seconds,
+        retention_days=settings.notification_retention_days,
+    )
+
+
+@contextmanager
+def checked_against(deploy: ProfileDeploy) -> Iterator[None]:
+    """Every check of a profile inside reads `deploy`, not settings."""
+    token = _DEPLOY.set(deploy)
+    try:
+        yield
+    finally:
+        _DEPLOY.reset(token)
+
+
+# -----------------------------------------------------------------------------
 # Violations: every problem is collected, then reported once
 # -----------------------------------------------------------------------------
 
@@ -362,7 +460,8 @@ def _raise_if_any(
     raise ProfileError(
         f"{subject} is invalid ({len(ordered)} {noun}); the "
         f"service does not start until every one is fixed:\n"
-        + "\n".join(f"  - {v.render()}" for v in ordered)
+        + "\n".join(f"  - {v.render()}" for v in ordered),
+        tuple(v.render() for v in ordered),
     )
 
 
@@ -377,11 +476,16 @@ class RawProfile:
 
     `types` is whatever the types document parsed to; `templates_by_locale`
     maps locale -> whatever that locale's template document parsed to.
-    Validation of the actual shapes happens in parse_profile().
+    `problems` -- what the source found while reading (a key declared
+    twice, an entry of templates/ that is not a <locale>.yaml, a
+    templates file that is not YAML): parse_profile reports them with
+    its own, in one refusal. Validation of the actual shapes happens in
+    parse_profile().
     """
 
     types: Any
     templates_by_locale: dict[str, Any] = field(default_factory=dict)
+    problems: tuple["Violation", ...] = ()
 
 
 class ProfileSource(Protocol):
@@ -433,9 +537,13 @@ class FileProfileSource:
     def load(self) -> RawProfile:
         """Read and YAML-parse the profile files; no shape validation.
 
-        Keys declared twice are collected over EVERY file and refused
-        together; unparseable YAML is refused at once (nothing after
-        it in that file can be trusted).
+        Keys declared twice are collected over EVERY file and handed to
+        parse_profile with the rest (RawProfile.problems). Unparseable
+        YAML in types.yaml is refused at once: nothing of the profile can
+        be judged without its types. A templates file that is not YAML is
+        one problem of that file, and its texts are left out -- the other
+        files are read and checked on (W4-1): `comms validate` names
+        every problem, not the first.
         """
         root = self._root
         if not root.is_dir():
@@ -476,9 +584,15 @@ class FileProfileSource:
                         f"would be skipped with its texts",
                     ))
                     continue
-                templates_by_locale[path.stem] = self._read_yaml(
-                    path, where, violations,
-                )
+                try:
+                    templates_by_locale[path.stem] = self._read_yaml(
+                        path, where, violations,
+                    )
+                except ProfileError as refused:
+                    # The refusal's own one problem -- comms' words, the
+                    # parser's built through exception_text (_read_yaml).
+                    (problem,) = refused.findings
+                    violations.append(Violation(where, "", "", problem))
         # A directory beside types.yaml and templates/ is no part of the
         # profile -- `template/` may be templates/ mistyped. Said, not
         # refused: in v3 a refused profile is a comms that does not start,
@@ -495,10 +609,10 @@ class FileProfileSource:
                     templates=_TEMPLATES_SUBDIR,
                 )
 
-        _raise_if_any(violations)
         return RawProfile(
             types=types_doc,
             templates_by_locale=templates_by_locale,
+            problems=tuple(violations),
         )
 
     @staticmethod
@@ -647,7 +761,7 @@ def _check_answer_keep(value: Any) -> str | None:
     problem = _check_duration(value)
     if problem is not None:
         return problem
-    days = settings.notification_retention_days
+    days = _deploy().retention_days
     if days > 0 and _duration_value(value) > timedelta(days=days):
         return (
             f"found {value!r}; longer than NOTIFICATION_RETENTION_DAYS="
@@ -714,7 +828,7 @@ def _backoff_base(value: Any) -> str | None:
     problem = _int_in_range(bound.lo, bound.hi)(value)
     if problem is not None:
         return problem
-    cap = settings.notification_retry_backoff_max_seconds
+    cap = _deploy().backoff_max_seconds
     if value > cap:
         return (
             f"found {value}; above NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS="
@@ -805,7 +919,7 @@ _FIELDS: dict[str, _Field] = {
             NUMERIC_BOUNDS["notification_max_delivery_attempts"].hi,
         ),
         default=lambda: (
-            settings.notification_max_delivery_attempts,
+            _deploy().max_delivery_attempts,
             "settings: NOTIFICATION_MAX_DELIVERY_ATTEMPTS",
         ),
     ),
@@ -815,7 +929,7 @@ _FIELDS: dict[str, _Field] = {
     "retry_backoff_seconds": _Field(
         check=_backoff_base,
         default=lambda: (
-            settings.notification_retry_backoff_base_seconds,
+            _deploy().backoff_base_seconds,
             "settings: NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS",
         ),
     ),
@@ -904,7 +1018,7 @@ def parse_profile(
     otherwise once, listing every violation found.
     """
     body = _versioned_body(raw.types)
-    violations: list[Violation] = []
+    violations: list[Violation] = list(raw.problems)
     types = _parse_types(body, violations)
     if types is not None:
         _require_msg_type_categories(types, violations)
@@ -918,24 +1032,71 @@ def parse_profile(
         templates[locale] = _parse_template_tree(
             locale, doc, declared, violations,
         )
-    for locale, type_key, problem in _telegram_markup_problems(templates):
+    for locale, default, type_key, problem in _telegram_markup_problems(templates):
         violations.append(Violation(
             f"{_TEMPLATES_SUBDIR}/{locale}.yaml", type_key, _TELEGRAM_TEXT,
-            f"{type_key}.{_TELEGRAM_TEXT} for a {locale} recipient: {problem}",
+            f"{type_key}.{_TELEGRAM_TEXT} for "
+            f"{_recipient(locale, default)}: {problem}",
         ))
+    violations.extend(_language_problems(templates))
 
     _raise_if_any(violations)
     return Profile(types=declared, templates=templates)
 
 
+# EVERY LANGUAGE OF THE PROFILE HAS EVERY TYPE (W4-1). A type with a
+# sheet in one language of the profile has a sheet in each: a text falls
+# back to the instance's default language (app/engine/template_engine.py
+# _locale_chain), and the profile cannot know which of its languages
+# that is -- `comms validate` runs with no instance. A type missing in
+# the default would reach every recipient whose language has no sheet as
+# the product's stored text, beside a language that has one. At the
+# start the instance is known, and its default must be a language of the
+# profile when the profile has any template: one language of LANGUAGES
+# the profile has no texts in (uk of en, ru) is lawful -- its recipients
+# get the default's texts -- but no texts in the default itself is the
+# same hole for every one of them.
+
+
+def _language_problems(templates: Mapping[str, TemplateTree]) -> list[Violation]:
+    """Every type missing in a language of the profile; at the start,
+    a default language the profile has no templates in."""
+    violations: list[Violation] = []
+    sheeted = {type_key for tree in templates.values() for type_key in tree}
+    for locale in sorted(templates):
+        for type_key in sorted(sheeted - set(templates[locale])):
+            others = ", ".join(sorted(
+                step for step in templates if type_key in templates[step]
+            ))
+            violations.append(Violation(
+                f"{_TEMPLATES_SUBDIR}/{locale}.yaml", type_key, "",
+                f"{type_key} has no sheet in {locale} and has one in "
+                f"{others}: every language of the profile has every type, "
+                f"for whichever of them is an instance's default language",
+            ))
+    default = _deploy().default_language
+    if default is not None and sheeted and default not in templates:
+        violations.append(Violation(
+            f"{_TEMPLATES_SUBDIR}/{default}.yaml", "", "",
+            f"the instance's default language {default} (DEFAULT_LANGUAGE) "
+            f"has no templates; the profile's languages are "
+            f"{', '.join(sorted(templates))} -- every text falls back to the "
+            f"default, so a letter in no language of the profile would go "
+            f"as the product's stored text",
+        ))
+    return violations
+
+
 # THE TELEGRAM TEXT IS CHECKED AS IT IS SENT (TPL-2): the title and the
 # body in one string, "\n\n" between, with ParseMode.HTML -- a tag may
 # open in the title and close in the body. EACH FIELD COMES BY THE CHAIN
-# OF LOCALES THE SEND WALKS (the recipient's, then DEFAULT_LOCALE --
+# OF LOCALES THE SEND WALKS (the recipient's, then DEFAULT_LANGUAGE --
 # app/engine/template_engine.py _locale_chain), field by field: a ru
 # title over the en body is a letter a ru recipient gets, so it is checked
 # for every locale of the profile (a locale the profile has no texts in
-# gets DEFAULT_LOCALE's alone, checked as that locale). A field no locale
+# gets DEFAULT_LANGUAGE's alone, checked as that locale). With no instance
+# (`comms validate`) the default is not known, and every language of the
+# profile is checked as the default (_defaults, W4-1). A field no locale
 # of the chain has stands as what the formatter puts there (the stored
 # title in <b>, the stored body); a template field as _FIELD_STANDS_AS.
 _TELEGRAM_TEXT = "telegram.title+body"
@@ -947,37 +1108,54 @@ _TELEGRAM_TEXT = "telegram.title+body"
 _FIELD_STANDS_AS = "x:/&amp;"
 
 
+def _defaults(templates: Mapping[str, TemplateTree]) -> list[str]:
+    """The default languages a profile is checked under: the deploy's,
+    or -- the instance not known (`comms validate`) -- every language of
+    the profile, each an instance's default it may become (W4-1)."""
+    known = _deploy().default_language
+    return [known] if known is not None else sorted(templates)
+
+
 def _telegram_markup_problems(
     templates: Mapping[str, TemplateTree],
-) -> list[tuple[str, str, str]]:
-    """(locale, type, why) for every telegram text Telegram would refuse
-    to parse, the title and the body of each taken by the send's chain."""
-    default = settings.default_locale
-    problems: list[tuple[str, str, str]] = []
-    for locale in sorted(templates):
-        chain = [locale] if locale == default else [locale, default]
-        type_keys = sorted({
-            type_key for step in chain for type_key in templates.get(step, {})
-        })
-        for type_key in type_keys:
-            title, body = (
-                _first_text(templates, chain, type_key, field)
-                for field in ("title", "body")
-            )
-            if title is None and body is None:
-                continue
-            problem = telegram_html_problem(
-                (_fields_as_one(title) if title is not None else "<b>1</b>")
-                + "\n\n"
-                + (_fields_as_one(body) if body is not None else "1")
-            )
-            if problem is not None:
-                problems.append((
-                    locale, type_key,
-                    f"Telegram would not parse the HTML of every letter -- "
-                    f"{problem}",
-                ))
+) -> list[tuple[str, str, str, str]]:
+    """(locale, default, type, why) for every telegram text Telegram
+    would refuse to parse, the title and the body of each taken by the
+    send's chain -- under every default of _defaults."""
+    problems: list[tuple[str, str, str, str]] = []
+    for default in _defaults(templates):
+        for locale in sorted(templates):
+            chain = [locale] if locale == default else [locale, default]
+            type_keys = sorted({
+                type_key for step in chain for type_key in templates.get(step, {})
+            })
+            for type_key in type_keys:
+                title, body = (
+                    _first_text(templates, chain, type_key, field)
+                    for field in ("title", "body")
+                )
+                if title is None and body is None:
+                    continue
+                problem = telegram_html_problem(
+                    (_fields_as_one(title) if title is not None else "<b>1</b>")
+                    + "\n\n"
+                    + (_fields_as_one(body) if body is not None else "1")
+                )
+                if problem is not None:
+                    problems.append((
+                        locale, default, type_key,
+                        f"Telegram would not parse the HTML of every letter -- "
+                        f"{problem}",
+                    ))
     return problems
+
+
+def _recipient(locale: str, default: str) -> str:
+    """Whose letter a telegram text is: a recipient of `locale`, on an
+    instance whose default is `default` when the chain reaches it."""
+    if locale == default:
+        return f"a {locale} recipient"
+    return f"a {locale} recipient (default language {default})"
 
 
 def _first_text(
@@ -1693,19 +1871,20 @@ def parse_overlay(raw: RawOverlay, base: Profile) -> dict[str, TemplateTree]:
     # the base's, by the send's chain -- an en overlay reaches every
     # locale that falls back to en. The base passed this check, so what
     # is found here is the overlay's.
-    for locale, type_key, problem in _telegram_markup_problems(
+    for locale, default, type_key, problem in _telegram_markup_problems(
         _overlaid(base.templates, result),
     ):
         # Named by the overlay files of the chain -- the ones that made
         # the text (an en overlay breaks a ru recipient's letter).
         files = ", ".join(
             f"{step}{_OVERLAY_SUFFIX}"
-            for step in dict.fromkeys((locale, settings.default_locale))
+            for step in dict.fromkeys((locale, default))
             if step in result
         )
         violations.append(Violation(
             _overlay_where(files), type_key, _TELEGRAM_TEXT,
-            f"{type_key}.{_TELEGRAM_TEXT} for a {locale} recipient: {problem}",
+            f"{type_key}.{_TELEGRAM_TEXT} for "
+            f"{_recipient(locale, default)}: {problem}",
         ))
     _raise_if_any(violations, _overlay_subject(raw.root))
     return result
@@ -1919,6 +2098,19 @@ def load_profile(
     return parse_profile(source.load(), llm_set_names)
 
 
+def validate_profile(root: Path) -> tuple[str, ...]:
+    """Every problem of the profile at `root`, checked as the start
+    checks it but with no instance (INSTANCE_NOT_KNOWN): empty when the
+    profile is good. `comms validate --profile` (W4-1). Reads no
+    settings, installs nothing."""
+    with checked_against(INSTANCE_NOT_KNOWN):
+        try:
+            load_profile(FileProfileSource(root))
+        except ProfileError as refused:
+            return refused.findings
+    return ()
+
+
 @dataclass(frozen=True)
 class LaneMix:
     """A lane that carries llm types beside types for people."""
@@ -2030,6 +2222,8 @@ def install_profile_from_settings() -> bool:
     switched-off channel is accepted (see CROSS-CHECK WITH THE DEPLOY).
     Nothing is installed until base and overlay both passed.
     """
+    from app.core.config import settings
+
     if settings.templates_overlay_dir and not settings.templates_dir:
         raise ProfileError(
             "TEMPLATES_OVERLAY_DIR is set but TEMPLATES_DIR is empty: the "

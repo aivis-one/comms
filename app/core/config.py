@@ -17,20 +17,33 @@
 #   channel is required and checked. No flag, or any other value:
 #   startup is refused naming the flag (load_settings below).
 #
-# DEFAULT_LOCALE:
-#   Per-deploy default used as the template-rendering fallback language
-#   (recipient locale -> default_locale -> stored title/body).
+# LANGUAGES / DEFAULT_LANGUAGE (W4-1):
+#   The instance's languages and its default, from the passport
+#   (primer.yaml `env`, protocol 5.2.2). Both required, no default in
+#   code: a start without them is refused naming them (language_problems
+#   below). A text is looked up in the recipient's language, then in
+#   DEFAULT_LANGUAGE, then the stored title/body
+#   (app/engine/template_engine.py _locale_chain). LANGUAGES itself is
+#   read here only -- the recipient's language is looked up in the
+#   profile directly, never in it.
 # =============================================================================
 
 import math
+import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.bounds import (
+    NOTIFICATION_MAX_DELIVERY_ATTEMPTS,
+    NOTIFICATION_RETENTION_DAYS,
+    NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS,
+    NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS,
+    NUMERIC_BOUNDS,
+)
 from app.core.channels import (
     CHANNEL_SPECS,
     ChannelSpec,
@@ -243,122 +256,6 @@ _EMAIL_API_BASE_URLS = {
     "us": "https://api.mailgun.net",
 }
 
-
-@dataclass(frozen=True)
-class Bound:
-    """The closed range a numeric setting may take, and why."""
-
-    lo: int
-    hi: int
-    why: str
-
-
-# The four lanes' batch sizes share one reason (P4-1).
-_LANE_BATCH_WHY = (
-    "jobs one pass of the lane selects; 0 does NOT switch the lane off "
-    "-- 'off' is leaving the lane out of COMMS_WORKER_LANES; above 1000 "
-    "one pass holds that many jobs in memory"
-)
-
-# The four lanes' deliver timeouts share one reason (P4-3).
-_LANE_DELIVER_TIMEOUT_WHY = (
-    "seconds one channel call of the lane may take before it is "
-    "abandoned as a timeout; 0 abandons every call; above 600 an attempt "
-    "holds its job's row and a pooled connection for ten minutes per "
-    "call; and not at or below the client timeout of a live channel "
-    "(checked below)"
-)
-
-# THE ONE TABLE OF NUMERIC BOUNDS (D1 / R3). Every int field of
-# Settings has a row -- a test walks the fields against this table, so
-# a new knob without a bound fails the suite. A value outside its row
-# refuses startup naming the variable: a service that came up on a
-# wrong number is worse than one that refused and said which (spec
-# §17.7). No clamping, no warning-instead, no default-instead.
-NUMERIC_BOUNDS: dict[str, Bound] = {
-    "consumer_batch_size": Bound(
-        1, 1000, "XREADGROUP COUNT: 0 reads nothing; above 1000 one read "
-        "holds that many envelopes in memory at once",
-    ),
-    "consumer_block_ms": Bound(
-        1, 60_000, "XREADGROUP BLOCK: 0 blocks FOREVER, so the consumer "
-        "never wakes to see a shutdown; above a minute it answers one late",
-    ),
-    "changes_stream_maxlen": Bound(
-        1, 10_000_000, "XADD MAXLEN of the push stream: 0 trims every "
-        "push as it is written -- a stream no listener can read",
-    ),
-    "notification_poll_interval_seconds": Bound(
-        1, 3600, "0 is a busy loop on the database; above an hour a "
-        "scheduled_at is honored an hour late",
-    ),
-    "notification_max_backoff_seconds": Bound(
-        1, 3600, "the idle worker's longest sleep; not below the poll "
-        "interval (checked below)",
-    ),
-    "notification_max_delivery_attempts": Bound(
-        1, 100, "0 attempts sends nothing and never fails; the profile's "
-        "retry_max_attempts refuses below 1 for the same reason",
-    ),
-    "notification_max_pipeline_attempts": Bound(
-        1, 100, "0 would close a job without one attempt; T12",
-    ),
-    "notification_lane_interactive_batch_size": Bound(
-        1, 1000, _LANE_BATCH_WHY,
-    ),
-    "notification_lane_critical_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
-    "notification_lane_normal_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
-    "notification_lane_bulk_batch_size": Bound(1, 1000, _LANE_BATCH_WHY),
-    "notification_lane_interactive_deliver_timeout_seconds": Bound(
-        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
-    ),
-    "notification_lane_critical_deliver_timeout_seconds": Bound(
-        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
-    ),
-    "notification_lane_normal_deliver_timeout_seconds": Bound(
-        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
-    ),
-    "notification_lane_bulk_deliver_timeout_seconds": Bound(
-        1, 600, _LANE_DELIVER_TIMEOUT_WHY,
-    ),
-    "notification_retry_backoff_base_seconds": Bound(
-        0, 86_400, "0 = no idle wait between attempts (the profile's "
-        "retry_backoff_seconds allows 0 too); above a day a retry "
-        "outlives any letter",
-    ),
-    "notification_retry_backoff_max_seconds": Bound(
-        0, 86_400, "the backoff cap; not below the base (checked below)",
-    ),
-    "notification_max_retry_after_seconds": Bound(
-        1, 86_400, "0 turns every 429 deferral into an immediate re-poll",
-    ),
-    "notification_max_rate_limit_deferrals": Bound(
-        0, 1000, "0 = every 429 is a regular transient failure",
-    ),
-    "notification_retention_days": Bound(
-        0, 3650, "0 DISABLES retention -- never 'delete everything'; a "
-        "negative number has no meaning",
-    ),
-    "notification_retention_interval_seconds": Bound(
-        1, 86_400, "0 does NOT mean 'every tick'; 'off' is "
-        "NOTIFICATION_RETENTION_DAYS=0",
-    ),
-    "thread_auto_close_days": Bound(
-        0, 3650, "0 DISABLES auto-close -- never a mass close; a negative "
-        "number has no meaning",
-    ),
-    "thread_auto_close_interval_seconds": Bound(
-        1, 86_400, "0 does NOT mean 'every tick'; 'off' is "
-        "THREAD_AUTO_CLOSE_DAYS=0",
-    ),
-    "llm_deliver_timeout_seconds": Bound(
-        1, 600, "seconds one call of the llm channel to ONE key set may "
-        "take; a job's call over its whole list of sets is bounded by "
-        "this times the number of sets; above 600 an attempt holds its "
-        "job's row for ten minutes per set; and not at or below the llm "
-        "client's own timeout when the channel is live (checked below)",
-    ),
-}
 
 # Pairs where one setting must not fall below another: (low, high).
 _ORDERED_PAIRS: tuple[tuple[str, str], ...] = (
@@ -647,9 +544,12 @@ class Settings(BaseSettings):
         """
         return _EMAIL_API_BASE_URLS[self.email_mailgun_region]
 
-    # -- Localization --
-    # Per-deploy default locale; template fallback language.
-    default_locale: str = "en"
+    # -- Languages (W4-1): the instance's, from the passport --
+    # LANGUAGES: codes joined by commas, `en,ru,uk` (the machine's form,
+    # protocol 5.2.2). DEFAULT_LANGUAGE: one of them, the language a text
+    # falls back to. Required, no default (language_problems).
+    languages: str = ""
+    default_language: str = ""
     # Fallback IANA timezone for recipients without an explicit one --
     # quiet-hours window math needs a timezone for everybody. Validated
     # at startup (a bad name must not surface on the delivery path).
@@ -657,25 +557,27 @@ class Settings(BaseSettings):
 
     # -- Product profile (per-deploy data: types + templates) --
     # Directory with the product profile: types.yaml + templates/.
-    # On the VPS it arrives as a bind-mount of the product repo's
-    # comms-profile/ (mount mechanics are Phase 5); tests point it at
-    # the fixture directory in this repo. Empty is tolerated ONLY in
+    # On a box the machine gives it: the product's directory, copied and
+    # bound read-only, its path under this variable (form D, primer.yaml
+    # `accepts.profile`); tests point it at the fixture directory in
+    # this repo. Empty is tolerated ONLY in
     # development (the Phase 1 stub-profile behavior for tests) --
     # see app/profile/loader.py: install_profile_from_settings.
     templates_dir: str = ""
     # Directory with the TEXT OVERLAY (PO-1): {locale}.yaml files of the
     # shape of templates/{locale}.yaml, each text replacing the base text
     # at the same locale, type, channel and field. On a box it has no
-    # mount until W4-1, and stays empty (deploy/INTEGRATION.md section
-    # 3). Empty = no overlay, the base texts as they are; set to
-    # a directory that does not exist = the service does not start. See
+    # mount -- the machine has no kind of data for it -- and stays empty
+    # (deploy/INTEGRATION.md section 3). Empty = no overlay, the base
+    # texts as they are; set to a directory that does not exist = the
+    # service does not start. See
     # app/profile/loader.py, THE TEXT OVERLAY.
     templates_overlay_dir: str = ""
 
     # -- Notification engine --
     notification_poll_interval_seconds: int = 5
     notification_max_backoff_seconds: int = 60
-    notification_max_delivery_attempts: int = 3
+    notification_max_delivery_attempts: int = NOTIFICATION_MAX_DELIVERY_ATTEMPTS
     # T12: how many attempts of the PIPELINE (resolve / deliver /
     # rollup, not a channel call) may end in an exception of comms' own
     # IN A ROW before the job gets its outcome -- FAILED, its waiting
@@ -732,8 +634,12 @@ class Settings(BaseSettings):
     # Defaults give ~30s/60s between the three attempts -- comparable
     # to the cbshome donor's 1-minute worker tick, where retries were
     # meaningful (review 1.1: retries burned within seconds).
-    notification_retry_backoff_base_seconds: int = 30
-    notification_retry_backoff_max_seconds: int = 600
+    notification_retry_backoff_base_seconds: int = (
+        NOTIFICATION_RETRY_BACKOFF_BASE_SECONDS
+    )
+    notification_retry_backoff_max_seconds: int = (
+        NOTIFICATION_RETRY_BACKOFF_MAX_SECONDS
+    )
 
     # Phase 2.3: TRUST limit on the channel-named 429 wait -- a
     # SEPARATE knob from our backoff policy on purpose. backoff_max
@@ -770,7 +676,7 @@ class Settings(BaseSettings):
     # "delete everything now". A stray RETENTION_DAYS=0 in env must
     # not become an irreversible wipe of the whole history; disabling
     # is loud (worker startup log).
-    notification_retention_days: int = 90
+    notification_retention_days: int = NOTIFICATION_RETENTION_DAYS
 
     # Phase 3a fix H: the retention pass runs on its OWN slow cadence,
     # not on the 5s worker tick -- the batched DELETE scans without an
@@ -934,6 +840,8 @@ class Settings(BaseSettings):
             channel_values(self),
         )
         problems.extend(channel_problems)
+        # W4-1: the instance's languages, as the passport gives them.
+        problems.extend(language_problems(self.languages, self.default_language))
         problems.extend(self._free_route_problems())
 
         # P4-1: the worker's lanes -- a set that takes nothing, or names
@@ -981,7 +889,7 @@ class Settings(BaseSettings):
                 f"'Europe/Berlin')."
             ) from exc
 
-        # Numeric bounds: the one table above (D1 / R3).
+        # Numeric bounds: the one table, app/core/bounds.py (D1 / R3).
         numeric = numeric_problems(
             {name: getattr(self, name) for name in NUMERIC_BOUNDS}
         )
@@ -1059,6 +967,58 @@ def channel_values(source: Settings) -> dict[str, str | None]:
             channel_flag_keys() + channel_env_keys() + channel_optional_keys()
         )
     }
+
+
+LANGUAGE_CODE = re.compile(r"[a-z]{2,3}")
+"""A language as the passport names it (protocol 5.2.2): the primary
+subtag alone, lower case -- `en`, `uk`, `haw`; never a region."""
+
+
+def language_problems(languages: str, default: str) -> list[str]:
+    """What is wrong with LANGUAGES and DEFAULT_LANGUAGE, each naming
+    its variable (W4-1). The machine renders both from the passport and
+    holds them to this form; comms holds them again, at its own start:
+    a start on a value it cannot read is a red start, never a fallback.
+
+    LANGUAGES: codes joined by commas, no spaces, at least one, each
+    once. DEFAULT_LANGUAGE: one code, among LANGUAGES. A recipient's
+    language is not held to either: it is looked up in the profile as
+    written (app/engine/template_engine.py).
+    """
+    problems: list[str] = []
+    codes = languages.split(",") if languages else []
+    if not codes:
+        problems.append(
+            "LANGUAGES is not set: the instance's languages, codes joined "
+            "by commas (`en,ru`), from the passport."
+        )
+    bad = sorted({code for code in codes if not LANGUAGE_CODE.fullmatch(code)})
+    if bad:
+        problems.append(
+            f"LANGUAGES={languages!r}: {', '.join(repr(code) for code in bad)} "
+            f"is not a language code -- two or three lower-case letters, no "
+            f"region, no spaces, joined by commas."
+        )
+    twice = sorted({code for code in codes if codes.count(code) > 1})
+    if twice:
+        problems.append(
+            f"LANGUAGES={languages!r}: {', '.join(twice)} is named twice."
+        )
+    if not default:
+        problems.append(
+            "DEFAULT_LANGUAGE is not set: the language a text falls back "
+            "to, one of LANGUAGES, from the passport."
+        )
+    elif not LANGUAGE_CODE.fullmatch(default):
+        problems.append(
+            f"DEFAULT_LANGUAGE={default!r} is not a language code -- two or "
+            f"three lower-case letters, no region."
+        )
+    elif codes and not bad and default not in codes:
+        problems.append(
+            f"DEFAULT_LANGUAGE={default!r} is not among LANGUAGES={languages!r}."
+        )
+    return problems
 
 
 def worker_lane_problem(value: str | None) -> str | None:

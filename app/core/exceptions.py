@@ -44,7 +44,16 @@ class ProfileError(CommsError):
     Raised at startup by app/profile/loader.py -- a broken profile
     (bad YAML, malformed tree, invalid format spec) must kill the
     service before it takes traffic, not surface on the delivery path.
+
+    `findings` -- every problem on its own, the way `comms validate
+    --profile` prints them, one per line (W4-1): the violations of a
+    refusal that lists several, or the message itself when the refusal
+    is one problem.
     """
+
+    def __init__(self, message: str, findings: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.findings: tuple[str, ...] = findings or (message,)
 
 
 class ConflictError(CommsError):

@@ -418,7 +418,9 @@ class TestImageRuns:
         # image, `comms derive bot-id` of a well-formed token and of a
         # malformed one. FIX W3-1: the runtime one more -- the migration
         # before the start (test_the_start_is_migrated_first_by_primer_yamls_command).
-        assert sorted(stage for stage, _ in runs) == ["runtime"] * 6 + ["test"] * 3
+        # W4-1: the runtime one more -- the profile's validator, as the
+        # machine runs it (test_the_profile_is_validated_as_the_machine_does).
+        assert sorted(stage for stage, _ in runs) == ["runtime"] * 7 + ["test"] * 3
         derives = [
             stage for stage, run in runs
             if re.search(r"comms:ci\s+comms derive bot-id\b", run)
@@ -463,13 +465,42 @@ class TestImageRuns:
         assert stacks["stacks"]["comms"]["migrate"] == "alembic upgrade head"
 
     def test_the_start_reads_the_profile_where_a_box_does(self) -> None:
-        (start,) = [r for _, r in _image_runs(_CI) if "TEMPLATES_DIR" in r]
+        """Until W4-1 the path was the compose file's constant, /profile.
+        Now the machine gives it: the copy of the kind `profile` at
+        /primer/data/<kind> (protocol 4.5, the machine's CONTAINER_DATA),
+        under the variable of primer.yaml `accepts.profile` -- and the
+        compose file sets it nowhere."""
+        (start,) = [
+            r for _, r in _image_runs(_CI)
+            if "TEMPLATES_DIR" in r and "--name comms-app" in r
+        ]
         ci_dir = re.search(r"-e TEMPLATES_DIR=(\S+)", start)
         assert ci_dir is not None
+        primer = yaml.safe_load((ROOT / "primer.yaml").read_text(encoding="utf-8"))
+        (kind,) = [k for k, a in primer["accepts"].items()
+                   if a["env"] == "TEMPLATES_DIR"]
+        assert ci_dir.group(1) == f"/primer/data/{kind}"
         services = _compose()["services"]
-        box = {services[n]["environment"]["TEMPLATES_DIR"]
-               for n in ("comms-app", "comms-worker", "comms-consumer")}
-        assert box == {ci_dir.group(1)}
+        assert not [n for n in ("comms-app", "comms-worker", "comms-consumer")
+                    if "TEMPLATES_DIR" in services[n]["environment"]]
+
+    def test_the_profile_is_validated_as_the_machine_does(self) -> None:
+        """W4-1: the image's validator of the profile, run as the machine
+        runs it (pridem steps/services.py DataCopy): the command of
+        primer.yaml `accepts.profile` read from the file, <dir> the copy's
+        path, no network, no capability, nothing of the instance but the
+        path -- in the runtime image, the one the machine builds."""
+        step = _CI.split("- name: The image has the comms command", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        assert "['accepts']['profile']['validate']" in step
+        (stage, run), = [
+            (s, r) for s, r in _image_runs(_CI) if "${validate//<dir>/" in r
+        ]
+        assert stage == "runtime"
+        assert "--network none" in run and "--cap-drop ALL" in run
+        assert "-e TEMPLATES_DIR=/primer/data/profile" in run
+        assert ":/primer/data/profile:ro" in run
+        assert not re.search(r"-e (?!TEMPLATES_DIR=)", run), run
 
 
 # ---------------------------------------------------------------------------

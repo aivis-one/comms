@@ -8,7 +8,7 @@
 #
 #   - The telegram title and body are checked for a recipient of every
 #     locale, each field by the chain the send walks (the locale, then
-#     DEFAULT_LOCALE -- "en" in the suite), a field standing as a value
+#     DEFAULT_LANGUAGE -- "en" in the suite), a field standing as a value
 #     with a link's characters ("x:/&amp;"): an unquoted attribute that
 #     would not take the letter's link is refused, as Telegram refuses it.
 #   - A JSON object's keys are escaped as its values are: a template that
