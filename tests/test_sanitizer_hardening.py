@@ -8,9 +8,13 @@
 #     key's prefix quadratic ("a-"*n -- 22 s on 80 000 characters before
 #     REV-6) and their neighbours; each doubling of n from 10 000 to
 #     80 000 at most triples the time (linear ~2, quadratic ~4). Timed by
-#     _assert_linear, the one measure of the file: the least of 5 runs,
-#     each of so many calls that a run takes 20 ms at 10 000. A ratio,
-#     not a number of seconds: the machine does not decide the test.
+#     _assert_linear, the one measure of the file: for each doubling, 5
+#     rounds of a run of n and a run of 2n back to back, each run of so
+#     many calls that it takes 20 ms at 10 000; the ratio is the least
+#     run of 2n over the least of n. A ratio, not a number of seconds:
+#     the machine does not decide the test -- and the two sides of it are
+#     measured in the same rounds, so a slowdown of the machine that lasts
+#     falls on both (FIX W6-2b #1).
 #   - NEVER FAILS: a repr or a str that raises, a value nested 2000 deep
 #     -> a line with <unreadable TYPE>, nothing of the value.
 #   - FORMS: the roots cookie, session_id, passphrase, pgpassword,
@@ -55,6 +59,9 @@
 # W6-2b -- a DSN's password with "?" or "#" in it:
 #   Q1  the rest of the URL cut at "?" and "#" again (REV-6's
 #       expression) -> TestQueryMarksInAPassword
+# FIX W6-2b #1 -- the measure's sides in the same rounds:
+#   F1  every run of n, then every run of 2n, again -> TestTheMeasure
+#   F2  no bound on the ratio                       -> TestTheMeasure
 # =============================================================================
 
 import decimal
@@ -337,6 +344,14 @@ def _fastest(work: Callable[[], object], repeats: int = 1) -> float:
     return min(runs)
 
 
+def _run(work: Callable[[str], object], text: str, repeats: int) -> float:
+    """One run: `repeats` calls of `work` on `text`, in seconds."""
+    started = time.perf_counter()
+    for _ in range(repeats):
+        work(text)
+    return time.perf_counter() - started
+
+
 def _assert_linear(work: Callable[[str], object], unit: str) -> None:
     """Each doubling of the input, 10 000 to 80 000 characters, at most
     triples the time -- judged as it comes, so a quadratic run fails on
@@ -344,16 +359,69 @@ def _assert_linear(work: Callable[[str], object], unit: str) -> None:
     quick to time alone (under 20 ms at 10 000) is timed as so many
     calls at every size that the first run takes 20 ms: a ratio of two
     figures of a few milliseconds is the machine's, not the pattern's
-    (TEST-1: 2.4 ms -> 9.7 ms on a slow CI, no defect)."""
+    (TEST-1: 2.4 ms -> 9.7 ms on a slow CI, no defect).
+
+    THE TWO SIDES OF A RATIO IN THE SAME ROUNDS (FIX W6-2b #1): each of 5
+    rounds runs n and then 2n, and the ratio is the least run of 2n over
+    the least of n. Measured one size after the other -- every run of n,
+    then every run of 2n -- a slowdown of the machine that lasted the
+    second's runs and not the first's multiplied the ratio: a linear
+    pattern read 3.09 and 3.13 on CI (x1.55 for a second), and a
+    quadratic one slowed on its smaller side could read under 3. A
+    slowdown longer than a round now falls on both sides; a shorter one
+    is a run the least of 5 leaves out."""
     first = unit * (10_000 // len(unit) + 1)
     repeats = max(1, int(0.02 / max(_fastest(lambda: work(first)), 1e-7)) + 1)
-    earlier = None
-    for n in (10_000, 20_000, 40_000, 80_000):
-        text = unit * (n // len(unit) + 1)
-        took = _fastest(lambda text=text: work(text), repeats)
-        if earlier is not None:
-            assert took / max(earlier, 1e-6) <= 3, (unit[:12], n, earlier, took)
-        earlier = took
+    for n in (10_000, 20_000, 40_000):
+        small = unit * (n // len(unit) + 1)
+        large = unit * (2 * n // len(unit) + 1)
+        runs_small: list[float] = []
+        runs_large: list[float] = []
+        for _ in range(5):
+            runs_small.append(_run(work, small, repeats))
+            runs_large.append(_run(work, large, repeats))
+        earlier, took = min(runs_small), min(runs_large)
+        assert took / max(earlier, 1e-6) <= 3, (unit[:12], 2 * n, earlier, took)
+
+
+class _Sleeps:
+    """A work whose time is set, not measured: `per_char` seconds of sleep
+    for each character (or its square, `power` 2), twice that from the
+    `slow_from`-th call on -- the machine slowed for good, as on CI (there
+    x1.55; x2 here, so the order the sides are measured in is read clear
+    of the sleep's own overhead)."""
+
+    def __init__(
+        self, *, power: int = 1, slow_from: int | None = None,
+        per_char: float = 1e-7,
+    ) -> None:
+        self.power, self.slow_from, self.per_char = power, slow_from, per_char
+        self.calls = 0
+
+    def __call__(self, text: str) -> None:
+        self.calls += 1
+        slower = 2.0 if self.slow_from and self.calls >= self.slow_from else 1.0
+        time.sleep(self.per_char * len(text) ** self.power / 10_000 ** (
+            self.power - 1) * slower)
+
+
+class TestTheMeasure:
+    """FIX W6-2b #1: _assert_linear on works whose time is known. F1, F2."""
+
+    def test_a_slowdown_that_lasts_is_not_the_pattern_s(self) -> None:
+        """Linear, and slowed by 2 for good from the 65th call. A call
+        is about 1 ms at 10 000, so a run is r = 13..20 calls; the 5
+        calls of the calibration come first. In the same rounds the
+        slowdown starts after the first round (5 + 2r < 65): both sides
+        keep a fast run, the ratio reads 2. One size after the other it
+        starts inside the runs of 10 000 and before those of 20 000
+        (5 + r < 65 <= 5 + 5r + 1): every run of 20 000 slowed, the ratio
+        about 4 -- the shape of the stand's red. Both hold for r = 12..29."""
+        _assert_linear(_Sleeps(slow_from=65), "a")
+
+    def test_the_pair_the_guard_sees_a_square(self) -> None:
+        with pytest.raises(AssertionError):
+            _assert_linear(_Sleeps(power=2), "a")
 
 
 class TestEveryPattern:
