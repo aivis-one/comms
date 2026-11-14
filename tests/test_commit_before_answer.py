@@ -218,8 +218,9 @@ class TestTheRule:
 
     @pytest.mark.parametrize("code", ["22001", "42703", "57014", "55P03", "23505"])
     def test_by_code_not_transient(self, code: str) -> None:
-        """Bad data, a statement, a cancelled one, a lock not available
-        (unreachable in comms: no NOWAIT, no lock_timeout), a key."""
+        """Bad data, a statement, a cancelled one (statement_timeout among
+        others), a lock not available (lock_timeout), a key. Raised for
+        real by the limits in tests/test_db_limits.py; held here by code."""
         assert not is_transient_db_error(_by_code(code))
 
     def test_operational_error_by_its_definition(self) -> None:

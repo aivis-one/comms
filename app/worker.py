@@ -86,9 +86,13 @@ from collections.abc import Awaitable, Callable
 import structlog
 
 from app.core import liveness
-from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT
 from app.core.config import settings
-from app.core.database import ProcessRole, dispose_engine, set_process_role
+from app.core.database import (
+    ProcessRole,
+    dispose_engine,
+    set_attempt_hold,
+    set_process_role,
+)
 from app.core.lanes import Lane
 from app.core.logging import setup_logging
 from app.core.sanitize import pipeline_error_of, sanitized_traceback
@@ -98,7 +102,12 @@ from app.engine.processor import (
     cleanup_terminal_notifications,
     process_lane,
 )
-from app.engine.service import LANE_CONCURRENCY, LANE_JOBS
+from app.engine.service import (
+    LANE_CONCURRENCY,
+    LANE_JOBS,
+    attempt_hold,
+    longest_attempt_hold,
+)
 from app.engine.wake import listen_for_wakes
 from app.engine.worker import run_engine_maintenance
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
@@ -106,7 +115,6 @@ from app.notifier import consume_close_notifications
 from app.profile.loader import (
     install_profile_from_settings,
     lanes_mixing_llm,
-    longest_llm_list,
 )
 
 logger = structlog.get_logger()
@@ -247,28 +255,12 @@ async def _isolated(
 
 def lane_step_bound(lane: Lane) -> float:
     """The longest a loop of `lane` may wait between two steps (LIVENESS,
-    the header): its places' attempts, one after another, each its
-    longest call and the database around it.
-
-    A pass waits for a place, and a place is given back when an attempt
-    ends; an attempt delivers one round of its lane's slots, and its calls
-    may wait for those of the lane's other jobs -- at most a round for
-    each place (app/engine/service.py delivery_portion). One call is the
-    lane's deliver timeout, or a model's: LLM_DELIVER_TIMEOUT_SECONDS for
-    each set of the longest list an llm type of the lane names, and the
-    body's download once (app/engine/service.py _deliver_single) -- taken
-    whether the llm channel is on or off, which only makes the bound
-    longer. The database's part is liveness.STEP_MARGIN_SECONDS.
+    the header): an attempt's hold of its job's row
+    (app/engine/service.py attempt_hold -- its places' attempts, one
+    after another, each its longest call) and the database around it,
+    liveness.STEP_MARGIN_SECONDS.
     """
-    call = float(settings.lane_deliver_timeout(lane))
-    sets = longest_llm_list(lane.value)
-    if sets:
-        call = max(
-            call,
-            settings.llm_deliver_timeout_seconds * sets
-            + LLM_BODY_DOWNLOAD_TIMEOUT,
-        )
-    return LANE_JOBS[lane] * call + liveness.STEP_MARGIN_SECONDS
+    return attempt_hold(lane) + liveness.STEP_MARGIN_SECONDS
 
 
 def _step_bound(log_fields: dict[str, str]) -> tuple[str, float]:
@@ -513,6 +505,9 @@ def main() -> None:
     # The worker renders templates -> it MUST have the profile. A
     # broken profile kills the process at startup (ProfileError).
     install_profile_from_settings()
+    # The database's limits wait for an attempt as long as it may hold
+    # its job's row -- read off the profile, so after it (W5-3).
+    set_attempt_hold(longest_attempt_hold())
     # The worker is the only process that delivers -> it builds the
     # channel registry BEFORE its loop. A registry that cannot be built
     # kills the worker here, at startup, instead of surfacing on the

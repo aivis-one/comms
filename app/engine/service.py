@@ -77,7 +77,7 @@ from app.audience.schedule import recipient_deferred_until
 from app.core.channels import LLM_BODY_DOWNLOAD_TIMEOUT, body_link_allowed
 from app.core.config import settings
 from app.core.constants import MAX_LLM_LETTER_CHARS
-from app.core.database import is_unique_violation_of
+from app.core.database import is_unique_violation_of, wait_for_attempts
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.lanes import Lane
 from app.core.sanitize import exception_text, sanitize_text, sanitized_traceback
@@ -118,7 +118,7 @@ from app.engine.models import (
 )
 from app.engine.resolver import resolve_targets
 from app.engine.wake import signal_lane
-from app.profile.loader import MAX_DURATION_DAYS, is_llm_route
+from app.profile.loader import MAX_DURATION_DAYS, is_llm_route, longest_llm_list
 from app.profile.registry import Decided, Layer, RecipientSchedule, registry
 
 logger = structlog.get_logger()
@@ -211,6 +211,39 @@ def delivery_portion(lane: Lane) -> int:
     lengthen the transaction again.
     """
     return LANE_CONCURRENCY[lane]
+
+
+def attempt_hold(lane: Lane) -> float:
+    """The longest an attempt of a `lane` job holds its row: one round of
+    the lane's slots, whose calls may wait for those of the lane's other
+    jobs -- a round for each of its places (delivery_portion). One call
+    is the lane's deliver timeout, or a model's: LLM_DELIVER_TIMEOUT_SECONDS
+    for each set of the longest list an llm type of the lane names, and
+    the body's download once (_deliver_single) -- taken whether the llm
+    channel is on or off, which only makes it longer. Read off the
+    installed profile: called after it.
+
+    The worker's liveness bound is this and the database's part
+    (app/worker.py lane_step_bound); the database's limits are derived
+    from the longest of the lanes (longest_attempt_hold)."""
+    call = float(settings.lane_deliver_timeout(lane))
+    sets = longest_llm_list(lane.value)
+    if sets:
+        call = max(
+            call,
+            settings.llm_deliver_timeout_seconds * sets
+            + LLM_BODY_DOWNLOAD_TIMEOUT,
+        )
+    return LANE_JOBS[lane] * call
+
+
+def longest_attempt_hold() -> float:
+    """The longest any attempt holds its job's row, over EVERY lane: a
+    wait for a job's row (app/core/database.py wait_for_attempts) may
+    meet an attempt of any lane -- the API and the consumer take none and
+    wait for all. What each entry point names to the database
+    (app/core/database.py set_attempt_hold), after its profile."""
+    return max(attempt_hold(lane) for lane in Lane)
 
 
 # -----------------------------------------------------------------------------
@@ -2099,6 +2132,8 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     #      portions inside the one transaction -- a row lock is held to
     #      the commit, so they would hold exactly as many rows.
     """
+    # The lock below waits for an attempt in flight: as long as its hold.
+    await wait_for_attempts(session)
     touched = (
         await session.execute(
             select(Notification)
@@ -2189,6 +2224,8 @@ async def close_notifications(
     """
     delivery_outcome = _CLOSING[outcome]
     step = _CLOSING_STEP[outcome]
+    # The lock below waits for an attempt in flight: as long as its hold.
+    await wait_for_attempts(session)
     stmt = (
         select(Notification)
         .where(condition, Notification.status.in_(_ACTIVE_STATUSES))

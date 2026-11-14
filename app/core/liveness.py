@@ -32,10 +32,13 @@
 #
 # THE BOUNDS are the loops' own (app/worker.py lane_step_bound,
 # app/transport/consumer.py, app/transport/push_relay.py), each with
-# STEP_MARGIN_SECONDS for the database steps around the bounded calls: a
-# statement has no time bound of its own yet (W5-3), so a step of the
-# database that takes longer than the margin is red -- a hang, which is
-# what this is for.
+# STEP_MARGIN_SECONDS for the database steps around the bounded calls.
+# A statement is bounded by its process's statement_timeout
+# (app/core/database.py LIMITS, W5-3), and the margin holds one at its
+# limit -- tests/test_db_limits.py holds the two together, not one
+# source: this module imports nothing of comms (THE CHECK). A step of the
+# database longer than the margin is red -- a hang, which is what this is
+# for.
 #
 # Not watched: the worker's wake listener (app/engine/wake.py). It waits
 # for notifications for as long as there are none, by design; a lost wake

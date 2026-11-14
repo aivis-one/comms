@@ -71,6 +71,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.core.database import named_connect_args
 from app.core.sanitize import sanitized_traceback
 
 logger = structlog.get_logger()
@@ -102,9 +103,9 @@ def wake_engine() -> AsyncEngine:
         # DB-1: no bound value in an error's text ([parameters]).
         hide_parameters=True,
         poolclass=NullPool,
-        connect_args={
-            "server_settings": {"application_name": WAKE_APPLICATION_NAME},
-        },
+        # The worker's limits, as its pool's (W5-3): LISTEN runs outside a
+        # transaction, so the idle limit never ends the listening session.
+        connect_args=named_connect_args(WAKE_APPLICATION_NAME),
     )
 
 

@@ -148,7 +148,7 @@ class TestThePulse:
 
 class TestTheBounds:
     def test_a_lane_without_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(worker, "longest_llm_list", lambda lane: 0)
+        monkeypatch.setattr(service, "longest_llm_list", lambda lane: 0)
         monkeypatch.setattr(
             settings, "notification_lane_bulk_deliver_timeout_seconds", 30,
         )
@@ -159,7 +159,7 @@ class TestTheBounds:
     def test_a_lane_with_llm_takes_the_models_call(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(worker, "longest_llm_list", lambda lane: 2)
+        monkeypatch.setattr(service, "longest_llm_list", lambda lane: 2)
         monkeypatch.setattr(settings, "llm_deliver_timeout_seconds", 120)
         call = 120 * 2 + LLM_BODY_DOWNLOAD_TIMEOUT
         assert worker.lane_step_bound(Lane.NORMAL) == (
@@ -248,7 +248,7 @@ class TestTheLaneLoop:
         monkeypatch.setattr(
             settings, f"notification_lane_{lane.value}_deliver_timeout_seconds", 1,
         )
-        monkeypatch.setattr(worker, "longest_llm_list", lambda name: 0)
+        monkeypatch.setattr(service, "longest_llm_list", lambda name: 0)
         monkeypatch.setattr(liveness, "STEP_MARGIN_SECONDS", 0.3)
         assert worker.lane_step_bound(lane) == 1.3
         channel = _SlowChannel(0.6)

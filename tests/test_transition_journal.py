@@ -45,6 +45,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import CategoryMute, Recipient
+from app.core import database
 from app.core.config import settings
 from app.core.database import dispose_engine, get_engine, get_session_factory
 from app.engine import processor, service
@@ -1580,10 +1581,20 @@ class TestLockRule:
     async def test_expiry_waits_for_the_attempt(
         self,
         db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """On a SECOND attempt: the job is already PROCESSING, resolve
         does not touch its row, so only the attempt's row lock stands
-        between it and an expiry."""
+        between it and an expiry.
+
+        The expiry's wait is bounded by close_notifications itself since
+        W5-3 (app/core/database.py wait_for_attempts: lock_timeout = the
+        attempt's hold and the margin), which replaces a lock_timeout the
+        caller set before -- the test's own `SET LOCAL lock_timeout`
+        held only while nothing lifted it. Made short here through the
+        hold, the same measurement on the code's own limit."""
+        monkeypatch.setattr(database, "_attempt_hold", 0.3)
+        monkeypatch.setattr(database, "WAIT_MARGIN_SECONDS", 0.2)
         recipient = await create_recipient(db_session)
         nid = await _intake(db_session, recipient.id)
         with _channel(_Spy({"in_app": EmailTransientError("provider error (503)")})):
@@ -1595,7 +1606,6 @@ class TestLockRule:
         class _ExpireWhileInFlight:
             async def deliver(self, *args: Any) -> bool:
                 async with get_session_factory()() as other:
-                    await other.execute(text("SET LOCAL lock_timeout = '500ms'"))
                     try:
                         await close_notifications(
                             other,

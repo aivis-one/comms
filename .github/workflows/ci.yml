@@ -131,7 +131,10 @@ jobs:
 
       # THE THREE PARTS (CI-2), the one place they are written. Parts 1
       # and 2 are lists of files, by the time of each file measured in CI
-      # (the step `Suite time by file`, run #299: ~247 s and ~237 s);
+      # (the step `Suite time by file`, run #299: ~247 s and ~237 s;
+      # W5-3: tests/test_migration_chain.py, ~4 min 50 s by run #350's
+      # durations, moved from part 3 to part 2, the shorter -- run #348's
+      # parts took 6 min 33 s, 5 min 15 s and 13 min 44 s);
       # part 3 is every other file -- `tests` without them (--ignore),
       # so a new test file is in part 3 by itself. Held here: the parts
       # together collect as many nodes as the whole suite and share no
@@ -156,6 +159,7 @@ jobs:
             tests/test_waiting_probe.py
             tests/test_h9_release.py
             tests/test_json_null.py
+            tests/test_migration_chain.py
         run: |
           set -o pipefail
           part3=tests

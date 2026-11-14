@@ -61,10 +61,12 @@ from app.core.database import (
     ProcessRole,
     dispose_engine,
     get_engine,
+    set_attempt_hold,
     set_process_role,
 )
 from app.core.logging import setup_logging
 from app.engine.formatters import channel_map, close_formatters, llm_set_map
+from app.engine.service import longest_attempt_hold
 from app.profile.loader import install_profile_from_settings
 from app.transport.connection import redis_client
 
@@ -88,6 +90,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     commit_from_environment()
     set_process_role(ProcessRole.API)
     install_profile_from_settings()
+    # The database's limits wait for an attempt as long as it may hold
+    # its job's row -- read off the profile, so after it (W5-3).
+    set_attempt_hold(longest_attempt_hold())
     if not settings.comms_service_token:
         # Only reachable in development: any other APP_ENV refuses to
         # start without the token (app/core/config.py). Loud on purpose

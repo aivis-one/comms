@@ -115,10 +115,12 @@ from app.core.database import (
     dispose_engine,
     get_engine,
     get_session_factory,
+    set_attempt_hold,
     set_process_role,
 )
 from app.engine.formatters import reset_formatters
 from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
+from app.engine.service import longest_attempt_hold
 from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.profile.loader import FileProfileSource, install_profile, load_profile
 from app.profile.registry import registry
@@ -258,8 +260,13 @@ def worker_process_role() -> None:
     process without a role (app/core/database.py ProcessRole), and the
     worker's pool is the one the lane budgets are held to. Before
     clean_db, which opens the first session; set again for each test,
-    since app/main.py lifespan (run by a few tests) names the API."""
+    since app/main.py lifespan (run by a few tests) names the API. The
+    attempt's hold with it, which the engine's limits are derived from
+    (W5-3): off the settings and the profile installed at the time --
+    the engine is the session's, made once, before the first test's
+    profile."""
     set_process_role(ProcessRole.WORKER)
+    set_attempt_hold(longest_attempt_hold())
 
 
 @pytest.fixture(autouse=True)

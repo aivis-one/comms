@@ -25,6 +25,7 @@ import socket
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 import structlog
 from sqlalchemy import text
@@ -134,12 +135,85 @@ RESERVED_CONNECTIONS = 3
 PROBE_CONNECTIONS = 1
 
 
+# THE DATABASE'S LIMITS (W5-3). Every connection of a comms process --
+# its pool's, its probe's, the worker's wake listener's -- carries three
+# limits the SERVER keeps, as startup parameters of the connection
+# (server_settings: a SET at connect runs in a transaction the pool's
+# reset rolls back, tests/test_lanes.py), and one the driver keeps:
+#   statement_timeout -- the longest one statement may run, its waits
+#       for locks included (57014);
+#   lock_timeout -- the longest one statement may wait for one lock
+#       (55P03); below statement_timeout, or it never fires first;
+#   idle_in_transaction_session_timeout -- the longest a transaction may
+#       sit between two statements; past it the server ends the session
+#       and the next statement fails as a connection gone (InterfaceError);
+#   command_timeout (asyncpg) -- the client's: for a server that does not
+#       answer at all; TimeoutError. It is the CONNECTION's, not a
+#       statement's, so it stands above the longest statement any
+#       connection may run: the waits for an attempt (below).
+# What each failure becomes is the one rule of transient failures below
+# (is_transient_db_error), unchanged: 57014 and 55P03 are not transient
+# -- a statement past three times its measure is a defect of comms, said
+# loudly; the session ended and the client's timeout are.
+#
+# THE ATTEMPT'S HOLD. An attempt holds its job's row through the
+# channel's call (app/engine/processor.py, THE LOCK RULE): its
+# transaction sits idle that long, and whoever waits for the row
+# (wait_for_attempts) waits that long. How long is the attempt's, set by
+# each entry point after its profile (set_attempt_hold,
+# app/engine/service.py longest_attempt_hold); the worker's idle limit
+# and the waits are that and WAIT_MARGIN_SECONDS. The migration keeps its
+# own: a lock limit, no statement limit -- migrations/env.py.
+
+
+@dataclass(frozen=True)
+class Limits:
+    """A process's limits, in seconds. idle None: the attempt's hold and
+    WAIT_MARGIN_SECONDS (the worker: its attempts sit idle in their
+    transactions through the channel's call)."""
+
+    statement: float
+    lock: float
+    idle: float | None
+
+
+# The numbers stand above the measure (MEASURED_SECONDS) by
+# MEASURE_MARGIN at least -- tests/test_db_limits.py holds it -- and are
+# round: a busy box, and a path the measure did not take.
+LIMITS: dict[ProcessRole, Limits] = {
+    ProcessRole.API: Limits(statement=10.0, lock=5.0, idle=10.0),
+    ProcessRole.WORKER: Limits(statement=30.0, lock=10.0, idle=None),
+    ProcessRole.CONSUMER: Limits(statement=30.0, lock=10.0, idle=10.0),
+}
+
+# The longest legitimate work of each process on a volume shaped like
+# production (tests/measure_db_limits.py SEED: 100 000 jobs, 270 000
+# deliveries, 10 000 people), the worst of two measurements of three
+# runs each, in seconds; measured 13 November 2026 at primer@8946b73,
+# Postgres 16. The worker's is the resolve of a job to everyone (10 000
+# deliveries in one transaction); the API's, the lane depth; the
+# consumer's, the forgetting of a person.
+MEASURED_SECONDS: dict[ProcessRole, float] = {
+    ProcessRole.API: 0.108,
+    ProcessRole.WORKER: 1.656,
+    ProcessRole.CONSUMER: 0.040,
+}
+MEASURE_MARGIN = 3.0
+
+# Above the attempt's hold: a wait for its row ends with its commit.
+WAIT_MARGIN_SECONDS = 30.0
+
+# The client's timeout above the server's longest: the server says why.
+CLIENT_MARGIN_SECONDS = 10.0
+
+
 # ---------------------------------------------------------------------------
 # Lazy singletons -- created on first access, not at import time
 # ---------------------------------------------------------------------------
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _role: ProcessRole | None = None
+_attempt_hold: float | None = None
 
 
 def set_process_role(role: ProcessRole) -> None:
@@ -148,18 +222,124 @@ def set_process_role(role: ProcessRole) -> None:
     _role = role
 
 
+def set_attempt_hold(seconds: float) -> None:
+    """Name the longest an attempt holds its job's row (the header): the
+    next engine's limits are derived from it."""
+    global _attempt_hold
+    _attempt_hold = seconds
+
+
+def wait_seconds() -> float:
+    """The longest a statement may wait for an attempt's row: its
+    lock_timeout in wait_for_attempts. Raises when no entry point named
+    the hold."""
+    if _attempt_hold is None:
+        raise RuntimeError(
+            "no attempt hold: the entry point must call set_attempt_hold() "
+            "after its profile, before the first engine -- the limits are "
+            "derived from it (app/core/database.py LIMITS)"
+        )
+    return _attempt_hold + WAIT_MARGIN_SECONDS
+
+
+def waiting_statement_seconds() -> float:
+    """The statement_timeout of a statement that waits for an attempt's
+    row (wait_for_attempts): the wait and the margin again for its own
+    work -- above the wait, so one wait past the hold fails as the lock
+    it is (55P03), as lock_timeout below statement_timeout does
+    everywhere (LIMITS)."""
+    return wait_seconds() + WAIT_MARGIN_SECONDS
+
+
+def connect_args(role: ProcessRole) -> dict[str, Any]:
+    """The limits of `role` as the driver takes them (the header)."""
+    limits = LIMITS[role]
+    wait = wait_seconds()
+    idle = wait if limits.idle is None else limits.idle
+    return {
+        "server_settings": {
+            "statement_timeout": _ms(limits.statement),
+            "lock_timeout": _ms(limits.lock),
+            "idle_in_transaction_session_timeout": _ms(idle),
+        },
+        "command_timeout": (
+            max(limits.statement, waiting_statement_seconds())
+            + CLIENT_MARGIN_SECONDS
+        ),
+    }
+
+
+def named_connect_args(application_name: str) -> dict[str, Any]:
+    """connect_args of this process's role, its connection named
+    `application_name` in pg_stat_activity: a connection of its own
+    outside the pool (the probe, the wake listener) carries the limits
+    of the pool's."""
+    args = connect_args(_role_set())
+    args["server_settings"]["application_name"] = application_name
+    return args
+
+
+def _ms(seconds: float) -> str:
+    return f"{round(seconds * 1000)}ms"
+
+
+def _role_set() -> ProcessRole:
+    if _role is None:
+        raise RuntimeError(
+            "no process role: the entry point must call "
+            "set_process_role() before the first engine -- its pool "
+            "is sized by it (app/core/database.py POOLS)"
+        )
+    return _role
+
+
+async def wait_for_attempts(session: AsyncSession) -> None:
+    """Let this transaction's statements wait for an attempt's row: a
+    statement that takes a job's row FOR UPDATE and waits (expiry,
+    cancellation, forgetting -- app/engine/service.py close_notifications,
+    withdraw_recipient) waits for the attempt's commit, as long as the
+    attempt's hold, which the process's own limits do not cover. SET
+    LOCAL: the transaction's, gone at its end; never a session's SET,
+    which would outlive it in the pool.
+
+    KNOWN CEILING (W5-3) -- A WAIT FOR SEVERAL ATTEMPTS IN ONE STATEMENT.
+      1. Mechanics: each wait for a lock is bounded by one attempt's hold
+         and the margin (lock_timeout); the statement by that and the
+         margin again (statement_timeout). A statement that locks several
+         jobs in id order waits
+         for each one's attempt; an attempt may take a job the statement
+         has not reached yet while it waits for an earlier one (the
+         attempt's lock SKIPs LOCKED rows, it does not wait), so the
+         waits can follow one another, and the statement fail with 57014
+         past the limit: the request is answered 500 (the API), the
+         event held (the consumer), the sweep's portion rolled back (the
+         worker). Nothing is half-done: the transaction rolls back.
+      2. Status: acknowledged by design.
+      3. Task: none -- not observed; it needs attempts of the same jobs
+         one after another for longer than the margin.
+      4. Unfreeze when: a 57014 in event_held, database_error_at_api_edge
+         or maintenance_pass_error naming close_notifications or
+         withdraw_recipient.
+      5. Agreed fix: a limit of the number of attempts the statement can
+         wait for (its jobs' count) times the hold -- or portions that
+         lock one job at a time.
+      6. Rejected: no statement_timeout on these transactions (a
+         forgotten holder would hang them again -- the reason for W5-3);
+         lock_timeout alone (it bounds one lock, not the statement).
+    """
+    statement = _ms(waiting_statement_seconds())
+    await session.execute(text(f"SET LOCAL statement_timeout = '{statement}'"))
+    await session.execute(text(f"SET LOCAL lock_timeout = '{_ms(wait_seconds())}'"))
+
+
 def get_engine() -> AsyncEngine:
     """Get or create the async engine (singleton), sized by the process's
-    role (POOLS). Raises when no role was set: see ProcessRole."""
+    role (POOLS) and bounded by its limits (LIMITS). Raises when no role
+    or no attempt hold was set: see ProcessRole, set_attempt_hold."""
     global _engine
     if _engine is None:
-        if _role is None:
-            raise RuntimeError(
-                "no process role: the entry point must call "
-                "set_process_role() before the first engine -- its pool "
-                "is sized by it (app/core/database.py POOLS)"
-            )
-        pool = POOLS[_role]
+        role = _role_set()
+        pool = POOLS[role]
         _engine = create_async_engine(
             settings.database_url,
             # DB-1: no bound value in an error's text ([parameters]).
@@ -169,6 +349,8 @@ def get_engine() -> AsyncEngine:
             max_overflow=pool.overflow,
             pool_pre_ping=True,
             pool_recycle=1800,
+            # W5-3: the role's limits (LIMITS).
+            connect_args=connect_args(role),
         )
     return _engine
 
@@ -234,9 +416,7 @@ async def _probe_once() -> bool:
         # DB-1: no bound value in an error's text ([parameters]).
         hide_parameters=True,
         poolclass=NullPool,
-        connect_args={
-            "server_settings": {"application_name": PROBE_APPLICATION_NAME},
-        },
+        connect_args=named_connect_args(PROBE_APPLICATION_NAME),
     )
     try:
         async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
@@ -475,10 +655,16 @@ def is_transient_db_error(exc: BaseException) -> bool:
         addresses included) -- and the pool's own timeout
         (sqlalchemy.exc.TimeoutError), an overload that passes.
     NOT TRANSIENT: everything else -- a constraint (class 23), bad data
-    (22), a statement or a right (42), a cancelled statement (57014).
-    NOT IN THE RULE: 55P03 lock_not_available. Nothing in comms can
-    reach it -- no NOWAIT and no lock_timeout anywhere; SKIP LOCKED skips
-    rather than fails (the TX-1 report).
+    (22), a statement or a right (42), a cancelled statement (57014: the
+    statement_timeout of LIMITS among others) and a lock not had in time
+    (55P03: lock_timeout of LIMITS). Each limit stands at least three
+    times above the measure of the work it bounds, and a wait for an
+    attempt's row is lifted to the attempt's hold (wait_for_attempts):
+    past them it is a defect of comms, counted and said, not a passing
+    state to wait out. NOWAIT is not used; SKIP LOCKED skips rather than
+    fails (the TX-1 report). The session ended by
+    idle_in_transaction_session_timeout and the driver's command_timeout
+    (TimeoutError, _network_failure) are transient, by the rows above.
 
     A FALSE TRANSIENT IS A BUG OF OURS, BOUNDED. The driver's
     InterfaceError is also what it raises when code misuses a
