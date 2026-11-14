@@ -1540,10 +1540,23 @@ class TestTheContract:
             jobs.AnswerState.NONE, jobs.AnswerState.KEPT, jobs.AnswerState.PURGED,
         }
 
-    def test_the_gateway_block_is_the_documented_one(self) -> None:
-        assert json.dumps(LLM_GATEWAY_ROUTING, separators=(", ", ": ")) in (
-            " ".join(_section_11().split())
-        )
+    def test_the_gateway_conditions_are_the_codes(self) -> None:
+        """Section 11 says what a gateway set asks of the gateway, and the
+        block comms sends is exactly that, both ways: no fallback to
+        another provider, no provider that collects the data.
+
+        Was test_the_gateway_block_is_the_documented_one, which held the
+        JSON block printed in section 11 word for word. DOC-1 took the
+        block out with the operator's part of the section: the product
+        neither sends nor sets it, and reads the conditions as prose.
+        That comms sends the block in every gateway request is held by
+        test_a_gateway_set_carries_the_routing_block."""
+        flat = " ".join(_section_11().split())
+        assert "does not silently fall back to another provider" in flat
+        assert "only providers that do not collect the data are used" in flat
+        assert LLM_GATEWAY_ROUTING == {
+            "allow_fallbacks": False, "data_collection": "deny",
+        }
 
     def test_the_env_example_and_the_generated_env_carry_the_key(self) -> None:
         example = (_REPO / "deploy" / ".env.example").read_text()
