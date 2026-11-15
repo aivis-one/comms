@@ -62,6 +62,13 @@
 # FIX W6-2b #1 -- the measure's sides in the same rounds:
 #   F1  every run of n, then every run of 2n, again -> TestTheMeasure
 #   F2  no bound on the ratio                       -> TestTheMeasure
+# W6-2c -- a port with a path behind it is not a password:
+#   G1  no port guard (W6-2b's expression)          -> TestAPortIsNotAPassword
+#   G2  a guard wider than a port, (?!\w+[/?#])     -> TestAPortIsNotAPassword,
+#                                                      TestQueryMarksInAPassword
+#   G3  the guard in _userinfo_redacted, after the
+#       word is taken                               -> TestAPortIsNotAPassword
+#   G4  any number of digits, \d+                   -> TestAPortIsNotAPassword
 # =============================================================================
 
 import decimal
@@ -323,7 +330,12 @@ _UNITS: dict[str, list[str]] = {
     "_QUERY_KEYVAL_RE": ["?token=", "&a=", "?a-"],
     "_SECRET_NAME_RE": ["a-", "token-", "a_b-"],
     "_TELEGRAM_TOKEN_RE": ["bot1234567:", "1234567:"],
-    "_URL_USERINFO_RE": ["://a:", "://", ":@", "://a:@b", "://a:x@"],
+    "_URL_USERINFO_RE": [
+        "://a:", "://", ":@", "://a:@b", "://a:x@",
+        # W6-2c: the port guard fires on every unit, and gives up after
+        # five digits on every unit.
+        "://a:1/", "://a:123456/",
+    ],
 }
 _PATTERNS = {
     name: value for name, value in vars(sanitize_module).items()
@@ -495,6 +507,56 @@ class TestQueryMarksInAPassword:
     ])
     def test_the_pair_no_at_no_userinfo(self, text: str) -> None:
         """No @ after the colon: no userinfo, the text as it is."""
+        assert sanitize_text(text) == text
+
+
+class TestAPortIsNotAPassword:
+    """W6-2c, the review's N2: after "host:", 1 to 5 digits and "/", "?" or
+    "#" are a port and what follows it -- the address as it is, though an
+    @ comes later in the word; every password W6-2b hid is still hidden.
+    G1-G4."""
+
+    @pytest.mark.parametrize("text", [
+        "http://storage:9000/audio/a.ogg?user=john@example.com",
+        "GET http://comms-app:8000/api/v1/recipients?email=a@b.c",
+        "https://api.telegram.org:443/bot123/sendMessage?chat_id=@channel",
+        "http://h:9000#to@b", "http://h:1?a@b",
+    ])
+    def test_the_address_as_it_is(self, text: str) -> None:
+        assert sanitize_text(text) == text
+
+    @pytest.mark.parametrize(("head", "password", "tail"), [
+        ("postgresql+asyncpg://comms:", "Zx9?" + "Qw#7", "@db/comms"),
+        ("postgresql://comms:", "p@ss/" + _SECRET, "@db:5432"),
+        ("redis://:", "4d0c" * 12, "@comms-redis:6379/0"),
+        # A port with no path is the userinfo's reading: user "h".
+        ("http://h:", "9000", "@x"),
+        # Six digits are no port.
+        ("postgresql://u:", "123456/" + _SECRET, "@db"),
+        # Digits alone end at their "@".
+        ("postgresql://u:", "1234", "@db/x?y=1"),
+    ])
+    def test_the_pair_a_password_is_hidden(
+        self, head: str, password: str, tail: str,
+    ) -> None:
+        cleaned = sanitize_text(head + password + tail)
+        assert cleaned == head + "[redacted]" + tail
+        assert sanitize_text(cleaned) == cleaned
+
+    def test_a_url_further_in_the_word_is_looked_at(self) -> None:
+        """The guard ends the match at the port, it does not take the word:
+        a URL in the query of a guarded one is still cleaned."""
+        text = f"http://h:9000/cb?next=https://u:{_SECRET}@h2/x"
+        cleaned = sanitize_text(text)
+        assert cleaned == "http://h:9000/cb?next=https://u:[redacted]@h2/x"
+        assert _SECRET not in cleaned
+
+    def test_the_price_a_password_shaped_as_a_port(self) -> None:
+        """A password that starts with 1 to 5 digits and then "/", "?" or
+        "#" reads as a port: left whole, the price app/core/sanitize.py
+        names at pattern 4. The deploy machine mints none such
+        (token_urlsafe: [A-Za-z0-9_-])."""
+        text = "postgresql://u:12/" + "ab@db"
         assert sanitize_text(text) == text
 
 
