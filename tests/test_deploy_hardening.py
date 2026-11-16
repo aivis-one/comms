@@ -31,6 +31,8 @@
 #         -> TestCompose.test_postgres_is_asked_over_tcp
 #   W6-2b: no stop_grace_period on comms-worker, or one under the stop's
 #         bound -> TestCompose.test_the_worker_s_stop_outlasts_its_bound
+#   W7-1: the machine checked out by a name, not a commit
+#         -> TestTheMachinePin
 # =============================================================================
 
 import asyncio
@@ -463,6 +465,19 @@ def _unreachable(run: str, image: set[str]) -> list[str]:
 
 
 _CI = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+
+class TestTheMachinePin:
+    """W7-1: job `machine` checks out Primer's machine by the commit of its
+    release (v0.1.0), not by the tag or a branch -- a name can be moved to
+    another commit, a commit cannot."""
+
+    def test_the_machine_is_checked_out_by_a_commit(self) -> None:
+        step = _CI.split("- name: Check out the machine (pinned)", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        assert "repository: inzoddwetrust/primer" in step
+        (ref,) = re.findall(r"^\s*ref:\s*(\S+)", step, re.M)
+        assert re.fullmatch(r"[0-9a-f]{40}", ref), ref
 
 
 class TestImageRuns:

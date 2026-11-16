@@ -49,36 +49,16 @@
 # THE PROFILE is not in this file (W4-1): it is data comms takes from
 # the product (primer.yaml `accepts.profile`, form D of protocol 4.5).
 # The machine copies the product's directory, runs `comms validate
-# --profile <dir>` on it in a throwaway container of the new image, and
-# its own override binds the copy read-only and sets TEMPLATES_DIR to it.
+# --profile <dir>` on it once, in a throwaway container of the new image,
+# and its own override binds the copy read-only and sets TEMPLATES_DIR to
+# it on every service of `accepts.profile.services` (W7-1, the machine's
+# DM-100) -- comms-app, comms-worker and comms-consumer, each of which
+# reads the profile at its start (install_profile_from_settings in
+# app/main.py, app/worker.py and app/consumer.py). Not a host path, a
+# named volume, `volumes_from` or a copy in the image: one copy, the
+# product's, bound by the machine (W4-1).
 # The text overlay (TEMPLATES_OVERLAY_DIR) has no form here: the machine
 # has no kind of data for it, and comms runs on the profile alone.
-#
-# KNOWN CEILING (acknowledged by design -- the profile on comms-app alone):
-#   1. Mechanics: the machine binds the data a service takes, and sets its
-#      variable, on the service's `app` only -- comms-app (pridem
-#      steps/build.py: data_binds on the entry's app service, at the
-#      commit CI's job `machine` pins). comms-worker and comms-consumer
-#      read the profile too (install_profile_from_settings in
-#      app/worker.py and app/consumer.py), get no TEMPLATES_DIR, and
-#      refuse to start: comms-app comes up, the two do not, and the
-#      machine installs comms nowhere yet.
-#   2. Status: acknowledged by design.
-#   3. Backlog ref: none in comms -- the machine's: a letter to Primer
-#      (gate W4-1) that a kind of data is bound on every application
-#      service of the entry, not on `app` alone.
-#   4. Promotion trigger (observable): the machine, at the commit CI's
-#      job `machine` pins, puts the bind and the variable of an accepted
-#      kind on comms-worker and comms-consumer as on comms-app.
-#   5. Agreed fix: nothing in this file -- the machine's override carries
-#      it; the ref of the job `machine` raised, this marker removed.
-#   6. Rejected: a host path, or a named volume comms-app fills for the
-#      other two (the machine refuses a host path; a volume is a second
-#      copy, empty at their start); `volumes_from` (not a key a service
-#      may have, the machine's SERVICE_KEYS); the profile served by
-#      comms-app or kept in the database (a second way to read one
-#      profile, and the worker made to wait on the API); the profile
-#      copied into the image (a profile is the product's, never comms').
 # =============================================================================
 
 # What every application process reads from the instance, by the keys of

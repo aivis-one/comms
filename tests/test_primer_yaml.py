@@ -37,7 +37,7 @@ _PRIMER: dict[str, Any] = yaml.safe_load(
 _ENV: dict[str, dict[str, Any]] = _PRIMER["env"]
 _PROVIDES: list[str] = _PRIMER["provides"]
 _REQUIRES: list[str] = _PRIMER["requires"]
-_ACCEPTS: dict[str, dict[str, str]] = _PRIMER["accepts"]
+_ACCEPTS: dict[str, dict[str, Any]] = _PRIMER["accepts"]
 # The variable of each kind of data comms takes: the machine's, never a
 # key of `env` (S.accepts-env, W4-1).
 _ACCEPTED_ENV: set[str] = {kind["env"] for kind in _ACCEPTS.values()}
@@ -144,6 +144,18 @@ class TestTheProfileIsData:
         assert _ACCEPTS["profile"]["env"] == "TEMPLATES_DIR"
         assert "templates_dir" in Settings.model_fields
         assert _unset_default(_DEFAULTS["TEMPLATES_DIR"])
+
+    def test_every_process_takes_the_profile(self) -> None:
+        """W7-1: each process of the image reads the profile at its start
+        (install_profile_from_settings), so `services` names every one --
+        the processes of deploy/docker-compose.yml, three, each a service
+        of it. Without the field the machine binds it on `app` alone and
+        the worker and the consumer refuse to start. Mutations: the field
+        removed, a process left out, a name compose does not have."""
+        services = _ACCEPTS["profile"]["services"]
+        assert sorted(_PROCESSES) == ["comms-app", "comms-consumer", "comms-worker"]
+        assert sorted(services) == sorted(_PROCESSES)
+        assert len(services) == len(set(services))
 
     def test_the_path_is_not_a_key_of_env(self) -> None:
         assert _ACCEPTED_ENV  # the pair: there is a variable to keep out

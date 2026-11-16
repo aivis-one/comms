@@ -85,8 +85,18 @@ env:
 # the migration, and gives the path under `env` -- TEMPLATES_DIR, the
 # variable comms reads; it is not a key of `env` above (S.accepts-env).
 # The validator is the loader of comms' start (app/cli.py validate).
+# `services` (W7-1, the machine's DM-100): every process reads the profile
+# at its start (install_profile_from_settings), so each gets the same
+# read-only bind and the same variable -- without the field the machine
+# gives it to `app` alone, and the worker and the consumer refuse to
+# start. tests/test_primer_yaml.py holds the list to the processes of
+# deploy/docker-compose.yml; a name compose does not have is a finding of
+# `pridem check` (scripts/check_primer_yaml.py).
 accepts:
-  profile: { validate: "comms validate --profile <dir>", env: TEMPLATES_DIR }
+  profile:
+    validate: "comms validate --profile <dir>"
+    env: TEMPLATES_DIR
+    services: [comms-app, comms-worker, comms-consumer]
 
 # What comms takes from the product (W4-2): /health says whether it was
 # given (`seams.requires_satisfied`, app/api/report.py).

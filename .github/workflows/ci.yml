@@ -248,7 +248,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: inzoddwetrust/primer
-          ref: 213a3ed250f14203e6608b0d0733fb9d2dc889a2
+          ref: 9103f46578daed6e5bce99979930b4f455093cab  # v0.1.0
           path: .primer
           persist-credentials: false
 
@@ -511,7 +511,8 @@ jobs:
       # THE PROFILE IS MOUNTED, AS ON A BOX (TX-4 FIX): the image carries
       # app/ and migrations/, not tests/ -- so the test profile is mounted
       # read-only on /primer/data/profile and TEMPLATES_DIR names it, the
-      # path the machine gives comms-app the profile at (W4-1: primer.yaml
+      # path the machine gives the profile at to each of comms-app,
+      # comms-worker and comms-consumer (W4-1, W7-1: primer.yaml
       # `accepts.profile`, /primer/data/<kind>; tests/test_deploy_hardening.py
       # holds both: every /app path of this step is in the image or
       # mounted, and TEMPLATES_DIR is the machine's path of the kind).

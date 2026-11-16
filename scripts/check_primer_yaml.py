@@ -18,7 +18,9 @@
 #      stop_for_migrate against the services. Every step must be green,
 #      `compose` among them, and must have run (W4-1: the profile's bind of
 #      a host path, the one finding allowed until then, is gone -- the
-#      profile is data comms takes, primer.yaml `accepts.profile`);
+#      profile is data comms takes, primer.yaml `accepts.profile`) -- a
+#      name of `accepts.<kind>.services` compose does not have among its
+#      findings (W7-1, the machine's DM-100);
 #   2. the seams, as seams_check asks them of a box: half seams (a name of
 #      `provides` without its key of `env`), a seam under an option the
 #      product takes without it, routes of a co-located service, data the
@@ -43,7 +45,11 @@
 #      `provides` among `seams.provides`, `requires_satisfied` true. The
 #      pair: the document is `ok`, so a degraded one cannot pass by its
 #      degradation.
-# AND ONE THING THE MACHINE DOES NOT CHECK: `persistent: true`. No rule of
+# AND TWO THINGS THE MACHINE DOES NOT CHECK. `accepts.<kind>.services`
+# present (W7-1): without it the machine gives the data to `app` alone,
+# which it allows -- every process of comms reads the profile, so its
+# absence is a finding here, on the machine's own model of the file.
+# `persistent: true`. No rule of
 # the machine refuses a service without it -- the machine only reads it
 # when it destroys -- so it is asserted here, on the machine's own model of
 # the file (a misspelt key never gets this far: the loader refuses any
@@ -190,6 +196,16 @@ def check(root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
     if not stack.accepts:
         found.append("accepts is empty: comms takes the product's profile as data")
     checked.append(f"seams: accepts {', '.join(stack.accepts)}, each taken")
+    for kind, accepted in stack.accepts.items():
+        if accepted.services is None:
+            found.append(
+                f"accepts.{kind}.services is absent: the machine gives the "
+                f"data to the app alone, and every process of comms reads it"
+            )
+        else:
+            checked.append(
+                f"loader: accepts.{kind} to {', '.join(accepted.services)}"
+            )
 
     for entry, stage in stack.stacks.items():
         if not stage.persistent:
