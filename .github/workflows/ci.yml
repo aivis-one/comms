@@ -248,7 +248,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: inzoddwetrust/primer
-          ref: 9103f46578daed6e5bce99979930b4f455093cab  # v0.1.0
+          ref: e5c9d63430ff2ea7c101c0405598736b934c0d0b  # v0.1.2
           path: .primer
           persist-credentials: false
 
