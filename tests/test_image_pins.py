@@ -15,6 +15,10 @@
 #   M3  a `services:` image back in CI                    -> TestCiNamesNone
 #   M4  a digest one hex short                            -> TestThePins
 #   M5  the docker-compose ecosystem out of dependabot.yml -> TestDependabot
+# W7-3 -- every pull request into `primer`, no `pip`:
+#   K1  github-actions back into `test`                  -> TestDependabot
+#   K2  the `pip` ecosystem back                         -> TestDependabot
+#   K3  docker back into `test`                          -> TestDependabot
 # =============================================================================
 
 import re
@@ -129,15 +133,38 @@ class TestCiNamesNone:
 
 class TestDependabot:
     """done-when 2: every place with an image is kept by an ecosystem,
-    into `test`, major lines (and Python's minor) left to a decision.
-    M5."""
+    major lines (and Python's minor) left to a decision. Every pull request
+    goes into `primer`, the line comms is delivered from -- until W7-3 into
+    `test`, then the working line, frozen as v3 since -- and there is no
+    `pip`: it raised ranges the hash-checked locks did not follow (the
+    owner, 18.11). M5, K1-K3."""
 
     @staticmethod
-    def _updates() -> dict[str, dict[str, Any]]:
+    def _entries() -> list[dict[str, Any]]:
         config: dict[str, Any] = yaml.safe_load(
             _DEPENDABOT.read_text(encoding="utf-8"),
         )
-        return {entry["package-ecosystem"]: entry for entry in config["updates"]}
+        entries: list[dict[str, Any]] = config["updates"]
+        return entries
+
+    @classmethod
+    def _updates(cls) -> dict[str, dict[str, Any]]:
+        return {entry["package-ecosystem"]: entry for entry in cls._entries()}
+
+    def test_every_entry_goes_to_primer(self) -> None:
+        entries = self._entries()
+        assert sorted(e["package-ecosystem"] for e in entries) == [
+            "docker", "docker-compose", "github-actions",
+        ]
+        for entry in entries:
+            assert entry["target-branch"] == "primer", entry["package-ecosystem"]
+
+    def test_no_pip(self) -> None:
+        """The entries as written, not by ecosystem: a second entry of one
+        ecosystem is not folded away."""
+        ecosystems = [e["package-ecosystem"] for e in self._entries()]
+        assert ecosystems, "the pair: entries read, not an empty file"
+        assert "pip" not in ecosystems
 
     def test_both_image_files_are_kept(self) -> None:
         updates = self._updates()
@@ -149,7 +176,7 @@ class TestDependabot:
         assert _COMPOSE.parent == _REPO / "deploy"
         for ecosystem in ("docker", "docker-compose"):
             entry = updates[ecosystem]
-            assert entry["target-branch"] == "test"
+            assert entry["target-branch"] == "primer"
             assert {
                 "dependency-name": "*",
                 "update-types": ["version-update:semver-major"],

@@ -653,10 +653,13 @@ def _unsatisfied(declared: list[Requirement], locked: dict[str, Version]) -> lis
 
 
 class TestTheLockSatisfies:
-    """Decision D2 (the owner): a Dependabot pull request that raises a
-    range in pyproject is not regenerated into the lock automatically --
-    it is closed by hand. This keeps it from being merged: the version
-    the lock pins must lie in every range pyproject declares."""
+    """The version each lock pins lies in every range pyproject declares:
+    a range changed by hand and the locks not regenerated with it (the
+    command of pyproject's THE TWO LOCKS) is red here. Until W7-3 the hand
+    was Dependabot's `pip` ecosystem (decision D2: its pull requests raised
+    ranges, never the locks, and were closed red); the owner took `pip`
+    out of .github/dependabot.yml on 18.11 -- the guard stays for any
+    edit of a range."""
 
     @pytest.mark.parametrize("lock", list(_LOCKS))
     def test_every_locked_version_is_in_its_range(self, lock: str) -> None:

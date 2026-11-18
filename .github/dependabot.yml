@@ -1,25 +1,26 @@
+# Dependabot keeps the pins of what comms runs on: the container images
+# and the GitHub Actions. Every pull request goes into `primer`, the line
+# comms is delivered from (the repository's default branch); `main` and
+# `test` are v3, frozen.
+#
+# No `pip` here (the owner, 18.11, revising D2): Dependabot raised a range
+# in pyproject.toml but did not regenerate the two hash-checked locks, so
+# each such pull request was red (tests/test_deploy_hardening.py
+# TestTheLockSatisfies) and closed by hand. The versions of the Python
+# dependencies move by the command of pyproject.toml's THE TWO LOCKS, in a
+# delivery of its own, when needed.
 version: 2
 updates:
-  - package-ecosystem: "pip"
-    directory: "/"
-    target-branch: "test"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    groups:
-      python:
-        patterns: ["*"]
-
   # Container images are pinned by digest, the tag kept for the line
   # (H10): a new digest or a newer tag of the same line comes as a pull
-  # request into `test`. A new major line (Postgres 17, Redis 8) -- and
+  # request into `primer`. A new major line (Postgres 17, Redis 8) -- and
   # for Python a new minor, 3.13 being a new line -- is a decision, not
   # an update, so it is ignored here.
   #
   # The Dockerfile: python:<tag>@sha256:... in both stages.
   - package-ecosystem: "docker"
     directory: "/"
-    target-branch: "test"
+    target-branch: "primer"
     schedule:
       interval: "weekly"
     ignore:
@@ -32,7 +33,7 @@ updates:
   # its Postgres from this file, so this entry keeps CI's too.
   - package-ecosystem: "docker-compose"
     directory: "/deploy"
-    target-branch: "test"
+    target-branch: "primer"
     schedule:
       interval: "weekly"
     ignore:
@@ -41,6 +42,6 @@ updates:
 
   - package-ecosystem: "github-actions"
     directory: "/"
-    target-branch: "test"
+    target-branch: "primer"
     schedule:
       interval: "weekly"
