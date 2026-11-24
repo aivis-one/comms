@@ -75,6 +75,11 @@
 #   G3  the guard in _userinfo_redacted, after the
 #       word is taken                               -> TestAPortIsNotAPassword
 #   G4  any number of digits, \d+                   -> TestAPortIsNotAPassword
+# R-4 -- the two names of the service's secrets in the key, a value
+# opening with [ or { to the end of the line, a set's "key" in JSON
+# (tests/test_sanitizer_service_secrets.py holds what they hide):
+#   R1  the key's prefix as SAN-1 wrote it, on the
+#       R-4 inputs alone                            -> TestEveryPattern
 # =============================================================================
 
 import decimal
@@ -330,12 +335,20 @@ _UNITS: dict[str, list[str]] = {
     "_AUTH_HEADER_RE": ["authorization: ", "authorization ", "Authorization:="],
     "_BEARER_RE": ["Bearer ", "bearer", "bearer\t"],
     "_COOKIE_HEADER_RE": ["cookie: ", "set-cookie:", "Cookie:a=b; "],
-    "_KEYVAL_RE": ["a-", "token-", "token=", "token: ", 'password="', "a_b-"],
+    "_KEYVAL_RE": [
+        "a-", "token-", "token=", "token: ", 'password="', "a_b-",
+        # R-4: the names, a value opening with a bracket, the names' runs.
+        "llm_key_sets=", "token={", "token=[", "comms_service_token_next-",
+        "llm-key-", "comms_service_",
+    ],
+    "_JSON_KEY_RE": ['"key": "', "'key':'", '"key"', '"key" :', '"key":"\\', "'key'"],
     "_LLM_KEY_RE": ["sk-", "sk-a!"],
     "_LONG_HEX_RE": ["a" * 47 + "-", "a"],
     "_MAILGUN_KEY_RE": ["key-", "a" * 32 + "-"],
-    "_QUERY_KEYVAL_RE": ["?token=", "&a=", "?a-"],
-    "_SECRET_NAME_RE": ["a-", "token-", "a_b-"],
+    "_QUERY_KEYVAL_RE": ["?token=", "&a=", "?a-", "?llm_key_sets="],
+    "_SECRET_NAME_RE": [
+        "a-", "token-", "a_b-", "comms-service-", "llm_key_", "token_next_",
+    ],
     "_TELEGRAM_TOKEN_RE": ["bot1234567:", "1234567:"],
     "_URL_USERINFO_RE": [
         "://a:", "://", ":@", "://a:@b", "://a:x@",

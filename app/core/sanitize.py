@@ -26,7 +26,7 @@ from typing import Any
 #   REDIS_URL           redis://:<pw>@host:6379/0 (EMPTY user --
 #                       the form deploy/docker-compose.yml builds) userinfo
 #   COMMS_SERVICE_TOKEN Authorization: Bearer <t>; bare hex         header,
-#                                                                  bearer, hex
+#   and _NEXT           (R-4: the name of the next one in the key)  bearer, hex
 #   TELEGRAM_BOT_TOKEN  .../bot<id>:<secret>/sendMessage inside an
 #                       aiohttp error text (aiogram wraps it as
 #                       "<ClientError class>: <error>")            telegram
@@ -34,7 +34,14 @@ from typing import Any
 #                       Authorization: Basic <b64 of api:key>     mailgun,
 #                                                                  header
 #   LLM_KEY_SETS keys   bare sk-<key chars>; Authorization: Bearer   llm,
-#                       <key> (the adapter's header)               bearer
+#                       <key> (the adapter's header); the whole    bearer,
+#                       value after its name, a JSON object of     pair,
+#                       sets; a set's key of any shape as          json key
+#                       "key": "<key>" (R-4)
+# The names of the list are written in the key below and held to the
+# secrets of the instance -- primer.yaml, by the data SEC-1 reads -- by
+# tests/test_sanitizer_service_secrets.py: a new secret whose name the
+# key does not know is red there.
 # The passwords and the service token the deploy machine mints
 # (token_urlsafe: 43 characters of [A-Za-z0-9_-]) are caught in the
 # userinfo, header and bearer forms above, and NOT bare -- see the KNOWN
@@ -54,6 +61,9 @@ from typing import Any
 #      the pair does not extend a value already [redacted]; the pair now
 #      takes the whole value first, so "password=sk-... more" is
 #      "password=[redacted]" -- up to the boundary, the pair's own rule;
+#      then a field named exactly key, quoted, with a string value -- a
+#      key of LLM_KEY_SETS where its JSON stands without the variable's
+#      name (R-4; _JSON_KEY_RE below);
 #   3. bearer on its own (a token with no header name in front);
 #   4. userinfo in a URL/DSN, EMPTY user allowed, the password running
 #      to the LAST @ before a space -- any other character in a password
@@ -89,7 +99,9 @@ from typing import Any
 #        secret, api_key/api-key/apikey, authorization, secret_key,
 #        private_key, credential/credentials -- REV-4b; cookie,
 #        session_id/sessionid, passphrase, pgpassword,
-#        secret_access_key -- REV-6; never a bare
+#        secret_access_key -- REV-6; and the two names of this service
+#        that end in no such word: comms_service_token_next,
+#        llm_key_sets -- R-4; never a bare
 #        "key": idempotency_key and correlation_key are on every line
 #        comms writes) with any
 #        prefix joined by _ or - (access_token, db_password,
@@ -101,9 +113,11 @@ from typing import Any
 #      - THE VALUE runs: inside quotes -- to the closing quote, the
 #        quotes kept (JSON, a dict's repr); after ? or & (a URL query)
 #        -- to the next &, #, quote or whitespace (a URL holds no raw
-#        space, and an access line keeps its ' HTTP/1.1" 200'); any
-#        other -- to the first , ; & ) ] } or the end of the line, so
-#        a value with a space in it leaves no tail.
+#        space, and an access line keeps its ' HTTP/1.1" 200'); opening
+#        with [ or { -- to the end of the line (R-4: a JSON value, as
+#        LLM_KEY_SETS is, was cut at its first , ] or } and the keys
+#        after it stayed); any other -- to the first , ; & ) ] } or the
+#        end of the line, so a value with a space in it leaves no tail.
 #      - A value that is already [redacted] (pattern 1's output, or
 #        this pattern's own on the second pass) is not extended: that
 #        is what keeps the text after a redacted header and makes the
@@ -112,7 +126,9 @@ from typing import Any
 #    THE PRICE of pattern 2, by design: a secret that itself contains
 #    , ; & ) ] } leaves the part after that character behind; the text
 #    after an unquoted value on the same line, up to that boundary, is
-#    eaten with it ("token=abc rest" -> "token=[redacted]"). The limit:
+#    eaten with it ("token=abc rest" -> "token=[redacted]"), and after a
+#    value opening with [ or { the rest of the line is ("secret={...},
+#    next" -> "secret=[redacted]"). The limit:
 #    a camelCase key (accessToken, apiKey) is not recognised -- with no
 #    _ or - before the credential word there is no boundary to stop at
 #    without also matching ordinary words that end in one.
@@ -175,18 +191,25 @@ _LLM_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
 #      ours to demand of a provider credential or of the machine, and a
 #      red start on a valid configuration).
 _LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{48,}\b")
-# The key: a credential word with any prefix joined by _ or -. LINEAR on
+# The key: a credential word -- or a name of this service's secrets
+# that ends in none (R-4) -- with any prefix joined by _ or -. LINEAR on
 # any text (REV-6): the prefix starts only where no letter, digit, _ or -
 # stands before it, and every repetition ends in a separator its letters
 # cannot take -- one way to split a run, so no start inside a run is
 # tried and nothing is tried twice. The prefix SAN-1 wrote,
 # \b(?:[a-z0-9]+[_-])*, tried every start of a run like "a-a-a-...":
-# quadratic, 22 s on 80 000 characters.
+# quadratic, 22 s on 80 000 characters. The names R-4 added are words of
+# the same list, behind the same prefix: whole literals, nothing that
+# repeats -- they widen no form. A rule "a credential word anywhere in
+# the name" is not this list: it would take token_status,
+# password_changed, passphrase_hint, and still miss llm_key_sets (no
+# bare "key" -- see the list of pattern 2).
 _KEY = (
     r"(?<![a-z0-9_-])(?:[a-z0-9]*[_-])*"
     r"(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|authorization"
     r"|secret[_-]?key|private[_-]?key|credentials?"
-    r"|cookie|session[_-]?id|passphrase|pgpassword|secret[_-]?access[_-]?key)"
+    r"|cookie|session[_-]?id|passphrase|pgpassword|secret[_-]?access[_-]?key"
+    r"|comms[_-]service[_-]token[_-]next|llm[_-]key[_-]sets)"
 )
 _REDACTED = "[redacted]"
 _QUERY_KEYVAL_RE = re.compile(
@@ -201,7 +224,21 @@ _KEYVAL_RE = re.compile(
     r"|\"(?:[^\"\\\r\n]|\\.)*\""
     r"|'(?:[^'\\\r\n]|\\.)*'"
     r"|[\"'][^\r\n]*"
+    r"|[\[{][^\r\n]*"
     rf"|{_UNQUOTED}(?:[ \t]*{_UNQUOTED})*)"
+)
+# A field named exactly key, in quotes, with a string value: the key of
+# a set of LLM_KEY_SETS where its JSON or a dict's repr stands without
+# the variable's name -- a key of any shape, not only sk- (R-4). The
+# quote must stand right before "key": idempotency_key, "keys", "monkey"
+# are not it, and neither is key= or a field `key` of a log event (a
+# section's key; is_secret_name below). The value runs as pattern 2's
+# quoted one: to the closing quote, or -- cut short -- to the end of the
+# line. A key escaped inside a JSON string (\"key\") is not seen, as
+# pattern 2 sees no escaped key either.
+_JSON_KEY_RE = re.compile(
+    r"([\"'])key\1(\s*:\s*)"
+    r"(\"(?:[^\"\\\r\n]|\\.)*\"?|'(?:[^'\\\r\n]|\\.)*'?)"
 )
 
 
@@ -213,6 +250,16 @@ def _keyval_redacted(match: re.Match[str]) -> str:
         closed = len(value) > 1 and value[-1] == value[0]
         return f"{head}{value[0]}{_REDACTED}{value[0] if closed else ''}"
     return f"{head}{_REDACTED}"
+
+
+def _json_key_redacted(match: re.Match[str]) -> str:
+    """_JSON_KEY_RE's replacement: the key and separator as written, the
+    value's quotes kept around [redacted] -- the closing one if it was
+    there."""
+    quote, sep, value = match.group(1), match.group(2), match.group(3)
+    closed = len(value) > 1 and value[-1] == value[0]
+    tail = value[0] if closed else ""
+    return f"{quote}key{quote}{sep}{value[0]}{_REDACTED}{tail}"
 
 
 def sanitize_text(text: str) -> str:
@@ -228,6 +275,7 @@ def sanitize_text(text: str) -> str:
     text = _COOKIE_HEADER_RE.sub(r"\1\2[redacted]", text)
     text = _QUERY_KEYVAL_RE.sub(rf"\1{_REDACTED}", text)
     text = _KEYVAL_RE.sub(_keyval_redacted, text)
+    text = _JSON_KEY_RE.sub(_json_key_redacted, text)
     text = _BEARER_RE.sub("bearer [redacted]", text)
     text = _URL_USERINFO_RE.sub(_userinfo_redacted, text)
     text = _TELEGRAM_TOKEN_RE.sub("[redacted]", text)
@@ -252,8 +300,9 @@ _SECRET_NAME_RE = re.compile(rf"(?i){_KEY}")
 def is_secret_name(name: str) -> bool:
     """Whether a NAME -- a field of a log event, a key of a dict in one
     -- is a credential's (REV-4b): the key of pattern 2, the whole name.
-    One rule with the text: "password", "x-api-key", "db_secret_key" are;
-    "passwords_match", "max_tokens", "idempotency_key" are not."""
+    One rule with the text: "password", "x-api-key", "db_secret_key",
+    "llm_key_sets" are; "passwords_match", "max_tokens",
+    "idempotency_key", "key" are not."""
     return _SECRET_NAME_RE.fullmatch(name) is not None
 
 
