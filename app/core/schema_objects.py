@@ -102,8 +102,10 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
         ),
     ),
     # The inbox keyset (D1 / R7, migration 0016): a page is an index
-    # range scan in the keyset's own order, sent rows only. The badge
-    # count is ix_notification_deliveries_unread's (H15).
+    # range scan in the keyset's own order, sent rows only; each row it
+    # walks is probed for its job's expiry_at by the primary key (R-5,
+    # KNOWN CEILING on app/engine/service.py _job_not_expired). The
+    # badge count is ix_notification_deliveries_unread's (H15).
     "ix_deliveries_inbox_keyset": IndexShape(
         unique=False,
         definition=(
@@ -154,7 +156,9 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
     ),
     # The badge's rows and nothing else (H15, migration 0031): sent,
     # unread, by recipient and channel -- get_unread_count and
-    # mark_all_read. No waiting delivery is in it, so no probe of
+    # mark_all_read, which probe each row's job for its expiry_at by
+    # the primary key (R-5, the KNOWN CEILING on app/engine/service.py
+    # _job_not_expired). No waiting delivery is in it, so no probe of
     # "does the job still wait?" can walk it (H14 FIX, KNOWN CEILING on
     # app/engine/service.py first_waiting_delivery).
     "ix_notification_deliveries_unread": IndexShape(

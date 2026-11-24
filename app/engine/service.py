@@ -61,6 +61,7 @@ from sqlalchemy import (
     case,
     delete,
     exists,
+    false,
     func,
     or_,
     select,
@@ -70,6 +71,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.audience.models import Recipient
 from app.audience.prefs import muted_recipient_ids
@@ -2532,6 +2534,65 @@ def _navigation_intent(
     return intent
 
 
+def _job_not_expired() -> ColumnElement[bool]:
+    """The inbox's one rule of time (R-5): a delivery is shown, counted
+    and written by the inbox while its job's expiry_at has not passed --
+    `expiry_at < now()` hides it, NULL never does. now() is the
+    database's, the start of the transaction: the page and its badge
+    (one read-only transaction, app/core/database.py get_db_reader), a
+    `read` and the badge it answers with (one transaction) compare
+    against one moment. An expiry_at equal to that moment is still
+    shown, as the expiry sweep does not expire it yet (strict `<`,
+    app/engine/processor.py expire_overdue_notifications). The job and
+    its deliveries stay readable by its key until retention (R-1); this
+    is the inbox's view only, as in v4.0.1, when the expiry cleanup took
+    the delivery away with its job. expiry_at is written once, at intake
+    (create_notification), so the rule reads a value nobody changes and
+    takes no lock on notifications.
+
+    The form is a scalar subquery on the job's primary key: Postgres
+    runs it as a SubPlan per delivery row, through notifications_pkey,
+    whatever the statistics say.
+
+    # KNOWN CEILING (the inbox pays a primary-key probe per delivery it
+    # reads; acknowledged by design -- R-5):
+    #   1. Mechanics: the badge (get_unread_count) and read-all
+    #      (mark_all_read) probe notifications_pkey once for every
+    #      unread in_app delivery of the recipient, the expired ones
+    #      included -- and since R-1 those stay until retention, so a
+    #      recipient who never reads entries that expire (reminders,
+    #      prompts) gathers up to the whole notification history of
+    #      them. A page probes once for every delivery it walks, the
+    #      expired between the shown ones included. Measured on 200k
+    #      jobs, one recipient with 4000 unread of which nine in ten
+    #      expired: the badge 4000 probes (~16k buffers, tens of ms
+    #      warm); the page of 21 walked 41 rows, ~0.2 ms.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: none -- the cheap form needs an index or a
+    #      column, a migration other than a new table, which the
+    #      Customer's order 2 section 2 rules out for v4.2.
+    #   4. Promotion trigger (observable): the first tag v5.* on primer,
+    #      or order 2 section 2 withdrawn.
+    #   5. Agreed fix: a new migration -- a partial index that serves
+    #      the rule, or expiry_at copied into the delivery at resolve
+    #      and the rule read off the delivery row itself.
+    #   6. Rejected: NOT EXISTS or a JOIN on notifications -- the
+    #      planner is then free to hash the recipient's rows against a
+    #      Parallel Seq Scan of all of notifications, and did on one
+    #      ANALYZE of the measurement above; the filter in the route --
+    #      a keyset page would come back short of its limit with a
+    #      next_cursor, and the badge would need a second count.
+    """
+    # Its own name for the job: the page joins notifications too, and
+    # the subquery must read the delivery's job, not correlate to that.
+    job = aliased(Notification)
+    expired = (
+        select(job.expiry_at < func.now())
+        .where(job.id == NotificationDelivery.notification_id)
+        .correlate(NotificationDelivery)
+        .scalar_subquery()
+    )
+    return ~func.coalesce(expired, false())
 
 
 async def list_recipient_deliveries(
@@ -2546,7 +2607,10 @@ async def list_recipient_deliveries(
     """List sent deliveries for a recipient, keyset-paginated.
 
     Only deliveries with status=sent are returned (the recipient sees
-    only what was actually delivered). Results enriched with title,
+    only what was actually delivered), and of those only the ones whose
+    job's expiry_at has not passed (_job_not_expired, R-5) -- the
+    cursor is the last row SHOWN, so the next page goes on past the
+    hidden ones. Results enriched with title,
     body, type and the NAVIGATIONAL action_data subset from the parent
     Notification, newest-first.
 
@@ -2582,6 +2646,7 @@ async def list_recipient_deliveries(
     conditions = [
         NotificationDelivery.recipient_id == recipient_id,
         NotificationDelivery.status == DeliveryStatus.SENT,
+        _job_not_expired(),
     ]
 
     if type_filter:
@@ -2650,7 +2715,8 @@ async def get_unread_count(
 ) -> int:
     """Count unread sent deliveries for the badge counter.
 
-    Unread = status=sent AND read_at IS NULL. `channel` scopes the
+    Unread = status=sent AND read_at IS NULL AND the job's expiry_at
+    not passed (_job_not_expired, R-5). `channel` scopes the
     count (the inbox badge counts in_app only -- a telegram delivery
     is never "read" and its read_at stays NULL forever; counting it
     would inflate the badge permanently). None = all channels
@@ -2660,6 +2726,7 @@ async def get_unread_count(
         NotificationDelivery.recipient_id == recipient_id,
         NotificationDelivery.status == DeliveryStatus.SENT,
         NotificationDelivery.read_at.is_(None),
+        _job_not_expired(),
     ]
     if channel is not None:
         conditions.append(NotificationDelivery.channel == channel)
@@ -2682,12 +2749,15 @@ async def mark_delivery_read(
     Sets read_at to now if not already set. Does nothing if already read.
 
     Raises:
-        NotFoundError: If delivery not found or belongs to another
-            recipient.
+        NotFoundError: If delivery not found, belongs to another
+            recipient, or its job's expiry_at has passed
+            (_job_not_expired, R-5) -- the inbox no longer shows it, and
+            v4.0.1, whose expiry cleanup had deleted it, answered 404.
     """
     stmt = select(NotificationDelivery).where(
         NotificationDelivery.id == delivery_id,
         NotificationDelivery.recipient_id == recipient_id,
+        _job_not_expired(),
     )
     result = await session.execute(stmt)
     delivery = result.scalar_one_or_none()
@@ -2711,8 +2781,10 @@ async def mark_all_read(
 ) -> int:
     """Mark all sent deliveries as read for a recipient.
 
-    Only updates deliveries with status=sent AND read_at IS NULL.
-    `channel` scopes the update (the inbox read-all touches in_app
+    Only updates deliveries with status=sent AND read_at IS NULL whose
+    job's expiry_at has not passed (_job_not_expired, R-5): the ones the
+    inbox shows -- an expired one keeps its read_at, as in v4.0.1, where
+    it no longer existed. `channel` scopes the update (the inbox read-all touches in_app
     only); None = all channels.
 
     Returns:
@@ -2722,6 +2794,7 @@ async def mark_all_read(
         NotificationDelivery.recipient_id == recipient_id,
         NotificationDelivery.status == DeliveryStatus.SENT,
         NotificationDelivery.read_at.is_(None),
+        _job_not_expired(),
     ]
     if channel is not None:
         conditions.append(NotificationDelivery.channel == channel)

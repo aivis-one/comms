@@ -7,7 +7,11 @@
 # with channel=in_app and status=sent, enriched with title / body /
 # navigational action_data from the parent Notification. Reading YOUR
 # OWN delivery rows -- never the notification's audience -- keeps the
-# BL-1 door open (set-based resolve stays a local change).
+# BL-1 door open (set-based resolve stays a local change). A delivery
+# whose job's expiry_at has passed is no longer in the inbox: not on the
+# page, not in any `unread`, 404 to `read`, unmarked by `read-all`
+# (R-5, app/engine/service.py _job_not_expired; deploy/INTEGRATION.md
+# section 3a) -- the job stays readable by its key until retention.
 #
 # CONTRACT (Phase 6 product proxy consumes as-is):
 #
@@ -37,8 +41,9 @@
 #
 #   POST /api/v1/recipients/{rid}/inbox/{delivery_id}/read
 #     -> 200 {"unread": <int>}          # idempotent; 404 if the
-#                                       # delivery is absent or not
-#                                       # this recipient's
+#                                       # delivery is absent, not
+#                                       # this recipient's, or its
+#                                       # job's expiry_at has passed
 #   POST /api/v1/recipients/{rid}/inbox/read-all
 #     -> 200 {"unread": <int>}          # always 0, returned anyway so
 #                                       # every mutation answers with
@@ -169,8 +174,9 @@ async def read_one(
 ) -> dict[str, int]:
     """Mark one delivery read (idempotent); returns the fresh badge.
 
-    404 when the delivery does not exist or belongs to another
-    recipient (the service layer does not distinguish, deliberately).
+    404 when the delivery does not exist, belongs to another recipient
+    or its job's expiry_at has passed (the service layer does not
+    distinguish, deliberately).
     The badge is computed in the SAME transaction/session as the
     read_at write, so it reflects this request's own effect.
     """

@@ -18,17 +18,23 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 
 import tests.test_h9_release as h11
 import tests.test_portion_select as h12
-from app.core.database import get_session_factory
-from app.engine.constants import DeliveryStatus
+from app.core.database import get_engine, get_session_factory
+from app.engine.constants import DeliveryChannel, DeliveryStatus
 from app.engine.models import Notification
 from app.engine.processor import ready_now
-from app.engine.service import first_waiting_delivery
+from app.engine.service import (
+    first_waiting_delivery,
+    get_unread_count,
+    list_recipient_deliveries,
+    mark_all_read,
+)
 from tests.conftest import analyze_with_nothing_waiting
 
 _STATUS_INDEX = "ix_notification_deliveries_status"
@@ -88,6 +94,61 @@ async def _paths(statement: str, *, without_status_index: bool) -> set[str]:
         await session.rollback()
     root = (json.loads(plan) if isinstance(plan, str) else plan)[0]
     return _indexes(root["Plan"])
+
+
+def _all_nodes(node: dict[str, Any]) -> list[dict[str, Any]]:
+    out = [node]
+    for child in node.get("Plans", []):
+        out.extend(_all_nodes(child))
+    return out
+
+
+async def _code_plans(recipient: UUID) -> dict[str, dict[str, Any]]:
+    """The EXPLAIN plan of each inbox statement the code sends for
+    `recipient` -- the badge, read-all's update, a page -- captured on
+    the connection and explained with its own parameters, in a
+    transaction rolled back."""
+    captured: list[tuple[str, str, Any]] = []
+    calls = {
+        "badge": lambda s: get_unread_count(
+            s, recipient, channel=DeliveryChannel.IN_APP,
+        ),
+        "read-all": lambda s: mark_all_read(
+            s, recipient, channel=DeliveryChannel.IN_APP,
+        ),
+        "page": lambda s: list_recipient_deliveries(
+            s, recipient, channel_filter=DeliveryChannel.IN_APP,
+        ),
+    }
+    sync_engine = get_engine().sync_engine
+    async with get_session_factory()() as session:
+        # The h11 seed sends without a sent_at; the page builds its
+        # cursor from one (rolled back with the rest).
+        await session.execute(text(
+            "UPDATE notification_deliveries SET sent_at = created_at "
+            "WHERE recipient_id = :r AND status = 'sent' AND sent_at IS NULL"
+        ), {"r": recipient})
+        for name, call in calls.items():
+            def record(conn: Any, cursor: Any, statement: str, parameters: Any,
+                       context: Any, executemany: bool, name: str = name) -> None:
+                captured.append((name, statement, parameters))
+
+            event.listen(sync_engine, "before_cursor_execute", record)
+            try:
+                await call(session)
+            finally:
+                event.remove(sync_engine, "before_cursor_execute", record)
+        plans: dict[str, dict[str, Any]] = {}
+        raw = await session.connection()
+        for name, statement, parameters in captured:
+            plan = (await raw.exec_driver_sql(
+                "EXPLAIN (FORMAT JSON) " + statement, parameters,
+            )).scalar_one()
+            plans[name] = (json.loads(plan) if isinstance(plan, str) else plan)[
+                0
+            ]["Plan"]
+        await session.rollback()
+    return plans
 
 
 _STATES = (
@@ -157,18 +218,35 @@ class TestTheBadgeAndForgetting:
         return recipient
 
     async def test_the_badge_reads_its_index(self) -> None:
-        recipient = await self._seed()
-        for statement in (
-            "SELECT count(*) FROM notification_deliveries WHERE recipient_id = "
-            f"'{recipient}' AND status = 'sent' AND read_at IS NULL "
-            "AND channel = 'in_app'",
-            "UPDATE notification_deliveries SET read_at = now() WHERE "
-            f"recipient_id = '{recipient}' AND status = 'sent' "
-            "AND read_at IS NULL AND channel = 'in_app'",
-        ):
-            assert "ix_notification_deliveries_unread" in await _paths(
-                statement, without_status_index=False,
-            ), statement
+        """The badge and read-all read ix_notification_deliveries_unread,
+        the page ix_deliveries_inbox_keyset; each reaches notifications
+        for its rule of time (R-5, app/engine/service.py
+        _job_not_expired) only through notifications_pkey, never by a
+        scan of it. The statements are the code's own, captured off the
+        connection -- until R-5 they were written out here, and a copy
+        would not have carried the rule the code added."""
+        recipient = UUID(str(await self._seed()))
+        plans = await _code_plans(recipient)
+        assert set(plans) == {"badge", "read-all", "page"}
+        wanted = {
+            "badge": "ix_notification_deliveries_unread",
+            "read-all": "ix_notification_deliveries_unread",
+            "page": "ix_deliveries_inbox_keyset",
+        }
+        for name, plan in plans.items():
+            assert wanted[name] in _indexes(plan), name
+            on_jobs = [
+                node for node in _all_nodes(plan)
+                if node.get("Relation Name") == "notifications"
+            ]
+            # The pair: the rule is in the plan -- notifications is read.
+            assert on_jobs, name
+            assert {n["Node Type"] for n in on_jobs} <= {
+                "Index Scan", "Index Only Scan",
+            }, (name, on_jobs)
+            assert {n["Index Name"] for n in on_jobs} == {
+                "notifications_pkey",
+            }, name
 
     async def test_forgetting_has_an_index(self) -> None:
         """withdraw_recipient's reads by recipient -- its jobs, their

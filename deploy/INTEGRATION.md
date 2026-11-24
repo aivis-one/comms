@@ -311,6 +311,13 @@ it is always on -- its delivery is the row the inbox reads, nothing
 leaves the process. What an instance has, comms says per channel in
 `GET /api/v1/channels/health` (`state`, section 5).
 
+**An inbox entry leaves with its job's `expiry_at`:** once it has
+passed, the in_app delivery is gone from the inbox page and from the
+`unread` badge of every answer, `read` on it is 404 `not_found` and
+`read-all` does not mark it, while the job, its deliveries included, is
+still read by its key (section 8) until retention removes it ("How long
+comms keeps things").
+
 **A request never names a channel.** The profile routes each type to
 its channels (`types.<type>.channels`). A request that still carries
 `channels` (or any other unknown field) is rejected at intake and

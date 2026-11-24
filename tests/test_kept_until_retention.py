@@ -159,8 +159,15 @@ def _envelope_expiry() -> str:
 
 class TestTheJobStays:
     """Finding 2.1, requirement 4: delivered, past its expiry_at, the
-    maintenance passes run -- read by its key 200, the inbox holds it, a
-    replay of the same event is the same job, no second letter. M1, M2."""
+    maintenance passes run -- read by its key 200, its delivery kept
+    with it, a replay of the same event is the same job, no second
+    letter. M1, M2.
+
+    Until R-5 this held "the inbox holds it" too: R-5 made the inbox
+    leave out an entry past its job's expiry_at, as v4.0.1 did by
+    deleting it (deploy/INTEGRATION.md section 3a,
+    tests/test_inbox_expiry.py) -- the delivery is now read by the key,
+    and the inbox is held empty."""
 
     @pytest.mark.parametrize(
         "type_key", [_ENVELOPE_TYPE, _PROFILE_TYPE], ids=["envelope", "profile"],
@@ -177,9 +184,16 @@ class TestTheJobStays:
         response = await client.get(_BY_KEY, params={"key": key})
         assert response.status_code == 200
         assert response.json()["job"]["id"] == str(job)
+        rows = await client.get(f"{_BY_KEY}/deliveries", params={"key": key})
+        assert rows.status_code == 200
+        assert [
+            (r["recipient_id"], r["channel"], r["status"])
+            for r in rows.json()["items"]
+        ] == [(str(recipient), "in_app", "sent")]
         inbox = await client.get(f"/api/v1/recipients/{recipient}/inbox")
         assert inbox.status_code == 200
-        assert len(inbox.json()["items"]) == 1
+        assert inbox.json()["items"] == []
+        assert inbox.json()["unread"] == 0
 
         # REPEAT: the same bytes twice more -- the same job each time.
         assert await _send(raw) is HandleResult.DUPLICATE
