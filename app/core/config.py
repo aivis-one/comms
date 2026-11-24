@@ -190,6 +190,11 @@ def lane_deliver_timeout_variable(lane: Lane) -> str:
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
+    # Every field whose value is a secret, or holds one, is repr=False:
+    # the settings object's repr never carries it (pydantic prints every
+    # field by default). Which fields those are is read from primer.yaml
+    # and held by tests/test_settings_secrets.py.
+
     # -- Application --
     # ONE MODE (LEG-1): comms has no development or production of its
     # own. The token is required to start, the schema endpoints are
@@ -198,7 +203,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # -- Database (dedicated comms database inside the product Postgres) --
-    database_url: str = ""
+    database_url: str = Field(default="", repr=False)
 
     # -- Event transport, push side (Phase 3c) --
     # The consumer process (`python -m app.consumer`) reads the
@@ -210,7 +215,7 @@ class Settings(BaseSettings):
     # here -- deliberately not coupled to any delivery channel.
     # Names below are FROZEN CONTRACT surface (Phase 3c item 7): the
     # product's outbox relay XADDs into comms_events_stream.
-    redis_url: str = ""
+    redis_url: str = Field(default="", repr=False)
     comms_events_stream: str = "comms:events"
     comms_consumer_group: str = "comms"
     # STABLE consumer name (not hostname/pid): after a restart the
@@ -288,7 +293,7 @@ class Settings(BaseSettings):
     # -- Telegram (shared bot with the product, see arch doc §7) --
     # The channel's keys (app/core/channels.py): with TELEGRAM_ENABLED
     # true both are required; with false neither is read.
-    telegram_bot_token: str = ""
+    telegram_bot_token: str = Field(default="", repr=False)
     # Base URL for deep-link buttons, e.g. "https://t.me/<product_bot>".
     # Consumed by TelegramFormatter.format_deep_link (ported from VELO).
     telegram_bot_url: str = ""
@@ -297,7 +302,7 @@ class Settings(BaseSettings):
     # With EMAIL_ENABLED true all three are required; with false none is
     # read. The sender has NO default on purpose: it is a product fact,
     # and a default would make a partial set look complete.
-    email_mailgun_api_key: str = ""
+    email_mailgun_api_key: str = Field(default="", repr=False)
     email_mailgun_domain: str = ""
     # A bare address, or the display form "Name <address>" -- a signed
     # sender is materially better for deliverability, which is the
@@ -314,7 +319,7 @@ class Settings(BaseSettings):
     # ..., "key": ..., "model": ..., "gateway": true|false}}. With
     # LLM_ENABLED true it is required, whole and well-formed, or startup
     # is refused naming the set and the field; with false it is not read.
-    llm_key_sets: str = ""
+    llm_key_sets: str = Field(default="", repr=False)
     # Seconds one call to ONE set may take; the job's call over its list
     # of sets is bounded by this times the length of the list
     # (app/engine/service.py). Not a lane's: a model writes for tens of
