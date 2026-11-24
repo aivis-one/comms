@@ -6,15 +6,17 @@
 #
 #   - TIME: sanitize_text and is_secret_name on runs that made the
 #     key's prefix quadratic ("a-"*n -- 22 s on 80 000 characters before
-#     REV-6) and their neighbours; each doubling of n from 10 000 to
-#     80 000 at most triples the time (linear ~2, quadratic ~4). Timed by
-#     _assert_linear, the one measure of the file: for each doubling, 5
-#     rounds of a run of n and a run of 2n back to back, each run of so
-#     many calls that it takes 20 ms at 10 000; the ratio is the least
-#     run of 2n over the least of n. A ratio, not a number of seconds:
-#     the machine does not decide the test -- and the two sides of it are
-#     measured in the same rounds, so a slowdown of the machine that lasts
-#     falls on both (FIX W6-2b #1).
+#     REV-6) and their neighbours. Timed by _assert_linear, the one
+#     measure of the file (TEST-2): 8 times the input takes at most 22
+#     times the time, from 2 500 to 20 000 characters and from 10 000 to
+#     80 000 -- linear ~8, quadratic ~64, so noise has to move a ratio
+#     2.5 times (measured) to turn either. The measure by doublings it
+#     replaced (2n at most x3: linear ~2, quadratic ~4) had a margin of
+#     1.4, and its reds were the machine's: TEST-1 (a run of a few ms),
+#     FIX W6-2b #1 (the sides in different rounds), CI #371 (3.22 on a
+#     linear pattern). A ratio, not a number of seconds: the machine does
+#     not decide the test, and the two sides of it are measured in the
+#     same rounds. The figures and the reasoning: its docstring.
 #   - NEVER FAILS: a repr or a str that raises, a value nested 2000 deep
 #     -> a line with <unreadable TYPE>, nothing of the value.
 #   - FORMS: the roots cookie, session_id, passphrase, pgpassword,
@@ -59,9 +61,13 @@
 # W6-2b -- a DSN's password with "?" or "#" in it:
 #   Q1  the rest of the URL cut at "?" and "#" again (REV-6's
 #       expression) -> TestQueryMarksInAPassword
-# FIX W6-2b #1 -- the measure's sides in the same rounds:
-#   F1  every run of n, then every run of 2n, again -> TestTheMeasure
+# FIX W6-2b #1 -- the measure's sides in the same rounds (TEST-2: 8n):
+#   F1  every run of n, then every run of 8n, again -> TestTheMeasure
 #   F2  no bound on the ratio                       -> TestTheMeasure
+# TEST-2 -- the measure with a margin over 2 (N1 and H1 above, put in
+# _PATTERNS, still red):
+#   B1  the bound back at 3                         -> TestEveryPattern,
+#                                                      TestLinearTime
 # W6-2c -- a port with a path behind it is not a password:
 #   G1  no port guard (W6-2b's expression)          -> TestAPortIsNotAPassword
 #   G2  a guard wider than a port, (?!\w+[/?#])     -> TestAPortIsNotAPassword,
@@ -72,6 +78,7 @@
 # =============================================================================
 
 import decimal
+import functools
 import io
 import json
 import logging
@@ -108,7 +115,7 @@ class TestLinearTime:
         "a-", "-", "a", "token-", "a_b-", "x" * 50 + "-", "a- b_", "password=x ",
     ])
     @pytest.mark.parametrize("function", [sanitize_text, is_secret_name])
-    def test_each_doubling_at_most_triples(
+    def test_eight_times_the_input_at_most_22_times_the_time(
         self, unit: str, function: Callable[[str], object],
     ) -> None:
         _assert_linear(function, unit)
@@ -364,74 +371,140 @@ def _run(work: Callable[[str], object], text: str, repeats: int) -> float:
     return time.perf_counter() - started
 
 
-def _assert_linear(work: Callable[[str], object], unit: str) -> None:
-    """Each doubling of the input, 10 000 to 80 000 characters, at most
-    triples the time -- judged as it comes, so a quadratic run fails on
-    the first doubling, before the next sizes cost minutes. A call too
-    quick to time alone (under 20 ms at 10 000) is timed as so many
-    calls at every size that the first run takes 20 ms: a ratio of two
-    figures of a few milliseconds is the machine's, not the pattern's
-    (TEST-1: 2.4 ms -> 9.7 ms on a slow CI, no defect).
+# The measure: each pair (n, 8n) in order; a run of n takes 20 ms.
+_PAIRS = ((2_500, 20_000), (10_000, 80_000))
+_RUN = 0.02
+_BOUND = 22
 
-    THE TWO SIDES OF A RATIO IN THE SAME ROUNDS (FIX W6-2b #1): each of 5
-    rounds runs n and then 2n, and the ratio is the least run of 2n over
-    the least of n. Measured one size after the other -- every run of n,
-    then every run of 2n -- a slowdown of the machine that lasted the
-    second's runs and not the first's multiplied the ratio: a linear
-    pattern read 3.09 and 3.13 on CI (x1.55 for a second), and a
-    quadratic one slowed on its smaller side could read under 3. A
-    slowdown longer than a round now falls on both sides; a shorter one
-    is a run the least of 5 leaves out."""
-    first = unit * (10_000 // len(unit) + 1)
-    repeats = max(1, int(0.02 / max(_fastest(lambda: work(first)), 1e-7)) + 1)
-    for n in (10_000, 20_000, 40_000):
+
+def _repeats(fastest: float) -> int:
+    """The calls of a run that takes 20 ms, one call `fastest` seconds at
+    the least: the measure's calibration, and _Sleeps's reckoning of it."""
+    return max(1, int(_RUN / max(fastest, 1e-7)) + 1)
+
+
+def _assert_linear(work: Callable[[str], object], unit: str) -> None:
+    """8 times the input takes at most 22 times the time (TEST-2): from
+    2 500 to 20 000 characters, then from 10 000 to 80 000. Linear work
+    reads ~8, quadratic ~64.
+
+    HOW: each pair is 5 rounds of a run of n and a run of 8n, each run so
+    many calls that a run of n takes 20 ms -- a ratio of two figures of a
+    few milliseconds is the machine's, not the pattern's (TEST-1: 2.4 ms
+    -> 9.7 ms on a slow CI, no defect). The ratio is the least run of 8n
+    over the least of n.
+
+    THE MARGIN. With a factor k between the sizes, linear reads k and
+    quadratic k^2; the bound that leaves both the same margin is k^1.5,
+    and the margin is sqrt(k). A margin of 2 needs k >= 4, and at 4 it is
+    2 on paper alone (measured 4.23 linear, ~15 quadratic: 1.9). k = 8
+    and the bound 22 leave 2.75 to linear and 2.91 to quadratic on paper;
+    measured on every unit of this file, through each pattern and the
+    whole sanitizer (TEST-2, the worst of each):
+
+        pair               linear  quadratic             margin
+        2 500 -> 20 000     8.66   55.2 (N1, through     2.54 / 2.51
+                                   sanitize_text)
+        10 000 -> 80 000    8.52   64.3 (N1)             2.58 / 2.92
+
+    so noise must move a ratio 2.5 times, up or down, to turn a linear
+    pattern red or a quadratic one green. A slope fitted over more sizes
+    was rejected: the same span gives the same information at its ends,
+    each size more costs time, and its margin hangs on the points the
+    noise lands on -- no one figure to hold.
+
+    THE ORDER OF THE PAIRS: the small one first, judged as it comes, so a
+    quadratic run fails before 80 000 costs minutes (H1: ~70 s a call at
+    80 000; red in ~22 s at the small pair). The large one keeps the
+    reach to 80 000: a quadratic term small beside the linear one shows
+    on long input alone.
+
+    THE TWO SIDES OF A RATIO IN THE SAME ROUNDS (FIX W6-2b #1). Measured
+    one size after the other -- every run of n, then every run of 2n -- a
+    slowdown of the machine that lasted the second's runs and not the
+    first's multiplied the ratio: a linear pattern read 3.09 and 3.13 on
+    CI (x1.55 for a second). A slowdown longer than a round now falls on
+    both sides; a shorter one is a run the least of 5 leaves out.
+
+    WHY THE MEASURE BY DOUBLINGS WENT: 2n at most x3 sat between linear
+    ~2 and quadratic ~4 with a margin of 1.5 and 1.33 (1.43 / 1.26
+    measured). TEST-1 and FIX W6-2b #1 mended how it measured, and the
+    stand still went red on noise: CI #371, 3.22 on _URL_USERINFO_RE,
+    which doubles at 1.95-2.03. A lasting slowdown that starts inside
+    round 1, between its two runs, still multiplies the ratio -- now it
+    has to be x2.75 to turn a linear work red, not x1.5."""
+    for n, eight_n in _PAIRS:
         small = unit * (n // len(unit) + 1)
-        large = unit * (2 * n // len(unit) + 1)
+        large = unit * (eight_n // len(unit) + 1)
+        repeats = _repeats(_fastest(functools.partial(work, small)))
         runs_small: list[float] = []
         runs_large: list[float] = []
         for _ in range(5):
             runs_small.append(_run(work, small, repeats))
             runs_large.append(_run(work, large, repeats))
         earlier, took = min(runs_small), min(runs_large)
-        assert took / max(earlier, 1e-6) <= 3, (unit[:12], 2 * n, earlier, took)
+        assert took / max(earlier, 1e-6) <= _BOUND, (
+            unit[:12], eight_n, earlier, took)
 
 
 class _Sleeps:
     """A work whose time is set, not measured: `per_char` seconds of sleep
-    for each character (or its square, `power` 2), twice that from the
-    `slow_from`-th call on -- the machine slowed for good, as on CI (there
-    x1.55; x2 here, so the order the sides are measured in is read clear
-    of the sleep's own overhead)."""
+    for each character (or its square, `power` 2) -- 2.5 ms a call at
+    2 500 characters, clear of the sleep's own overhead.
+
+    `lasting`: slower by 4 for good from a call reckoned from the
+    measure's own calibration, not from a fixed count -- a fixed count
+    holds for a window of r, the calls of a run, and r hangs on how long
+    the runner's sleep takes (TEST-2). The first 5 calls are the
+    measure's calibration at 2 500; the work times them and takes, by
+    _repeats, the r the measure takes. The slowdown starts at call
+    5 + 3r + 1. In the same rounds that is the run of 20 000 of round 2:
+    round 1 whole and the run of 2 500 of round 2 keep each side a fast
+    run, the ratio reads 8. One size after the other it is inside the
+    runs of 2 500 (after the first, 5 + r, before the last, 5 + 5r):
+    every run of 20 000 slowed, the ratio about 32, over 22. Both hold
+    with r reckoned one off the measure's, for r > 2. x4, not the x1.55
+    seen on CI: under the margin of 2.5 a slowdown of x2 no longer tells
+    the two orders apart."""
 
     def __init__(
-        self, *, power: int = 1, slow_from: int | None = None,
-        per_char: float = 1e-7,
+        self, *, power: int = 1, lasting: bool = False, per_char: float = 1e-6,
     ) -> None:
-        self.power, self.slow_from, self.per_char = power, slow_from, per_char
+        self.power, self.lasting, self.per_char = power, lasting, per_char
         self.calls = 0
+        self.calibration: list[float] = []
+        self.repeats: int | None = None
+        self.slow_from: int | None = None
 
     def __call__(self, text: str) -> None:
         self.calls += 1
-        slower = 2.0 if self.slow_from and self.calls >= self.slow_from else 1.0
+        slower = 4.0 if self.slow_from and self.calls >= self.slow_from else 1.0
+        started = time.perf_counter()
         time.sleep(self.per_char * len(text) ** self.power / 10_000 ** (
             self.power - 1) * slower)
+        if self.lasting and self.calls <= 5:
+            self.calibration.append(time.perf_counter() - started)
+            if self.calls == 5:
+                self.repeats = _repeats(min(self.calibration))
+                self.slow_from = 5 + 3 * self.repeats + 1
 
 
 class TestTheMeasure:
-    """FIX W6-2b #1: _assert_linear on works whose time is known. F1, F2."""
+    """FIX W6-2b #1, TEST-2: _assert_linear on works whose time is known.
+    F1, F2."""
 
     def test_a_slowdown_that_lasts_is_not_the_pattern_s(self) -> None:
-        """Linear, and slowed by 2 for good from the 65th call. A call
-        is about 1 ms at 10 000, so a run is r = 13..20 calls; the 5
-        calls of the calibration come first. In the same rounds the
-        slowdown starts after the first round (5 + 2r < 65): both sides
-        keep a fast run, the ratio reads 2. One size after the other it
-        starts inside the runs of 10 000 and before those of 20 000
-        (5 + r < 65 <= 5 + 5r + 1): every run of 20 000 slowed, the ratio
-        about 4 -- the shape of the stand's red. Both hold for r = 12..29."""
-        _assert_linear(_Sleeps(slow_from=65), "a")
+        """Linear, slowed by 4 for good from round 2 of the first pair on
+        (_Sleeps, `lasting`): green in the same rounds, red one size after
+        the other (F1). The pair: the slowdown came, and inside the first
+        pair's 5 + 10r calls."""
+        work = _Sleeps(lasting=True)
+        _assert_linear(work, "a")
+        assert work.repeats is not None and work.slow_from is not None
+        assert work.slow_from <= 5 + 10 * work.repeats < work.calls
 
     def test_the_pair_the_guard_sees_a_square(self) -> None:
+        """Quadratic: 2 500 -> 20 000 reads ~64, over 22 (F2)."""
         with pytest.raises(AssertionError):
             _assert_linear(_Sleeps(power=2), "a")
 
