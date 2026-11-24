@@ -20,11 +20,11 @@
 #                         rule)
 #
 #   On a box the machine renders the flag `false` for an option the
-#   passport does not switch on, and writes its literal
-#   `primer-switched-off` into a key under `when:` of a switched-off
-#   option (the machine v0.1.8, pridem/stacks/options.py: flag(), off()
-#   and LITERAL). That value is not known here and never compared: the
-#   keys of a switched-off module are simply not read.
+#   passport does not switch on, and writes its own literal of a
+#   switched-off option into every key under `when:` of it (the machine
+#   v0.1.8, pridem/stacks/options.py: flag(), off() and LITERAL). That
+#   value is not known here and never compared: the keys of a
+#   switched-off module are simply not read.
 #
 # A module is NOT a channel: it is not in CHANNEL_SPECS, has no
 # DeliveryChannel, no formatter and no state in the channel map of the
