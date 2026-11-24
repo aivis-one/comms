@@ -36,9 +36,10 @@
 # and acknowledged (a malformed one is dropped, a stale or deleted one
 # is logged with its class). What is refused since F1.4: a blank string
 # or a zero standing for "no value" (THE SNAPSHOT RULE below). An
-# unknown but non-blank timezone is still stored as-is with a loud
-# warning here (early signal) and degrades to DEFAULT_TIMEZONE at
-# computation time (app/audience/schedule.py).
+# unknown but non-blank timezone -- a directory of the zone database
+# too, "America" (R-2) -- is still stored as-is with a loud warning here
+# (early signal), on both paths alike, and degrades to DEFAULT_TIMEZONE
+# at computation time (app/audience/schedule.py).
 #
 # THE RECIPIENT'S ROW AND A FIRST ATTEMPT (W6-2a). A job's first attempt
 # inserts its deliveries; their foreign key takes FOR KEY SHARE on each
@@ -61,13 +62,13 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
+from app.audience.schedule import open_zone
 from app.core.config import settings
 from app.core.database import once_more_on_insert_race, wait_for_attempts
 from app.core.exceptions import (
@@ -85,7 +86,9 @@ def _warn_if_unknown_timezone(
     recipient_id: UUID,
     timezone: str | None,
 ) -> None:
-    """Early signal for an unresolvable synced timezone.
+    """Early signal for an unresolvable synced timezone -- a name that
+    opens no zone (app/audience/schedule.py open_zone), a directory of
+    the zone database among them (R-2).
 
     Never rejects (poison-pill rule): the value is stored as-is and
     quiet-hours math degrades to DEFAULT_TIMEZONE with its own warning
@@ -94,9 +97,7 @@ def _warn_if_unknown_timezone(
     """
     if timezone is None:
         return
-    try:
-        ZoneInfo(timezone)
-    except (KeyError, ValueError):
+    if open_zone(timezone) is None:
         logger.warning(
             "invalid_timezone_synced",
             recipient_id=str(recipient_id),

@@ -237,6 +237,27 @@ def recipient_deferred_until(
     return next_delivery_allowed_at(now, tz=tz, windows=windows)
 
 
+def open_zone(name: str) -> ZoneInfo | None:
+    """The zone a product's name opens, or None -- the ONE reading of a
+    synced zone name (R-2): app/audience/sync.py at intake, both write
+    paths, and _resolve_tz below at delivery.
+
+    What a name that opens no zone raises is zoneinfo's, by its form:
+    an unknown key (ZoneInfoNotFoundError, a KeyError), a malformed one
+    or a file that is not a zone (ValueError), and a DIRECTORY of the
+    zone database -- "America", "Etc", "America/Argentina" -- read from
+    the tzdata package, which raises IsADirectoryError (measured on
+    Python 3.12 with the tzdata of both locks). Until R-2 that one was
+    not caught: the user_upserted was held, and every later event of
+    its person with it; PUT answered 500. No other OSError is caught: a
+    failure to read a real zone is comms', not the name's.
+    """
+    try:
+        return ZoneInfo(name)
+    except (KeyError, ValueError, IsADirectoryError):
+        return None
+
+
 def _resolve_tz(name: str | None) -> ZoneInfo:
     """Recipient timezone with fallback to the deploy default.
 
@@ -246,12 +267,12 @@ def _resolve_tz(name: str | None) -> ZoneInfo:
     """
     if name is None:
         return ZoneInfo(settings.default_timezone)
-    try:
-        return ZoneInfo(name)
-    except (KeyError, ValueError):
+    zone = open_zone(name)
+    if zone is None:
         logger.warning(
             "invalid_recipient_timezone",
             timezone=name,
             fallback=settings.default_timezone,
         )
         return ZoneInfo(settings.default_timezone)
+    return zone

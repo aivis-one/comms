@@ -36,6 +36,10 @@
 #   MAX_GROUP_KEY_LEN -- group_memberships.group_key
 #                        (app/audience/models.py) + the group_changed
 #                        envelope (app/transport/events.py)
+#   MAX_TARGET_VALUE_LEN -- notifications.target_value
+#                        (app/engine/models.py) + the target of a
+#                        notification_request and of a reminder_cancel
+#                        (app/transport/events.py)
 #
 # WHY HERE (and not introspected from the models, as in Phase 2):
 #   The profile validator used to read these widths off the mapped
@@ -137,6 +141,28 @@ MAX_LLM_AUDIO_URL_LEN = 4096
 # The longest name of an llm key set (LLM_KEY_SETS, app/core/channels.py)
 # -- the width of llm_calls / llm_answers columns that hold it.
 MAX_LLM_SET_NAME_LEN = 64
+
+# Width of notifications.target_value -- the address of a job as the
+# product wrote it: a recipient uuid, a group key or "*" (R-2). A uuid
+# is read by UUID(), which takes any number of '-', 'urn:' and 'uuid:'
+# around its 32 digits, and the value is kept as sent (it is compared by
+# equality, never put into one form) -- so the form check alone bounds
+# nothing, and a longer value reached the INSERT: the request was held,
+# and the person it named with it. Refused at the parse instead, past
+# this width, for every target type.
+MAX_TARGET_VALUE_LEN = 200
+
+# A reminder_cancel (R-2): how many type keys its `types` may name, and
+# how long each may be. A cancel's list is bounded only by the types a
+# profile declares, and 1000 stands far above any profile and far below
+# the driver's ceiling of parameters in one statement (32767, asyncpg):
+# past that ceiling the cancel's statement failed as a transient error,
+# and the cancel was held for good, with every later request under its
+# correlation. A key is compared with notifications.type by equality,
+# never stored; 200 is the length the parse has always taken, now
+# written in the contract.
+MAX_CANCEL_TYPES = 1000
+MAX_CANCEL_TYPE_KEY_LEN = 200
 
 # Width of notifications.idempotency_key -- the producer-supplied
 # dedup key of a stream-ingested notification request (Phase 3c).

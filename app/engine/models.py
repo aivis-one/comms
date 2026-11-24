@@ -70,6 +70,7 @@ from app.core.constants import (
     MAX_CORRELATION_LEN,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_LLM_SET_NAME_LEN,
+    MAX_TARGET_VALUE_LEN,
     MAX_TITLE_LEN,
     MAX_TYPE_KEY_LEN,
 )
@@ -117,7 +118,7 @@ class Notification(UUIDMixin, Base):
 
     # Bare value: uuid string for USER, group_key for GROUP, "*" for ALL.
     target_value: Mapped[str | None] = mapped_column(
-        String(200),
+        String(MAX_TARGET_VALUE_LEN),
         nullable=True,
     )
 

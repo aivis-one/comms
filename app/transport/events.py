@@ -7,7 +7,10 @@
 # THE FIELDS OF EVERY EVENT ARE WRITTEN ONCE, in deploy/INTEGRATION.md
 # section 7 -- one table per event -- and held to the parsers below by
 # tests/test_event_contract.py: the table of each event equals the
-# allowed set in EVENT_FIELDS, both ways (D1 / R5). Not repeated here: a
+# allowed set in EVENT_FIELDS, both ways (D1 / R5). Every bound a parser
+# below checks -- a length, a count, a range -- is written in its row by
+# the same number, and held to the constant both ways, and to the parse
+# at its edge, by tests/test_event_bounds.py (R-2). Not repeated here: a
 # second full copy is the copy the next change forgets.
 #
 # THE FRAME: one Redis Stream entry is {event, data} and, optionally,
@@ -63,6 +66,8 @@ from uuid import UUID
 from app.core.constants import (
     MAX_ACTION_DATA_BYTES,
     MAX_BODY_LEN,
+    MAX_CANCEL_TYPE_KEY_LEN,
+    MAX_CANCEL_TYPES,
     MAX_CORRELATION_LEN,
     MAX_EMAIL_HTML_LEN,
     MAX_EMAIL_LEN,
@@ -75,6 +80,7 @@ from app.core.constants import (
     MAX_LLM_AUDIO_URL_LEN,
     MAX_LOCALE_LEN,
     MAX_SNAPSHOT_VERSION,
+    MAX_TARGET_VALUE_LEN,
     MAX_TELEGRAM_ID,
     MAX_TIMEZONE_LEN,
     MAX_TITLE_LEN,
@@ -787,7 +793,14 @@ def _validate_target(
     target_type: Any, target_value: Any, event: str
 ) -> tuple[str, str]:
     """Per-target_type form check for target_value (early signal; the
-    membership/type checks happen downstream)."""
+    membership/type checks happen downstream).
+
+    THE LENGTH FIRST, for every target type (R-2): a uuid form passes
+    UUID() at any length (it drops every '-', 'urn:' and 'uuid:'), and
+    the value is kept as sent -- past the column's width it failed at
+    the INSERT, and the request was held with its person behind it. A
+    refusal here names the field and the width, never the value.
+    """
     if target_type not in (
         TargetType.USER,
         TargetType.GROUP,
@@ -796,6 +809,11 @@ def _validate_target(
         raise ValidationError(
             f"{event}: target_type must be one of user/group/all, "
             f"got {target_type!r}"
+        )
+    if isinstance(target_value, str) and len(target_value) > MAX_TARGET_VALUE_LEN:
+        raise ValidationError(
+            f"{event}: field 'target_value' exceeds "
+            f"{MAX_TARGET_VALUE_LEN} characters"
         )
     if target_type == TargetType.USER:
         # Must be a uuid string (bare product user id).
@@ -1301,8 +1319,16 @@ def _parse_reminder_cancel(data: dict[str, Any]) -> ReminderCancel:
             f"{event}: types must be a non-empty list of reminder "
             f"type keys"
         )
+    # The length of the list as sent, repeats counted (R-2): unbounded,
+    # a list past the driver's parameters held the cancel for good
+    # (app/core/constants.py MAX_CANCEL_TYPES).
+    if len(raw_types) > MAX_CANCEL_TYPES:
+        raise ValidationError(
+            f"{event}: types holds more than {MAX_CANCEL_TYPES} type keys"
+        )
     types = [
-        _string(t, "types[]", event, max_len=200) for t in raw_types
+        _string(t, "types[]", event, max_len=MAX_CANCEL_TYPE_KEY_LEN)
+        for t in raw_types
     ]
 
     correlation = _string(

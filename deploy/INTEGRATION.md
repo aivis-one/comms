@@ -519,8 +519,8 @@ construction, so it takes no key:
 | `POST /threads/{id}/retag` | sets values; a repeat finds the thread already moved and back in the pool |
 | `POST /threads/{id}/read` | the pointer only moves forward |
 | `POST /sections` | create-or-find by key |
-| `POST /inbox/{delivery_id}/read`, `POST /inbox/read-all` | set a value |
-| `PATCH /preferences` | sets values |
+| `POST /recipients/{id}/inbox/{delivery_id}/read`, `POST /recipients/{id}/inbox/read-all` | set a value |
+| `PATCH /recipients/{id}/preferences` | sets values |
 
 `POST /threads/unread-counts` is a read that takes a body.
 
@@ -548,7 +548,10 @@ snapshot only when its version is higher than the stored one: an event
 that arrives late cannot roll the address book back. The stored version
 with other content is a conflict. "No value" is an explicit `null` for
 `telegram_id`, `email`, `locale` and `timezone` -- a blank string or a
-telegram id of 0 is refused on both paths.
+telegram id of 0 is refused on both paths. Both paths take the bounds
+of the `user_upserted` table (section 7): past one, `PUT` answers 422
+`validation` naming the field. A `timezone` that opens no zone is
+stored as sent on both paths, as that table says.
 
 **Deleting a person.** `DELETE /api/v1/recipients/{id}` with
 `{"version": N}`, or the `user_deleted` event `{v, recipient_id,
@@ -811,6 +814,13 @@ Delivery is at-least-once. comms acknowledges an entry after it has
 been processed, so any event may arrive more than once; the rules
 below make every replay harmless.
 
+**Every range `a..b` and every "at most N" in the tables of this
+section is a bound comms checks** -- a length in characters, unless the
+row names bytes, days or items; a range includes both ends. A value
+past one is the producer's error: a `notification_request` is rejected
+under its key, naming the field, and every other event is dropped (see
+**What "dropped" is** below) -- never held.
+
 ### `notification_request` -- a job
 
 A job is an **envelope** comms reads, plus a **letter** it carries and
@@ -820,9 +830,9 @@ never interprets.
 |---|---|---|---|
 | `v` | required | frame | `1` |
 | `idempotency_key` | required | envelope | string, 1..200 -- names the request (see below) |
-| `type` | required | envelope | declared by the profile; the profile routes it to its channels |
+| `type` | required | envelope | string, 1..50, declared by the profile; the profile routes it to its channels |
 | `target_type` | by type | envelope | `user` \| `group` \| `all` -- required for a type delivered to people, refused for an llm type (section 11) |
-| `target_value` | by type | envelope | a recipient uuid, a group key, or `*`, matching `target_type`; with `target_type` or not at all |
+| `target_value` | by type | envelope | a recipient uuid, a group key (1..100), or `*`, matching `target_type`; at most 200 characters in any form -- a uuid is kept and compared as sent, never rewritten; with `target_type` or not at all |
 | `scheduled_at` | optional | envelope | ISO 8601 with a zone -- "not before"; at most 3650 days ahead of the intake, refused under the key past that |
 | `expiry_at` | optional | envelope | ISO 8601 with a zone; in the future and after `scheduled_at`; wins over the profile's `expires_after` |
 | `correlation` | optional | envelope | string, 1..200 -- the product's own reference, stored untouched (see below) |
@@ -935,10 +945,10 @@ correlation; what it means is the product's.
 | field | | rule |
 |---|---|---|
 | `v` | required | `1` |
-| `types` | required | a non-empty list of type keys |
+| `types` | required | a list of 1..1000 type keys, repeats counted; each a string of 1..200 |
 | `correlation` | required | string, 1..200 -- equal to the `correlation` the jobs were sent with |
 | `target_type` | optional | with `target_value`, both or neither; the same forms as in `notification_request` |
-| `target_value` | optional | with `target_type`, both or neither |
+| `target_value` | optional | with `target_type`, both or neither; the same forms and bounds as in `notification_request` |
 
 Every job of one of `types` with that exact `correlation` (and that
 target, when given) that has not reached an outcome is closed with the
@@ -957,11 +967,11 @@ never a telegram id of `0`.
 |---|---|
 | `v` | `1` |
 | `recipient_id` | the product's user uuid |
-| `version` | integer `>= 1`, monotonic per user |
-| `telegram_id` | integer, non-zero, or `null` |
-| `email` | non-blank string or `null` |
-| `locale` | non-blank string or `null` |
-| `timezone` | IANA zone name or `null` |
+| `version` | integer 1..9223372036854775807, monotonic per user |
+| `telegram_id` | integer -9223372036854775808..9223372036854775807, non-zero, or `null` |
+| `email` | non-blank string, 1..320, or `null` |
+| `locale` | non-blank string, 1..8, or `null` |
+| `timezone` | IANA zone name, 1..64, or `null`; a name that opens no zone -- unknown, or a directory of the zone database such as `America` -- is stored as sent and said in comms' log, and the person's schedule is then read in the deploy's default zone |
 | `active` | boolean |
 
 ### `user_deleted` -- forgetting
@@ -973,7 +983,7 @@ tombstone.
 |---|---|
 | `v` | `1` |
 | `recipient_id` | the product's user uuid |
-| `version` | integer `>= 1`, in the same order as `user_upserted` |
+| `version` | integer 1..9223372036854775807, in the same order as `user_upserted` |
 
 **The version orders the snapshots.** Older than the stored version --
 refused as stale; equal with the same bytes -- a replay; equal with
@@ -1003,7 +1013,7 @@ letter.
 | field | rule |
 |---|---|
 | `v` | `1` |
-| `group_key` | string, 1..200, opaque to comms |
+| `group_key` | string, 1..100, opaque to comms |
 | `recipient_id` | the product's user uuid; `user_upserted` comes first |
 | `member` | `true` ensures the membership, `false` removes it |
 
