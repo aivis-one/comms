@@ -171,7 +171,7 @@ def _refused(outcome: SignInRefused) -> JSONResponse:
 
 
 @router.post("/complete", response_model=None)
-async def complete(body: LoginCompleteIn) -> dict[str, Any] | JSONResponse:
+async def complete(body: LoginCompleteIn) -> JSONResponse:
     """Complete a sign-in: the person, or the refusal of the contract."""
     outcome = await complete_sign_in(
         body.state,
@@ -182,12 +182,9 @@ async def complete(body: LoginCompleteIn) -> dict[str, Any] | JSONResponse:
     if isinstance(outcome, SignInRefused):
         return _refused(outcome)
     person = outcome.identity
-    logger.info(
-        "login_completed",
-        provider=person.provider,
-        telegram_status=outcome.telegram_status,
-    )
-    return {
+    # Encoded HERE, before the line that says the product got it (R-6):
+    # the log names only an outcome the product receives.
+    answer = JSONResponse({
         "provider": person.provider,
         "subject": person.subject,
         "verified_at": person.verified_at.isoformat(),
@@ -199,4 +196,10 @@ async def complete(body: LoginCompleteIn) -> dict[str, Any] | JSONResponse:
             "photo_url": person.photo_url,
             "bot_access_granted": person.bot_access_granted,
         },
-    }
+    })
+    logger.info(
+        "login_completed",
+        provider=person.provider,
+        telegram_status=outcome.telegram_status,
+    )
+    return answer

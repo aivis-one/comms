@@ -30,12 +30,13 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+from jwt.algorithms import ECAlgorithm, RSAAlgorithm, get_default_algorithms
 from structlog.testing import capture_logs
 
 from app.core.config import TELEGRAM_LOGIN_ISSUER
 from app.login.identity import (
     CLOCK_LEEWAY,
+    ID_TOKEN_MAX_CHARS,
     IdTokenRejected,
     TelegramIdentity,
     bot_access_granted,
@@ -575,3 +576,107 @@ class TestNothingShown:
             _verify(_token(key=_RSA_OTHER))
             _verify("abc")
         assert logs == []
+
+
+# -----------------------------------------------------------------------------
+# R-6 -- every algorithm PyJWT knows; the id_token's length and characters
+# -----------------------------------------------------------------------------
+
+
+class TestEveryEntryIsAWord:
+    """R-6 item 1: whatever `alg` and `kty` a key set entry names, the
+    token gets a word or the person -- never an exception. Enumerated at
+    run time from PyJWT's own registry, so a new PyJWT's new name is in
+    the grid without an edit here. On b8b5e12 `alg: none` raised
+    NotImplementedError out of PyJWK (R-3 enumerated the entry's fields by
+    JSON type, not by the names PyJWT gives meaning to)."""
+
+    @pytest.mark.parametrize("kty", ["RSA", "EC", "oct", "OKP", "unit-kty"])
+    @pytest.mark.parametrize(
+        "alg", [*sorted(get_default_algorithms()), "unit-alg", ""],
+    )
+    def test_every_cell(self, alg: str, kty: str) -> None:
+        entry = {**_jwk(_RSA, "k-rsa", alg=None), "kty": kty, "alg": alg}
+        if kty == "EC":
+            entry.update(_jwk(_EC, "k-rsa", alg=None), alg=alg)
+        result = _verify(_token(), {"keys": [entry]})
+        # The entry's own `alg` is not compared with the token's (out of
+        # R-6): an RSA key named for RS384 verifies an RS256 token as the
+        # key it is. What is held is that every cell ends in an outcome.
+        assert isinstance(result, IdTokenRejected | TelegramIdentity), result
+        if (alg, kty) == ("RS256", "RSA"):
+            assert isinstance(result, TelegramIdentity), "the pair"
+
+    def test_the_registry_holds_none(self) -> None:
+        """The pair: the grid has the name that raised."""
+        assert "none" in get_default_algorithms()
+
+    def test_none_is_no_key(self) -> None:
+        entry = {**_jwk(_RSA, "k-rsa", alg=None), "alg": "none"}
+        assert _verify(_token(), {"keys": [entry]}) is R.UNKNOWN_KEY
+
+
+class TestTheIdTokenItself:
+    """R-6 item 3 and 2: the id_token is at most ID_TOKEN_MAX_CHARS before
+    anything parses it -- `too_long` -- and ASCII, as a compact JWT is:
+    any other character, a lone surrogate among them, is `malformed`."""
+
+    @pytest.mark.parametrize(("length", "word"), [
+        (ID_TOKEN_MAX_CHARS, R.MALFORMED),
+        (ID_TOKEN_MAX_CHARS + 1, R.TOO_LONG),
+    ], ids=["at-the-bound", "one-past"])
+    def test_the_bound_is_exact(self, length: int, word: IdTokenRejected) -> None:
+        """At the bound the token is parsed (and is garbage); past it, not."""
+        assert _verify("a" * length) is word
+
+    def test_the_bound_is_16_ki(self) -> None:
+        assert ID_TOKEN_MAX_CHARS == 16 * 1024
+
+    def test_claims_json_cannot_read_do_not_fit(self) -> None:
+        """Why verified_claims catches no RecursionError: the shallowest
+        claims json cannot read make an id_token past the bound, refused
+        before json sees them. Found here for the interpreter that runs,
+        so a smaller recursion limit, or a larger bound, is red here."""
+        low, high = 1, 1_000_000
+        while low < high:
+            depth = (low + high) // 2
+            try:
+                json.loads("[" * depth + "]" * depth)
+                low = depth + 1
+            except RecursionError:
+                high = depth
+        assert 1 < low < 1_000_000, "the pair: json has a depth it cannot read"
+        claims = '{"a":' + "[" * low + "]" * low + "}"
+        head = _b64(json.dumps({"alg": "RS256", "kid": "k-rsa"}).encode())
+        shortest = len(head) + 1 + len(_b64(claims.encode())) + 1
+        assert shortest > ID_TOKEN_MAX_CHARS
+
+    @pytest.mark.parametrize("bad", ["\ud800", "\u00e9", "\u0661"],
+                             ids=["surrogate", "latin", "arabic-digit"])
+    def test_not_ascii(self, bad: str) -> None:
+        token = _token()
+        assert _verify(token[:5] + bad + token[5:]) is R.MALFORMED
+        assert isinstance(_verify(token), TelegramIdentity), "the pair"
+
+
+class TestANameNoUtf8Holds:
+    """R-6 item 2: a string claim that cannot be encoded (a lone
+    surrogate) is no name -- `null`, as an empty one -- and the rest of
+    the person stands."""
+
+    @pytest.mark.parametrize(("claim", "field"), [
+        ("family_name", "last_name"),
+        ("preferred_username", "username"),
+        ("picture", "photo_url"),
+    ])
+    def test_each_field(self, claim: str, field: str) -> None:
+        value = "https://cdn.example.org/\ud800" if claim == "picture" else "\ud800"
+        person = _verify(_token(_claims(**{claim: value})))
+        assert isinstance(person, TelegramIdentity)
+        assert getattr(person, field) is None
+        assert person.first_name == "Ada", "the pair"
+
+    def test_the_first_name_falls_back_to_name(self) -> None:
+        person = _verify(_token(_claims(given_name="\ud800")))
+        assert isinstance(person, TelegramIdentity)
+        assert person.first_name == "Ada Lovelace"

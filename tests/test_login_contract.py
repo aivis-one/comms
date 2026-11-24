@@ -6,7 +6,9 @@ The product writes its fake of comms by the samples of section 16
 (``json`` blocks, each under its label: route, status, and the class of
 a refusal). Each is held to an answer the code really gives: the suite's
 application with the sign-in's router included for the test, Telegram a
-MockTransport (app/login/telegram.py new_client replaced) -- every
+MockTransport whose answers come as streams, as a real transport's do
+(tests/helpers.py StreamingMockTransport; app/login/telegram.py
+new_client replaced) -- every
 refusal reached by its real path, none by a stub of the outcome. Held:
 
   - the keys at every depth and the JSON types, both ways (a key of the
@@ -67,6 +69,7 @@ from app.login.attempts import (
 )
 from app.login.complete import Refusal
 from app.main import app
+from tests.helpers import StreamingMockTransport
 
 _DOC = (Path(__file__).resolve().parents[1] / "deploy" / "INTEGRATION.md").read_text(
     encoding="utf-8",
@@ -268,7 +271,7 @@ def tg(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Telegram]:
     monkeypatch.setattr(settings, "telegram_login_client_secret", _SECRET)
     monkeypatch.setattr(
         telegram, "new_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(fake.handle)),
+        lambda: httpx.AsyncClient(transport=StreamingMockTransport(fake.handle)),
     )
     routes = app.router.routes
     before = list(routes)

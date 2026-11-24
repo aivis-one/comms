@@ -28,11 +28,13 @@
 import itertools
 import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audience.models import GroupMembership, Recipient
@@ -1076,3 +1078,46 @@ def redis_answering(monkeypatch: Any) -> None:
         return True
 
     monkeypatch.setattr(main_module, "redis_answers", answers)
+
+
+# -----------------------------------------------------------------------------
+# A stand-in of an HTTP service whose answers come as a real transport's
+# -----------------------------------------------------------------------------
+
+
+class _Unread(httpx.AsyncByteStream):
+    """A body not yet read: what a real transport hands httpx."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self._body:
+            yield self._body
+
+
+def streamed(status: int, body: bytes, headers: dict[str, str]) -> httpx.Response:
+    """An answer whose `body` is on the wire as given -- gzip stays gzip,
+    nothing is inflated or read before the code under test reads it."""
+    return httpx.Response(status, headers=headers, stream=_Unread(body))
+
+
+class StreamingMockTransport(httpx.MockTransport):
+    """httpx.MockTransport, its answers streams as a real transport's are.
+
+    httpx reads -- and inflates -- an answer built in memory (content=,
+    json=) the moment it is made, so code that reads the raw stream with
+    a bound (app/login/telegram.py, R-6) finds it consumed. An answer
+    built in memory is sent on as a stream of its bytes; one made by
+    `streamed` passes as it is. An answer built in memory with a
+    Content-Encoding is refused: httpx has inflated it already, and the
+    test would not send what it means to."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await super().handle_async_request(request)
+        if not response.is_stream_consumed:
+            return response
+        assert "content-encoding" not in response.headers, (
+            "build an encoded answer with tests.helpers.streamed"
+        )
+        return streamed(response.status_code, response.content, dict(response.headers))

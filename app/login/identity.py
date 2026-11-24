@@ -4,6 +4,8 @@
 #
 # What the sign-in hands a product is taken ONLY from an id_token that
 # passed every check of the contract (form of v4.2):
+#   - at most ID_TOKEN_MAX_CHARS, and ASCII -- a compact JWT is -- before
+#     anything parses it (R-6): `too_long`, `malformed`;
 #   - the signature, by Telegram's published key the token names by its
 #     `kid` -- exactly one key of the set given;
 #   - the algorithm RS256 or ES256, from the token's header but out of
@@ -37,8 +39,15 @@
 # NOTHING OF A TOKEN, A CLAIM OR A KEY reaches a log, an exception or a
 # repr: this module logs nothing and raises nothing of its own; PyJWT's
 # exceptions are turned into a word here; the identity's repr names no
-# field. NO VALUE OF TELEGRAM'S RAISES out of it (R-3): a number past a
-# float, claims nested past what json reads -- each is a word.
+# field. NO VALUE OF TELEGRAM'S RAISES out of it (R-3, R-6): a number
+# past a float, a key set entry of any `alg` PyJWT knows (`none` raised
+# NotImplementedError), a character no UTF-8 holds -- each is a word, or,
+# in a name, no name: a string the answer could not encode (a lone
+# surrogate, which json reads from "\ud800") is null, as an empty one.
+# Claims nested past what json reads (RecursionError) cannot be reached:
+# the shallowest such make an id_token past ID_TOKEN_MAX_CHARS, refused
+# before anything parses it -- tests/test_login_identity.py holds that
+# for the interpreter it runs on.
 # =============================================================================
 
 import math
@@ -60,6 +69,9 @@ from app.login.attempts import BOT_ACCESS_SCOPE, PROVIDER_TELEGRAM
 # contract): RS256 is Telegram's default, ES256 the other one BotFather
 # offers with the profile scope.
 ALGORITHMS = ("RS256", "ES256")
+# The longest id_token parsed. Telegram's of 24.11 was about 1 KB; the
+# exchange's whole body is bounded too (app/login/telegram.py).
+ID_TOKEN_MAX_CHARS = 16 * 1024
 # The smallest RSA key an RS256 token of Telegram's is verified with.
 RSA_MIN_BITS = 2048
 # How far the clocks of the box and of Telegram may be apart for `exp`
@@ -79,6 +91,7 @@ class IdTokenRejected(StrEnum):
     MALFORMED = "malformed"
     ALGORITHM = "algorithm"
     NO_KID = "no_kid"
+    TOO_LONG = "too_long"
     UNKNOWN_KEY = "unknown_key"
     AMBIGUOUS_KEY = "ambiguous_key"
     KEY_TYPE = "key_type"
@@ -138,7 +151,9 @@ def _key(jwks: object, kid: str) -> Any | IdTokenRejected:
         return IdTokenRejected.AMBIGUOUS_KEY
     try:
         return jwt.PyJWK(dict(named[0])).key
-    except (jwt.PyJWTError, TypeError, ValueError, KeyError):
+    except (jwt.PyJWTError, TypeError, ValueError, KeyError, NotImplementedError):
+        # NotImplementedError: `"alg": "none"` -- PyJWT's NoneAlgorithm has
+        # no key to build (the one name of its registry that raises it).
         return IdTokenRejected.UNKNOWN_KEY
 
 
@@ -173,6 +188,12 @@ def verified_claims(
     """The claims of `id_token` once every check of the contract passed
     (the module's header), or the word of the first that failed."""
     if not isinstance(id_token, str) or not id_token:
+        return IdTokenRejected.MALFORMED
+    if len(id_token) > ID_TOKEN_MAX_CHARS:
+        return IdTokenRejected.TOO_LONG
+    if not id_token.isascii():
+        # PyJWT encodes the token before its own try: a lone surrogate
+        # raised UnicodeEncodeError out of get_unverified_header.
         return IdTokenRejected.MALFORMED
     try:
         header = jwt.get_unverified_header(id_token)
@@ -210,9 +231,6 @@ def verified_claims(
         # anything else of it is a token that cannot be read.
         if isinstance(failed, jwt.InvalidSignatureError):
             return IdTokenRejected.SIGNATURE
-        return IdTokenRejected.MALFORMED
-    except RecursionError:
-        # Claims nested deeper than json reads: no token to read.
         return IdTokenRejected.MALFORMED
     except (jwt.PyJWTError, TypeError, ValueError):
         # Any other failure of PyJWT to verify with the key that fits.
@@ -264,7 +282,15 @@ def telegram_id(value: object) -> int | None:
 
 
 def _text(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
+    """A name's string: not empty, and one the answer can encode -- a
+    lone surrogate cannot be UTF-8, and is no name."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
 
 
 def _https(value: object) -> str | None:

@@ -3,8 +3,11 @@ app/login/telegram.py).
 
 The route is included in the suite's application for each test (the
 suite runs with `login` off, as a deploy without it); Telegram is a
-MockTransport (app/login/telegram.py new_client replaced) -- the suite's
-tripwire stays under every other client; the keys are the test's own.
+MockTransport (app/login/telegram.py new_client replaced) whose answers
+come as streams, as a real transport's do (tests/helpers.py
+StreamingMockTransport: R-6 reads the raw stream with a bound) -- the
+suite's tripwire stays under every other client; the keys are the test's
+own.
 
 Held: the body's form before the take; the take's three refusals; the
 exchange and the keys, each answer of Telegram to its class -- the live
@@ -21,9 +24,12 @@ tests/test_login_switched_off.py).
 
 import asyncio
 import base64
+import gzip
 import json
 import re
 import time
+import tracemalloc
+import zlib
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +60,7 @@ from app.login.complete import Refusal, SignInRefused
 from app.login.identity import IdTokenRejected
 from app.login.models import LoginAttempt
 from app.main import app
+from tests.helpers import StreamingMockTransport, streamed
 
 _BOT_ID = "123456"
 _TOKEN = _BOT_ID + ":" + "unit-test-login-complete"
@@ -128,7 +135,7 @@ def tg(monkeypatch: pytest.MonkeyPatch) -> Iterator[Telegram]:
     monkeypatch.setattr(settings, "telegram_login_client_secret", _SECRET)
     monkeypatch.setattr(
         telegram, "new_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(fake.handle)),
+        lambda: httpx.AsyncClient(transport=StreamingMockTransport(fake.handle)),
     )
     routes = app.router.routes
     before = list(routes)
@@ -649,8 +656,15 @@ async def test_the_client_is_bounded_and_ignores_the_environment() -> None:
 _REAL_TRANSPORT = httpx.AsyncHTTPTransport.handle_async_request
 _REAL_NEW_CLIENT = telegram.new_client
 
-# Nested a hundred thousand deep: valid JSON, past what json can read.
-_DEEP = "[" * 100_000 + "]" * 100_000
+# Nested 12000 deep: valid JSON, past what json can read (CPython 3.12
+# raises RecursionError from 9998 on: its C recursion limit), and 24 KB,
+# under the bound of a body -- so the depth is what is refused, not the
+# size. Was 10**5 deep (R-3): R-6 bounds a body at BODY_MAX_BYTES, and
+# 200 KB is now refused for its size (TestTheSizeIsBounded). Claims
+# nested so deep make an id_token past ID_TOKEN_MAX_CHARS: `too_long`
+# before json reads them (tests/test_login_identity.py holds that the
+# shallowest claims json cannot read do not fit).
+_DEEP = "[" * 12_000 + "]" * 12_000
 
 
 def _signed(header: dict[str, Any], payload: str) -> str:
@@ -715,12 +729,14 @@ class TestNoAnswerOfTelegramIsA500:
     the key set, the token's claims -- reaches an outcome of the contract,
     its word in the log. Each case is the reviewer's reproduction of
     4.2.0 (exp 10**400, a private key, a body nested past json's depth),
-    the depth in all three places it is read, `iat` beside `exp`."""
+    the depth in all three places it is read, `iat` beside `exp`. Claims
+    so deep were `malformed` (R-3); since R-6 the id_token they make is
+    `too_long` before anything parses it."""
 
     @pytest.mark.parametrize(("case", "status", "cls", "word"), [
         ("deep-exchange-body", 503, "provider_unavailable", "token_not_json"),
         ("deep-jwks-body", 503, "provider_unavailable", "jwks_not_json"),
-        ("deep-claims", 502, "id_token_invalid", "malformed"),
+        ("deep-claims", 502, "id_token_invalid", "too_long"),
         ("exp-10-400", 502, "id_token_invalid", "no_exp"),
         ("iat-10-400", 502, "id_token_invalid", "no_iat"),
         ("private-jwk", 502, "id_token_invalid", "key_type"),
@@ -758,11 +774,13 @@ def _good_exchange_body() -> bytes:
 Answer = Callable[[asyncio.StreamWriter], Awaitable[None]]
 
 
-def _at_once(body: bytes) -> Answer:
+def _at_once(body: bytes, encoding: str | None = None) -> Answer:
+    """The whole answer at once; `encoding` its Content-Encoding, if any."""
+    coded = b"" if encoding is None else f"Content-Encoding: {encoding}\r\n".encode()
     async def answer(writer: asyncio.StreamWriter) -> None:
         writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body,
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" + coded
+            + b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body,
         )
         await writer.drain()
     return answer
@@ -818,6 +836,25 @@ class _Served:
         await self.server.wait_closed()
 
 
+@pytest.fixture
+def real_telegram(
+    tg: Telegram, monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[str, str], None]:
+    """The real transport and the real client of a sign-in, the bound
+    _BOUND; the returned function points Telegram's two addresses at the
+    test's servers."""
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _REAL_TRANSPORT,
+    )
+    monkeypatch.setattr(telegram, "new_client", _REAL_NEW_CLIENT)
+    monkeypatch.setattr(telegram, "TELEGRAM_TIMEOUT_SECONDS", _BOUND)
+
+    def point(token_url: str, jwks_url: str) -> None:
+        monkeypatch.setattr(telegram, "TELEGRAM_LOGIN_TOKEN_URL", token_url)
+        monkeypatch.setattr(telegram, "TELEGRAM_LOGIN_JWKS_URL", jwks_url)
+    return point
+
+
 class TestTheWholeRequestIsBounded:
     """R-3 item 1: each of the two requests is bounded from its start to
     its end -- TELEGRAM_TIMEOUT_SECONDS, whatever the server does. Real
@@ -826,21 +863,6 @@ class TestTheWholeRequestIsBounded:
     _GAP seconds never trips a per-read timeout; the bound does, and the
     answer is a 503 within the bound and a gap. The 4.2.0 candidate held
     such an exchange for the whole drip."""
-
-    @pytest.fixture
-    def real_telegram(
-        self, tg: Telegram, monkeypatch: pytest.MonkeyPatch,
-    ) -> Callable[[str, str], None]:
-        monkeypatch.setattr(
-            httpx.AsyncHTTPTransport, "handle_async_request", _REAL_TRANSPORT,
-        )
-        monkeypatch.setattr(telegram, "new_client", _REAL_NEW_CLIENT)
-        monkeypatch.setattr(telegram, "TELEGRAM_TIMEOUT_SECONDS", _BOUND)
-
-        def point(token_url: str, jwks_url: str) -> None:
-            monkeypatch.setattr(telegram, "TELEGRAM_LOGIN_TOKEN_URL", token_url)
-            monkeypatch.setattr(telegram, "TELEGRAM_LOGIN_JWKS_URL", jwks_url)
-        return point
 
     async def _timed(self, client: AsyncClient) -> tuple[Any, float, list[Any]]:
         state = await _start(client)
@@ -892,3 +914,326 @@ class TestTheWholeRequestIsBounded:
             "jwks_timeout",
         ]
         assert (token.requests, keys.requests) == (1, 1)
+
+
+# -----------------------------------------------------------------------------
+# R-6 -- what R-3 did not hold: `alg: none`, a lone surrogate, the size
+# -----------------------------------------------------------------------------
+
+# The bounds the tests count against: 64 KiB a body, 16 Ki characters an
+# id_token (app/login/telegram.py, app/login/identity.py).
+_BODY_MAX = 64 * 1024
+_ID_TOKEN_MAX = 16 * 1024
+
+
+def _refused_words(logs: list[Any]) -> list[str]:
+    return [e["reason"] for e in logs if e["event"] == "login_refused"]
+
+
+def _outcome_of_log(logs: list[Any]) -> list[str]:
+    """What the log says the product got: `completed`, or the class."""
+    return [
+        "completed" if e["event"] == "login_completed" else e["error_class"]
+        for e in logs if e["event"] in ("login_completed", "login_refused")
+    ]
+
+
+def _outcome_of_answer(resp: Any) -> str:
+    return "completed" if resp.status_code == 200 else _class(resp)
+
+
+class TestNoneIsNoKey:
+    """R-6 item 1: a key set entry with `"alg": "none"` -- PyJWK raised
+    NotImplementedError, past what _key caught: a 500 on 4.2.0 (b8b5e12).
+    Now the entry is no key: 502 `unknown_key`. Every algorithm of PyJWT's
+    registry is held at the unit (tests/test_login_identity.py)."""
+
+    async def test_the_reviewers_entry(self, client: AsyncClient, tg: Telegram) -> None:
+        entry = {**_jwks()["keys"][0], "alg": "none"}
+        tg.jwks = _answer(200, json.dumps({"keys": [entry]}))
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert (resp.status_code, _class(resp)) == (502, "id_token_invalid")
+        assert _refused_words(logs) == ["unknown_key"]
+
+
+def _person_claims(**changes: Any) -> dict[str, Any]:
+    stamp = int(datetime.now(UTC).timestamp())
+    return {"iss": TELEGRAM_LOGIN_ISSUER, "aud": _BOT_ID, "exp": stamp + 300,
+            "iat": stamp - 5, "id": _TELEGRAM_ID, "given_name": "Ada",
+            "name": "Ada Lovelace", "family_name": "Lovelace",
+            "preferred_username": "ada_mark",
+            "picture": "https://cdn.example.org/ada.jpg", **changes}
+
+
+def _person_token(**changes: Any) -> str:
+    # PyJWT writes the claims with ensure_ascii: a lone surrogate travels
+    # as the escape "\ud800", which json reads back as the lone surrogate.
+    return jwt.encode(_person_claims(**changes), _KEY, algorithm="RS256",
+                      headers={"kid": _KID})
+
+
+_SURROGATE = "\ud800"
+
+
+class TestALoneSurrogate:
+    """R-6 item 2: a lone surrogate -- what json reads from "\\ud800" --
+    is a Python string no UTF-8 holds. In the id_token itself PyJWT raised
+    UnicodeEncodeError before its own try (a 500 on b8b5e12); in a name of
+    a token signed right, the route logged `login_completed` and the answer
+    then failed to encode -- the attempt spent, the log saying the product
+    got a person it never got. Now: the id_token is `malformed` (a compact
+    JWT is ASCII), a name that cannot be encoded is `null` (as an empty
+    one), and the log line is written after the answer is encoded."""
+
+    @pytest.mark.parametrize("id_token", [
+        "eyJ" + _SURROGATE + ".e30.c2ln",
+        "eyJ\u00e9.e30.c2ln",
+    ], ids=["surrogate", "non-ascii"])
+    async def test_in_the_id_token(
+        self, client: AsyncClient, tg: Telegram, id_token: str,
+    ) -> None:
+        # The exchange's body carries it as json would: escaped.
+        tg.token = _answer(200, json.dumps({"id_token": id_token}))
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert (resp.status_code, _class(resp)) == (502, "id_token_invalid")
+        assert _refused_words(logs) == ["malformed"]
+
+    @pytest.mark.parametrize(("claim", "field", "expected"), [
+        ("given_name", "first_name", "Ada Lovelace"),  # falls back to `name`
+        ("family_name", "last_name", None),
+        ("preferred_username", "username", None),
+        ("picture", "photo_url", None),
+    ])
+    async def test_in_a_name_of_a_good_token(
+        self, client: AsyncClient, tg: Telegram,
+        claim: str, field: str, expected: str | None,
+    ) -> None:
+        value = _SURROGATE
+        if claim == "picture":
+            value = "https://cdn.example.org/" + _SURROGATE
+        tg.token = _with_id_token(_person_token(**{claim: value}))
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert resp.status_code == 200, resp.text
+        person = resp.json()["telegram"]
+        assert person[field] == expected
+        others = {"first_name": "Ada", "last_name": "Lovelace",
+                  "username": "ada_mark",
+                  "photo_url": "https://cdn.example.org/ada.jpg"}
+        del others[field]
+        assert {name: person[name] for name in others} == others, "the pair"
+        assert _outcome_of_log(logs) == ["completed"]
+
+    async def test_no_name_at_all(self, client: AsyncClient, tg: Telegram) -> None:
+        """EMPTY: given_name and name both a lone surrogate -> null."""
+        tg.token = _with_id_token(_person_token(given_name=_SURROGATE, name=_SURROGATE))
+        state = await _start(client)
+        resp = await _complete(client, state)
+        assert resp.status_code == 200 and resp.json()["telegram"]["first_name"] is None
+
+    @pytest.mark.parametrize("case", [
+        "good", "surrogate-name", "surrogate-id-token", "private-jwk", "no-id",
+    ])
+    async def test_the_log_says_what_the_product_got(
+        self, client: AsyncClient, tg: Telegram, case: str,
+    ) -> None:
+        """One log line of the outcome, and it is the answer's: a person
+        logged is a person answered, a class logged is the class answered."""
+        if case == "surrogate-name":
+            tg.token = _with_id_token(_person_token(given_name=_SURROGATE))
+        elif case == "surrogate-id-token":
+            tg.token = _answer(200, json.dumps({"id_token": "eyJ" + _SURROGATE}))
+        elif case == "private-jwk":
+            tg.jwks = _answer(200, json.dumps(_private_jwks()))
+        elif case == "no-id":
+            tg.token = _with_id_token(_person_token(id="not-an-id"))
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert _outcome_of_log(logs) == [_outcome_of_answer(resp)]
+
+
+class TestTheSizeIsBounded:
+    """R-6 item 3: each of Telegram's two answers is read up to
+    BODY_MAX_BYTES -- the bytes on the wire AND the bytes it decodes to --
+    and the id_token up to ID_TOKEN_MAX_CHARS before it is parsed. httpx
+    read a body whole and inflated gzip whole: on b8b5e12 474 KB of gzip
+    took 471 MB. The request asks for gzip alone, the only coding comms
+    inflates -- by its own bounded inflater; any other is `*_encoding`."""
+
+    @pytest.mark.parametrize("step", ["token", "jwks"])
+    async def test_a_gzip_bomb_on_a_real_socket(
+        self, client: AsyncClient, real_telegram: Callable[[str, str], None],
+        step: str,
+    ) -> None:
+        """32 MB of zeros in about 32 KB of gzip: refused for its size, and
+        the memory it takes stays near the bound -- measured."""
+        bomb = gzip.compress(b"\0" * (32 * 1024 * 1024))
+        assert len(bomb) < _BODY_MAX, "the pair: the wire is under the bound"
+        exchange, key_set = _good_exchange_body(), json.dumps(_jwks()).encode()
+        bomb_at = _at_once(bomb, "gzip")
+        token = _Served(bomb_at if step == "token" else _at_once(exchange))
+        keys = _Served(bomb_at if step == "jwks" else _at_once(key_set))
+        del bomb
+        async with token as token_url, keys as jwks_url:
+            real_telegram(token_url, jwks_url)
+            state = await _start(client)
+            tracemalloc.start()
+            try:
+                before = tracemalloc.get_traced_memory()[0]
+                with capture_logs() as logs:
+                    resp = await _complete(client, state)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        assert (resp.status_code, _class(resp)) == (503, "provider_unavailable")
+        assert _refused_words(logs) == [f"{step}_too_large"]
+        assert peak - before < 2 * 1024 * 1024
+
+    @pytest.mark.parametrize("step", ["token", "jwks"])
+    async def test_an_endless_body_on_a_real_socket(
+        self, client: AsyncClient, real_telegram: Callable[[str, str], None],
+        step: str,
+    ) -> None:
+        """8 KB every 0.05 s without end: refused for its size, long before
+        the bound of time."""
+        exchange, key_set = _good_exchange_body(), json.dumps(_jwks()).encode()
+        endless = _endless(8 * 1024, 0.05, 40)
+        token = _Served(endless if step == "token" else _at_once(exchange))
+        keys = _Served(endless if step == "jwks" else _at_once(key_set))
+        async with token as token_url, keys as jwks_url:
+            real_telegram(token_url, jwks_url)
+            state = await _start(client)
+            started = time.monotonic()
+            with capture_logs() as logs:
+                resp = await _complete(client, state)
+            took = time.monotonic() - started
+        assert (resp.status_code, _class(resp)) == (503, "provider_unavailable")
+        assert _refused_words(logs) == [f"{step}_too_large"]
+        assert took < _BOUND
+
+    async def test_gzip_signs_in_on_a_real_socket(
+        self, client: AsyncClient, real_telegram: Callable[[str, str], None],
+    ) -> None:
+        """The pair: both answers in gzip -- inflated and read."""
+        token = _Served(_at_once(gzip.compress(_good_exchange_body()), "gzip"))
+        keys = _Served(_at_once(gzip.compress(json.dumps(_jwks()).encode()), "gzip"))
+        async with token as token_url, keys as jwks_url:
+            real_telegram(token_url, jwks_url)
+            state = await _start(client)
+            resp = await _complete(client, state)
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.parametrize(("size", "word"), [
+        (_BODY_MAX, None), (_BODY_MAX + 1, "token_too_large"),
+    ], ids=["at-the-bound", "one-past"])
+    @pytest.mark.parametrize("coded", [False, True], ids=["identity", "gzip"])
+    async def test_the_bound_is_exact(
+        self, client: AsyncClient, tg: Telegram, size: int, word: str | None,
+        coded: bool,
+    ) -> None:
+        """A good exchange body padded with spaces to `size` decoded bytes."""
+        body = _good_exchange_body()
+        body = body + b" " * (size - len(body))
+        assert len(body) == size
+        wire = gzip.compress(body) if coded else body
+        headers = {"content-type": "application/json"}
+        if coded:
+            headers["content-encoding"] = "gzip"
+
+        async def answer(request: httpx.Request) -> httpx.Response:
+            return streamed(200, wire, headers)
+        tg.token = answer
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        if word is None:
+            assert resp.status_code == 200, resp.text
+        else:
+            assert (resp.status_code, _refused_words(logs)) == (503, [word])
+
+    async def test_the_wire_is_bounded_too(
+        self, client: AsyncClient, tg: Telegram,
+    ) -> None:
+        """gzip of empty deflate blocks: 200 KB on the wire that decode to
+        nothing -- the wire's own count refuses it."""
+        header = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+        empty_block = b"\x00\x00\x00\xff\xff"  # stored, not final, 0 bytes
+        last_block = b"\x01\x00\x00\xff\xff"
+        wire = (header + empty_block * (200 * 1024 // 5) + last_block
+                + b"\x00" * 8)  # crc32 and size of nothing
+        assert zlib.decompress(wire, 16 + zlib.MAX_WBITS) == b"", "the pair"
+
+        async def answer(request: httpx.Request) -> httpx.Response:
+            return streamed(200, wire, {"content-encoding": "gzip"})
+        tg.token = answer
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert (resp.status_code, _refused_words(logs)) == (503, ["token_too_large"])
+
+    @pytest.mark.parametrize(("encoding", "wire"), [
+        ("br", b"\x8b\x03\x80{}\x03"),
+        ("deflate", zlib.compress(b"{}")),
+        ("gzip", b"not gzip at all"),
+    ], ids=["br", "deflate", "broken-gzip"])
+    @pytest.mark.parametrize("step", ["token", "jwks"])
+    async def test_a_coding_comms_does_not_inflate(
+        self, client: AsyncClient, tg: Telegram, encoding: str, wire: bytes,
+        step: str,
+    ) -> None:
+        async def answer(request: httpx.Request) -> httpx.Response:
+            return streamed(200, wire, {"content-encoding": encoding})
+        if step == "token":
+            tg.token = answer
+        else:
+            tg.jwks = answer
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert (resp.status_code, _refused_words(logs)) == (503, [f"{step}_encoding"])
+
+    async def test_gzip_is_all_comms_asks_for(
+        self, client: AsyncClient, tg: Telegram,
+    ) -> None:
+        state = await _start(client)
+        assert (await _complete(client, state)).status_code == 200
+        asked = [r.headers.get("accept-encoding") for r in tg.requests]
+        assert asked == ["gzip", "gzip"]
+
+    async def test_a_long_id_token(self, client: AsyncClient, tg: Telegram) -> None:
+        """An id_token past ID_TOKEN_MAX_CHARS, its body under the body's
+        bound: refused before it is parsed."""
+        id_token = "e30." * ((_ID_TOKEN_MAX + 4) // 4)
+        assert len(id_token) > _ID_TOKEN_MAX
+        tg.token = _with_id_token(id_token)
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert (resp.status_code, _class(resp)) == (502, "id_token_invalid")
+        assert _refused_words(logs) == ["too_long"]
+
+
+def _endless(piece: int, gap: float, pieces: int) -> Answer:
+    """Chunks of `piece` spaces every `gap` seconds, `pieces` of them: a
+    body far past the bound, if anyone reads it."""
+    async def answer(writer: asyncio.StreamWriter) -> None:
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n",
+        )
+        chunk = f"{piece:x}\r\n".encode() + b" " * piece + b"\r\n"
+        for _ in range(pieces):
+            if writer.is_closing():
+                return
+            writer.write(chunk)
+            await writer.drain()
+            await asyncio.sleep(gap)
+        writer.write(b"0\r\n\r\n")
+        await writer.drain()
+    return answer
