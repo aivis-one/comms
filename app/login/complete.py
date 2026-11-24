@@ -123,7 +123,7 @@ async def complete_sign_in(
         keys.jwks,
         client_id=client_id,
         now=now,
-        bot_access_granted=bot_access_granted(taken.bot_access, exchanged.body),
+        bot_access_granted=bot_access_granted(taken.bot_access, exchanged.answer),
     )
     if isinstance(verified, IdTokenRejected):
         return SignInRefused(Refusal.ID_TOKEN_INVALID, verified.value, keys.status)

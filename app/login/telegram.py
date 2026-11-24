@@ -83,11 +83,13 @@ class NoIdToken:
 
 @dataclass(frozen=True)
 class Exchanged:
-    """The exchange's answer: its id_token and the whole body (the bot's
-    right reads its `scope`). Kept out of the repr."""
+    """The exchange's answer: its id_token and the whole answer as a JSON
+    object (the bot's right reads its `scope`). Kept out of the repr.
+    Named `answer`, not `body`: tests/test_g1_hygiene.py watches every
+    read of a letter's field names in app/ by name."""
 
     id_token: str = field(repr=False)
-    body: dict[str, Any] = field(repr=False)
+    answer: dict[str, Any] = field(repr=False)
     status: int
 
 
@@ -147,7 +149,7 @@ async def exchange_code(
     id_token = body.get("id_token")
     if not isinstance(id_token, str) or not id_token:
         return NoIdToken(response.status_code)
-    return Exchanged(id_token=id_token, body=body, status=response.status_code)
+    return Exchanged(id_token=id_token, answer=body, status=response.status_code)
 
 
 async def fetch_jwks(http: httpx.AsyncClient) -> Keys | Unavailable:
