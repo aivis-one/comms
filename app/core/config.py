@@ -81,6 +81,12 @@ _EMAIL_API_BASE_URLS = {
     "us": "https://api.mailgun.net",
 }
 
+# Where the sign-in through Telegram sends the browser (the option
+# `login`, app/login/attempts.py): Telegram's OIDC authorization
+# endpoint. A constant of comms, not a key of `env` -- here, for the
+# domain-literal fence's one exemption, as the provider addresses above.
+TELEGRAM_LOGIN_AUTHORIZE_URL = "https://oauth.telegram.org/auth"
+
 
 # Pairs where one setting must not fall below another: (low, high).
 _ORDERED_PAIRS: tuple[tuple[str, str], ...] = (

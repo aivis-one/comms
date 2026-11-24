@@ -83,7 +83,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.core.channels import channel_spec
+from app.core.channels import channel_spec, telegram_bot_id
 
 if TYPE_CHECKING:
     from aiogram.client.telegram import TelegramAPIServer
@@ -158,10 +158,9 @@ def _link_host(environ: Mapping[str, str]) -> str:
 
 
 def derive_bot_id(environ: Mapping[str, str]) -> str:
-    """The bot's id, from the token alone."""
-    from aiogram.utils.token import extract_bot_id
-
-    return str(extract_bot_id(_token(environ)))
+    """The bot's id, from the token alone (app/core/channels.py
+    telegram_bot_id)."""
+    return telegram_bot_id(_token(environ))
 
 
 async def derive_bot_url(

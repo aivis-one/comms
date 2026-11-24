@@ -54,7 +54,7 @@ _APP = _REPO / "app"
 _RANKS: dict[str, int] = {
     "core": 0,
     "profile": 1,
-    "audience": 2, "messaging": 2,
+    "audience": 2, "messaging": 2, "login": 2,
     "engine": 3,
     "forgetting": 4, "notifier": 4, "variants": 4,
     "api": 5, "transport": 5,

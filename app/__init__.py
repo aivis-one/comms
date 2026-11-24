@@ -10,7 +10,8 @@
 #   rank 0  core                         settings, database, sanitizer,
 #                                        the closed sets (channels, lanes)
 #   rank 1  profile                      the product's types and templates
-#   rank 2  audience, messaging          recipients and groups; threads
+#   rank 2  audience, messaging, login   recipients and groups; threads;
+#                                        the sign-in attempts (v4.2)
 #   rank 3  engine                       intake, pipeline, journal
 #   rank 4  forgetting, notifier,        across engine, audience, messaging
 #           variants

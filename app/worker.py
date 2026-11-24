@@ -16,8 +16,9 @@
 #   - one maintenance loop: the engine's expiry sweep and expired
 #     cleanup (engine.worker.run_engine_maintenance), the close-notify
 #     consumer, and -- each behind its own cadence gate -- the
-#     notification retention pass (engine.processor) and the thread
-#     auto-close pass (messaging.processor).
+#     notification retention pass (engine.processor), the thread
+#     auto-close pass (messaging.processor) and the purge of the sign-in
+#     attempts (login.attempts).
 # Keeping the loops and both cadence gates here is what lets `engine`
 # stay MESSAGING-FREE (Phase 4b, edit 3 / the DAG hygiene of 3b): the
 # only place that imports both engine and messaging is this entrypoint.
@@ -115,6 +116,7 @@ from app.engine.service import (
 )
 from app.engine.wake import listen_for_wakes
 from app.engine.worker import run_engine_maintenance
+from app.login.attempts import PURGE_INTERVAL_SECONDS, purge_login_attempts
 from app.messaging.processor import AutoClosePassError, auto_close_idle_threads
 from app.notifier import consume_close_notifications
 from app.profile.loader import (
@@ -129,10 +131,12 @@ logger = structlog.get_logger()
 # (restart = bounded catch-up). Two workers -> two cheap idempotent
 # scans per interval; NO DB coordination (see the KNOWN CEILING markers
 # in the two processors -- do not "fix" this with a distributed lock).
-# Each pass keeps its OWN gate: retention and auto-close are unrelated
-# frequencies and must not share a timestamp. --
+# Each pass keeps its OWN gate: retention, auto-close and the purge of
+# the sign-in attempts are unrelated frequencies and must not share a
+# timestamp. --
 _last_retention_at: float | None = None
 _last_auto_close_at: float | None = None
+_last_login_purge_at: float | None = None
 
 
 def reset_retention_gate() -> None:
@@ -147,9 +151,16 @@ def reset_auto_close_gate() -> None:
     _last_auto_close_at = None
 
 
+def reset_login_purge_gate() -> None:
+    """Reset the sign-in purge's cadence gate (tests)."""
+    global _last_login_purge_at
+    _last_login_purge_at = None
+
+
 # Sessions the maintenance loop holds at once: its passes run one after
 # another, each in one session at a time (the expiry sweep, the expired
-# cleanup, the close-notify consumer, retention, auto-close). Counted
+# cleanup, the close-notify consumer, retention, auto-close, the purge
+# of the sign-in attempts). Counted
 # with the lanes' against the pool (app/engine/service.py
 # LANE_CONCURRENCY, LANE_JOBS; tests/test_lanes.py holds the sum).
 MAINTENANCE_SESSIONS = 1
@@ -172,7 +183,7 @@ async def run_maintenance_pass() -> int:
         maintenance loop's backoff). The slow passes do not count: they
         keep their own cadence whatever the loop's interval.
     """
-    global _last_retention_at, _last_auto_close_at
+    global _last_retention_at, _last_auto_close_at, _last_login_purge_at
 
     # EACH PASS ON ITS OWN (TX-3): a pass that fails is logged with its
     # class and place and the others still run in this cycle -- before,
@@ -211,6 +222,21 @@ async def run_maintenance_pass() -> int:
         )
         if due and await _auto_close_pass() is not None:
             _last_auto_close_at = now
+
+    # The purge of the sign-in attempts (L-2): ALWAYS, whatever the
+    # notification retention and whether `login` is on -- an attempt is
+    # kept 24 hours by the contract, and the rows of a time the option
+    # was on must go after it is switched off. Off, it is one DELETE over
+    # an empty index an interval.
+    now = time.monotonic()
+    due = (
+        _last_login_purge_at is None
+        or now - _last_login_purge_at >= PURGE_INTERVAL_SECONDS
+    )
+    if due and await _isolated(
+        "login_purge", purge_login_attempts,
+    ) is not None:
+        _last_login_purge_at = now
 
     return done
 

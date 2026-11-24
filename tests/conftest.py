@@ -129,6 +129,7 @@ from app.core.database import (
 from app.engine.formatters import reset_formatters
 from app.engine.models import IntakeOutcome, Notification, NotificationDelivery
 from app.engine.service import longest_attempt_hold
+from app.login.models import LoginAttempt
 from app.messaging.models import Message, Section, Thread, ThreadReadState
 from app.profile.loader import FileProfileSource, install_profile, load_profile
 from app.profile.registry import registry
@@ -300,6 +301,8 @@ async def clean_db(
         await session.execute(delete(CategoryMute))
         await session.execute(delete(GroupMembership))
         await session.execute(delete(Recipient))
+        # The sign-in attempts (L-2): a table of their own, no FK.
+        await session.execute(delete(LoginAttempt))
         await session.commit()
     yield
 

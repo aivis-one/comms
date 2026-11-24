@@ -45,6 +45,9 @@ from app.core.schema_objects import include_object
 # Phase 1: notification engine
 from app.engine.models import Notification, NotificationDelivery  # noqa: F401
 
+# v4.2: the sign-in attempts of the option `login` (L-2)
+from app.login.models import LoginAttempt  # noqa: F401
+
 # Phase 4a: messaging data layer (threads / messages / read state /
 # sections)
 from app.messaging.models import (  # noqa: F401

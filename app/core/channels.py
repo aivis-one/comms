@@ -66,7 +66,11 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
 
-from aiogram.utils.token import TokenValidationError, validate_token
+from aiogram.utils.token import (
+    TokenValidationError,
+    extract_bot_id,
+    validate_token,
+)
 
 # A validator returns None for a well-formed value, or a short
 # human-readable description of what the value should look like. It
@@ -144,6 +148,14 @@ def _telegram_token(value: str) -> str | None:
     except TokenValidationError:
         return "expected the bot token shape '<digits>:<secret>'"
     return None
+
+
+def telegram_bot_id(token: str) -> str:
+    """The bot's id: the digits before the colon of a token of the shape
+    _telegram_token accepts (aiogram's extract_bot_id). The one place
+    comms reads it -- `comms derive bot-id` (app/cli.py) and the sign-in's
+    client id (app/api/login.py) both ask here."""
+    return str(extract_bot_id(token))
 
 
 def _telegram_url(value: str) -> str | None:

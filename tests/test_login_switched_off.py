@@ -22,7 +22,9 @@ includes (FastAPI 0.141 keeps them wrapped, `original_router`).
 
 Mutations: a route that is no v4.0.1 route (3.1), a key of `env` without
 `when` (3.2), one more option (3.3) -- each red here. The twin of 3.1 --
-the same route included only with LOGIN_ENABLED true -- green.
+the same route included only with LOGIN_ENABLED true -- green; since
+L-2 that twin is the code (app/main.py), and with the option on the
+start of the sign-in is in the table (TestTheRoutesWithLoginOn).
 """
 
 import copy
@@ -146,12 +148,13 @@ def _run(code: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
 
 
 @cache
-def _probe(passport: str, secret: str) -> dict[str, Any]:
+def _probe(passport: str, secret: str, login: str = "false") -> dict[str, Any]:
     """What a process of comms starts with: the v4.0.1 instance of
-    `passport` plus the option off and `secret`."""
+    `passport` plus the option's flag `login` (off unless said) and
+    `secret`."""
     env = {
         **_instance_env(_PASSPORTS[passport]),
-        "LOGIN_ENABLED": "false",
+        "LOGIN_ENABLED": login,
         "TELEGRAM_LOGIN_CLIENT_SECRET": secret,
     }
     done = _run(_PROBE.replace("EXCLUDE", repr(_NEW_SETTINGS)), env)
@@ -169,6 +172,16 @@ class TestTheRoutes:
         assert len(_ROUTES_V401) > 30
         assert ["GET", "/health"] in _ROUTES_V401
         assert routes == _ROUTES_V401
+
+
+class TestTheRoutesWithLoginOn:
+    def test_the_twin_with_login_on_the_start_is_there(self) -> None:
+        """L-2's twin of the guard: the same instance with the option on
+        (the channel it needs on, a secret set) has v4.0.1's routes and
+        the start of the sign-in, nothing else -- the guard above sees
+        the flag, not the file."""
+        routes = _probe("telegram", _MARK, "true")["routes"]
+        assert routes == sorted([*_ROUTES_V401, ["POST", "/api/v1/login/start"]])
 
 
 class TestTheStart:

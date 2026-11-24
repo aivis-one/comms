@@ -462,6 +462,12 @@ MIGRATION_OWNED_CHECKS = frozenset({
     # or an object of subject, text and an optional html, none blank.
     "ck_notifications_email_not_json_null",
     "ck_notifications_email_form",
+    # A sign-in attempt (L-2, migration 0042): the one provider; a
+    # fingerprint of the state, never the state; the verifier there
+    # exactly while the attempt is not taken.
+    "ck_login_attempts_provider",
+    "ck_login_attempts_state_hash",
+    "ck_login_attempts_verifier_until_taken",
 })
 
 
