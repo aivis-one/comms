@@ -314,10 +314,13 @@ class TestNoTokenInTheLog:
 
     def test_the_repr_carries_no_token(self) -> None:
         """M7. The pair: the repr is the settings' own, other fields in
-        it."""
+        it -- log_level with its value, read off the object. Until SEC-1
+        the pair was database_url; SEC-1 made it repr=False (the DSN
+        carries POSTGRES_PASSWORD, tests/test_settings_secrets.py), and
+        log_level holds no secret."""
         source = _settings(
             comms_service_token=_CURRENT, comms_service_token_next=_NEXT,
         )
         text = repr(source)
-        assert "database_url=" in text
+        assert f"log_level={source.log_level!r}" in text
         assert _CURRENT not in text and _NEXT not in text
