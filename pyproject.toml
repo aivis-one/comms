@@ -38,6 +38,11 @@ dependencies = [
     # dependency below (the API test client) -- same library, two roles.
     "httpx>=0.27.0,<1.0",
     "redis>=5.0.0,<6.0",
+    # The signature of Telegram's id_token for the option `login` (RS256
+    # or ES256, app/login/identity.py). PyJWT already reaches the image
+    # through redis; the `crypto` extra brings `cryptography`, without
+    # which PyJWT verifies no asymmetric algorithm.
+    "pyjwt[crypto]>=2.10.0,<3.0",
     "pyyaml>=6.0.0,<7.0",
     "tzdata>=2024.1",
 ]
