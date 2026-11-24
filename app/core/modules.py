@@ -10,8 +10,12 @@
 #     flag `false`     -> the module is off on this deploy; its keys are
 #                         NOT read and NOT checked, whatever they hold
 #     flag `true`      -> every channel the module needs must be switched
-#                         on, and every key of the module set (not empty,
-#                         not whitespace alone); otherwise startup is
+#                         on, every key of the module set (not empty,
+#                         not whitespace alone), and every key of those
+#                         channels the module reads must pass the
+#                         module's own rule (channel_key_checks: `login`
+#                         holds the bot's id in TELEGRAM_BOT_TOKEN to
+#                         what it sends Telegram); otherwise startup is
 #                         REFUSED, naming the option and every such key
 #                         -- never a key's value: keys carry secrets
 #     any other value, or no flag at all
@@ -38,10 +42,10 @@
 # message, fixed in one pass.
 # =============================================================================
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from app.core.channels import FLAG_VALUES, channel_spec
+from app.core.channels import FLAG_VALUES, channel_spec, telegram_bot_id_problem
 
 
 @dataclass(frozen=True)
@@ -57,16 +61,23 @@ class ModuleSpec:
     keys: tuple[str, ...]
     # The channels a switched-on module needs switched on.
     channels: tuple[str, ...]
+    # Keys of those channels the module reads, each with the module's own
+    # rule over them (the problem, or None). Judged only when every
+    # channel of the module is on and the key set: an off channel, or a
+    # missing key, is the channel's to name.
+    channel_key_checks: tuple[tuple[str, Callable[[str], str | None]], ...] = ()
 
 
 MODULE_SPECS: tuple[ModuleSpec, ...] = (
     # The sign-in through Telegram: the OIDC client's secret, from
-    # BotFather; the sign-in is Telegram's, so the channel is needed.
+    # BotFather; the sign-in is Telegram's, so the channel is needed --
+    # and the bot's id in its token is the client id (R-3).
     ModuleSpec(
         name="login",
         flag="LOGIN_ENABLED",
         keys=("TELEGRAM_LOGIN_CLIENT_SECRET",),
         channels=("telegram",),
+        channel_key_checks=(("TELEGRAM_BOT_TOKEN", telegram_bot_id_problem),),
     ),
 )
 
@@ -123,13 +134,21 @@ def module_problems(values: Mapping[str, str | None]) -> list[str]:
             continue
 
         lines: list[str] = []
+        channels_on = True
         for channel in spec.channels:
             channel_flag = channel_spec(channel).flag
+            if values.get(channel_flag or "") != "true":
+                channels_on = False
             if values.get(channel_flag or "") == "false":
                 lines.append(
                     f"  needs channel '{channel}', which is switched off "
                     f"({channel_flag}=false)"
                 )
+        for key, check in spec.channel_key_checks if channels_on else ():
+            value = values.get(key) or ""
+            problem = check(value) if value else None
+            if problem is not None:
+                lines.append(f"  {key}: {problem}")
         missing = [key for key in spec.keys if (values.get(key) or "") == ""]
         if missing:
             lines.append(f"  missing: {', '.join(missing)}")

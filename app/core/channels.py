@@ -154,8 +154,32 @@ def telegram_bot_id(token: str) -> str:
     """The bot's id: the digits before the colon of a token of the shape
     _telegram_token accepts (aiogram's extract_bot_id). The one place
     comms reads it -- `comms derive bot-id` (app/cli.py) and the sign-in's
-    client id (app/api/login.py) both ask here."""
+    client id (app/api/login.py) both ask here. With the option `login`
+    on, the start has held it to telegram_bot_id_problem's rule."""
     return str(extract_bot_id(token))
+
+
+# The bot's id as the sign-in sends it to Telegram (its OIDC client id):
+# ASCII digits, as many as an id of 64 bits has at most.
+_BOT_ID = re.compile(r"[0-9]{1,19}")
+
+
+def telegram_bot_id_problem(token: str) -> str | None:
+    """Why the bot's id in `token` cannot be the sign-in's client id, or
+    None. The rule of the option `login` (app/core/modules.py), not of the
+    channel: aiogram's shape takes any str.isdigit() before the colon --
+    a superscript, another script's digits, more digits than int() reads
+    -- on which telegram_bot_id raises or reads another number. Silent on
+    a token the channel itself refuses (_telegram_token): that is the
+    channel's one line. Names no part of the token."""
+    if _telegram_token(token) is not None:
+        return None
+    if _BOT_ID.fullmatch(token.partition(":")[0]):
+        return None
+    return (
+        "the bot's id before the colon is not 1 to 19 ASCII digits -- the "
+        "sign-in sends it to Telegram as its client id"
+    )
 
 
 def _telegram_url(value: str) -> str | None:

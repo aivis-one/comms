@@ -21,6 +21,8 @@ import base64
 import hashlib
 import hmac
 import json
+import math
+import random
 from datetime import UTC, datetime
 from typing import Any
 
@@ -218,11 +220,164 @@ class TestTheKey:
         assert _verify(_token(key=_RSA_OTHER)) is R.SIGNATURE
 
     def test_a_key_of_the_wrong_type(self) -> None:
-        """RS256 named, the EC key's kid: the signature does not verify."""
+        """RS256 named, the EC key's kid: refused for the key's type,
+        before any signature is checked.
+
+        Was SIGNATURE (L-3a): PyJWT refused to verify with a key of the
+        wrong type, and that was all the check there was. R-3 checks the
+        key against the algorithm first (TestTheKeyFitsTheAlgorithm), so
+        the word is the key's -- the signature is never looked at."""
         token = _token()
         head = _b64(json.dumps({"alg": "RS256", "kid": "k-ec"}).encode())
         swapped = ".".join([head, *token.split(".")[1:]])
-        assert _verify(swapped) is R.SIGNATURE
+        assert _verify(swapped) is R.KEY_TYPE
+
+
+def _prime(bits: int) -> int:
+    """A random prime of `bits` bits (Miller-Rabin, 32 rounds)."""
+    while True:
+        candidate = random.getrandbits(bits) | (1 << (bits - 1)) | 1
+        if all(candidate % p for p in (3, 5, 7, 11, 13, 17, 19, 23)) and all(
+            _passes(candidate, random.randrange(2, candidate - 1))
+            for _ in range(32)
+        ):
+            return candidate
+
+
+def _passes(n: int, a: int) -> bool:
+    d, s = n - 1, 0
+    while d % 2 == 0:
+        d, s = d // 2, s + 1
+    x = pow(a, d, n)
+    if x in (1, n - 1):
+        return True
+    for _ in range(s - 1):
+        x = x * x % n
+        if x == n - 1:
+            return True
+    return False
+
+
+def _rsa_of(bits: int) -> rsa.RSAPrivateKey:
+    """An RSA key of `bits` bits -- cryptography makes none under 1024,
+    and loads one built from its primes."""
+    if bits >= 1024:
+        return rsa.generate_private_key(public_exponent=65537, key_size=bits)
+    e = 65537
+    while True:
+        p, q = _prime(bits // 2), _prime(bits // 2)
+        if p != q and math.gcd(e, (p - 1) * (q - 1)) == 1:
+            break
+    d = pow(e, -1, (p - 1) * (q - 1))
+    numbers = rsa.RSAPrivateNumbers(
+        p, q, d, d % (p - 1), d % (q - 1), pow(q, -1, p),
+        rsa.RSAPublicNumbers(e, p * q),
+    )
+    return numbers.private_key()
+
+
+_RSA_1024 = _rsa_of(1024)
+_RSA_512 = _rsa_of(512)
+_EC_384 = ec.generate_private_key(ec.SECP384R1())
+_EC_K1 = ec.generate_private_key(ec.SECP256K1())
+
+
+def _entry(kind: str) -> dict[str, Any]:
+    """A key set entry named `k-under-test`, of the kind named."""
+    if kind == "rsa-2048":
+        entry = _jwk(_RSA, "x", alg=None)
+    elif kind == "rsa-1024":
+        entry = _jwk(_RSA_1024, "x", alg=None)
+    elif kind == "rsa-512":
+        entry = _jwk(_RSA_512, "x", alg=None)
+    elif kind == "rsa-private":
+        entry = json.loads(RSAAlgorithm.to_jwk(_RSA))
+    elif kind == "ec-p256":
+        entry = _jwk(_EC, "x", alg=None)
+    elif kind == "ec-p256-private":
+        entry = json.loads(ECAlgorithm.to_jwk(_EC))
+    elif kind == "ec-p384":
+        entry = _jwk(_EC_384, "x", alg=None)
+    elif kind == "ec-secp256k1":
+        entry = json.loads(ECAlgorithm.to_jwk(_EC_K1.public_key()))
+    elif kind == "oct-pem":
+        # The confusion of a hostile key set: an HMAC key whose bytes are
+        # the PEM of an RSA public key -- PyJWT reads such bytes as that
+        # key for RS256.
+        pem = _RSA.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        entry = {"kty": "oct", "k": _b64(pem)}
+    else:
+        assert kind == "oct"
+        entry = {"kty": "oct", "k": _b64(b"unit-hmac-key-" + b"x" * 18)}
+    entry["kid"] = "k-under-test"
+    return entry
+
+
+# The key that signs a token of each algorithm when the entry's own key
+# cannot (a public entry, an HMAC key): the entry is refused before any
+# signature is checked, so what signed it does not matter.
+_SIGNER = {"rs256": _RSA, "es256": _EC}
+_OWN_SIGNER: dict[str, Any] = {
+    "rsa-2048": _RSA, "rsa-1024": _RSA_1024, "rsa-512": _RSA_512,
+    "rsa-private": _RSA, "ec-p256": _EC, "ec-p256-private": _EC,
+}
+
+
+class TestTheKeyFitsTheAlgorithm:
+    """R-3 item 3: the key named by `kid` must be of the algorithm --
+    RS256 an RSA PUBLIC key of at least 2048 bits, ES256 an EC PUBLIC key
+    on P-256 -- or the token is refused with the word `key_type`: a key
+    set of Telegram's is no reason to verify with a weak, private, HMAC
+    or foreign key. Each cell signed by the entry's own key where it can
+    sign under the algorithm -- so on the 4.2.0 candidate RSA-512,
+    RSA-1024, the private EC key and the PEM in an `oct` gave the person."""
+
+    @pytest.mark.parametrize(("alg", "kind", "fits"), [
+        ("RS256", "rsa-2048", True),
+        ("RS256", "rsa-1024", False),
+        ("RS256", "rsa-512", False),
+        ("RS256", "rsa-private", False),
+        ("RS256", "ec-p256", False),
+        ("RS256", "ec-p256-private", False),
+        ("RS256", "ec-p384", False),
+        ("RS256", "ec-secp256k1", False),
+        ("RS256", "oct-pem", False),
+        ("RS256", "oct", False),
+        ("ES256", "ec-p256", True),
+        ("ES256", "ec-p256-private", False),
+        ("ES256", "ec-p384", False),
+        ("ES256", "ec-secp256k1", False),
+        ("ES256", "rsa-2048", False),
+        ("ES256", "rsa-1024", False),
+        ("ES256", "rsa-512", False),
+        ("ES256", "rsa-private", False),
+        ("ES256", "oct-pem", False),
+        ("ES256", "oct", False),
+    ], ids=lambda value: value if isinstance(value, str) else None)
+    def test_every_cell(self, alg: str, kind: str, fits: bool) -> None:
+        own = _OWN_SIGNER.get(kind)
+        own_fits_alg = own is not None and (
+            isinstance(own, rsa.RSAPrivateKey) == (alg == "RS256")
+        )
+        signer = own if own_fits_alg else _SIGNER[alg.lower()]
+        token = _token(key=signer, alg=alg, kid="k-under-test")
+        result = _verify(token, {"keys": [_entry(kind)]})
+        if fits:
+            assert isinstance(result, TelegramIdentity), result
+        else:
+            assert result is R.KEY_TYPE
+
+    def test_the_grid_has_both_outcomes(self) -> None:
+        """The pair: a fitting key of each algorithm gives the person,
+        through the same entries and the same signing."""
+        for alg, kind in (("RS256", "rsa-2048"), ("ES256", "ec-p256")):
+            token = _token(key=_OWN_SIGNER[kind], alg=alg, kid="k-under-test")
+            assert isinstance(
+                _verify(token, {"keys": [_entry(kind)]}), TelegramIdentity,
+            )
 
 
 class TestTheClaims:

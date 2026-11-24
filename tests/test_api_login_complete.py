@@ -23,6 +23,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -636,3 +637,258 @@ async def test_the_client_is_bounded_and_ignores_the_environment() -> None:
         assert built.timeout == httpx.Timeout(10.0)
         assert built.trust_env is False
         assert built.follow_redirects is False
+
+
+# -----------------------------------------------------------------------------
+# R-3 -- a crooked answer of Telegram: never a 500, never past the bound
+# -----------------------------------------------------------------------------
+
+# Taken at import, before the suite's tripwire replaces them: the real
+# transport (the session's autouse tripwire, tests/conftest.py, patches
+# it after collection) and the real client of a sign-in (tg replaces it).
+_REAL_TRANSPORT = httpx.AsyncHTTPTransport.handle_async_request
+_REAL_NEW_CLIENT = telegram.new_client
+
+# Nested a hundred thousand deep: valid JSON, past what json can read.
+_DEEP = "[" * 100_000 + "]" * 100_000
+
+
+def _signed(header: dict[str, Any], payload: str) -> str:
+    """A token signed by the test's key over a payload PyJWT will not make."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    signing_input = f"{b64(json.dumps(header).encode())}.{b64(payload.encode())}"
+    signature = _KEY.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
+    return f"{signing_input}.{b64(signature)}"
+
+
+def _answer(status: int, content: str) -> Handler:
+    async def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status, content=content.encode(),
+            headers={"content-type": "application/json"},
+        )
+    return answer
+
+
+def _with_id_token(id_token: str) -> Handler:
+    return _answer(200, json.dumps({"id_token": id_token, "scope": "openid profile"}))
+
+
+def _private_jwks() -> dict[str, Any]:
+    """The test's key with its private parameters (d, p, q, ...)."""
+    entry = json.loads(RSAAlgorithm.to_jwk(_KEY))
+    entry["kid"] = _KID
+    assert "d" in entry, "the pair: the entry is private"
+    return {"keys": [entry]}
+
+
+def _hostile(tg: Telegram, case: str) -> None:
+    stamp = int(datetime.now(UTC).timestamp())
+    claims = {"iss": TELEGRAM_LOGIN_ISSUER, "aud": _BOT_ID, "exp": stamp + 300,
+              "iat": stamp - 5, "id": _TELEGRAM_ID}
+    if case == "deep-exchange-body":
+        tg.token = _answer(200, '{"id_token": ' + _DEEP + "}")
+    elif case == "deep-jwks-body":
+        tg.jwks = _answer(200, '{"keys": ' + _DEEP + "}")
+    elif case == "deep-claims":
+        tg.token = _with_id_token(_signed(
+            {"alg": "RS256", "kid": _KID, "typ": "JWT"}, '{"a": ' + _DEEP + "}",
+        ))
+    elif case in ("exp-10-400", "iat-10-400"):
+        name = case.split("-")[0]
+        tg.token = _with_id_token(_signed(
+            {"alg": "RS256", "kid": _KID, "typ": "JWT"},
+            json.dumps({**claims, name: 10**400}),
+        ))
+    else:
+        assert case == "private-jwk"
+        tg.jwks = _answer(200, json.dumps(_private_jwks()))
+
+
+class TestNoAnswerOfTelegramIsA500:
+    """R-3 item 2: every value of Telegram's answer -- the exchange's body,
+    the key set, the token's claims -- reaches an outcome of the contract,
+    its word in the log. Each case is the reviewer's reproduction of
+    4.2.0 (exp 10**400, a private key, a body nested past json's depth),
+    the depth in all three places it is read, `iat` beside `exp`."""
+
+    @pytest.mark.parametrize(("case", "status", "cls", "word"), [
+        ("deep-exchange-body", 503, "provider_unavailable", "token_not_json"),
+        ("deep-jwks-body", 503, "provider_unavailable", "jwks_not_json"),
+        ("deep-claims", 502, "id_token_invalid", "malformed"),
+        ("exp-10-400", 502, "id_token_invalid", "no_exp"),
+        ("iat-10-400", 502, "id_token_invalid", "no_iat"),
+        ("private-jwk", 502, "id_token_invalid", "key_type"),
+    ], ids=lambda value: value if isinstance(value, str) else None)
+    async def test_a_crooked_value(
+        self, client: AsyncClient, tg: Telegram,
+        case: str, status: int, cls: str, word: str,
+    ) -> None:
+        _hostile(tg, case)
+        state = await _start(client)
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        assert (resp.status_code, _class(resp)) == (status, cls), resp.text
+        assert [e["reason"] for e in logs if e["event"] == "login_refused"] == [word]
+
+    async def test_the_pair_a_good_answer_signs_in(
+        self, client: AsyncClient, tg: Telegram,
+    ) -> None:
+        """The cases above differ from a good answer only in the one value."""
+        state = await _start(client)
+        assert (await _complete(client, state)).status_code == 200
+
+
+# The test's bound, the gap between two bytes, and how many there are: a
+# per-read timeout of the bound never fires, a whole answer comes long
+# after it.
+_BOUND, _GAP, _PIECES = 1.0, 0.25, 12
+assert _GAP < _BOUND < _GAP * _PIECES
+
+
+def _good_exchange_body() -> bytes:
+    return json.dumps({"id_token": _id_token(), "scope": "openid profile"}).encode()
+
+
+Answer = Callable[[asyncio.StreamWriter], Awaitable[None]]
+
+
+def _at_once(body: bytes) -> Answer:
+    async def answer(writer: asyncio.StreamWriter) -> None:
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body,
+        )
+        await writer.drain()
+    return answer
+
+
+def _dripping(body: bytes) -> Answer:
+    """Headers at once, then one byte of whitespace every _GAP seconds,
+    _PIECES times, then the body: a whole answer, if anyone waits."""
+    async def answer(writer: asyncio.StreamWriter) -> None:
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n",
+        )
+        for _ in range(_PIECES):
+            if writer.is_closing():
+                return
+            writer.write(b"1\r\n \r\n")
+            await writer.drain()
+            await asyncio.sleep(_GAP)
+        writer.write(f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n")
+        await writer.drain()
+    return answer
+
+
+class _Served:
+    """A local server of one answer; counts the requests it took."""
+
+    def __init__(self, answer: Answer) -> None:
+        self.answer = answer
+        self.requests = 0
+        self.server: asyncio.Server | None = None
+
+    async def handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+    ) -> None:
+        await reader.read(65536)
+        self.requests += 1
+        try:
+            await self.answer(writer)
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            writer.close()
+
+    async def __aenter__(self) -> str:
+        self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
+        port = self.server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{port}/"
+
+    async def __aexit__(self, *exc: object) -> None:
+        assert self.server is not None
+        self.server.close()
+        await self.server.wait_closed()
+
+
+class TestTheWholeRequestIsBounded:
+    """R-3 item 1: each of the two requests is bounded from its start to
+    its end -- TELEGRAM_TIMEOUT_SECONDS, whatever the server does. Real
+    sockets and the real client of a sign-in (its per-read timeout set to
+    the same bound, as in production): a server that sends a byte every
+    _GAP seconds never trips a per-read timeout; the bound does, and the
+    answer is a 503 within the bound and a gap. The 4.2.0 candidate held
+    such an exchange for the whole drip."""
+
+    @pytest.fixture
+    def real_telegram(
+        self, tg: Telegram, monkeypatch: pytest.MonkeyPatch,
+    ) -> Callable[[str, str], None]:
+        monkeypatch.setattr(
+            httpx.AsyncHTTPTransport, "handle_async_request", _REAL_TRANSPORT,
+        )
+        monkeypatch.setattr(telegram, "new_client", _REAL_NEW_CLIENT)
+        monkeypatch.setattr(telegram, "TELEGRAM_TIMEOUT_SECONDS", _BOUND)
+
+        def point(token_url: str, jwks_url: str) -> None:
+            monkeypatch.setattr(telegram, "TELEGRAM_LOGIN_TOKEN_URL", token_url)
+            monkeypatch.setattr(telegram, "TELEGRAM_LOGIN_JWKS_URL", jwks_url)
+        return point
+
+    async def _timed(self, client: AsyncClient) -> tuple[Any, float, list[Any]]:
+        state = await _start(client)
+        started = time.monotonic()
+        with capture_logs() as logs:
+            resp = await _complete(client, state)
+        return resp, time.monotonic() - started, logs
+
+    async def test_the_pair_real_sockets_sign_in(
+        self, client: AsyncClient, real_telegram: Callable[[str, str], None],
+    ) -> None:
+        """The harness reaches Telegram's stand-ins over real sockets."""
+        token, keys = _Served(_at_once(_good_exchange_body())), _Served(
+            _at_once(json.dumps(_jwks()).encode()))
+        async with token as token_url, keys as jwks_url:
+            real_telegram(token_url, jwks_url)
+            resp, took, _ = await self._timed(client)
+        assert resp.status_code == 200, resp.text
+        assert (token.requests, keys.requests) == (1, 1)
+        assert took < _BOUND
+
+    async def test_a_dripping_exchange(
+        self, client: AsyncClient, real_telegram: Callable[[str, str], None],
+    ) -> None:
+        token = _Served(_dripping(_good_exchange_body()))
+        keys = _Served(_at_once(json.dumps(_jwks()).encode()))
+        async with token as token_url, keys as jwks_url:
+            real_telegram(token_url, jwks_url)
+            resp, took, logs = await self._timed(client)
+        assert (resp.status_code, _class(resp)) == (503, "provider_unavailable")
+        assert _BOUND <= took < _BOUND + 3 * _GAP
+        assert [e["reason"] for e in logs if e["event"] == "login_refused"] == [
+            "token_timeout",
+        ]
+        assert keys.requests == 0
+
+    async def test_dripping_keys(
+        self, client: AsyncClient, real_telegram: Callable[[str, str], None],
+    ) -> None:
+        """The keys' bound is their own: counted from their request."""
+        token = _Served(_at_once(_good_exchange_body()))
+        keys = _Served(_dripping(json.dumps(_jwks()).encode()))
+        async with token as token_url, keys as jwks_url:
+            real_telegram(token_url, jwks_url)
+            resp, took, logs = await self._timed(client)
+        assert (resp.status_code, _class(resp)) == (503, "provider_unavailable")
+        assert _BOUND <= took < _BOUND + 3 * _GAP
+        assert [e["reason"] for e in logs if e["event"] == "login_refused"] == [
+            "jwks_timeout",
+        ]
+        assert (token.requests, keys.requests) == (1, 1)

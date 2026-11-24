@@ -188,3 +188,72 @@ class TestTheRegistry:
 
     def test_the_secret_is_kept_out_of_repr(self) -> None:
         assert Settings.model_fields["telegram_login_client_secret"].repr is False
+
+
+# -----------------------------------------------------------------------------
+# R-3 -- the bot's id, with `login` on
+# -----------------------------------------------------------------------------
+
+# The secret half of each token: the test looks for it in every refusal.
+_TOKEN_MARK = "unit" + "-bot-token-" + "secret-mark"
+
+
+def _token(bot_id: str) -> str:
+    return bot_id + ":" + _TOKEN_MARK
+
+
+# The bot's id of a token aiogram takes (str.isdigit before the colon):
+# what the sign-in sends Telegram as its client id must be ASCII digits,
+# 1 to 19 of them.
+_IDS: list[tuple[str, bool]] = [
+    ("123456", True),
+    ("1" * 19, True),
+    ("1" * 20, False),
+    ("1" * 5000, False),  # past int()'s 4300 digits: a ValueError on 4.2.0
+    ("\u00b2", False),  # superscript two: isdigit, not int()
+    ("\u0661\u0662\u0663", False),  # Arabic-Indic 123: int() reads 123
+]
+
+
+class TestTheBotsId:
+    """R-3 item 4: with `login` on, the bot's id in TELEGRAM_BOT_TOKEN --
+    the sign-in's client id -- is 1 to 19 ASCII digits, or the start is
+    refused naming the key and never its value. With `login` off the
+    start is what it was: the channel's own rule, aiogram's, alone. The
+    4.2.0 candidate started on "²:…" and then failed every sign-in with a
+    bare ValueError."""
+
+    @pytest.mark.parametrize(("bot_id", "fits"), _IDS, ids=lambda v: repr(v)[:12])
+    @pytest.mark.parametrize("login", ["true", "false"])
+    def test_every_cell(self, login: str, bot_id: str, fits: bool) -> None:
+        token = _token(bot_id)
+        if fits or login == "false":
+            started = _settings(login, "true", _MARK, telegram_bot_token=token)
+            assert started.login_enabled == login
+            return
+        text = _refusal(login, "true", _MARK, telegram_bot_token=token)
+        assert "option 'login' is misconfigured:" in text
+        assert "  TELEGRAM_BOT_TOKEN: the bot's id" in text
+        assert "channel 'telegram'" not in text
+        assert _TOKEN_MARK not in text and bot_id not in text and _MARK not in text
+
+    def test_silent_when_the_channel_is_off(self) -> None:
+        """With telegram off the token is not the channel's to read: the
+        option's refusal is its need of the channel, nothing of the id."""
+        text = _refusal("true", "false", _MARK, telegram_bot_token=_token("\u00b2"))
+        assert "needs channel 'telegram'" in text
+        assert "TELEGRAM_BOT_TOKEN" not in text
+
+    def test_silent_when_the_channel_refuses_the_token(self) -> None:
+        """A token not of aiogram's shape is the channel's refusal alone --
+        one line about it, not two."""
+        text = _refusal("true", "true", _MARK, telegram_bot_token="abc" + _TOKEN_MARK)
+        assert "channel 'telegram' is misconfigured:" in text
+        assert "option 'login'" not in text
+
+    def test_named_once_beside_another_problem(self) -> None:
+        """REPEAT: the id and an empty secret -- two lines of ONE refusal."""
+        text = _refusal("true", "true", "", telegram_bot_token=_token("\u00b2"))
+        assert text.count("option 'login' is misconfigured:") == 1
+        assert text.count("TELEGRAM_BOT_TOKEN: the bot's id") == 1
+        assert text.count("missing: TELEGRAM_LOGIN_CLIENT_SECRET") == 1

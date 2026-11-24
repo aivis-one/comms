@@ -25,7 +25,9 @@
 # client_id is the bot's id, read from TELEGRAM_BOT_TOKEN by the one
 # function `comms derive bot-id` uses (app/core/channels.py
 # telegram_bot_id). The option needs the channel on (app/core/modules.py),
-# so the token is there and of its shape.
+# so the token is there and of its shape; and the option's start holds
+# the id 1..19 ASCII digits (app/core/channels.py telegram_bot_id_problem)
+# -- aiogram's shape takes any isdigit(), which int() fails on or reads.
 #
 # COMPLETE takes {state, code}: `state` in exactly the form start gives
 # (STATE_PATTERN, ASCII -- checked BEFORE the attempt is taken), `code`

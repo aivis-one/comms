@@ -5,14 +5,22 @@
 # The code exchange (TELEGRAM_LOGIN_TOKEN_URL: HTTP Basic with the client
 # id and secret, the attempt's redirect_uri and verifier) and Telegram's
 # keys (TELEGRAM_LOGIN_JWKS_URL, fetched for every sign-in: no cache, by
-# the contract). Each request is bounded by TELEGRAM_TIMEOUT_SECONDS.
+# the contract).
+#
+# EACH REQUEST IS BOUNDED WHOLE by TELEGRAM_TIMEOUT_SECONDS -- from its
+# start to the last byte of its answer -- by asyncio.timeout around it
+# (R-3). The client's own httpx.Timeout bounds each PHASE alone (connect,
+# write, every read): a server that sends a byte now and then never trips
+# it, and the 4.2.0 candidate held such an exchange for 16 s under a
+# timeout of 2.5. The contract promises the product 10 s a request.
 #
 # THE CALLER HOLDS NO TRANSACTION while these run (app/login/complete.py):
 # the attempt is taken and committed before the first.
 #
 # WHAT AN ANSWER MEANS (the contract and the live sign-in of 24.11):
-#   - no answer (a timeout, the network), a status other than 200, a body
-#     that is not a JSON object -> Telegram is unavailable;
+#   - no answer (a timeout, the network, the whole bound passed), a
+#     status other than 200, a body that is not a JSON object -- or one
+#     nested past what json reads -> Telegram is unavailable;
 #   - 200 with `error` in the body -> Telegram refused the exchange. The
 #     live sign-in answered a wrong code and a wrong secret alike: 200,
 #     {"error": "invalid_grant"} -- the refusal is read off the BODY, not
@@ -32,6 +40,7 @@
 # log line and exception; a failure of httpx is turned into a word.
 # =============================================================================
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,8 +48,8 @@ import httpx
 
 from app.core.config import TELEGRAM_LOGIN_JWKS_URL, TELEGRAM_LOGIN_TOKEN_URL
 
-# Each request to Telegram, at most (the contract: two requests, 10 s
-# each).
+# Each request to Telegram, at most, whole (the contract: two requests,
+# 10 s each). Read at each request.
 TELEGRAM_TIMEOUT_SECONDS = 10.0
 
 # The error codes of a token endpoint (RFC 6749 §5.2): the only words of
@@ -106,7 +115,8 @@ def _json_object(
 ) -> dict[str, Any] | Unavailable:
     try:
         body = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: valid JSON nested deeper than json reads.
         return Unavailable(f"{step}_not_json", response.status_code)
     if not isinstance(body, dict):
         return Unavailable(f"{step}_not_object", response.status_code)
@@ -124,17 +134,20 @@ async def exchange_code(
 ) -> Exchanged | Refused | NoIdToken | Unavailable:
     """Exchange the sign-in's code at Telegram's token endpoint."""
     try:
-        response = await http.post(
-            TELEGRAM_LOGIN_TOKEN_URL,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": client_id,
-                "code_verifier": code_verifier,
-            },
-            auth=(client_id, client_secret),
-        )
+        async with asyncio.timeout(TELEGRAM_TIMEOUT_SECONDS):
+            response = await http.post(
+                TELEGRAM_LOGIN_TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                    "client_id": client_id,
+                    "code_verifier": code_verifier,
+                },
+                auth=(client_id, client_secret),
+            )
+    except TimeoutError:
+        return Unavailable("token_timeout", None)
     except httpx.HTTPError:
         return Unavailable("token_unreachable", None)
     if response.status_code != 200:
@@ -155,7 +168,10 @@ async def exchange_code(
 async def fetch_jwks(http: httpx.AsyncClient) -> Keys | Unavailable:
     """Telegram's published keys -- fetched now, never kept."""
     try:
-        response = await http.get(TELEGRAM_LOGIN_JWKS_URL)
+        async with asyncio.timeout(TELEGRAM_TIMEOUT_SECONDS):
+            response = await http.get(TELEGRAM_LOGIN_JWKS_URL)
+    except TimeoutError:
+        return Unavailable("jwks_timeout", None)
     except httpx.HTTPError:
         return Unavailable("jwks_unreachable", None)
     if response.status_code != 200:

@@ -9,10 +9,18 @@
 #   - the algorithm RS256 or ES256, from the token's header but out of
 #     OUR list (ALGORITHMS): `none`, HS256 -- a public key used as an HMAC
 #     secret --, any other is refused before a key is looked at;
+#   - the key of the algorithm (R-3): RS256 an RSA PUBLIC key of at least
+#     RSA_MIN_BITS, ES256 an EC PUBLIC key on P-256 -- checked on the key
+#     PyJWT built from the set's entry, the object the signature would be
+#     verified with, so a private key, an HMAC (`oct`) key, a weak or a
+#     foreign one is refused before any signature is checked. An `oct`
+#     entry whose bytes are the PEM of an RSA key would otherwise verify
+#     RS256: PyJWT reads such bytes as that key;
 #   - `iss` is TELEGRAM_LOGIN_ISSUER, `aud` a string equal to the client id
 #     (the bot's id);
-#   - `exp` and `iat` present, numbers, and right against the moment of
-#     the check, with CLOCK_LEEWAY for the clocks of the box and Telegram.
+#   - `exp` and `iat` present, numbers a float can hold, and right
+#     against the moment of the check, with CLOCK_LEEWAY for the clocks of
+#     the box and Telegram.
 # Every failure is one outcome, IdTokenRejected, whose member is the WORD
 # of the reason -- for the log, never a value. `nbf` is not checked: the
 # contract does not name it, and Telegram sends none.
@@ -29,7 +37,8 @@
 # NOTHING OF A TOKEN, A CLAIM OR A KEY reaches a log, an exception or a
 # repr: this module logs nothing and raises nothing of its own; PyJWT's
 # exceptions are turned into a word here; the identity's repr names no
-# field.
+# field. NO VALUE OF TELEGRAM'S RAISES out of it (R-3): a number past a
+# float, claims nested past what json reads -- each is a word.
 # =============================================================================
 
 import math
@@ -42,6 +51,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import jwt
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from app.core.config import TELEGRAM_LOGIN_ISSUER
 from app.login.attempts import BOT_ACCESS_SCOPE, PROVIDER_TELEGRAM
@@ -50,6 +60,8 @@ from app.login.attempts import BOT_ACCESS_SCOPE, PROVIDER_TELEGRAM
 # contract): RS256 is Telegram's default, ES256 the other one BotFather
 # offers with the profile scope.
 ALGORITHMS = ("RS256", "ES256")
+# The smallest RSA key an RS256 token of Telegram's is verified with.
+RSA_MIN_BITS = 2048
 # How far the clocks of the box and of Telegram may be apart for `exp`
 # and `iat`.
 CLOCK_LEEWAY = timedelta(seconds=30)
@@ -69,6 +81,7 @@ class IdTokenRejected(StrEnum):
     NO_KID = "no_kid"
     UNKNOWN_KEY = "unknown_key"
     AMBIGUOUS_KEY = "ambiguous_key"
+    KEY_TYPE = "key_type"
     SIGNATURE = "signature"
     NO_EXP = "no_exp"
     EXPIRED = "expired"
@@ -129,11 +142,29 @@ def _key(jwks: object, kid: str) -> Any | IdTokenRejected:
         return IdTokenRejected.UNKNOWN_KEY
 
 
+def _fits(key: object, alg: str) -> bool:
+    """`key` -- as PyJWT built it from the set's entry -- is one an `alg`
+    token of Telegram's may be verified with: a PUBLIC key of the
+    algorithm's family, RSA of RSA_MIN_BITS or more, EC on P-256."""
+    if alg == "RS256":
+        return isinstance(key, rsa.RSAPublicKey) and key.key_size >= RSA_MIN_BITS
+    if alg == "ES256":
+        return isinstance(key, ec.EllipticCurvePublicKey) and isinstance(
+            key.curve, ec.SECP256R1,
+        )
+    return False
+
+
 def _numeric_date(value: object) -> float | None:
-    """A JWT NumericDate: a finite JSON number -- never true or false."""
+    """A JWT NumericDate: a finite JSON number -- never true or false, nor
+    an integer past what a float holds (10**400 is valid JSON)."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def verified_claims(
@@ -156,6 +187,8 @@ def verified_claims(
     key = _key(jwks, kid)
     if isinstance(key, IdTokenRejected):
         return key
+    if not _fits(key, alg):
+        return IdTokenRejected.KEY_TYPE
     try:
         claims: dict[str, Any] = jwt.decode(
             id_token,
@@ -178,8 +211,11 @@ def verified_claims(
         if isinstance(failed, jwt.InvalidSignatureError):
             return IdTokenRejected.SIGNATURE
         return IdTokenRejected.MALFORMED
+    except RecursionError:
+        # Claims nested deeper than json reads: no token to read.
+        return IdTokenRejected.MALFORMED
     except (jwt.PyJWTError, TypeError, ValueError):
-        # A key of the wrong type for the algorithm, among others.
+        # Any other failure of PyJWT to verify with the key that fits.
         return IdTokenRejected.SIGNATURE
 
     moment = now.timestamp()
