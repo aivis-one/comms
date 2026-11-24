@@ -1,8 +1,9 @@
 # =============================================================================
-# COMMS Service -- the sign-in's start (the option `login`, L-2)
+# COMMS Service -- the sign-in: start and complete (the option `login`)
 # =============================================================================
 #
-#   POST /api/v1/login/start
+#   POST /api/v1/login/start      (L-2)
+#   POST /api/v1/login/complete   (L-3b)
 #
 # The product starts a sign-in through Telegram: comms records the
 # attempt (app/login/attempts.py) and answers with its `state`, the URL
@@ -25,12 +26,28 @@
 # function `comms derive bot-id` uses (app/core/channels.py
 # telegram_bot_id). The option needs the channel on (app/core/modules.py),
 # so the token is there and of its shape.
+#
+# COMPLETE takes {state, code}: `state` in exactly the form start gives
+# (STATE_PATTERN, ASCII -- checked BEFORE the attempt is taken), `code`
+# a string of 1..CODE_MAX. The sign-in is done by app/login/complete.py:
+# the attempt taken and committed first, then Telegram, outside any
+# transaction -- so this route takes no session of its own. The answer
+# is the person (§3 of the form) or a refusal of the class the contract
+# names, with the status of its row (deploy/INTEGRATION.md, section 5)
+# and a fixed message. One log line per outcome, `login_completed` or
+# `login_refused`: the provider, the class, the word of the reason,
+# Telegram's status -- never the state, the code, the verifier, the
+# id_token, the secret, the keys, the Telegram id or the person's data.
+# A refusal of the API's own -- validation, unauthorized, unavailable --
+# is answered and logged by the API's common paths.
 # =============================================================================
 
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+import structlog
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -41,11 +58,21 @@ from pydantic import (
 )
 
 from app.api.deps import DbSession
+from app.api.errors import ErrorClass, error_response
 from app.core.channels import telegram_bot_id
 from app.core.config import settings
-from app.login.attempts import REDIRECT_URI_MAX, start_attempt
+from app.login.attempts import PROVIDER_TELEGRAM, REDIRECT_URI_MAX, start_attempt
+from app.login.complete import Refusal, SignInRefused, complete_sign_in
+
+logger = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v1/login", tags=["login"])
+
+# The form of a state start gives: 32 random bytes, base64url, 43
+# characters (app/login/attempts.py STATE_BYTES).
+STATE_PATTERN = r"^[A-Za-z0-9_-]{43}$"
+# Telegram's code, at most -- no form of it is promised.
+CODE_MAX = 2048
 
 
 def _redirect_uri_problem(value: str) -> str | None:
@@ -92,4 +119,82 @@ async def start(body: LoginStartIn, session: DbSession) -> dict[str, Any]:
         "state": started.state,
         "authorize_url": started.authorize_url,
         "expires_at": started.expires_at.isoformat(),
+    }
+
+
+class LoginCompleteIn(BaseModel):
+    """The body of a complete."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: StrictStr = Field(pattern=STATE_PATTERN)
+    code: StrictStr = Field(min_length=1, max_length=CODE_MAX)
+
+
+# The status of each class: its row of the contract's table
+# (deploy/INTEGRATION.md, section 5).
+_STATUS = {
+    Refusal.LOGIN_UNKNOWN: 404,
+    Refusal.LOGIN_EXPIRED: 410,
+    Refusal.LOGIN_REPLAYED: 409,
+    Refusal.PROVIDER_REFUSED: 422,
+    Refusal.PROVIDER_UNAVAILABLE: 503,
+    Refusal.ID_TOKEN_INVALID: 502,
+}
+_MESSAGES = {
+    Refusal.LOGIN_UNKNOWN: "the sign-in is not known; begin it again",
+    Refusal.LOGIN_EXPIRED: "the sign-in has expired; begin it again",
+    Refusal.LOGIN_REPLAYED: "the sign-in was completed already; begin it again",
+    Refusal.PROVIDER_REFUSED: "Telegram refused the sign-in; begin it again",
+    Refusal.PROVIDER_UNAVAILABLE: (
+        "Telegram could not be asked; begin the sign-in again later"
+    ),
+    Refusal.ID_TOKEN_INVALID: "Telegram's answer did not prove the person",
+}
+
+
+def _refused(outcome: SignInRefused) -> JSONResponse:
+    logger.info(
+        "login_refused",
+        provider=PROVIDER_TELEGRAM,
+        error_class=outcome.refusal.value,
+        reason=outcome.reason,
+        telegram_status=outcome.telegram_status,
+    )
+    return error_response(
+        _STATUS[outcome.refusal],
+        ErrorClass(outcome.refusal.value),
+        _MESSAGES[outcome.refusal],
+    )
+
+
+@router.post("/complete", response_model=None)
+async def complete(body: LoginCompleteIn) -> dict[str, Any] | JSONResponse:
+    """Complete a sign-in: the person, or the refusal of the contract."""
+    outcome = await complete_sign_in(
+        body.state,
+        body.code,
+        client_id=telegram_bot_id(settings.telegram_bot_token),
+        client_secret=settings.telegram_login_client_secret,
+    )
+    if isinstance(outcome, SignInRefused):
+        return _refused(outcome)
+    person = outcome.identity
+    logger.info(
+        "login_completed",
+        provider=person.provider,
+        telegram_status=outcome.telegram_status,
+    )
+    return {
+        "provider": person.provider,
+        "subject": person.subject,
+        "verified_at": person.verified_at.isoformat(),
+        "telegram": {
+            "id": person.telegram_id,
+            "first_name": person.first_name,
+            "last_name": person.last_name,
+            "username": person.username,
+            "photo_url": person.photo_url,
+            "bot_access_granted": person.bot_access_granted,
+        },
     }

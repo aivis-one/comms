@@ -21,6 +21,13 @@
 #   ConflictError (by subclass)          -> 409  conflict | stale_snapshot
 #                                                | recipient_deleted
 #   CursorExpiredError                   -> 410  cursor_expired
+#   a refused sign-in (app/api/login.py complete, answered there)
+#                                        -> 404 login_unknown | 410
+#                                           login_expired | 409
+#                                           login_replayed | 422
+#                                           provider_refused | 503
+#                                           provider_unavailable | 502
+#                                           id_token_invalid
 #   any other 4xx of the framework       -> its status, bad_request
 #     (today a 400: a body it cannot read as JSON) -- the caller's
 #     request, never `internal` (API-2)
@@ -104,6 +111,14 @@ class ErrorClass(StrEnum):
     # A 4xx the framework raised that no class above names (API-2): the
     # request could not be read; fix it, do not repeat it.
     BAD_REQUEST = "bad_request"
+    # The sign-in (the option `login`, app/api/login.py complete): the
+    # attempt's take, Telegram's answers, the id_token (L-3b).
+    LOGIN_UNKNOWN = "login_unknown"
+    LOGIN_EXPIRED = "login_expired"
+    LOGIN_REPLAYED = "login_replayed"
+    PROVIDER_REFUSED = "provider_refused"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    ID_TOKEN_INVALID = "id_token_invalid"
 
 
 # What the caller is told on a TRANSIENT database failure (TX-1). Fixed

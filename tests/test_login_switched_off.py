@@ -175,13 +175,17 @@ class TestTheRoutes:
 
 
 class TestTheRoutesWithLoginOn:
-    def test_the_twin_with_login_on_the_start_is_there(self) -> None:
-        """L-2's twin of the guard: the same instance with the option on
+    def test_the_twin_with_login_on_the_sign_in_is_there(self) -> None:
+        """The twin of the guard: the same instance with the option on
         (the channel it needs on, a secret set) has v4.0.1's routes and
-        the start of the sign-in, nothing else -- the guard above sees
-        the flag, not the file."""
+        the sign-in's two -- start (L-2) and complete (L-3b) --, nothing
+        else: the guard above sees the flag, not the file."""
         routes = _probe("telegram", _MARK, "true")["routes"]
-        assert routes == sorted([*_ROUTES_V401, ["POST", "/api/v1/login/start"]])
+        assert routes == sorted([
+            *_ROUTES_V401,
+            ["POST", "/api/v1/login/complete"],
+            ["POST", "/api/v1/login/start"],
+        ])
 
 
 class TestTheStart:

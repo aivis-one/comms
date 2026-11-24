@@ -88,6 +88,10 @@ _EMAIL_API_BASE_URLS = {
 # is sent to its authorization endpoint (app/login/attempts.py).
 TELEGRAM_LOGIN_ISSUER = "https://oauth.telegram.org"
 TELEGRAM_LOGIN_AUTHORIZE_URL = f"{TELEGRAM_LOGIN_ISSUER}/auth"
+# Where the code is exchanged, and where Telegram's keys are published
+# (app/login/telegram.py).
+TELEGRAM_LOGIN_TOKEN_URL = f"{TELEGRAM_LOGIN_ISSUER}/token"
+TELEGRAM_LOGIN_JWKS_URL = f"{TELEGRAM_LOGIN_ISSUER}/.well-known/jwks.json"
 
 
 # Pairs where one setting must not fall below another: (low, high).

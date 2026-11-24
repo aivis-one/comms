@@ -419,15 +419,21 @@ body, with a class a program can branch on:
 | 401 | `unauthorized` | the service token is missing or wrong -- asked first, on every path but `/health` and `/ready`, before anything of the request is read: without it an unknown route, another method, a body of any size or shape is this 401 too |
 | 403 | `forbidden` | the actor has no role in this thread |
 | 404 | `not_found` | the entity or the route does not exist (a route: with the token) |
+| 404 | `login_unknown` | the sign-in's `state` was never given by `start`, or its attempt is older than a day (`POST /api/v1/login/complete`). Begin the sign-in again |
 | 405 | `method_not_allowed` | the route exists, the method does not (with the token) |
 | 409 | `conflict` | a key or a version is taken by other content; a thread claimed by another operator, or changed by another call while it was being assigned or released (section 14) |
 | 409 | `stale_snapshot` | a recipient snapshot or deletion older than the stored one |
 | 409 | `recipient_deleted` | the recipient was deleted -- nothing re-attaches to it |
+| 409 | `login_replayed` | the sign-in's attempt was taken already: a repeated `complete`, even while the first is still running. Do not repeat; begin again |
 | 410 | `cursor_expired` | a changes cursor older than the retention period (section 9) |
+| 410 | `login_expired` | more than 10 minutes since the sign-in's `start`. Begin again |
 | 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
 | 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read on a route that takes no body model -- on one that does, the framework answers `400` `bad_request` (above) |
+| 422 | `provider_refused` | Telegram refused the code exchange -- a wrong, used or expired code, another `redirect_uri`, a wrong client secret. Begin again; on every one, check the secret and the Allowed URLs |
 | 500 | `internal` | our defect; the text carries nothing from it |
+| 502 | `id_token_invalid` | Telegram's `id_token` is missing or does not pass the checks of the sign-in. The sign-in is refused; repeats are a reason to read comms' log |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
+| 503 | `provider_unavailable` | Telegram did not answer, answered other than 200, or not a JSON object -- on the code exchange or on its keys. Begin again later |
 
 The message is for a human; the class is the contract.
 
