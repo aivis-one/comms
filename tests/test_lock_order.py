@@ -34,7 +34,7 @@
 #   M1  close_notifications without ORDER BY      -> TestCloseAgainstClose
 #   M2  withdraw_recipient without ORDER BY        -> TestWithdrawAgainstClose
 #   M3  withdraw locking only the jobs it closes   -> TestWithdrawAgainstCleanup
-#       (the cleanup's cascade then waits on a delivery, not on the job)
+#       (retention's cascade then waits on a delivery, not on the job)
 # NOT BUILT: which side wins the shared row once Z commits -- the
 # loop's, not the code's; the tests hold "both end, no 40P01".
 # =============================================================================
@@ -50,10 +50,11 @@ from sqlalchemy import and_, func, select, text
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_session_factory, is_transient_db_error
 from app.engine.constants import DeliveryStatus, NotificationStatus, TargetType
 from app.engine.models import Notification, NotificationDelivery
-from app.engine.processor import cleanup_expired_notifications
+from app.engine.processor import cleanup_terminal_notifications
 from app.engine.service import (
     close_notifications,
     create_notification,
@@ -390,14 +391,19 @@ class TestWithdrawAgainstClose:
 
 class TestWithdrawAgainstCleanup:
     """The implicit pair (H7 gate 0.3): forgetting rewrites the
-    deliveries and journal of FINISHED jobs; the expiry cleanup deletes
-    finished jobs with their deliveries and journal by cascade. Since
-    forgetting locks every job it will write, the two queue on the JOB
-    row -- never on a child, where their orders would cross. Seen in
-    pg_locks: the waiting cleanup holds its tuple lock on notifications.
-    M3 (only the jobs it closes locked) moves the wait onto
-    notification_deliveries. Both end; the job is gone, forgotten
-    first."""
+    deliveries and journal of FINISHED jobs; retention deletes finished
+    jobs with their deliveries and journal by cascade. Since forgetting
+    locks every job it will write, the two queue on the JOB row --
+    never on a child, where their orders would cross. Seen in pg_locks:
+    the waiting retention holds its tuple lock on notifications. M3
+    (only the jobs it closes locked) moves the wait onto
+    notification_deliveries. Both end; the job is gone, forgotten first.
+
+    Until R-1 the deleter here was the expiry cleanup, on a job past its
+    expiry_at; R-1 removed it, and retention -- the one deleter left,
+    with the same batch delete through the primary key
+    (app/engine/service.py _id_in_batch) -- takes its place, on a job
+    older than the retention period."""
 
     async def test_they_queue_on_the_job(self) -> None:
         async with get_session_factory()() as session:
@@ -411,17 +417,19 @@ class TestWithdrawAgainstCleanup:
             ), {"i": job})
             await session.execute(text(
                 "UPDATE notifications SET status = 'sent', "
-                "expiry_at = now() - interval '1 minute' WHERE id = :i"
-            ), {"i": job})
+                "created_at = now() - make_interval(days => :d), "
+                "scheduled_at = now() - make_interval(days => :d) "
+                "WHERE id = :i"
+            ), {"i": job, "d": settings.notification_retention_days + 1})
             await session.commit()
 
         factory = get_session_factory()
         async with factory() as forgetting:
             await withdraw_recipient(forgetting, recipient)
-            cleanup = asyncio.ensure_future(cleanup_expired_notifications())
+            cleanup = asyncio.ensure_future(cleanup_terminal_notifications())
             relation = None
             for _ in range(int(_BOUND / _POLL)):
-                # The cleanup's DELETE waiting on the job row -- by its
+                # Retention's DELETE waiting on the job row -- by its
                 # locks, not its text (tests/helpers.py row_waiters).
                 deleters = [
                     w for _, w in await row_waiters("notifications")

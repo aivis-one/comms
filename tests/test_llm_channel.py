@@ -69,7 +69,7 @@ from app.engine.models import (
 )
 from app.engine.processor import (
     _close_at_ceiling,
-    cleanup_expired_notifications,
+    cleanup_terminal_notifications,
     process_lane,
     purge_expired_llm_answers,
 )
@@ -78,6 +78,7 @@ from app.engine.service import (
     close_notifications,
     llm_letter_encoding,
 )
+from app.engine.worker import run_engine_maintenance
 from app.profile.loader import (
     FileProfileSource,
     install_profile,
@@ -1038,11 +1039,20 @@ class TestTheAnswer:
         kept = (await _read(bare_client, fresh))["job"]["answer"]
         assert kept["state"] == "kept" and _ANSWER_SENTINEL in kept["body"]
 
-    async def test_the_expiry_cleanup_waits_for_the_answers_term(
-        self, provider: _Provider,
+    async def test_past_its_expiry_the_job_outlives_the_answers_term(
+        self, provider: _Provider, bare_client: AsyncClient,
     ) -> None:
-        """An llm job past its expiry_at, answered: kept while its body is
-        -- then deleted like any expired job."""
+        """An llm job past its expiry_at, answered: the maintenance pass
+        clears the body at keep_until and deletes nothing -- read by its
+        key, the job is there with its answer purged; retention takes
+        the job, and its answer with it, once the job is older than the
+        period (deploy/INTEGRATION.md "How long comms keeps things": no
+        answer outlives the notification history).
+
+        Until R-1 this was test_the_expiry_cleanup_waits_for_the_answers_
+        term: the expiry cleanup kept such a job while its body was kept
+        and deleted it right after the purge, releasing its key before
+        retention. R-1 removed the cleanup."""
         provider.on(_GW_HOST, _ok())
         key = _key()
         await _send(_request(key, "ask.solo"))
@@ -1055,15 +1065,36 @@ class TestTheAnswer:
                 .values(expiry_at=past)
             )
             await session.commit()
-        assert await cleanup_expired_notifications() == 0
+        await run_engine_maintenance()
+        assert (await _read(bare_client, key))["job"]["answer"]["state"] == "kept"
         async with get_session_factory()() as session:
             await session.execute(
                 update(LLMAnswer).where(LLMAnswer.notification_id == job_id)
                 .values(keep_until=past)
             )
             await session.commit()
-        await purge_expired_llm_answers()
-        assert await cleanup_expired_notifications() == 1
+        await run_engine_maintenance()
+        assert (await _read(bare_client, key))["job"]["answer"]["state"] == "purged"
+
+        old = datetime.now(UTC) - timedelta(
+            days=settings.notification_retention_days + 1,
+        )
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(Notification).where(Notification.id == job_id)
+                .values(created_at=old, scheduled_at=old)
+            )
+            # The product's push published (app/transport/push_relay.py):
+            # retention does not take a job while one is owed.
+            await session.execute(
+                text("DELETE FROM push_outbox WHERE notification_id = :i"),
+                {"i": job_id},
+            )
+            await session.commit()
+        assert await cleanup_terminal_notifications() == 1
+        async with get_session_factory()() as session:
+            assert await session.get(Notification, job_id) is None
+            assert await session.get(LLMAnswer, job_id) is None
 
     async def test_an_outcome_pushes(self, provider: _Provider) -> None:
         provider.on(_GW_HOST, _ok())

@@ -1861,12 +1861,12 @@ def _answer_row(call: LLMCall, reply: LLMReply) -> LLMAnswer:
 # not pay it. The paths: close_notifications (expiry, cancellation)
 # and withdraw_recipient (forgetting), which locks EVERY job it will
 # write, finished ones included, before its mass updates. The batch
-# deletes of retention and of the expiry cleanup take their jobs in the
-# same order, through the primary key (_id_in_batch: id = ANY(ARRAY),
-# whose keys an index scan walks sorted), and their cascade reaches a
-# job's deliveries and journal only after the job -- so forgetting and
-# a cleanup queue on a job row, never on its children
-# (tests/test_lock_order.py).
+# delete of retention takes its jobs in the same order, through the
+# primary key (_id_in_batch: id = ANY(ARRAY), whose keys an index scan
+# walks sorted), and its cascade reaches a job's deliveries and journal
+# only after the job -- so forgetting and retention queue on a job row,
+# never on its children (tests/test_lock_order.py). Retention is the one
+# deleter of jobs since R-1.
 
 
 def first_waiting_delivery(
@@ -2094,8 +2094,8 @@ async def withdraw_recipient(session: AsyncSession, recipient_id: UUID) -> int:
     this function (app/forgetting.py, WHAT HOLDS THE WINDOW). EVERY
     job the mass updates below reach is locked -- finished ones too, in
     ascending id (THE ORDER OF ROW LOCKS): those updates touch the
-    deliveries and journal rows of finished jobs that retention and the
-    expiry cleanup delete in batches, and two writers of the same rows
+    deliveries and journal rows of finished jobs that retention deletes
+    in batches, and two writers of the same rows
     that took them in two orders would deadlock. Every
     delivery of theirs, finished or not, loses its error_message -- a
     provider's words may quote the address being forgotten -- and every
@@ -2393,7 +2393,18 @@ async def delete_terminal_notifications_batch(
     was due is still bounded by created_at only (app/engine/changes.py
     KNOWN CEILING P2-3).
 
-    NOT WHILE A PUSH IS OWED (REV-2, as the expiry cleanup since H7):
+    THE ONE DELETER OF JOBS (R-1): a job is removed here and nowhere
+    else -- its expiry_at bounds when it may be delivered, not how long
+    it is kept, and its idempotency key lives as long as the job
+    (deploy/INTEGRATION.md section 7, "How long comms keeps things").
+    The expiry cleanup that deleted a finished job past its expiry_at
+    is gone; its index stays until the next major (KNOWN CEILING on
+    ix_notifications_expired_deletable, app/core/schema_objects.py).
+    A model's answer does not hold the job: answer_keep is not longer
+    than the retention period (app/profile/loader.py
+    _check_answer_keep), and the answer goes with the job.
+
+    NOT WHILE A PUSH IS OWED (REV-2):
     a job with a row in push_outbox is skipped -- the cascade would
     take the push with the job before the product got it. The relay
     deletes the row once it has published; the next pass deletes the
@@ -2453,97 +2464,11 @@ def _id_in_batch(batch_ids: Any) -> Any:
     buffers and time at 50k rows / a 250-row batch), but on other
     estimates -- a batch that is a large fraction of the table -- it
     picks a hash semi-join over a seq scan of notifications. That
-    choice is the planner's to make per ANALYZE, and this runs on
-    EVERY pass of the worker's maintenance loop (beside the lane loops
-    since P4-1, no longer on the delivery path): a pass that runs that
-    often should not change plan under it. Used by both batch deletes:
-    retention's and the expiry cleanup's.
+    choice is the planner's to make per ANALYZE, and a delete that runs
+    batch after batch through a backlog should not change plan under
+    it. Used by retention's batch delete.
     """
     return Notification.id == any_(func.array(batch_ids))
-
-
-# The outcomes an expired job may be deleted in by the expiry cleanup
-# (app/engine/processor.py cleanup_expired_notifications): every outcome
-# but failed -- a failure is kept for inspection until general
-# retention takes it. The SAME list is the predicate of the partial
-# index the batch select runs on (ix_notifications_expired_deletable,
-# migration 0023) -- the planner uses that index only while this
-# list implies its predicate; tests/test_expired_cleanup_index.py holds
-# the two equal.
-_EXPIRED_DELETABLE_STATUSES = (
-    NotificationStatus.SENT,
-    NotificationStatus.PARTIAL_SENT,
-    NotificationStatus.EXPIRED,
-    NotificationStatus.CANCELLED,
-    NotificationStatus.SUPPRESSED,
-    NotificationStatus.NO_RECIPIENTS,
-)
-
-
-async def delete_expired_notifications_batch(
-    session: AsyncSession,
-    *,
-    now: datetime,
-    limit: int,
-) -> int:
-    """Delete ONE batch of expired terminal notifications (H2).
-
-    COMMIT-FREE, like delete_terminal_notifications_batch: the caller
-    (the expiry cleanup in app/engine/processor.py) owns the drain loop
-    and the per-batch commit, so the FK cascade of one transaction --
-    deliveries, journal, push_outbox rows -- is bounded to `limit` jobs
-    and the outbox rows it holds are let go batch by batch. Returns the
-    number of rows deleted in this batch.
-
-    BY INDEX (H5): the select is served by the partial index
-    ix_notifications_expired_deletable -- (expiry_at) over the rows
-    this very filter can match -- in expiry order, so neither a scan of
-    the table nor a sort of it; the delete goes through the primary key
-    (_id_in_batch).
-
-    NOT WHILE A PUSH IS OWED (H7): a job with a row in push_outbox is
-    skipped -- the cascade would take the push with the job, and the
-    product, told nothing and finding nothing by its key, would lose
-    the result itself (deploy/INTEGRATION.md section 10: a push may be
-    lost, the result may not). The relay deletes the row once it has
-    published; the next pass deletes the job. No deadline of its own,
-    and none in general retention either since REV-2: it skips such a
-    job the same way (delete_terminal_notifications_batch, its KNOWN
-    CEILING for a push never published). The check is an anti-join on
-    ix_push_outbox_notification, beside the partial index, not instead
-    of it (tests/test_push_survives_cleanup.py).
-
-    NOT WHILE AN ANSWER IS KEPT (P5-1): a job whose model answer still
-    has its body is skipped the same way -- an anti-join on the primary
-    key of llm_answers; once purge_llm_answers clears the body at
-    keep_until, the job goes like any other. General retention bounds
-    this too.
-    """
-    batch_ids = (
-        select(Notification.id)
-        .where(
-            Notification.expiry_at.isnot(None),
-            Notification.expiry_at < now,
-            Notification.status.in_(_EXPIRED_DELETABLE_STATUSES),
-            ~exists().where(PushOutbox.notification_id == Notification.id),
-            # NOT WHILE A MODEL'S ANSWER IS KEPT (P5-1): the job's expiry
-            # bounds when it may be ASKED, not how long its answer is
-            # kept -- that is the type's answer_keep. The purge clears
-            # the body at keep_until; the next pass deletes the job.
-            ~exists().where(
-                LLMAnswer.notification_id == Notification.id,
-                LLMAnswer.body.is_not(None),
-            ),
-        )
-        .order_by(Notification.expiry_at)
-        .limit(limit)
-        .scalar_subquery()
-    )
-    result = await session.execute(
-        delete(Notification).where(_id_in_batch(batch_ids)),
-    )
-    deleted: int = result.rowcount  # type: ignore[attr-defined]
-    return deleted
 
 
 async def purge_llm_answers(

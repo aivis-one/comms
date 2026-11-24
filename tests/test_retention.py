@@ -392,8 +392,9 @@ class TestWorkerMaintenanceCadence:
     both passes are monkeypatched out -- these tests are about
     SCHEDULING, not deletion/closing. P4-1 moved the deliveries out of
     this pass into the lane loops: the stubbed engine unit is now the
-    expiry sweep + expired cleanup (run_engine_maintenance), formerly
-    the delivery batch (run_notification_batch)."""
+    expiry sweep + the purge of the model answers past their term
+    (run_engine_maintenance; the expired cleanup it ran too until R-1),
+    formerly the delivery batch (run_notification_batch)."""
 
     @pytest.fixture(autouse=True)
     def _stub_pass(
@@ -450,7 +451,7 @@ class TestWorkerMaintenanceCadence:
         assert self.calls["auto_close"] == 1
 
     async def test_pass_order_is_engine_then_the_rest(self) -> None:
-        """The engine's expiry sweep and cleanup first; close-notify
+        """The engine's expiry sweep and purge first; close-notify
         runs every pass right after; the two gated scans last. (Before
         P4-1 this was "deliveries first -- maintenance never delays
         them"; deliveries left this pass for the lane loops, which no

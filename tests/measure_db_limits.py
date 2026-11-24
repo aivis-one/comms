@@ -46,7 +46,6 @@ from app.engine.reminders import cancel_reminders
 from app.engine.service import (
     accept_notification,
     close_notifications,
-    delete_expired_notifications_batch,
     delete_terminal_notifications_batch,
     get_unread_count,
     list_recipient_deliveries,
@@ -80,9 +79,9 @@ async def _seed(session: AsyncSession) -> None:
         "FROM generate_series(1, :n) g"
     ), {"n": people})
     # Jobs: most finished long ago (retention's work), a tenth expired
-    # past their expiry (the expiry cleanup's), the rest waiting in every
-    # lane (the passes' and the sweep's); a tenth carry a correlation
-    # (the reminders' cancel), one person each.
+    # past their expiry (kept until retention since R-1), the rest
+    # waiting in every lane (the passes' and the sweep's); a tenth carry
+    # a correlation (the reminders' cancel), one person each.
     await session.execute(text(
         "INSERT INTO notifications (id, type, title, body, target_type, "
         "target_value, idempotency_key, fingerprint, channels, "
@@ -181,9 +180,6 @@ OPERATIONS: dict[ProcessRole, dict[str, Callable[[AsyncSession], Awaitable[Any]]
         ),
         "retention batch": lambda s: delete_terminal_notifications_batch(
             s, cutoff=datetime.now(UTC) - timedelta(days=30), limit=1000,
-        ),
-        "expired cleanup batch": lambda s: delete_expired_notifications_batch(
-            s, now=datetime.now(UTC), limit=1000,
         ),
         "lane depth": lane_depth,
     },

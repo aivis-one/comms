@@ -10,14 +10,17 @@
 #     2. deliver  -- call channel formatters
 #     3. rollup   -- update notification status from delivery statuses
 #
-#   Plus: expire overdue notifications, delete expired delivered
-#   ones, and (on its own slow cadence -- scheduled by app/worker.py)
-#   drain terminal notifications past retention (Phase 3a item 5).
+#   Plus: expire overdue notifications, clear model answers past their
+#   term, and (on its own slow cadence -- scheduled by app/worker.py)
+#   drain terminal notifications past retention (Phase 3a item 5) --
+#   the one deleter of jobs since R-1: a job past its expiry_at is
+#   expired, not deleted, and keeps its key until retention takes it
+#   (app/engine/service.py delete_terminal_notifications_batch).
 #
 # CALLED BY:
 #   app/worker.py: one loop per lane of the process calls process_lane;
 #   the maintenance loop calls app/engine/worker.py
-#   (run_engine_maintenance: the expiry sweep + the expired cleanup)
+#   (run_engine_maintenance: the expiry sweep + the purge of answers)
 #   and the retention pass on its own cadence. The worker LOOPS and all
 #   maintenance scheduling live in app/worker.py (the neutral layer
 #   above engine and messaging), which keeps `engine` messaging-free
@@ -144,7 +147,6 @@ from app.engine.service import (
     LANE_JOBS,
     close_notifications,
     close_waiting_deliveries,
-    delete_expired_notifications_batch,
     delete_intake_outcomes_before,
     delete_terminal_notifications_batch,
     deliver_notification,
@@ -1054,83 +1056,15 @@ async def _resolve_at_ceiling(
     return True
 
 
-async def cleanup_expired_notifications() -> int:
-    """Delete expired notifications that have been fully delivered.
-
-    Removes notifications where:
-      - expiry_at < now()
-      - status is an outcome other than failed (a failure is kept for
-        inspection until general retention takes it)
-      - no push is owed for them (H7): a job whose push_outbox row the
-        relay has not published yet waits for it -- the cascade would
-        take the push with the job (delete_expired_notifications_batch)
-
-    Suppressed, no-recipients and cancelled are outcomes like sent: an
-    expired one is as dead as an expired sent one. General retention of
-    terminal notifications by age (NOTIFICATION_RETENTION_DAYS) is the
-    other pass, cleanup_terminal_notifications -- this cleanup only
-    covers rows that carry an explicit expiry_at.
-
-    Deliveries are CASCADE-deleted automatically.
-
-    IN BATCHES (H2), like cleanup_terminal_notifications: the service
-    supplies one commit-free batch of _RETENTION_BATCH_SIZE jobs
-    (delete_expired_notifications_batch); this loop commits each. One
-    unbounded DELETE held the cascade's push_outbox rows for its whole
-    transaction -- rows the relay (app/transport/push_relay.py) then
-    skipped, tick after tick.
-
-    AT MOST _EXPIRED_MAX_BATCHES_PER_PASS BATCHES (H5): this runs on
-    EVERY pass of the worker's maintenance loop (app/worker.py), so one
-    pass stops at the ceiling and leaves the rest of a backlog to the
-    next pass -- which comes at the poll interval, since a pass that
-    deleted something keeps the loop from backing off. A pass also
-    stops on a short batch -- where the pass ends, not a proof that
-    nothing more is expired: under READ COMMITTED a row another deleter
-    took meanwhile shortens a batch, and the tail goes on the next
-    pass. (Since P4-1 the
-    loop runs beside the lane loops, not on the delivery path.)
-
-    Returns:
-        Number of notifications deleted in this pass, over its batches.
-        A failing batch is rolled back and logged; the batches before
-        it stay deleted and are counted.
-    """
-    factory = get_session_factory()
-    now = datetime.now(UTC)
-    total = 0
-
-    async with factory() as session:
-        try:
-            for _ in range(_EXPIRED_MAX_BATCHES_PER_PASS):
-                deleted = await delete_expired_notifications_batch(
-                    session, now=now, limit=_RETENTION_BATCH_SIZE,
-                )
-                await session.commit()
-                liveness.step()
-                total += deleted
-                if deleted < _RETENTION_BATCH_SIZE:
-                    break
-
-            if total:
-                logger.info("notifications_cleaned_up", count=total)
-            return total
-
-        except Exception as exc:
-            await session.rollback()
-            logger.error(
-                "notification_cleanup_error",
-                deleted=total,
-                exception=sanitized_traceback(exc),
-            )
-            return total
-
-
 async def purge_expired_llm_answers() -> int:
     """Clear the model answers past their term (P5-1), in batches of
-    _RETENTION_BATCH_SIZE, at most _EXPIRED_MAX_BATCHES_PER_PASS a pass
-    -- the expiry cleanup's shape, on the same maintenance loop. A
-    failing batch is rolled back and logged; the batches before it stay.
+    _RETENTION_BATCH_SIZE, at most _EXPIRED_MAX_BATCHES_PER_PASS a pass,
+    on every pass of the maintenance loop: one pass stops at the
+    ceiling and leaves the rest of a backlog to the next pass, which
+    comes at the poll interval, since a pass that cleared something
+    keeps the loop from backing off. A pass also stops on a short
+    batch. A failing batch is rolled back and logged; the batches
+    before it stay.
 
     Returns:
         Number of answers cleared in this pass.
@@ -1170,14 +1104,16 @@ _EXPIRY_PORTION = 500
 
 # Phase 3a item 5: rows deleted per retention batch. One batch = one
 # transaction (bounded FK cascade); the drain loops commit between
-# batches -- the retention pass below and, since H2, the expiry cleanup
-# above. Module-level so tests can shrink it to force a multi-batch
-# drain.
+# batches -- the retention pass below and the purge of answers above.
+# Module-level so tests can shrink it to force a multi-batch drain.
 _RETENTION_BATCH_SIZE = 1000
 
-# H5: batches one expiry-cleanup pass deletes at most -- a backlog of
-# _EXPIRED_MAX_BATCHES_PER_PASS x _RETENTION_BATCH_SIZE jobs a pass,
-# the rest on the next pass. Module-level so tests can shrink it.
+# H5: batches one pass of the purge of answers past their term clears
+# at most -- a backlog of _EXPIRED_MAX_BATCHES_PER_PASS x
+# _RETENTION_BATCH_SIZE answers a pass, the rest on the next pass (the
+# expiry cleanup that shared it is gone since R-1: the KNOWN CEILING on
+# ix_notifications_expired_deletable, app/core/schema_objects.py).
+# Module-level so tests can shrink it.
 _EXPIRED_MAX_BATCHES_PER_PASS = 10
 
 

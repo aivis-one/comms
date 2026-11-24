@@ -45,13 +45,12 @@
 # rolling over) holding a row is skipped, not waited for, and the row
 # is deleted by whichever commits -- a duplicate push at worst, never a
 # lost one (tests/test_relay_vs_retention.py TestTwoRelays). The job
-# deleters no longer meet the relay: the expiry cleanup (H7) and
-# retention (REV-2) both skip a job whose push is still owed
-# (app/engine/service.py delete_expired_notifications_batch,
-# delete_terminal_notifications_batch), so their ON DELETE CASCADE never
-# reaches an outbox row. Until then it did, and SKIP LOCKED is what
-# kept a relay that waited for a cascade's row while holding another
-# from closing a cycle with it -- 40P01.
+# deleter no longer meets the relay: retention (REV-2) -- the one deleter
+# of jobs since R-1 -- skips a job whose push is still owed
+# (app/engine/service.py delete_terminal_notifications_batch), so its
+# ON DELETE CASCADE never reaches an outbox row. Until then it did, and
+# SKIP LOCKED is what kept a relay that waited for a cascade's row while
+# holding another from closing a cycle with it -- 40P01.
 #
 # REDIS AWAY: the tick fails, the rows stay, the next tick tries again.
 # The worker never touches redis, so transitions go on and the outbox

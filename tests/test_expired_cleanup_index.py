@@ -1,40 +1,43 @@
 # =============================================================================
-# H5 -- the expiry cleanup by index, a ceiling per pass; the schedule
-# gate errs toward the recipient
+# H5 -- retention's delete through the primary key; the ceiling of a
+# maintenance pass; the schedule gate errs toward the recipient
 # =============================================================================
 #
-# Б1: the batch select of the expiry cleanup runs on
-# ix_notifications_expired_deletable (migration 0023) and both batch
-# deletes -- the cleanup's and retention's -- go through the primary key
+# Since R-1 there is no expiry cleanup: a finished job past its
+# expiry_at is kept, with its key, until retention removes it
+# (tests/test_kept_until_retention.py). Its index,
+# ix_notifications_expired_deletable (migration 0023), is read by no
+# query and stays until the next major -- the KNOWN CEILING on its entry
+# in app/core/schema_objects.py; tests/test_schema_objects.py holds its
+# definition against pg_indexes. What this file held of the cleanup and
+# of the index went with it (R-1 report); what stands:
+#
+# Б1: retention's batch delete goes through the primary key
 # (`id = ANY(ARRAY(...))`), never a scan of notifications outside the
 # batch select. Plans are read with EXPLAIN on the very statement the
 # code executes (captured on the connection), over a seeded table of
-# realistic shape. One pass deletes at most
-# _EXPIRED_MAX_BATCHES_PER_PASS batches.
+# realistic shape. One pass of the purge of the model answers past their
+# term clears at most _EXPIRED_MAX_BATCHES_PER_PASS batches -- the
+# ceiling the expiry cleanup shared with it until R-1. Two retention
+# passes (two workers) over the same rows: one waits, each row deleted
+# once.
 #
 # Б2: the schedule gate asks the recipient's schedule for every value
 # but bypass.
 #
 # MUTATIONS these tests were written against (each turns one red):
-#   M1  the index not created           -> TestThePlan (expiry select)
-#   M2  the cleanup's delete back on IN (subquery)
-#                                       -> TestThePlan (expiry outer)
 #   M2r retention's delete back on IN (subquery)
 #                                       -> TestThePlan (retention outer)
-#   M3  the index predicate without the statuses
-#                                       -> TestTheIndex
-#   M4  no ceiling (drain to the end)   -> TestTheCeiling
+#   M4  no ceiling in the purge (drain to the end)
+#                                       -> TestTheCeiling
 #   M5  the ceiling counted in rows, not batches
 #                                       -> TestTheCeiling
 #   M6  the gate back on == respect     -> TestTheGate (unknown value)
 #   M7  the gate asking always          -> TestTheGate (bypass)
-#   M8  no commit between the cleanup's batches
-#                                       -> TestConcurrentDeleters: 40P01
 # =============================================================================
 
 import asyncio
 import json
-import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -44,20 +47,15 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import event, func, select, text
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.engine.processor as processor
 from app.core.database import get_engine, get_session_factory
 from app.engine import service
 from app.engine.constants import DeliveryStatus, NotificationStatus
-from app.engine.models import Notification, NotificationDelivery
-from app.engine.processor import cleanup_expired_notifications
-from app.engine.service import (
-    _EXPIRED_DELETABLE_STATUSES,
-    delete_expired_notifications_batch,
-    delete_terminal_notifications_batch,
-)
+from app.engine.models import LLMAnswer, Notification, NotificationDelivery
+from app.engine.processor import purge_expired_llm_answers
+from app.engine.service import delete_terminal_notifications_batch
 from tests.helpers import notification_row_fields, row_waiters, sql_shape
 from tests.test_recipient_schedule_field import (
     _channel,
@@ -66,7 +64,6 @@ from tests.test_recipient_schedule_field import (
     _outside_its_schedule,
 )
 
-_INDEX = "ix_notifications_expired_deletable"
 _BOUND = 10.0
 _POLL = 0.01
 
@@ -76,35 +73,43 @@ _POLL = 0.01
 # -----------------------------------------------------------------------------
 
 
-async def _job(
-    *,
-    status: str = NotificationStatus.SENT,
-    expiry_at: datetime | None,
-    created_at: datetime | None = None,
-) -> UUID:
+async def _job() -> UUID:
+    """A finished job (sent): what retention deletes."""
     async with get_session_factory()() as session:
         job = Notification(
             type="unit_event_in_app", title="T", body="B",
-            target_type="all", target_value="*", status=status,
-            expiry_at=expiry_at, **notification_row_fields(),
+            target_type="all", target_value="*",
+            status=NotificationStatus.SENT, **notification_row_fields(),
         )
         session.add(job)
-        await session.flush()
-        if created_at is not None:
-            await session.execute(
-                text("UPDATE notifications SET created_at = :c WHERE id = :i"),
-                {"c": created_at, "i": job.id},
-            )
         await session.commit()
         return job.id
 
 
-async def _expired(n: int) -> list[UUID]:
+async def _finished(n: int) -> list[UUID]:
+    return [await _job() for _ in range(n)]
+
+
+async def _answers_past_their_term(n: int) -> None:
+    """`n` jobs, each with a model's answer whose body is still kept
+    and whose keep_until has passed."""
     now = datetime.now(UTC)
-    return [
-        await _job(expiry_at=now - timedelta(minutes=n - i))
-        for i in range(n)
-    ]
+    async with get_session_factory()() as session:
+        for job in await _finished(n):
+            session.add(LLMAnswer(
+                notification_id=job, body="the answer", answered_set="s",
+                answered_at=now - timedelta(hours=2),
+                keep_until=now - timedelta(hours=1),
+            ))
+        await session.commit()
+
+
+async def _kept_answers() -> int:
+    async with get_session_factory()() as session:
+        return int((await session.execute(
+            select(func.count()).select_from(LLMAnswer)
+            .where(LLMAnswer.body.is_not(None))
+        )).scalar_one())
 
 
 async def _left() -> int:
@@ -199,28 +204,6 @@ def _index_names(nodes: list[dict]) -> set[str]:
 
 
 # -----------------------------------------------------------------------------
-# Б1 (1) -- the index, as the schema holds it
-# -----------------------------------------------------------------------------
-
-
-class TestTheIndex:
-    async def test_its_predicate_is_the_cleanup_s_status_list(
-        self, db_session: AsyncSession,
-    ) -> None:
-        """Read back from pg_indexes: the statuses of the predicate are
-        exactly _EXPIRED_DELETABLE_STATUSES, both ways, and the key is
-        expiry_at."""
-        definition = (await db_session.execute(text(
-            "SELECT indexdef FROM pg_indexes WHERE indexname = :name"
-        ), {"name": _INDEX})).scalar_one()
-        statuses = set(re.findall(r"'([a-z_]+)'::character varying", definition))
-        assert statuses == {str(s) for s in _EXPIRED_DELETABLE_STATUSES}
-        assert "btree (expiry_at)" in definition
-        assert "expiry_at IS NOT NULL" in definition
-        assert NotificationStatus.FAILED not in statuses
-
-
-# -----------------------------------------------------------------------------
 # Б1 (2) and gate item 1 -- the plans
 # -----------------------------------------------------------------------------
 
@@ -231,30 +214,6 @@ class TestThePlan:
     async def _realistic(self, pristine_tables: None) -> None:
         # After pristine_tables, never before: it would truncate the seed.
         await _seed(total=50000, every=200)
-
-    async def test_the_cleanup_batch_runs_on_the_index_and_the_pkey(self) -> None:
-        """No scan of notifications anywhere in the plan: the batch is
-        selected on the partial index, the rows deleted through the
-        primary key. The pair: both indexes are named in the plan."""
-        plan = await _plan_of(
-            delete_expired_notifications_batch,
-            now=datetime.now(UTC), limit=1000,
-        )
-        nodes = _nodes(plan)
-        assert _seq_scans_of_notifications(nodes) == []
-        assert {_INDEX, "notifications_pkey"} <= _index_names(nodes)
-        # The batch is selected ONCE, as an InitPlan, and the delete
-        # walks the primary key -- the shape `id = ANY(ARRAY(...))`
-        # gives whatever the estimates. `id IN (...)` leaves the join
-        # to the planner: a nested loop on the pkey here, a hash
-        # semi-join over a scan of the whole table on other estimates.
-        assert any(
-            child.get("Parent Relationship") == "InitPlan"
-            for child in plan.get("Plans", [])
-        )
-        assert "notifications_pkey" in _index_names(
-            _nodes(plan, skip_init_plans=True),
-        )
 
     async def test_the_retention_delete_scans_nothing_outside_its_select(
         self,
@@ -281,6 +240,11 @@ class TestThePlan:
 
 
 class TestTheCeiling:
+    """The ceiling per pass, on the purge of the model answers past their
+    term -- its one user since R-1 removed the expiry cleanup, whose
+    ceiling these tests held until then (same loop shape, same
+    constant)."""
+
     @pytest.fixture(autouse=True)
     def _small(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(processor, "_RETENTION_BATCH_SIZE", 2)
@@ -289,26 +253,25 @@ class TestTheCeiling:
     async def test_a_backlog_past_the_ceiling_goes_over_several_ticks(
         self,
     ) -> None:
-        """Ten expired, batches of two, three batches a pass: 6, then 4,
-        then nothing -- the backlog continues where the last pass
-        stopped."""
-        await _expired(10)
-        assert await cleanup_expired_notifications() == 6
-        assert await _left() == 4
-        assert await cleanup_expired_notifications() == 4
-        assert await cleanup_expired_notifications() == 0
-        assert await _left() == 0
+        """Ten past their term, batches of two, three batches a pass: 6,
+        then 4, then nothing -- the backlog continues where the last
+        pass stopped."""
+        await _answers_past_their_term(10)
+        assert await purge_expired_llm_answers() == 6
+        assert await _kept_answers() == 4
+        assert await purge_expired_llm_answers() == 4
+        assert await purge_expired_llm_answers() == 0
+        assert await _kept_answers() == 0
 
     async def test_exactly_the_ceiling(self) -> None:
-        await _expired(6)
-        assert await cleanup_expired_notifications() == 6
-        assert await cleanup_expired_notifications() == 0
+        await _answers_past_their_term(6)
+        assert await purge_expired_llm_answers() == 6
+        assert await purge_expired_llm_answers() == 0
 
     async def test_under_the_ceiling_drains_in_one_call(self) -> None:
-        await _expired(5)
-        assert await cleanup_expired_notifications() == 5
-        assert await _left() == 0
-
+        await _answers_past_their_term(5)
+        assert await purge_expired_llm_answers() == 5
+        assert await _kept_answers() == 0
 
 
 def test_the_production_ceiling() -> None:
@@ -326,7 +289,7 @@ async def _pid(session: AsyncSession) -> int:
     return int((await session.execute(text("SELECT pg_backend_pid()"))).scalar_one())
 
 
-async def _waiting_deleters(exclude: int | None = None) -> list[int]:
+async def _waiting_deleters() -> list[int]:
     """The backends waiting to DELETE a job row -- by their LOCKS
     (tests/helpers.py row_waiters): a tuple lock FOR UPDATE under a
     RowExclusiveLock of notifications. Until TX-3 by the text's prefix
@@ -334,42 +297,32 @@ async def _waiting_deleters(exclude: int | None = None) -> list[int]:
     the identity; a waiter is identified by what it waits with now."""
     return [
         pid for pid, wait in await row_waiters("notifications")
-        if wait.is_delete and pid != exclude
+        if wait.is_delete
     ]
 
 
-def _sqlstate(exc: BaseException | None) -> str | None:
-    orig = getattr(exc, "orig", None)
-    return getattr(orig, "sqlstate", None) or getattr(
-        getattr(orig, "__cause__", None), "sqlstate", None,
-    )
-
-
 class TestConcurrentDeleters:
-    @pytest.mark.parametrize("second", ["expiry", "retention"])
-    async def test_one_waits_both_finish_each_row_once(self, second: str) -> None:
-        """A holds a batch of the expiry cleanup; B -- another worker's
-        expiry cleanup, or retention -- deletes the same rows: B waits
-        for A (observed, not timed), A commits, B finishes. Deleted
-        exactly n, once."""
-        await _expired(4)
-        now = datetime.now(UTC)
+    async def test_one_waits_both_finish_each_row_once(self) -> None:
+        """A holds a batch of retention; B -- another worker's retention
+        (the cadence gate is per process, app/engine/processor.py
+        cleanup_terminal_notifications) -- deletes the same rows: B
+        waits for A (observed, not timed), A commits, B finishes.
+        Deleted exactly n, once. Until R-1 the pair was the expiry
+        cleanup against itself and against retention, and a test of
+        their crossing orders (expiry_at against created_at); since
+        R-1 retention is the one deleter, and both of its batches take
+        their rows in one order."""
+        await _finished(4)
+        cutoff = datetime.now(UTC) + timedelta(seconds=1)
         factory = get_session_factory()
         async with factory() as a, factory() as b:
-            assert await delete_expired_notifications_batch(
-                a, now=now, limit=100,
+            assert await delete_terminal_notifications_batch(
+                a, cutoff=cutoff, limit=100,
             ) == 4
             b_pid = await _pid(b)
-            if second == "expiry":
-                b_task = asyncio.ensure_future(
-                    delete_expired_notifications_batch(b, now=now, limit=100),
-                )
-            else:
-                b_task = asyncio.ensure_future(
-                    delete_terminal_notifications_batch(
-                        b, cutoff=now + timedelta(seconds=1), limit=100,
-                    ),
-                )
+            b_task = asyncio.ensure_future(
+                delete_terminal_notifications_batch(b, cutoff=cutoff, limit=100),
+            )
             waited = False
             for _ in range(int(_BOUND / _POLL)):
                 if b_pid in await _waiting_deleters():
@@ -384,65 +337,6 @@ class TestConcurrentDeleters:
         assert waited
         assert b_deleted == 0
         assert await _left() == 0
-
-    async def test_the_cleanup_against_retention_with_crossing_keys(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Keys that cross: X expires first but was created last, Y the
-        other way round. Retention (B, batches of one) takes Y and holds
-        it; the expiry cleanup (A, the real pass, batches of one) takes
-        X, commits, then wants Y and waits for B -- B, for its next
-        batch, does not find X (gone, committed) and wants nothing of
-        A. Both reach the end; each row deleted once. Without the commit
-        between the cleanup's batches (M8) A would hold X while waiting
-        for Y, and B would want X: both wait, 40P01."""
-        monkeypatch.setattr(processor, "_RETENTION_BATCH_SIZE", 1)
-        monkeypatch.setattr(processor, "_EXPIRED_MAX_BATCHES_PER_PASS", 3)
-        now = datetime.now(UTC)
-        x = await _job(
-            expiry_at=now - timedelta(hours=2),
-            created_at=now - timedelta(days=1),
-        )
-        y = await _job(
-            expiry_at=now - timedelta(hours=1),
-            created_at=now - timedelta(days=2),
-        )
-        cutoff = now + timedelta(seconds=1)
-        factory = get_session_factory()
-        async with factory() as b:
-            await b.execute(text("SET LOCAL deadlock_timeout = '3s'"))
-            b_pid = await _pid(b)
-            assert await delete_terminal_notifications_batch(
-                b, cutoff=cutoff, limit=1,
-            ) == 1  # Y, the oldest created
-            a_task = asyncio.ensure_future(cleanup_expired_notifications())
-            a_waits = False
-            for _ in range(int(_BOUND / _POLL)):
-                if await _waiting_deleters(exclude=b_pid):
-                    a_waits = True
-                    break
-                if a_task.done():
-                    break
-                await asyncio.sleep(_POLL)
-            assert a_waits
-            b_error: BaseException | None = None
-            try:
-                b_second = await delete_terminal_notifications_batch(
-                    b, cutoff=cutoff, limit=1,
-                )
-                await b.commit()
-            except DBAPIError as exc:
-                b_error, b_second = exc, -1
-                await b.rollback()
-        a_deleted = await a_task
-        assert _sqlstate(b_error) is None, b_error
-        assert b_second == 0
-        assert a_deleted == 1  # X; Y was B's
-        async with factory() as session:
-            assert (await session.execute(
-                select(func.count()).select_from(Notification)
-                .where(Notification.id.in_([x, y]))
-            )).scalar_one() == 0
 
 
 # -----------------------------------------------------------------------------

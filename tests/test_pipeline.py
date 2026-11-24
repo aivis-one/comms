@@ -5,7 +5,8 @@
 #   - resolve: deliveries per recipient x channel, idempotency, no-target
 #   - deliver: success / transient failure + retries / permanent failure
 #   - rollup: sent / failed / partial_sent
-#   - expire + cleanup, scheduled_at gating (reminder mechanism)
+#   - expire (the job kept until retention), scheduled_at gating
+#     (reminder mechanism)
 #
 # The worker/processor commits in its own sessions -- assertions
 # re-read state through a fresh session.
@@ -31,10 +32,11 @@ from app.engine.constants import (
 from app.engine.formatters import MessageRejectedError
 from app.engine.models import Notification, NotificationDelivery
 from app.engine.processor import (
-    cleanup_expired_notifications,
+    cleanup_terminal_notifications,
     process_pending_notifications,
 )
 from app.engine.service import create_notification, resolve_notification
+from app.engine.worker import run_engine_maintenance
 from tests.helpers import create_recipient, intake_fields
 
 
@@ -671,22 +673,39 @@ class TestSchedulingAndExpiry:
         assert fresh.status == NotificationStatus.EXPIRED
         assert await _fetch_deliveries(notification.id) == []
 
-    async def test_cleanup_deletes_expired_delivered(
+    async def test_an_expired_job_is_kept_until_retention(
         self, db_session: AsyncSession,
     ) -> None:
-        """cleanup removes terminal notifications past expiry_at.
+        """An expired job stays through the maintenance passes; the
+        retention pass takes it once it is older than the period.
 
-        Reaches the overdue state by time passing after acceptance, as
+        Until R-1 this was test_cleanup_deletes_expired_delivered: the
+        expiry cleanup deleted the job right after the sweep expired it,
+        and its key was free for a second job before retention
+        (deploy/INTEGRATION.md section 7). R-1 removed the cleanup;
+        the job and its key go only with retention. Reaches the overdue
+        state by time passing after acceptance, as
         test_overdue_notification_expires explains."""
         recipient = await create_recipient(db_session)
         notification = await _accepted_then_overdue(db_session, recipient.id)
 
-        # First batch expires it; cleanup then deletes it.
         await process_pending_notifications()
-        deleted = await cleanup_expired_notifications()
-        assert deleted == 1
+        await run_engine_maintenance()
+        assert await cleanup_terminal_notifications() == 0
+        fresh = await _fetch_notification(notification.id)
+        assert fresh.status == NotificationStatus.EXPIRED
 
         factory = get_session_factory()
+        async with factory() as session:
+            old = datetime.now(UTC) - timedelta(
+                days=settings.notification_retention_days + 1,
+            )
+            job = await session.get(Notification, notification.id)
+            assert job is not None
+            job.created_at = old
+            job.scheduled_at = old
+            await session.commit()
+        assert await cleanup_terminal_notifications() == 1
         async with factory() as session:
             result = await session.execute(
                 select(Notification).where(

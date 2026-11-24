@@ -3,13 +3,15 @@
 # no 40P01, both sides reach the end, no outbox row is lost
 # =============================================================================
 #
-# Since H7 (the expiry cleanup) and REV-2 (retention) neither deleter
-# takes a job whose push is still owed, so neither cascade reaches an
-# outbox row: the crossing described below (as it stood until REV-2)
-# can no longer be built, and
-# the tests hold that the deleters never meet the relay
-# (TestTheRetentionNeverMeetsTheRelay, TestTheExpiryCleanup). The relay's
-# SKIP LOCKED stays, held against a second relay (TestTwoRelays).
+# Since REV-2 retention does not take a job whose push is still owed, so
+# its cascade never reaches an outbox row: the crossing described below
+# (as it stood until REV-2) can no longer be built, and the tests hold
+# that the deleter never meets the relay
+# (TestTheRetentionNeverMeetsTheRelay). Retention is the one deleter of
+# jobs since R-1: the expiry cleanup, which skipped an owed push the
+# same way since H7 and was held here by a test of its own, is gone
+# (tests/test_kept_until_retention.py). The relay's SKIP LOCKED stays,
+# held against a second relay (TestTwoRelays).
 #
 # Real sessions on real connections; the order is built with locks and
 # observed in pg_stat_activity, never with sleeps.
@@ -49,7 +51,6 @@ import app.transport.push_relay as relay
 from app.core.database import get_session_factory
 from app.engine.constants import NotificationStatus, TargetType
 from app.engine.models import Notification, PushOutbox
-from app.engine.processor import cleanup_expired_notifications
 from app.engine.service import delete_terminal_notifications_batch
 from tests.helpers import notification_row_fields
 
@@ -158,7 +159,7 @@ class TestTheRetentionNeverMeetsTheRelay:
     relay's a, both finish, no row lost -- true then. REV-2 made
     retention skip a job whose push is still owed
     (delete_terminal_notifications_batch, an anti-join on push_outbox),
-    as H7 made the expiry cleanup (TestTheExpiryCleanup below): its
+    as H7 had made the expiry cleanup, removed by R-1: its
     cascade never reaches an outbox row, so it never meets the relay --
     and with no lock of each other's held, no cycle of the two can be
     built at all. Held now, more precisely: with R open (a deleted,
@@ -234,37 +235,3 @@ class TestTwoRelays:
         async with get_session_factory()() as session:
             assert await relay.delete_published(session, []) == 0
             assert await relay.delete_published(session, [10**12]) == 0
-
-
-class TestTheExpiryCleanup:
-    """The second deleter: cleanup_expired_notifications.
-
-    Until H7 the cleanup deleted X and Y whatever they owed, its cascade
-    WAITED for R on a, and the test held that both reached the end with
-    no row lost -- true then. H7 made the cleanup skip a job whose push
-    is still owed (delete_expired_notifications_batch, an anti-join on
-    push_outbox): the cascade never reaches an outbox row, so it never
-    meets R. Held now, more precisely: with R open the cleanup deletes
-    nothing and does not wait; R committed, the next pass deletes X
-    (its push published) and keeps Y (b still owed); R rolled back,
-    both stay, rows and all."""
-
-    @pytest.mark.parametrize("r_commits", [True, False])
-    async def test_the_cleanup_never_meets_the_relay(self, r_commits: bool) -> None:
-        x, y, a, _b = await _jobs()
-        factory = get_session_factory()
-        async with factory() as r:
-            assert await relay.delete_published(r, [a]) == 1
-            assert await asyncio.wait_for(
-                cleanup_expired_notifications(), _BOUND,
-            ) == 0
-            if r_commits:
-                await r.commit()
-            else:
-                await r.rollback()
-        assert await cleanup_expired_notifications() == (1 if r_commits else 0)
-        assert await _count(Notification, Notification.id == x) == (
-            0 if r_commits else 1
-        )
-        assert await _count(Notification, Notification.id == y) == 1
-        assert await _count(PushOutbox) == (1 if r_commits else 2)

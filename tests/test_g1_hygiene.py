@@ -130,8 +130,6 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         _NOT_A_JOB + "LLMAnswer.body, the model's answer for the product",
     ("app/engine/service.py", "_answer_row", "body"):
         _NOT_A_JOB + "LLMReply.body, the model's answer being stored",
-    ("app/engine/service.py", "delete_expired_notifications_batch", "body"):
-        _NOT_A_JOB + "LLMAnswer.body in a WHERE",
     ("app/engine/service.py", "purge_llm_answers", "body"):
         _NOT_A_JOB + "LLMAnswer.body in a WHERE",
     ("app/api/messaging.py", "_message_out", "body"):

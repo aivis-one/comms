@@ -188,9 +188,37 @@ MIGRATION_OWNED_INDEXES: dict[str, IndexShape] = {
             "WHERE (correlation IS NOT NULL)"
         ),
     ),
-    # The expiry cleanup's batch select, in expiry order, over the rows
-    # it may delete (H5, migration 0023). The status list is
-    # app/engine/service.py _EXPIRED_DELETABLE_STATUSES.
+    # Built for the expiry cleanup's batch select (H5, migration 0023);
+    # read by no query since R-1, which removed that cleanup.
+    #
+    # KNOWN CEILING (acknowledged by design -- R-1, a dead index):
+    #   1. Mechanics: no statement reads this index any more -- the
+    #      expiry cleanup (cleanup_expired_notifications, in
+    #      app/engine/processor.py until R-1) deleted a finished job as
+    #      soon as its expiry_at passed, releasing the job's idempotency key
+    #      before retention (deploy/INTEGRATION.md section 7), and R-1
+    #      removed it; retention (app/engine/service.py
+    #      delete_terminal_notifications_batch) is the one deleter of
+    #      jobs. Postgres still maintains the index: every insert or
+    #      update that leaves a row with an expiry_at in one of the six
+    #      outcomes of its predicate (sent, partial_sent, expired,
+    #      cancelled, suppressed, no_recipients) writes an index entry
+    #      nobody reads, on the hot notifications table.
+    #   2. Status: acknowledged by design.
+    #   3. Backlog ref: none -- the removal is a migration other than a
+    #      new table, which the Customer's order 2 section 2 rules out
+    #      for v4.2: its migrations add new tables only.
+    #   4. Promotion trigger (observable): the first tag v5.* on primer,
+    #      or order 2 section 2 withdrawn.
+    #   5. Agreed fix: ONE new migration -- DROP INDEX CONCURRENTLY IF
+    #      EXISTS ix_notifications_expired_deletable in an
+    #      autocommit_block, migration 0041's form -- and this entry
+    #      removed in the same commit.
+    #   6. Rejected: dropping it now (order 2 section 2); bringing back
+    #      a pass that reads it -- any pass over expired finished jobs
+    #      is either a premature delete or a copy of retention.
+    # Its existence and definition are held by tests/test_schema_objects.py
+    # against pg_indexes, like every entry here.
     "ix_notifications_expired_deletable": IndexShape(
         unique=False,
         definition=(

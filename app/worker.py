@@ -13,8 +13,9 @@
 #   - one delivery loop per lane of this process
 #     (engine.processor.process_lane, P4-1), woken by intake through
 #     one listener (engine.wake.listen_for_wakes, P4-2);
-#   - one maintenance loop: the engine's expiry sweep and expired
-#     cleanup (engine.worker.run_engine_maintenance), the close-notify
+#   - one maintenance loop: the engine's expiry sweep and purge of the
+#     model answers past their term
+#     (engine.worker.run_engine_maintenance), the close-notify
 #     consumer, and -- each behind its own cadence gate -- the
 #     notification retention pass (engine.processor), the thread
 #     auto-close pass (messaging.processor) and the purge of the sign-in
@@ -158,8 +159,8 @@ def reset_login_purge_gate() -> None:
 
 
 # Sessions the maintenance loop holds at once: its passes run one after
-# another, each in one session at a time (the expiry sweep, the expired
-# cleanup, the close-notify consumer, retention, auto-close, the purge
+# another, each in one session at a time (the expiry sweep, the purge
+# of answers, the close-notify consumer, retention, auto-close, the purge
 # of the sign-in attempts). Counted
 # with the lanes' against the pool (app/engine/service.py
 # LANE_CONCURRENCY, LANE_JOBS; tests/test_lanes.py holds the sum).
@@ -168,7 +169,7 @@ MAINTENANCE_SESSIONS = 1
 
 async def run_maintenance_pass() -> int:
     """One pass of the maintenance loop: the engine's expiry sweep and
-    expired cleanup, the close-notify consumer, then the two slow
+    purge of answers, the close-notify consumer, then the two slow
     passes -- each gated to its OWN cadence.
 
     It runs beside the lane loops, never on the delivery path: the
@@ -179,8 +180,8 @@ async def run_maintenance_pass() -> int:
     even when a pass drains a backlog.
 
     Returns:
-        Jobs expired and deleted plus close notices emitted (drives the
-        maintenance loop's backoff). The slow passes do not count: they
+        Jobs expired, answers cleared and close notices emitted (drives
+        the maintenance loop's backoff). The slow passes do not count: they
         keep their own cadence whatever the loop's interval.
     """
     global _last_retention_at, _last_auto_close_at, _last_login_purge_at
