@@ -402,6 +402,21 @@ service honours the wait it names -- which can exceed the life of a
 code by a wide margin. `expiry_at` is what stops a delivery that has
 outlived its point; without it the service has no way to know.
 
+**The sign-in is an option too, and no channel: `login`.** With it
+comms signs a person in through Telegram for the product (section 16).
+It needs the option `telegram`: the sign-in is the bot's, so an
+instance with `login` and without `telegram` does not start -- comms
+refuses its start, naming the option and the channel. The product
+declares both in its own `options`, and the instance's passport switches
+them on; the deploy machine refuses an option the product does not
+declare. With `login` on, the machine asks the instance's owner one
+question more, `TELEGRAM_LOGIN_CLIENT_SECRET` -- the Client Secret of the
+bot's sign-in, from BotFather (section 16); the product neither gives
+nor reads it. The option is off until the passport switches it on. Off,
+the sign-in's routes do not exist -- `POST /api/v1/login/start` and
+`POST /api/v1/login/complete` answer `404` `not_found`, as any unknown
+route -- and nothing else of comms differs from an instance without it.
+
 ## 5. The resource protocol (F1.4)
 
 Every resource route -- recipients, threads, messages, sections, read
@@ -429,7 +444,7 @@ body, with a class a program can branch on:
 | 410 | `login_expired` | more than 10 minutes since the sign-in's `start`. Begin again |
 | 413 | `bad_request` | the request's body is larger than 1048576 bytes (1 MiB) -- refused before it is read, with or without a `Content-Length`; the largest body the field limits allow is about 30 KB |
 | 422 | `validation` | the input is wrong; `fields` names each input. A string in the body the database cannot store -- a NUL character or a lone surrogate, in a value or a key, at any depth -- is refused so, naming the top-level field and never its value; in the query string -- a NUL (`%00`) in a parameter's value or name, on every route -- so too, naming the parameter and never its value. A boolean or integer field takes that JSON type only: `true` is not an integer, `"1"` is not one either, `"no"` or `0` is not a boolean (the snapshot's `telegram_id` and `active`, a preference toggle, a thread's `priority`); a time that leaves the range once moved to UTC (`0001-01-01T00:00:00+05:00` as a read pointer) is refused, and so is a body nested deeper than its JSON can be read on a route that takes no body model -- on one that does, the framework answers `400` `bad_request` (above) |
-| 422 | `provider_refused` | Telegram refused the code exchange -- a wrong, used or expired code, another `redirect_uri`, a wrong client secret. Begin again; on every one, check the secret and the Allowed URLs |
+| 422 | `provider_refused` | Telegram refused the code exchange -- a wrong, used or expired code, another `redirect_uri`, a wrong client secret. Begin again; on every one, check the secret and the bot's Redirect URIs (Allowed URLs in Telegram's documentation) |
 | 500 | `internal` | our defect; the text carries nothing from it |
 | 502 | `id_token_invalid` | Telegram's `id_token` is missing or does not pass the checks of the sign-in. The sign-in is refused; repeats are a reason to read comms' log |
 | 503 | `unavailable` | a transient failure of comms' database -- a deadlock, a lost or refused connection, a restart, an overload; with `Retry-After: 1`. The outcome is unknown: repeat the same request |
@@ -2009,6 +2024,256 @@ IPv4 address without a trailing dot, a port from 1 to 65535 -- it
 refuses comms' start, with the llm channel on or off. Empty, comms
 starts, and every audio link is rejected.
 
+## 16. Signing a person in through Telegram
+
+With the option `login` (section 3a) comms signs a person in through
+Telegram for the product: OpenID Connect, a code with PKCE (`S256`).
+The product starts the sign-in, sends the browser to Telegram, takes
+the browser back on its own address and hands comms what Telegram gave
+it; comms exchanges the code, checks Telegram's `id_token` and answers
+with the person. Whom to let in is the product's decision: comms says
+who the person is, never whether they may enter. Two routes, behind the
+service token like every `/api/v1` route; with the option off neither
+exists -- `404` `not_found`, as any unknown route.
+
+### The steps of a sign-in
+
+| # | who | what |
+|---|---|---|
+| 1 | browser -> product | the person asks to sign in with Telegram |
+| 2 | product -> comms | `POST /api/v1/login/start` |
+| 3 | comms | makes the `state` and the PKCE verifier, records the attempt for 10 minutes, answers with `state`, `authorize_url` and `expires_at` |
+| 4 | product -> browser | puts the `state` in a cookie of its own (`HttpOnly`, `Secure`, `SameSite=Lax`, for the life of the attempt) and answers `302` to `authorize_url` |
+| 5 | browser <-> Telegram | the person confirms the sign-in at Telegram; Telegram sends the browser back to `redirect_uri` with `code` and `state` |
+| 6 | product | compares the `state` of the address with the `state` of its cookie. No cookie, or another value: the product refuses, and comms is not called |
+| 7 | product -> comms | `POST /api/v1/login/complete` |
+| 8 | comms -> Telegram | exchanges the code, fetches Telegram's keys, checks the `id_token` |
+| 9 | comms -> product | the person, or a refusal |
+| 10 | product | decides by `subject` whom it lets in: its own person gets its session, a stranger its refusal |
+
+### `start`
+
+    POST /api/v1/login/start
+
+| field | value |
+|---|---|
+| `provider` | required: `"telegram"`, the one provider |
+| `redirect_uri` | required: an `https` URL with a host and no fragment, 1..2048 characters -- the product's return address. comms keeps it with the attempt and sends it on the code exchange itself. comms has no list of allowed addresses: that list is the bot's Redirect URIs in BotFather (below), and Telegram refuses an address not on it at step 5 |
+| `bot_access` | optional, `false`: `true` asks Telegram for the scope `telegram:bot_access` too -- the bot's right to write to the person after the sign-in |
+
+Any other field, or a value of another JSON type (`"true"` is no
+boolean), is `422` `validation`, naming the field and never its value
+(section 5); nothing is kept of a refused start.
+
+The answer -- here of a start with `bot_access: true`:
+
+**`POST /api/v1/login/start` -- 200**
+
+```json
+{
+  "state": "Yp3kQ9xWv2mN8rT5sL1cA7dF4gH6jK0zB3nM5pR8tU1",
+  "authorize_url": "https://oauth.telegram.org/auth?client_id=7000000001&redirect_uri=https%3A%2F%2Fproduct.example.org%2Fauth%2Ftelegram%2Freturn&response_type=code&scope=openid+profile+telegram%3Abot_access&state=Yp3kQ9xWv2mN8rT5sL1cA7dF4gH6jK0zB3nM5pR8tU1&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256",
+  "expires_at": "2026-12-01T10:10:00.482913+00:00"
+}
+```
+
+| field | what it is |
+|---|---|
+| `state` | the attempt's name: 43 characters of `[A-Za-z0-9_-]` (32 random bytes). The cookie of step 4 keeps it; `complete` takes it back as it is |
+| `authorize_url` | where to send the browser: Telegram's `https://oauth.telegram.org/auth` with `client_id` (the bot's id), `redirect_uri`, `response_type=code`, `scope` (`openid profile`, and `telegram:bot_access` when asked), `state`, `code_challenge` and `code_challenge_method=S256`. Send it as it is |
+| `expires_at` | when the attempt expires: 10 minutes after the start. ISO 8601 in UTC with the offset `+00:00`, never `Z`; the fraction of a second is there unless it is zero. Read it with a parser of ISO 8601, not by its length |
+
+### `complete`
+
+    POST /api/v1/login/complete
+
+| field | value |
+|---|---|
+| `state` | required: the `state` Telegram brought back at step 5 -- after step 6, the cookie's. Of exactly the form `start` gives, or `422` `validation` before anything else is done |
+| `code` | required: Telegram's `code` of step 5, a string of 1..2048 characters |
+
+**The attempt is taken first.** comms takes the attempt -- once, ever
+-- and commits that before it asks Telegram anything. Once `complete`
+has got that far, the attempt is spent whatever the outcome: the next
+`complete` of the same `state` is `login_replayed`, even while the first
+one still runs. Then comms makes two requests to Telegram, the code
+exchange and its keys, at most 10 seconds each: give `complete` a
+timeout of at least 25 seconds. Nothing is retried; after any refusal
+the sign-in begins again with `start`.
+
+The answer, the person:
+
+**`POST /api/v1/login/complete` -- 200**
+
+```json
+{
+  "provider": "telegram",
+  "subject": "123456789",
+  "verified_at": "2026-12-01T10:03:12.654321+00:00",
+  "telegram": {
+    "id": 123456789,
+    "first_name": "Anna",
+    "last_name": null,
+    "username": "anna",
+    "photo_url": "https://t.me/i/userpic/320/anna.jpg",
+    "bot_access_granted": true
+  }
+}
+```
+
+| field | what it is |
+|---|---|
+| `provider` | `"telegram"` |
+| `subject` | the person's id at the provider, a string: for Telegram the Telegram id in decimal digits -- never the token's `sub`. Compare it as a string; do not parse it |
+| `verified_at` | when comms checked the `id_token`; the form of `expires_at` |
+| `telegram.id` | the Telegram id, an integer 1..2^63-1. Telegram's token carries it as a number or as a string of digits; comms answers a number |
+| `telegram.first_name` | a string or `null`: the token's `given_name`, else its `name` |
+| `telegram.last_name` | a string or `null`: `family_name` |
+| `telegram.username` | a string or `null`: `preferred_username` |
+| `telegram.photo_url` | a string or `null`: `picture` when it is an `https` URL with a host, else `null` |
+| `telegram.bot_access_granted` | a boolean: this sign-in gave the bot the right to write to the person. `true` only when `start` asked (`bot_access: true`) and Telegram's answer to the code exchange either names no `scope` -- then the scope granted is the one asked (RFC 6749 §5.1) -- or names one that holds `telegram:bot_access`. It says nothing of a right the person gave the bot otherwise |
+
+Every key is always there: a value that may be `null` is `null`, never
+absent, and an empty string from Telegram is `null` too. The scopes
+asked are `openid profile`, and `telegram:bot_access` when asked; the
+phone is never asked.
+
+**What the `id_token` must pass** before anything of it is answered:
+the signature, by Telegram's published key named by the token's `kid`
+(a token without `kid` is refused); the algorithm `RS256` or `ES256` --
+any other is refused before a key is looked at; `iss`
+`https://oauth.telegram.org`; `aud` the bot's id; `exp` and `iat`
+present and right against the moment of the check, with 30 seconds for
+the clocks of the box and of Telegram; an `id` that is a Telegram id.
+Any failure is `502` `id_token_invalid`.
+
+**Why the product can trust the answer.** The person reaches the product
+only in comms' answer to the product's own request, inside the box and
+under the service token: the browser never carries it. comms answers
+only for a `state` it gave at `start` (32 random bytes), and the code is
+exchanged with that attempt's verifier and `redirect_uri`: a code given
+under another attempt is not exchanged by Telegram.
+
+### Refusals of a sign-in
+
+Each class travels with the status of its row of the table in section
+5. The bodies are the common form of section 5, without `fields`; the
+class is the contract, the message is for a human:
+
+**`POST /api/v1/login/complete` -- 404 `login_unknown`**
+
+```json
+{"error": {"class": "login_unknown", "message": "the sign-in is not known; begin it again"}}
+```
+
+**`POST /api/v1/login/complete` -- 410 `login_expired`**
+
+```json
+{"error": {"class": "login_expired", "message": "the sign-in has expired; begin it again"}}
+```
+
+**`POST /api/v1/login/complete` -- 409 `login_replayed`**
+
+```json
+{"error": {"class": "login_replayed", "message": "the sign-in was completed already; begin it again"}}
+```
+
+**`POST /api/v1/login/complete` -- 422 `provider_refused`**
+
+```json
+{"error": {"class": "provider_refused", "message": "Telegram refused the sign-in; begin it again"}}
+```
+
+**`POST /api/v1/login/complete` -- 503 `provider_unavailable`**
+
+```json
+{"error": {"class": "provider_unavailable", "message": "Telegram could not be asked; begin the sign-in again later"}}
+```
+
+**`POST /api/v1/login/complete` -- 502 `id_token_invalid`**
+
+```json
+{"error": {"class": "id_token_invalid", "message": "Telegram's answer did not prove the person"}}
+```
+
+What to do is in the table of section 5: every one of them is answered
+by beginning the sign-in again with `start`. The API's own refusals
+come as on every route: `422` `validation`, `401` `unauthorized`, and
+`503` `unavailable`. A `503` `unavailable` of `complete` leaves unknown
+whether the attempt was taken: a repeat of the same request completes
+the sign-in or answers `login_replayed` -- then begin again.
+
+### The browser is the product's to bind
+
+**The attempt is bound to the browser by the product**: the cookie with
+the `state` (step 4) and its comparison at the return (step 6). Without
+them a sign-in can be swapped: someone starts a sign-in with their own
+Telegram account and slips the person the return link -- the person's
+browser comes back with that code and that `state`, and the sign-in
+completes as the other account. comms never sees the browser and
+cannot check this.
+
+### The bot and BotFather
+
+The sign-in goes through the bot comms sends through (the `telegram`
+option): Telegram's OpenID Connect client is the bot itself, its client
+id the bot's id, which comms reads from the bot's token -- no key of the
+instance holds it. Hence `login` needs `telegram` (section 3a).
+
+**What the instance's owner does in BotFather by hand, once:** the bot
+-> **Login Widget** -> **Switch to OpenID Connect Login** -> **Redirect
+URIs** (Allowed URLs in Telegram's documentation): registers the
+product's return address -- the `redirect_uri` the product sends to
+`start`, exactly; several domains, several addresses. There too are the
+**Client ID** -- the bot's id -- and the **Client Secret**, which is the
+answer to the deploy machine's question `TELEGRAM_LOGIN_CLIENT_SECRET`.
+The signing algorithm stays as it is: `RS256` by default, `ES256`
+allowed; any other is refused by comms (`id_token_invalid`).
+
+A wrong secret does not stop comms from starting: it is checked by
+Telegram alone, and the first `complete` answers `provider_refused`.
+
+### What comms writes to its log
+
+One line per outcome of a `complete` whose body was the contract's:
+`login_completed`, with the provider and the status of Telegram's last
+answer, or `login_refused`, with the provider, `error_class`, `reason`
+-- the word of the reason (`expired`, `invalid_grant`, `token_status`,
+`signature`, ...) -- and `telegram_status`, the status of Telegram's
+answer it stopped at (`null` where Telegram was not asked or did not
+answer). The API's own refusals -- `validation`, `unauthorized`,
+`unavailable` -- are written by the API's common lines, not these. No
+line ever holds the `state`, the `code`, the verifier, the `id_token`,
+the client secret, Telegram's keys, the Telegram id or the person's
+data.
+
+### What Telegram did on the live sign-in of 24.11.2026
+
+Observations of Telegram, not rules of comms; Telegram may change them:
+
+- it refused the code exchange with HTTP `200` and `{"error":
+  "invalid_grant"}` -- for a wrong code and for a wrong client secret
+  alike. The two cannot be told apart: both are `provider_refused`.
+  comms reads the refusal off the body; an answer other than `200` is
+  `provider_unavailable`;
+- it did not ask the person about the bot's right and answered a
+  `scope` without `telegram:bot_access`: `bot_access_granted` was
+  `false`. A product that has to write to the person does not count on
+  the sign-in for it: the person presses `/start` in the bot;
+- its `id_token` carried `id` as a string of digits;
+- the Client ID BotFather showed was the bot's id.
+
+### A stand-in of comms in the product's tests
+
+The product's tests fake comms by the answers above: the two routes,
+their bodies, the person and the six refusals. The fake's
+`authorize_url` may point at a stub of the product's own that sends the
+browser straight back to `redirect_uri` with any `code` and the same
+`state`: Telegram is not needed there. The answers above are held equal
+to comms' own by comms' tests -- their keys, their types, their fixed
+values exactly, the rest by form: an answer of comms that changes
+without its sample here is a red CI of comms.
+
 ## How long comms keeps things
 
 The questions every product asks once, answered here so the answer is
@@ -2045,6 +2310,16 @@ answer is kept by its type.
   nowhere. It is acknowledged and leaves one line in comms' log, its
   address without its letter; nothing is replayed -- once the cause is
   fixed, your outbox sends the event again.
+
+- **A sign-in attempt** (section 16): **24 hours** from its `start`,
+  completed or not; the worker removes it within an hour after. Its
+  PKCE verifier is erased the moment `complete` takes the attempt. What
+  an attempt keeps is no person: the fingerprint of its `state` (never
+  the `state` itself), the provider, the `redirect_uri`, whether
+  `bot_access` was asked, its times. Who signed in -- the Telegram id,
+  the name, the username, the photo -- passes through comms into the
+  answer of `complete` and is kept nowhere. Telegram's keys are fetched
+  for every sign-in and not kept either.
 
 A product that needs history kept longer than comms keeps it should
 retain its own copy: comms is the delivery service, not the archive.
