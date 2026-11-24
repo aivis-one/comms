@@ -33,6 +33,9 @@
 #         bound -> TestCompose.test_the_worker_s_stop_outlasts_its_bound
 #   W7-1: the machine checked out by a name, not a commit
 #         -> TestTheMachinePin
+#   REL-1: the reader of installs blind -> TestCi (the pair on ci.yml);
+#         a line that says `pip install` and is not read, or one not
+#         hash-checked, in a workflow without other installs -> TestCi
 # =============================================================================
 
 import asyncio
@@ -189,6 +192,17 @@ def _pip_installs(data: dict[str, Any]) -> list[str]:
     ]
 
 
+def _pip_lines(data: dict[str, Any]) -> list[str]:
+    """Every line of every step's `run` that says `pip install` anywhere
+    in it -- what _pip_installs is to have read (REL-1)."""
+    return [
+        line.strip()
+        for job in data["jobs"].values() for step in job["steps"]
+        for line in str(step.get("run", "")).splitlines()
+        if "pip install" in line
+    ]
+
+
 # What a hash-checked install looks like: a file installed under
 # --require-hashes, written out -- a lock, or a stanza of one. Until W1-1
 # `pip install -r requirements.lock` passed as well, pip switching into
@@ -269,11 +283,27 @@ class TestCi:
     def test_every_install_is_hash_checked(self, workflow: Path) -> None:
         """REV-5: no package reaches CI that the lock's hashes do not
         name -- not the project built by `pip install -e .` (its
-        setuptools came unpinned), not a bare `pyyaml==` pin."""
+        setuptools came unpinned), not a bare `pyyaml==` pin.
+
+        EVERY LINE THAT SAYS `pip install` IS ONE THE READER READ (REL-1).
+        Until REL-1 the pair here was "this workflow's installs are not
+        empty": right while every workflow installed something, and it
+        held the reader against reading nothing. release.yml installs
+        nothing -- gh and the standard library are the runner's -- so the
+        pair is test_the_reader_reads_ci_s_installs below, and here the
+        reader is held to miss no line: a line it misses (`cd x && pip
+        install y`) is an install nobody checks."""
         data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
         installs = _pip_installs(data)
-        assert installs, "the pair: there are installs to read"
+        assert installs == _pip_lines(data)
         assert _unhashed(installs) == []
+
+    def test_the_reader_reads_ci_s_installs(self) -> None:
+        """The pair of test_every_install_is_hash_checked (REL-1): ci.yml
+        installs, and the reader sees it -- a reader that read nothing
+        would leave that test green on every workflow."""
+        data = yaml.safe_load(_CI)
+        assert _pip_installs(data)
 
     def test_the_guard_sees_an_unhashed_install(self) -> None:
         installs = [

@@ -1,0 +1,164 @@
+# =============================================================================
+# COMMS Service -- the release button (REL-1)
+# =============================================================================
+# A release of comms is a tag vX.Y.Z on the first parent of primer, X.Y.Z
+# the version of pyproject.toml, made by this workflow and by no hand:
+# Actions, release, Run workflow on primer. One job; each step refuses
+# before anything is made:
+#   - the run is on refs/heads/primer;
+#   - the tag is "v" and [project] version, read by tomllib -- of the form
+#     vX.Y.Z, not a tag that exists, after the last vX.Y.Z tag (sort -V,
+#     as the machine's release compares);
+#   - the commit is the head of primer when the button was pressed
+#     (GITHUB_SHA), on the first parent of origin/primer;
+#   - the last run of .github/workflows/ci.yml on that commit by a push
+#     has finished green -- one still running, red, or none is a refusal
+#     that names the run; no waiting.
+# Last, `gh release create --target`: it makes the tag. A step that fails
+# before it leaves no tag and no release. Only the job's token has
+# rights -- it writes contents and reads actions -- and the checkout keeps
+# no token in .git/config (tests/test_deploy_hardening.py holds every
+# workflow to that).
+#
+# NOT TAKEN from the machine's release workflow (inzoddwetrust/primer,
+# v0.1.8), each for its reason:
+#   - a pushed tag as a second way in: it makes the tag past every check
+#     here, and the owner pushes no tag from a terminal;
+#   - tier 1 run again: the full suite is ~16 min, and a green ci.yml on
+#     this very commit is required above;
+#   - the wheel and install.sh: the machine takes comms by its tag from
+#     git, and no artifact is read;
+#   - tier 3: comms has none.
+# Nor release notes, a changelog or a "review passed" gate: the release
+# carries one line, its tag and its commit; what is released is the
+# owner's decision, not a step.
+#
+# KNOWN CEILING -- a tag made past the button while the button runs.
+#   1. Mechanism: "not a tag that exists" is read from the checkout's
+#      tags; a tag of the same name made elsewhere after the checkout (a
+#      release from the web UI) is not seen, and `gh release create` then
+#      releases that tag where it stands -- --target names the commit of
+#      a tag it makes, not of one that exists. Two runs of this workflow
+#      do not meet there: `concurrency` below queues the second, and its
+#      checkout sees the first one's tag.
+#   2. Status: acknowledged by design.
+#   3. Task: none -- tags of comms are made by the owner alone, through
+#      this button; the window is the seconds between the checkout and
+#      the last step.
+#   4. Trigger: a tag vX.Y.Z of comms made other than by this workflow --
+#      by anyone, any way -- or a second person who releases comms.
+#   5. Agreed fix: make the tag first through the API (POST git/refs,
+#      answered 422 when the tag exists), then `gh release create
+#      --verify-tag`.
+#   6. Rejected: a second look at the tags just before the last step --
+#      it narrows the window and does not close it; `concurrency` alone --
+#      it orders the runs of this workflow, not a tag made elsewhere.
+# =============================================================================
+
+name: release
+
+on:
+  workflow_dispatch:
+
+# Two presses: the second waits for the first and then finds its tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# THE TOKEN GETS NOTHING BY DEFAULT (TX-4): the job says what it needs.
+permissions: {}
+
+# bash -eo pipefail: a failing command anywhere in a step refuses.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # A checkout of the whole history and two calls of the API: ~1 min.
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      # Every branch and every tag: the steps below read the tags and
+      # origin/primer.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # TAG and SHA for every later step. The version by tomllib, the
+      # runner's python3: [project] version itself, whatever the file's
+      # quotes and spacing; no key, or a file that is not TOML, fails the
+      # substitution and the step. An empty `last` (no vX.Y.Z tag) sorts
+      # first, so the comparison needs no case of its own.
+      - name: The tag and the commit of this release
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/primer" ]; then
+            echo "the release is run on primer, not $GITHUB_REF"
+            exit 1
+          fi
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          tag="v$version"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag '$tag' is not vX.Y.Z (the version of pyproject.toml)"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "$tag exists: this version is released -- raise the version of pyproject.toml"
+            exit 1
+          fi
+          git tag --list "v*" > "$RUNNER_TEMP/tags"
+          last=$({ grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' "$RUNNER_TEMP/tags" || true; } | sort -V | tail -n 1)
+          if [ "$(printf '%s\n%s\n' "$last" "$tag" | sort -V | tail -n 1)" != "$tag" ]; then
+            echo "$tag is not after $last"
+            exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "release $tag at $GITHUB_SHA"
+
+      # Into a file, not a pipe: grep -q stops at the first match, and
+      # rev-list writing on into the closed pipe dies of SIGPIPE, which
+      # pipefail turns into a refusal.
+      - name: The commit is on the first parent of primer
+        run: |
+          git rev-list --first-parent origin/primer > "$RUNNER_TEMP/first-parent"
+          if ! grep -qx "$SHA" "$RUNNER_TEMP/first-parent"; then
+            echo "$SHA is not on the first parent of primer"
+            exit 1
+          fi
+
+      # The last run by its number; a run started again keeps its number
+      # and reads as its last attempt.
+      - name: ci.yml is green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&per_page=100" > "$RUNNER_TEMP/runs.json"
+          python3 - "$RUNNER_TEMP/runs.json" <<'EOF'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              runs = json.load(handle)["workflow_runs"]
+          if not runs:
+              sys.exit("ci.yml has not run on this commit by a push: no release")
+          last = max(runs, key=lambda run: run["run_number"])
+          state = last["conclusion"] if last["status"] == "completed" else last["status"]
+          if state != "success":
+              sys.exit(f"ci.yml on this commit is {state}: {last['html_url']}")
+          print(f"ci.yml on this commit is green: {last['html_url']}")
+          EOF
+
+      # Last: the release, and with it the tag on SHA.
+      - name: The release, and with it the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" --target "$SHA" \
+            --title "comms $TAG" --notes "comms $TAG at $SHA"
