@@ -64,6 +64,9 @@
 #   (formatters.build_formatters with full settings and a fake Bot), and
 #   a test of a switched-off channel passes its flag false itself rather
 #   than lean on this fence.
+#   The modules (app/core/modules.py: `login`) are fenced the same way,
+#   from their own registry: every module flag false, every module key
+#   blanked -- a test that switches one on passes its flag and keys.
 #   Second line: the network tripwire fixtures below make any real
 #   outbound request fail the test -- ONE PER CLIENT LIBRARY. The
 #   telegram tripwire patches aiogram's transport, which says nothing
@@ -87,10 +90,11 @@ from __future__ import annotations
 import os
 
 from app.core.channels import channel_env_keys, channel_flag_keys
+from app.core.modules import module_env_keys, module_flag_keys
 
-for _key in channel_flag_keys():
+for _key in channel_flag_keys() + module_flag_keys():
     os.environ[_key] = "false"
-for _key in channel_env_keys():
+for _key in channel_env_keys() + module_env_keys():
     os.environ[_key] = ""
 # The suite's service token: in force for every test (`suite_token`),
 # presented by `client` and `bare_client`. Not of a real key's shape.

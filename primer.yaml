@@ -29,7 +29,7 @@
 schema: 1
 name: comms
 kind: service
-options: [telegram, email, llm]
+options: [telegram, email, llm, login]
 
 stacks:
   comms:
@@ -55,6 +55,11 @@ env:
   TELEGRAM_ENABLED: { source: passport, key: options.telegram }
   EMAIL_ENABLED: { source: passport, key: options.email }
   LLM_ENABLED: { source: passport, key: options.llm }
+  # An option that is no channel, a module (app/core/modules.py): the
+  # sign-in through Telegram. Switched by its flag alike; the machine
+  # renders `false` for a passport without it (pridem/stacks/options.py
+  # flag(), the machine v0.1.8).
+  LOGIN_ENABLED: { source: passport, key: options.login }
   # The instance's languages and its default (protocol 5.2.2): comms has
   # none of its own -- its product's, from the passport (W4-1). A text
   # falls back to DEFAULT_LANGUAGE (app/engine/template_engine.py).
@@ -71,6 +76,10 @@ env:
   # A fact of the instance's provider account, though the code has a default.
   EMAIL_MAILGUN_REGION: { source: param, when: email }
   LLM_KEY_SETS: { source: asked, when: llm }
+  # The OIDC client's secret, from BotFather. Under `when: login`: with
+  # the option off the machine writes its literal into it (off() and
+  # LITERAL of pridem/stacks/options.py) and comms does not read it.
+  TELEGRAM_LOGIN_CLIENT_SECRET: { source: asked, when: login }
   # The point of the product's object store (W4-2): `<alias>:<port>`, the
   # one place a letter's audio link may point -- `http://<it>/...` (protocol
   # 4.7). Not under `when: llm`: the machine checks `requires` whatever the
@@ -123,8 +132,11 @@ provides:
   #      of deploy/INTEGRATION.md section 15 -- one delivery.
   #   6. Rejected: the product asking the operator for the same token (two
   #      copies of one secret, rule 2 of the passport: `asked` is the one
-  #      who checks); comms checking the sign-in for the product (comms
-  #      decides nothing for a product).
+  #      who checks); comms checking the Mini App's `initData` with the
+  #      bot's token for the product. The OIDC sign-in a product asks
+  #      comms for is another thing -- the option `login`
+  #      (app/core/modules.py) -- and with it, as without it, comms does
+  #      not decide whom the product lets in.
   - TELEGRAM_BOT_TOKEN
 
 report: { health: /health, ready: /ready, logs: json, junit: true }

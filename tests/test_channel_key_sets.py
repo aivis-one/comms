@@ -328,8 +328,9 @@ class TestStartupRefusal:
                 "TELEGRAM_ENABLED": "true",
                 "EMAIL_ENABLED": "false",
                 "LLM_ENABLED": "false",
-                # Required at every start since W4-1; not what this
-                # class is about.
+                # Required at every start since L-1 (app/core/modules.py)
+                # and W4-1; not what this class is about.
+                "LOGIN_ENABLED": "false",
                 "LANGUAGES": "en",
                 "DEFAULT_LANGUAGE": "en",
                 **env,

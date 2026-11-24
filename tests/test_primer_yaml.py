@@ -29,6 +29,7 @@ import yaml
 from app import cli
 from app.core.channels import CHANNEL_SPECS
 from app.core.config import Settings
+from app.core.modules import MODULE_SPECS
 
 _REPO = Path(__file__).resolve().parents[1]
 _PRIMER: dict[str, Any] = yaml.safe_load(
@@ -130,6 +131,16 @@ class TestEnvIsWhatCommsReads:
 
 
 _CHANNELS = [spec for spec in CHANNEL_SPECS if spec.flag is not None]
+# Every option of the instance: a channel with a flag, or a module (L-1,
+# app/core/modules.py) -- switched alike, by its flag from the passport,
+# its keys under `when: <option>`.
+_OPTIONS: list[Any] = [*_CHANNELS, *MODULE_SPECS]
+
+
+def _option_keys(spec: Any) -> list[str]:
+    """The keys of an option: a channel's declared and defaulted ones, a
+    module's own."""
+    return [*spec.keys, *getattr(spec, "optional_validators", {})]
 
 
 class TestTheProfileIsData:
@@ -183,18 +194,29 @@ class TestTheProfileIsData:
 
 
 class TestChannels:
-    def test_the_options_are_the_switchable_channels(self) -> None:
-        assert _CHANNELS  # the pair
-        assert sorted(_PRIMER["options"]) == sorted(spec.name for spec in _CHANNELS)
+    def test_the_options_are_the_switchable_channels_and_the_modules(
+        self,
+    ) -> None:
+        """Was test_the_options_are_the_switchable_channels: every option
+        was a channel. L-1 added an option that is no channel, `login`, a
+        module of app/core/modules.py -- the options are now both
+        registries together, each name once, so a misspelt option is
+        still red. Mutation 1.3: `login` out of `options`."""
+        assert _CHANNELS and MODULE_SPECS  # the pair
+        names = [spec.name for spec in _OPTIONS]
+        assert len(names) == len(set(names))
+        assert sorted(_PRIMER["options"]) == sorted(names)
 
-    @pytest.mark.parametrize("spec", _CHANNELS, ids=lambda spec: spec.name)
+    @pytest.mark.parametrize("spec", _OPTIONS, ids=lambda spec: spec.name)
     def test_the_flag_comes_from_the_passport(self, spec: Any) -> None:
         assert _ENV[spec.flag] == {"source": "passport", "key": f"options.{spec.name}"}
 
-    @pytest.mark.parametrize("spec", _CHANNELS, ids=lambda spec: spec.name)
+    @pytest.mark.parametrize("spec", _OPTIONS, ids=lambda spec: spec.name)
     def test_every_key_of_the_channel_is_under_its_option(self, spec: Any) -> None:
-        keys = [*spec.keys, *spec.optional_validators]
-        assert keys  # the pair: the channel has keys
+        """A module's keys too, since L-1. Mutation 1.1: the secret of
+        `login` without `when: login`."""
+        keys = _option_keys(spec)
+        assert keys  # the pair: the option has keys
         for key in keys:
             if key in _ENV:
                 assert _ENV[key].get("when") == spec.name, key
@@ -205,14 +227,15 @@ class TestChannels:
             assert _ENV[key].get("when") == "telegram", key
 
     def test_every_key_under_an_option_is_its_channels(self) -> None:
-        """The other way: a key under `when: <channel>` is a key of that
-        channel, or a variable of the command that derives for it."""
-        for key, source in _ENV.items():
-            when = source.get("when")
-            if when is None:
-                continue
-            (spec,) = [spec for spec in _CHANNELS if spec.name == when]
-            assert key in (*spec.keys, *spec.optional_validators, *cli.READS), key
+        """The other way: a key under `when: <option>` is a key of that
+        channel or module, or a variable of the command that derives for
+        a channel. The pair: a module's key is among them (L-1)."""
+        under = {key for key, source in _ENV.items() if source.get("when")}
+        assert "TELEGRAM_LOGIN_CLIENT_SECRET" in under
+        for key in sorted(under):
+            when = _ENV[key]["when"]
+            (spec,) = [spec for spec in _OPTIONS if spec.name == when]
+            assert key in (*_option_keys(spec), *cli.READS), key
 
 
 class TestDerived:

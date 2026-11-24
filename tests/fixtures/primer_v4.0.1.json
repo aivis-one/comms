@@ -1,0 +1,142 @@
+{
+  "accepts": {
+    "profile": {
+      "env": "TEMPLATES_DIR",
+      "services": [
+        "comms-app",
+        "comms-worker",
+        "comms-consumer"
+      ],
+      "validate": "comms validate --profile <dir>"
+    }
+  },
+  "env": {
+    "COMMS_API_URL": {
+      "source": "address"
+    },
+    "COMMS_EVENTS_ADDRESS": {
+      "endpoint": "events",
+      "source": "address"
+    },
+    "COMMS_EVENTS_PASSWORD": {
+      "source": "minted"
+    },
+    "COMMS_SERVICE_TOKEN": {
+      "source": "minted"
+    },
+    "DEFAULT_LANGUAGE": {
+      "key": "default_language",
+      "source": "passport"
+    },
+    "EMAIL_ENABLED": {
+      "key": "options.email",
+      "source": "passport"
+    },
+    "EMAIL_FROM_ADDRESS": {
+      "source": "param",
+      "when": "email"
+    },
+    "EMAIL_MAILGUN_API_KEY": {
+      "source": "asked",
+      "when": "email"
+    },
+    "EMAIL_MAILGUN_DOMAIN": {
+      "source": "param",
+      "when": "email"
+    },
+    "EMAIL_MAILGUN_REGION": {
+      "source": "param",
+      "when": "email"
+    },
+    "LANGUAGES": {
+      "key": "languages",
+      "source": "passport"
+    },
+    "LLM_ENABLED": {
+      "key": "options.llm",
+      "source": "passport"
+    },
+    "LLM_KEY_SETS": {
+      "source": "asked",
+      "when": "llm"
+    },
+    "POSTGRES_PASSWORD": {
+      "source": "minted"
+    },
+    "PRODUCT_STORAGE_ADDRESS": {
+      "from": "product",
+      "source": "seam"
+    },
+    "TELEGRAM_BOT_TOKEN": {
+      "source": "asked",
+      "when": "telegram"
+    },
+    "TELEGRAM_BOT_URL": {
+      "run": "comms derive bot-url",
+      "source": "derived",
+      "when": "telegram"
+    },
+    "TELEGRAM_ENABLED": {
+      "key": "options.telegram",
+      "source": "passport"
+    },
+    "TELEGRAM_LINK_HOST": {
+      "source": "param",
+      "when": "telegram"
+    }
+  },
+  "kind": "service",
+  "name": "comms",
+  "options": [
+    "telegram",
+    "email",
+    "llm"
+  ],
+  "provides": [
+    "COMMS_API_URL",
+    "COMMS_SERVICE_TOKEN",
+    "COMMS_EVENTS_ADDRESS",
+    "COMMS_EVENTS_PASSWORD",
+    "TELEGRAM_BOT_URL",
+    "TELEGRAM_BOT_TOKEN"
+  ],
+  "report": {
+    "health": "/health",
+    "junit": true,
+    "logs": "json",
+    "ready": "/ready"
+  },
+  "requires": [
+    "PRODUCT_STORAGE_ADDRESS"
+  ],
+  "schema": 1,
+  "stacks": {
+    "comms": {
+      "app": {
+        "health": "/health",
+        "port": 8000,
+        "ready": "/ready",
+        "service": "comms-app"
+      },
+      "compose": "deploy/docker-compose.yml",
+      "expose": {
+        "events": {
+          "port": 6379,
+          "scheme": "redis",
+          "service": "comms-redis"
+        }
+      },
+      "migrate": "alembic upgrade head",
+      "persistent": true,
+      "stop_for_migrate": [
+        "comms-app",
+        "comms-worker",
+        "comms-consumer"
+      ],
+      "test": {
+        "run": "python -m pytest tests/ --junitxml=/tmp/junit.xml",
+        "target": "test"
+      }
+    }
+  }
+}

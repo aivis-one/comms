@@ -42,7 +42,9 @@
 # with its own keys and its own switch, and is NOT a channel of this
 # registry -- one bot has exactly one update receiver, and a receiver
 # switched on by the mere presence of the sending token would start at
-# a deploy that only asked to send.
+# a deploy that only asked to send. Nor is an option of the instance
+# that is not a way to send -- the sign-in through Telegram (`login`):
+# it is a module, app/core/modules.py, with its own flag and keys.
 #
 # WHY A SEPARATE MODULE: it imports no settings. The test suite reads
 # the flags and the declared keys BEFORE the settings object exists, to

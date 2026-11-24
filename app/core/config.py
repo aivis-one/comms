@@ -19,6 +19,13 @@
 #   channel is required and checked. No flag, or any other value:
 #   startup is refused naming the flag (load_settings below).
 #
+# MODULES:
+#   An option that is not a channel -- `login` -- is switched the same
+#   way, by its flag (LOGIN_ENABLED) and by nothing else; see
+#   app/core/modules.py for the rule. false: its keys are not read.
+#   true: the channels it needs are on and its keys set, or startup is
+#   refused naming the option and the keys, never their values.
+#
 # LANGUAGES / DEFAULT_LANGUAGE (W4-1):
 #   The instance's languages and its default, from the passport
 #   (primer.yaml `env`, protocol 5.2.2). Both required, no default in
@@ -60,6 +67,7 @@ from app.core.channels import (
     storage_address_problem,
 )
 from app.core.lanes import Lane
+from app.core.modules import module_env_keys, module_flag_keys, module_problems
 
 # Valid structlog log levels.
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -262,6 +270,14 @@ class Settings(BaseSettings):
     telegram_enabled: str | None = None
     email_enabled: str | None = None
     llm_enabled: str | None = None
+
+    # -- Module flags and keys (app/core/modules.py) --
+    # The flag by the channels' rule above: text, exactly "true" or
+    # "false", no default. With LOGIN_ENABLED false the secret is not
+    # read, whatever it holds; with true it is required. repr=False: the
+    # settings object's repr never carries it.
+    login_enabled: str | None = None
+    telegram_login_client_secret: str = Field(default="", repr=False)
 
     # -- Telegram (shared bot with the product, see arch doc §7) --
     # The channel's keys (app/core/channels.py): with TELEGRAM_ENABLED
@@ -634,6 +650,12 @@ class Settings(BaseSettings):
             channel_values(self),
         )
         problems.extend(channel_problems)
+        # The modules (app/core/modules.py): collected with the rest, one
+        # message. They read the channel flags too -- a module names the
+        # channels it needs.
+        problems.extend(module_problems(
+            {**channel_values(self), **module_values(self)},
+        ))
         # W4-1: the instance's languages, as the passport gives them.
         problems.extend(language_problems(self.languages, self.default_language))
         problems.extend(self._free_route_problems())
@@ -757,6 +779,17 @@ def channel_values(source: Settings) -> dict[str, str | None]:
         for key in (
             channel_flag_keys() + channel_env_keys() + channel_optional_keys()
         )
+    }
+
+
+def module_values(source: Settings) -> dict[str, str | None]:
+    """Every module flag and key of `source` by its variable name --
+    what app/core/modules.py module_problems reads besides the channel
+    flags. Every one is a field of Settings under its lower-case name
+    (pinned by a test)."""
+    return {
+        key: getattr(source, key.lower())
+        for key in module_flag_keys() + module_env_keys()
     }
 
 

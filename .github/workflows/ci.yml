@@ -66,12 +66,14 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://comms:comms@localhost:5432/comms_test
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
-      # Every channel's flag is required at every start (W2-1,
-      # app/core/channels.py), `alembic` below included; off -- the
-      # suite switches on what it tests (tests/conftest.py).
+      # Every channel's and module's flag is required at every start
+      # (W2-1, app/core/channels.py, app/core/modules.py), `alembic`
+      # below included; off -- the suite switches on what it tests
+      # (tests/conftest.py).
       TELEGRAM_ENABLED: "false"
       EMAIL_ENABLED: "false"
       LLM_ENABLED: "false"
+      LOGIN_ENABLED: "false"
       # The instance's languages (W4-1), required at every start, as the
       # passport gives them on a box: a start without them is refused.
       LANGUAGES: en,ru
@@ -298,10 +300,11 @@ jobs:
       # settings before the suite's own fence runs. A test value -- the
       # suite replaces it anyway (tests/conftest.py).
       COMMS_SERVICE_TOKEN: ci-not-a-secret-service-token
-      # The channel flags, as in `checks` (W2-1).
+      # The channel and module flags, as in `checks` (W2-1).
       TELEGRAM_ENABLED: "false"
       EMAIL_ENABLED: "false"
       LLM_ENABLED: "false"
+      LOGIN_ENABLED: "false"
       # The instance's languages, as in `checks` (W4-1).
       LANGUAGES: en,ru
       DEFAULT_LANGUAGE: en
@@ -538,6 +541,7 @@ jobs:
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \
+            -e LOGIN_ENABLED=false \
             -e LANGUAGES=en,ru -e DEFAULT_LANGUAGE=en \
             comms:ci $migrate
           redis=$(python -c "import yaml; print(yaml.safe_load(open('deploy/docker-compose.yml'))['services']['comms-redis']['image'])")
@@ -552,6 +556,7 @@ jobs:
             -e TELEGRAM_ENABLED=true \
             -e EMAIL_ENABLED=true \
             -e LLM_ENABLED=false \
+            -e LOGIN_ENABLED=false \
             -e LANGUAGES=en,ru -e DEFAULT_LANGUAGE=en \
             -e TELEGRAM_BOT_TOKEN="$token" \
             -e TELEGRAM_BOT_URL=https://t.me/comms_ci_bot \
@@ -617,5 +622,6 @@ jobs:
             -e DATABASE_URL=postgresql+asyncpg://comms:comms@127.0.0.1:5432/comms_test \
             -e COMMS_SERVICE_TOKEN=ci-not-a-secret-service-token \
             -e TELEGRAM_ENABLED=false -e EMAIL_ENABLED=false -e LLM_ENABLED=false \
+            -e LOGIN_ENABLED=false \
             -e LANGUAGES=en,ru -e DEFAULT_LANGUAGE=en \
             comms:test sh -c "alembic upgrade head && alembic check && python -m pytest -q --durations=50 $PART_ARGS"

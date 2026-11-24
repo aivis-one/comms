@@ -55,6 +55,7 @@ from structlog.testing import capture_logs
 from app.core.channels import channel_flag_keys
 from app.core.config import settings
 from app.core.constants import MAX_REQUEST_BODY_BYTES
+from app.core.modules import module_flag_keys
 from app.main import app
 from tests.helpers import redis_answering
 
@@ -91,9 +92,10 @@ def _settings_in_a_fresh_process(
 
 
 _DATABASE = {"DATABASE_URL": "postgresql+asyncpg://u:p@db/comms_unit"}
-# Every channel's flag, written (W2-1: required at every start): these
-# tests are about the mode and the token, not the channels.
-_CHANNELS_OFF = dict.fromkeys(channel_flag_keys(), "false")
+# Every option's flag, written -- the channels' (W2-1) and the modules'
+# (L-1, app/core/modules.py), each required at every start: these tests
+# are about the mode and the token, not the options.
+_OPTIONS_OFF = dict.fromkeys(channel_flag_keys() + module_flag_keys(), "false")
 # The instance's languages, required at every start since W4-1.
 _LANGUAGES = {"LANGUAGES": "en", "DEFAULT_LANGUAGE": "en"}
 # The variable that named the mode until LEG-1, assembled: it is read by
@@ -143,7 +145,7 @@ class TestOneMode:
         result = _settings_in_a_fresh_process(
             "from app.core.config import settings",
             **_DATABASE, **_mode(mode),
-            **{**_CHANNELS_OFF, "LLM_ENABLED": "true"},
+            **{**_OPTIONS_OFF, "LLM_ENABLED": "true"},
             LLM_KEY_SETS=_FREE_SETS,
         )
         assert result.returncode == 1, result.stdout
@@ -155,7 +157,7 @@ class TestOneMode:
     def test_no_database_url_refuses_the_start(self, mode: str | None) -> None:
         result = _settings_in_a_fresh_process(
             "from app.core.config import settings",
-            **_CHANNELS_OFF, **_mode(mode), COMMS_SERVICE_TOKEN=_TOKEN,
+            **_OPTIONS_OFF, **_mode(mode), COMMS_SERVICE_TOKEN=_TOKEN,
         )
         assert result.returncode == 1, result.stdout
         assert "DATABASE_URL is required." in result.stderr
@@ -169,7 +171,7 @@ class TestOneMode:
         writes the machine's JSON line and refuses a missing profile."""
         result = _settings_in_a_fresh_process(
             _FULL_START,
-            **_DATABASE, **_CHANNELS_OFF, **_mode(mode),
+            **_DATABASE, **_OPTIONS_OFF, **_mode(mode),
             COMMS_SERVICE_TOKEN=_TOKEN, PRIMER_RELEASE="one-mode-release",
         )
         assert result.returncode == 0, result.stderr
