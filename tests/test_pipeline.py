@@ -704,6 +704,9 @@ class TestSchedulingAndExpiry:
             assert job is not None
             job.created_at = old
             job.scheduled_at = old
+            # Since A1 retention counts from the deadline too: it goes
+            # back with the rest (until A1, an hour behind was enough).
+            job.expiry_at = old + timedelta(hours=1)
             await session.commit()
         assert await cleanup_terminal_notifications() == 1
         async with factory() as session:

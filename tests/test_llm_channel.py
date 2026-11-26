@@ -1080,9 +1080,14 @@ class TestTheAnswer:
             days=settings.notification_retention_days + 1,
         )
         async with get_session_factory()() as session:
+            # Since A1 retention counts from the deadline too: it goes
+            # back with the rest (until A1, a second behind was enough).
             await session.execute(
                 update(Notification).where(Notification.id == job_id)
-                .values(created_at=old, scheduled_at=old)
+                .values(
+                    created_at=old, scheduled_at=old,
+                    expiry_at=old + timedelta(hours=1),
+                )
             )
             # The product's push published (app/transport/push_relay.py):
             # retention does not take a job while one is owed.

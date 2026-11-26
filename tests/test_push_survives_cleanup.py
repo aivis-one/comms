@@ -76,7 +76,11 @@ async def _finished(type_key: str, lane: Lane) -> UUID:
         await process_lane(lane)
     async with get_session_factory()() as session:
         await session.execute(text(
-            "UPDATE notifications SET expiry_at = now() - interval '1 minute', "
+            # The deadline past by the period too: since A1 retention
+            # counts from the latest of creation, scheduled_at and
+            # expiry_at (until A1 a minute behind was enough).
+            "UPDATE notifications SET "
+            "expiry_at = now() - make_interval(days => :d) + interval '1 hour', "
             "created_at = now() - make_interval(days => :d), "
             "scheduled_at = now() - make_interval(days => :d) WHERE id = :i"
         ), {"i": nid, "d": settings.notification_retention_days + 1})

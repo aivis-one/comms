@@ -246,8 +246,10 @@ class TestRetentionPass:
 
 
 class TestRetentionMeasuresFromTheDueTime:
-    """REV-2 item 2: the age is the later of created_at and scheduled_at,
-    and a job whose push is still owed is not deleted.
+    """REV-2 item 2: the age is the later of created_at and scheduled_at
+    (and of expiry_at since A1 -- these jobs carry none:
+    tests/test_key_lives_its_deadline.py), and a job whose push is still
+    owed is not deleted.
 
     MUTATIONS these tests were written against (each turns one red):
       T1 the age on created_at alone       -> test_a_late_reminder_...
@@ -329,7 +331,8 @@ class TestACancelledJobAgesFromCreation:
     still pending; every other outcome comes of an attempt, and only a
     due job is attempted -- app/engine/processor.py ready_now). Every
     other outcome ages from the later of created_at and scheduled_at,
-    as REV-2 set.
+    as REV-2 set (and of expiry_at since A1, which these jobs do not
+    carry).
 
     MUTATIONS these tests were written against (each turns one red):
       A1 greatest() for every status

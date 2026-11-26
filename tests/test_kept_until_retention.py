@@ -21,7 +21,7 @@
 #       expiry_at again                    -> TestTheJobStays
 #   M2  retention takes a job past its expiry_at before its age
 #                                          -> TestTheJobStays
-#   M5  retention ages a job from expiry_at, not from _retention_age
+#   M5  retention ages a job from expiry_at alone, not from _retention_age
 #                                          -> TestTheKeyIsReleasedByRetention
 # =============================================================================
 
@@ -119,13 +119,18 @@ async def _past_its_expiry(key: str) -> None:
 
 async def _past_retention(key: str) -> None:
     """More time passes: the job is older than the retention period,
-    counted from the later of its creation and scheduled_at."""
+    counted from the latest of its creation, scheduled_at and expiry_at.
+    Until A1 the expiry_at was left where _past_its_expiry put it (a
+    minute behind): retention did not count from it then; since A1 it
+    does, and "past retention" moves the deadline back with the rest."""
     days = settings.notification_retention_days + 1
     async with get_session_factory()() as session:
         await session.execute(text(
             "UPDATE notifications SET "
             "created_at = now() - make_interval(days => :d), "
-            "scheduled_at = now() - make_interval(days => :d) "
+            "scheduled_at = now() - make_interval(days => :d), "
+            "expiry_at = now() - make_interval(days => :d) "
+            "+ interval '1 hour' "
             "WHERE idempotency_key = :k"
         ), {"k": key, "d": days})
         await session.commit()

@@ -2372,22 +2372,29 @@ _RETENTION_TERMINAL_STATUSES = (
 )
 
 
-# The outcomes retention ages from created_at, not from the later of
-# created_at and scheduled_at (REV-8): the one a job can reach before it
-# is due. See delete_terminal_notifications_batch.
+# The outcomes retention ages from created_at, not from the latest of
+# created_at, scheduled_at and expiry_at (REV-8, A1): the one a job can
+# reach before it is due. See delete_terminal_notifications_batch.
 _RETENTION_FROM_CREATION_STATUSES = (NotificationStatus.CANCELLED,)
 
 
 def _retention_age() -> ColumnElement[datetime]:
     """The instant a terminal job's retention counts from -- ONE
     expression, the one KNOWN CEILING BL-3's index would be built on
-    (app/engine/processor.py cleanup_terminal_notifications)."""
+    (app/engine/processor.py cleanup_terminal_notifications): the
+    latest of created_at, scheduled_at and expiry_at (A1), created_at
+    for a cancelled job (REV-8). greatest() skips a NULL, so a job with
+    no expiry_at ages as before."""
     return case(
         (
             Notification.status.in_(_RETENTION_FROM_CREATION_STATUSES),
             Notification.created_at,
         ),
-        else_=func.greatest(Notification.created_at, Notification.scheduled_at),
+        else_=func.greatest(
+            Notification.created_at,
+            Notification.scheduled_at,
+            Notification.expiry_at,
+        ),
     )
 
 
@@ -2414,21 +2421,33 @@ async def delete_terminal_notifications_batch(
     not deleted before it has lived its retention from the moment it
     was due. Measured on created_at alone, a reminder scheduled past
     the horizon was deleted within the hour of its send -- gone from
-    the inbox, 404 by its key. EXCEPT A CANCELLED JOB (REV-8), which
-    ages from created_at (_RETENTION_FROM_CREATION_STATUSES): the one
-    outcome a job can reach before it is due -- a cancel of a job still
-    pending; every other outcome comes of an attempt, and only a due job
-    is attempted (app/engine/processor.py ready_now), or of an expiry,
-    which is after scheduled_at. Measured from scheduled_at, a reminder
-    cancelled two years ahead kept its title and body two years and the
-    period. The model carries no updated_at; what a job does after it
-    was due is still bounded by created_at only (app/engine/changes.py
-    KNOWN CEILING P2-3).
+    the inbox, 404 by its key. AND OF expiry_at (A1): nor before it has
+    lived its retention from the last moment it could be delivered.
+    Measured without it, a job whose deadline lay past the period -- an
+    envelope's absolute expiry_at, a profile's expires_after longer
+    than the period -- was deleted while its event could still be
+    delivered, its key with it, and a replay of the event was a new job:
+    a second letter. Its key is now kept until the deadline and the
+    period after it (deploy/INTEGRATION.md "How long comms keeps
+    things"); no request is refused for it.
+
+    EXCEPT A CANCELLED JOB (REV-8), which ages from created_at
+    (_RETENTION_FROM_CREATION_STATUSES): the one outcome a job can reach
+    before it is due -- a cancel of a job still pending; every other
+    outcome comes of an attempt, and only a due job is attempted
+    (app/engine/processor.py ready_now), or of an expiry, which is after
+    scheduled_at. Measured from scheduled_at (or its
+    expiry_at), a reminder cancelled two years ahead kept its title and
+    body two years and the period. The model carries no updated_at: a
+    job WITHOUT an expiry_at that ends long after it was due -- retries,
+    a channel down -- still ages from created_at and scheduled_at only
+    (app/engine/changes.py KNOWN CEILING P2-3).
 
     THE ONE DELETER OF JOBS (R-1): a job is removed here and nowhere
-    else -- its expiry_at bounds when it may be delivered, not how long
-    it is kept, and its idempotency key lives as long as the job
-    (deploy/INTEGRATION.md section 7, "How long comms keeps things").
+    else -- its expiry_at bounds when it may be delivered and is where
+    its retention counts from at the latest (A1), never its end; its
+    idempotency key lives as long as the job (deploy/INTEGRATION.md
+    section 7, "How long comms keeps things").
     The expiry cleanup that deleted a finished job past its expiry_at
     is gone; its index stays until the next major (KNOWN CEILING on
     ix_notifications_expired_deletable, app/core/schema_objects.py).

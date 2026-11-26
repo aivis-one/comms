@@ -2299,9 +2299,12 @@ answer is kept by its type.
 
 - **Notification history**: **90 days** by default. A notification in
   a terminal state (and its deliveries) is removed by the worker's
-  retention pass after that many days, counted from the later of its
-  creation and its `scheduled_at` -- a job sent late lives its days
-  from when it was due -- except a `cancelled` one, counted from its
+  retention pass after that many days, counted from the latest of its
+  creation, its `scheduled_at` and its `expiry_at` -- a job sent late
+  lives its days from when it was due, and a job with a deadline from
+  that deadline: as long as its event could still be delivered, and
+  that many days after, its key is taken and a replay of it is the same
+  job (section 7) -- except a `cancelled` one, counted from its
   creation: a cancel is the one outcome a job can reach before it is
   due, and a reminder cancelled years ahead is not kept for those
   years. Nothing is removed while a delivery is still pending, nor
