@@ -344,38 +344,68 @@ async def accept_notification(
     An ACCEPTED job wakes the loops of its lane when the caller's
     transaction commits (app/engine/wake.py, spec §8.4); DUPLICATE and
     CONFLICT created nothing and wake nothing.
+
+    THE HOLDER GONE IS THE KEY FREE (A2). A failed insert does not lock
+    the holder, and the read after it takes a new snapshot (READ
+    COMMITTED): retention can remove the holder between the two. By the
+    contract the key is then released (deploy/INTEGRATION.md section 7)
+    -- so the request is inserted ONCE more, in a new savepoint, and is
+    ACCEPTED; a writer that took the key again in that moment is read
+    and answered by, DUPLICATE or CONFLICT. Once, as
+    app/core/database.py once_more_on_insert_race: the holder of the
+    second collision is a job of this very moment, and retention -- the
+    one deleter of jobs -- takes only finished jobs older than its
+    period, so nothing of comms removes it; gone again, it is raised
+    (scalar_one), not chased. Until A2 the first read was scalar_one(),
+    and the window raised NoResultFound instead of an answer: the stream
+    held the entry and its subjects to the next pass over the pending
+    list, a message ping answered 500, a close notice waited a pass.
     """
-    try:
-        async with session.begin_nested():
-            notification = await create_notification(
-                session,
-                idempotency_key=idempotency_key,
-                fingerprint=fingerprint,
-                **fields,
-            )
-    except IntegrityError as exc:
-        # Only OUR index means "key taken"; any other violation is a
-        # real bug and must not be swallowed as a replay. By the
-        # driver's SQLSTATE and constraint name, never by the text: the
-        # text carries the failing row, our key included
-        # (app/core/database.py is_unique_violation_of).
-        if not is_unique_violation_of(exc, IDEMPOTENCY_INDEX_NAME):
-            raise
-        holder = (
-            await session.execute(
-                select(Notification).where(
-                    Notification.idempotency_key == idempotency_key,
+    async def insert() -> Notification | None:
+        """The job, under a savepoint; None when the key is taken."""
+        try:
+            async with session.begin_nested():
+                return await create_notification(
+                    session,
+                    idempotency_key=idempotency_key,
+                    fingerprint=fingerprint,
+                    **fields,
                 )
-            )
-        ).scalar_one()
-        outcome = (
-            Intake.DUPLICATE
-            if holder.fingerprint == fingerprint
-            else Intake.CONFLICT
-        )
-        return Acceptance(outcome=outcome, notification=holder)
+        except IntegrityError as exc:
+            # Only OUR index means "key taken"; any other violation is a
+            # real bug and must not be swallowed as a replay. By the
+            # driver's SQLSTATE and constraint name, never by the text:
+            # the text carries the failing row, our key included
+            # (app/core/database.py is_unique_violation_of).
+            if not is_unique_violation_of(exc, IDEMPOTENCY_INDEX_NAME):
+                raise
+            return None
+
+    holder_of_the_key = select(Notification).where(
+        Notification.idempotency_key == idempotency_key,
+    )
+    notification = await insert()
+    if notification is None:
+        holder = (await session.execute(holder_of_the_key)).scalar_one_or_none()
+        if holder is None:
+            logger.info("intake_key_released", idempotency_key=idempotency_key)
+            notification = await insert()
+            if notification is None:
+                holder = (await session.execute(holder_of_the_key)).scalar_one()
+                return _answered_by(holder, fingerprint)
+        else:
+            return _answered_by(holder, fingerprint)
     await signal_lane(session, notification.lane)
     return Acceptance(outcome=Intake.ACCEPTED, notification=notification)
+
+
+def _answered_by(holder: Notification, fingerprint: str) -> Acceptance:
+    """The answer of a taken key: the same bytes are the holder again,
+    other bytes a conflict with it."""
+    outcome = (
+        Intake.DUPLICATE if holder.fingerprint == fingerprint else Intake.CONFLICT
+    )
+    return Acceptance(outcome=outcome, notification=holder)
 
 
 async def record_intake_outcome(
