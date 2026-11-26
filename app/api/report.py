@@ -107,8 +107,9 @@ does not carry primer.yaml; tests/test_report.py holds the two equal."""
 
 REQUIRES: tuple[str, ...] = ("PRODUCT_STORAGE_ADDRESS",)
 """`requires` of primer.yaml: the product's storage (W4-2), the one seam
-comms takes from the product. `requires_satisfied` is _requires_satisfied
-below; tests/test_report.py holds this list to the file."""
+comms takes from the product, under `when: llm` (S-1). `requires_satisfied`
+is _requires_satisfied below; tests/test_report.py holds this list to the
+file."""
 
 MIB = 1024 * 1024
 MAX_UPLOAD_MB = MAX_REQUEST_BODY_BYTES // MIB
@@ -212,10 +213,16 @@ async def _within[T](call: Callable[[], Awaitable[T]]) -> T | Exception:
 
 
 def _requires_satisfied() -> bool:
-    """The product's storage is given and reads as an address: off the
-    validated settings, where a malformed one refused startup -- so a
-    seam that is written is one comms builds its body links on
-    (Settings.body_link_prefix), and an empty one is not satisfied."""
+    """The seams of the options switched on are given (S-1, the machine's
+    DM-122). The product's storage is the llm channel's: with the channel
+    off it is not required, and the answer is true whatever the seam holds
+    -- the machine's literal. With the channel on it is given and reads as
+    an address: off the validated settings, where a malformed one refused
+    startup -- so a seam that is written is one comms builds its body
+    links on (Settings.body_link_prefix), and an empty one is not
+    satisfied."""
+    if settings.llm_enabled != "true":
+        return True
     return settings.body_link_prefix is not None
 
 

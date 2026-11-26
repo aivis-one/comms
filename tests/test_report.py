@@ -31,6 +31,7 @@
 #   M13 no refusal without PRIMER_COMMIT        -> TestTheCommit
 #   M14 the revision not kept after the fall    -> TestTheRevision
 #   W4-2 `requires_satisfied` always true       -> TestTheSeams
+#   S-1 `requires_satisfied` of an option off   -> TestTheSeams
 # =============================================================================
 
 import asyncio
@@ -61,6 +62,7 @@ from app.api.report import (
 from app.core.config import settings
 from app.core.constants import MAX_REQUEST_BODY_BYTES
 from tests.helpers import redis_answering
+from tests.test_llm_channel import _SETS
 
 _REPO = Path(__file__).resolve().parents[1]
 _PRIMER = yaml.safe_load((_REPO / "primer.yaml").read_text(encoding="utf-8"))
@@ -92,10 +94,23 @@ _STORAGE = "store-files:9000"
 """A product storage's address of the form the machine gives (W4-2)."""
 
 
+_LITERAL = "primer-switched-off"
+"""What the machine writes into the seam with the option llm off (the
+machine v0.1.11, DM-122)."""
+
+
 def _storage_given(monkeypatch: pytest.MonkeyPatch) -> None:
     """The seam comms requires, as on a box: the golden answer is one
     whose seams are satisfied."""
     monkeypatch.setattr(settings, "product_storage_address", _STORAGE)
+
+
+def _llm(monkeypatch: pytest.MonkeyPatch, flag: str) -> None:
+    """The llm channel switched by its flag; on, with a whole key set, so
+    the channel is live and the answer is `ok`."""
+    monkeypatch.setattr(settings, "llm_enabled", flag)
+    if flag == "true":
+        monkeypatch.setattr(settings, "llm_key_sets", json.dumps(_SETS))
 
 
 def _shape(value: Any) -> Any:
@@ -210,19 +225,46 @@ class TestTheSeams:
         self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
         address: str, satisfied: bool,
     ) -> None:
-        """W4-2: `requires_satisfied` is the seam of the product's
-        storage given -- read off the validated settings, where a
-        malformed one refused startup (tests/test_llm_audio.py
+        """W4-2: with the llm channel on, `requires_satisfied` is the seam
+        of the product's storage given -- read off the validated settings,
+        where a malformed one refused startup (tests/test_llm_audio.py
         TestTheSeam) -- and false without it; the machine refuses the
         rollout on false (`seams_verify`). The rest of the answer is the
-        same either way: still 200, still `ok`."""
+        same either way: still 200, still `ok`. Ran with the channel off
+        (the suite's fence) until S-1: the seam was required whatever the
+        options; now it is the llm channel's, so the channel is switched
+        on here, and off is test_an_off_channel_requires_nothing."""
         redis_answering(monkeypatch)
+        _llm(monkeypatch, "true")
         monkeypatch.setattr(settings, "product_storage_address", address)
         response = await client.get("/health")
         assert response.status_code == 200
         body = response.json()
+        assert body["details"]["channels"]["llm"] == "live"
         assert body["seams"]["requires_satisfied"] is satisfied
         assert body["status"] == "ok"
+
+    @pytest.mark.parametrize(
+        "address", [_LITERAL, "", _STORAGE], ids=["literal", "empty", "given"],
+    )
+    async def test_an_off_channel_requires_nothing(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+        address: str,
+    ) -> None:
+        """S-1 (the machine's DM-122): the seams are those of the options
+        switched on. With the llm channel off the storage is not required
+        -- the seam holds the machine's literal, or anything -- and the
+        answer is true, on every request alike. The pair: the channel is
+        off in the answer, and the same seam empty with it on is false
+        (test_satisfied_is_the_storage_given)."""
+        redis_answering(monkeypatch)
+        _llm(monkeypatch, "false")
+        monkeypatch.setattr(settings, "product_storage_address", address)
+        for _ in range(2):
+            body = (await client.get("/health")).json()
+            assert body["details"]["channels"]["llm"] == "not_configured"
+            assert body["seams"]["requires_satisfied"] is True
+            assert body["status"] == "ok"
 
 
 class TestTheChecks:

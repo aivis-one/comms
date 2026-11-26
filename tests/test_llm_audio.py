@@ -473,13 +473,29 @@ def _production(**values: str) -> Settings:
 
 
 _LLM_ON = {"llm_enabled": "true", "llm_key_sets": json.dumps(_SETS)}
+_LLM_OFF = {"llm_enabled": "false"}
+
+# What the machine writes into a key of a switched-off option (the machine
+# v0.1.11, pridem/stacks/options.py off() and LITERAL; DM-122 for a seam).
+_LITERAL = "primer-switched-off"
+
+# Values of the seam that are not `<host>:<port>`.
+_BROKEN_SEAMS = [
+    "store", "store:", ":9000", "store:0", "store:70000", "store:09000",
+    "store:+90", "Store.Internal:9000", "store.:9000", "-store:9000",
+    "http://store:9000", "store:9000/", "store:9000/x", "[::1]:80",
+    " store:9000", "store:9000 ", "u@store:9000", "   ",
+]
 
 
 class TestTheSeam:
     """W4-2: PRODUCT_STORAGE_ADDRESS, the one address a body link may be
     on. Was TestTheList, over LLM_BODY_HOSTS -- a list the operator
-    wrote, read only with the llm channel on; the machine gives the seam
-    whatever the options, so it is read and checked either way."""
+    wrote, read only with the llm channel on. W4-2 read the seam whatever
+    the options, because the machine gave and required it so; since S-1
+    (the machine's DM-122) the seam is under `when: llm`, the machine
+    writes its literal into it with the option off, and comms reads it
+    with the llm channel on only -- as the list was."""
 
     @pytest.mark.parametrize(
         "value", ["store.internal:9000", "store-files:80", "10.0.0.7:65535", "s3:1"],
@@ -489,32 +505,49 @@ class TestTheSeam:
         source = _production(**_LLM_ON, product_storage_address=value)
         assert source.body_link_prefix == f"http://{value}/"
 
-    @pytest.mark.parametrize(
-        "value",
-        [
-            "store", "store:", ":9000", "store:0", "store:70000", "store:09000",
-            "store:+90", "Store.Internal:9000", "store.:9000", "-store:9000",
-            "http://store:9000", "store:9000/", "store:9000/x", "[::1]:80",
-            " store:9000", "store:9000 ", "u@store:9000", "   ",
-        ],
-    )
-    @pytest.mark.parametrize("llm", ["true", "false"])
-    def test_a_broken_seam_refuses_startup(self, value: str, llm: str) -> None:
-        """A red start, the llm channel on or off: the machine gives the
-        seam whatever the options, so a malformed one is a defect of the
-        box either way. The value is not echoed."""
-        values = _LLM_ON if llm == "true" else {"llm_enabled": "false"}
+    @pytest.mark.parametrize("value", _BROKEN_SEAMS)
+    def test_a_broken_seam_refuses_startup(self, value: str) -> None:
+        """A red start with the llm channel on: the machine gives the seam
+        then, so a malformed one is a defect of the box. The value is not
+        echoed. Was parametrized over the channel on and off too: with it
+        off the seam was read whatever the options (W4-2) -- since S-1 it
+        is not, test_an_off_channel_does_not_read_the_seam."""
         with pytest.raises(ValidationError) as caught:
-            _production(**values, product_storage_address=value)
+            _production(**_LLM_ON, product_storage_address=value)
         refusal = format_startup_error(caught.value)
         assert "PRODUCT_STORAGE_ADDRESS is not <host>:<port>" in refusal
         assert value.strip() == "" or value.strip() not in refusal
+
+    @pytest.mark.parametrize(
+        "value", [_LITERAL, *_BROKEN_SEAMS, "", "store.internal:9000"],
+    )
+    def test_an_off_channel_does_not_read_the_seam(self, value: str) -> None:
+        """S-1: with the llm channel off the seam is not read, whatever it
+        holds -- the machine's literal above all, which is no address --
+        so the service starts, and no body link is built on it. The pair:
+        the same literal with the channel on is a refusal."""
+        source = _production(**_LLM_OFF, product_storage_address=value)
+        assert source.llm_enabled == "false"
+        assert source.product_storage_address == value
+        assert source.body_link_prefix is None
+        with pytest.raises(ValidationError, match="PRODUCT_STORAGE_ADDRESS"):
+            _production(**_LLM_ON, product_storage_address=_LITERAL)
+
+    def test_a_broken_flag_is_named_alone(self) -> None:
+        """S-1: a flag that is neither true nor false is the refusal, and
+        the seam beside it is not judged -- whether the channel reads it
+        is not known. The pair: the flag is named."""
+        with pytest.raises(ValidationError) as caught:
+            _production(llm_enabled="yes", product_storage_address=_LITERAL)
+        refusal = format_startup_error(caught.value)
+        assert "LLM_ENABLED" in refusal
+        assert "PRODUCT_STORAGE_ADDRESS" not in refusal
 
     @pytest.mark.parametrize("llm", ["true", "false"])
     def test_an_empty_seam_starts_with_no_storage(self, llm: str) -> None:
         """The pair to the refusal: empty is no storage, not a defect --
         the service starts, and nothing may be fetched."""
-        values = _LLM_ON if llm == "true" else {"llm_enabled": "false"}
+        values = _LLM_ON if llm == "true" else _LLM_OFF
         source = _production(**values, product_storage_address="")
         assert source.body_link_prefix is None
         assert _production(**values).body_link_prefix is None

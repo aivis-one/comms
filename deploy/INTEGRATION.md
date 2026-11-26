@@ -2034,12 +2034,13 @@ from: product`:
 
 | seam | what it is |
 |---|---|
-| `PRODUCT_STORAGE_ADDRESS` | `<host>:<port>` of the point of the product's object store, no scheme -- the one place an audio link may point (section 11). The product declares it as a point of one of its stacks; the machine puts comms' three processes on that point's network. Not under an option: the machine requires it whatever the options, so a product with no such point is refused by the machine's plan |
+| `PRODUCT_STORAGE_ADDRESS` | `<host>:<port>` of the point of the product's object store, no scheme -- the one place an audio link may point (section 11). The product declares it as a point of one of its stacks; the machine puts comms' three processes on that point's network. Under `when: llm`: with the option on, the machine requires it, so a product with no such point is refused by the machine's plan; with the option off, nothing is required of the product -- the machine writes its literal into the seam and makes no network |
 
-Given in another form than `<host>:<port>` -- a lower-case name or an
-IPv4 address without a trailing dot, a port from 1 to 65535 -- it
-refuses comms' start, with the llm channel on or off. Empty, comms
-starts, and every audio link is rejected.
+With the llm channel on, given in another form than `<host>:<port>` --
+a lower-case name or an IPv4 address without a trailing dot, a port from
+1 to 65535 -- it refuses comms' start; empty, comms starts, and every
+audio link is rejected. With the llm channel off, comms does not read
+it, whatever it holds.
 
 ## 16. Signing a person in through Telegram
 

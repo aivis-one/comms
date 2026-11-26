@@ -228,14 +228,19 @@ class TestChannels:
 
     def test_every_key_under_an_option_is_its_channels(self) -> None:
         """The other way: a key under `when: <option>` is a key of that
-        channel or module, or a variable of the command that derives for
-        a channel. The pair: a module's key is among them (L-1)."""
+        channel or module, a variable of the command that derives for a
+        channel, or a seam comms takes from the product (`requires`) --
+        the third since S-1, the product's storage under `when: llm` (the
+        machine's DM-122): not a key of the channel, which is live without
+        it; its option is held by TestTheContract. The pair: a module's
+        key and the seam are among them (L-1, S-1)."""
         under = {key for key, source in _ENV.items() if source.get("when")}
         assert "TELEGRAM_LOGIN_CLIENT_SECRET" in under
+        assert "PRODUCT_STORAGE_ADDRESS" in under
         for key in sorted(under):
             when = _ENV[key]["when"]
             (spec,) = [spec for spec in _OPTIONS if spec.name == when]
-            assert key in (*_option_keys(spec), *cli.READS), key
+            assert key in (*_option_keys(spec), *cli.READS, *_REQUIRES), key
 
 
 class TestDerived:
@@ -305,12 +310,30 @@ class TestTheContract:
 
     def test_the_seam_taken_is_a_seam_from_the_product(self) -> None:
         """W4-2, both ways: every name of `requires` is a key of `env` from
-        the product, under no option -- the machine checks `requires`
-        whatever the options (its half_seams) -- and every such key of
-        `env` is in `requires`."""
-        assert _ENV["PRODUCT_STORAGE_ADDRESS"] == {"source": "seam", "from": "product"}
+        the product, and every such key of `env` is in `requires`. Held
+        the seam under no option until S-1, when the machine checked
+        `requires` whatever the options; its option is now
+        test_the_seam_is_under_the_option_that_reads_it."""
+        storage = _ENV["PRODUCT_STORAGE_ADDRESS"]
+        assert (storage["source"], storage["from"]) == ("seam", "product")
         seams = sorted(key for key, value in _ENV.items() if value["source"] == "seam")
         assert seams == sorted(_REQUIRES)
+
+    def test_the_seam_is_under_the_option_that_reads_it(self) -> None:
+        """S-1 (the machine's DM-122): the product's storage is read by the
+        llm channel alone (app/core/config.py), so it is under `when: llm`
+        -- with the option off the machine requires nothing of the
+        product -- and section 15 says so in its row, with the option the
+        file names. The pair: the row is read."""
+        assert _ENV["PRODUCT_STORAGE_ADDRESS"] == {
+            "source": "seam", "from": "product", "when": "llm",
+        }
+        block = _block(_section("15"), _TAKES)
+        (row,) = [
+            line for line in block.splitlines()
+            if line.startswith("| `PRODUCT_STORAGE_ADDRESS` |")
+        ]
+        assert f"Under `when: {_ENV['PRODUCT_STORAGE_ADDRESS']['when']}`" in row
 
     def test_every_seam_is_a_key_of_env(self) -> None:
         assert _PROVIDES

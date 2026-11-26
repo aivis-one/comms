@@ -336,23 +336,28 @@ class Settings(BaseSettings):
     # `<host>:<port>` of the point of the product's object store, the seam
     # PRODUCT_STORAGE_ADDRESS the machine gives comms from the product
     # (primer.yaml `requires`). A body link is fetched only from
-    # `http://<it>/...`. NOT a key of the llm channel: the seam is not
-    # under an option -- the machine gives it, and requires it, whatever
-    # the instance's options -- and /health answers for it with the llm
-    # channel off too (app/api/report.py). Written, it must have its form
-    # always, or startup is refused; empty = this deploy has no
-    # product storage, every body link is refused, and /health says the
-    # seam is not satisfied.
+    # `http://<it>/...`. Read by the llm channel alone, so it is read only
+    # with LLM_ENABLED true (S-1, the machine's DM-122): the seam is under
+    # `when: llm` in primer.yaml, and with the option off the machine
+    # writes its literal into it and requires nothing of the product. Not
+    # a key of the llm channel (app/core/channels.py) all the same: empty
+    # with the channel on starts, and the channel is live. With the
+    # channel on, written, it must have its form, or startup is refused;
+    # empty = this deploy has no product storage, every body link is
+    # refused, and /health says the seam is not satisfied.
     product_storage_address: str = ""
 
     @property
     def body_link_prefix(self) -> str | None:
         """`http://<PRODUCT_STORAGE_ADDRESS>/`: what a body link must
         begin with (app/core/channels.py body_link_allowed); None when the
-        deploy has no product storage. Built HERE -- the one file the
+        deploy has no product storage, or the llm channel is switched off
+        -- the seam is then not read, and the machine's literal in it
+        never becomes an address. Built HERE -- the one file the
         domain-literal fence allows a scheme in. Read only off validated
-        settings: a malformed address refused startup."""
-        if self.product_storage_address == "":
+        settings: with the channel on, a malformed address refused
+        startup."""
+        if self.llm_enabled != "true" or self.product_storage_address == "":
             return None
         return f"http://{self.product_storage_address}/"
 
@@ -695,8 +700,14 @@ class Settings(BaseSettings):
             )
         # W4-2: a seam the machine gave in a form comms cannot read is a
         # defect of the box -- a red start, never a deploy that refuses
-        # every voice in silence. Empty is no storage, not a defect.
-        if self.product_storage_address != "":
+        # every voice in silence. Empty is no storage, not a defect. Only
+        # with the llm channel on (S-1): off, the seam holds the machine's
+        # literal and is not read, whatever it holds; a flag that is
+        # neither true nor false is refused by the channel rule above.
+        if (
+            self.llm_enabled == "true"
+            and self.product_storage_address != ""
+        ):
             storage_problem = storage_address_problem(self.product_storage_address)
             if storage_problem is not None:
                 problems.append(storage_problem)

@@ -82,9 +82,11 @@ env:
   TELEGRAM_LOGIN_CLIENT_SECRET: { source: asked, when: login }
   # The point of the product's object store (W4-2): `<alias>:<port>`, the
   # one place a letter's audio link may point -- `http://<it>/...` (protocol
-  # 4.7). Not under `when: llm`: the machine checks `requires` whatever the
-  # options, and /health answers for it with the llm channel off too.
-  PRODUCT_STORAGE_ADDRESS: { source: seam, from: product }
+  # 4.7). Under `when: llm` (S-1): only the llm channel reads it. With the
+  # option off the machine requires nothing of the product, writes its
+  # literal into it and makes no pair (the machine v0.1.11, DM-122); comms
+  # does not read it, and /health says its seams are satisfied.
+  PRODUCT_STORAGE_ADDRESS: { source: seam, from: product, when: llm }
 
 # The data comms takes from the product (W4-1, form D of protocol 4.5):
 # the product's profile -- its directory named in the product's
@@ -107,8 +109,9 @@ accepts:
     env: TEMPLATES_DIR
     services: [comms-app, comms-worker, comms-consumer]
 
-# What comms takes from the product (W4-2): /health says whether it was
-# given (`seams.requires_satisfied`, app/api/report.py).
+# What comms takes from the product (W4-2): /health says whether the seams
+# of the options switched on were given (`seams.requires_satisfied`,
+# app/api/report.py) -- the storage's with llm on, none with it off.
 requires:
   - PRODUCT_STORAGE_ADDRESS
 

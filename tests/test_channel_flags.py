@@ -555,10 +555,13 @@ class TestTheDelivery:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """M9: with llm off the body's link is not checked -- not even
-        against the product's storage, which is given (W4-2: the seam is
-        read whatever the options; until then the list that judged the
-        link was the channel's own key, not read) -- and the job ends in
-        the same outcome, its letter and link gone with it."""
+        against the product's storage, which is written -- and the job
+        ends in the same outcome, its letter and link gone with it. Held
+        here until S-1 by a storage given and a link off it; since S-1
+        (the seam under `when: llm`, the machine's DM-122) the seam is not
+        read with the channel off, there is no prefix to check against,
+        and a check at intake would refuse the job as having no storage --
+        so the job taken is the proof the link was not checked."""
         from app.profile.loader import (
             FileProfileSource,
             install_profile,
@@ -569,7 +572,8 @@ class TestTheDelivery:
         install_profile(load_profile(FileProfileSource(_profile(tmp_path / "p"))))
         assert settings.llm_enabled == "false"
         monkeypatch.setattr(settings, "product_storage_address", "store.internal:9000")
-        assert settings.body_link_prefix is not None
+        assert settings.product_storage_address != ""
+        assert settings.body_link_prefix is None
         notification = await create_notification(
             db_session, **intake_fields(), type="ask.off",
             title=None, body=None, target_type=None, target_value=None,
