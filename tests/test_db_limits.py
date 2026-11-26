@@ -117,6 +117,22 @@ async def bounded(
     set_process_role(ProcessRole.WORKER)
 
 
+# Each role's own idle limit as the code sets it, taken at import, before
+# any test's `bounded` (TEST-3).
+_OWN_IDLE = {role: LIMITS[role].idle for role in ProcessRole}
+
+
+def own_idle(role: ProcessRole) -> float:
+    """`role`'s own idle_in_transaction_session_timeout, for `bounded`'s
+    `idle` in a test whose property is not that limit: the fixture's
+    0.4 s ends a transaction whose client stalls between two statements
+    (CI #391: a DELETE answered 503, 08003), which such a test does not
+    hold. The worker's is the hold and the margin (`bounded`)."""
+    idle = _OWN_IDLE[role]
+    assert idle is not None, role
+    return idle
+
+
 async def _shown(engine: Any) -> dict[str, str]:
     async with engine.connect() as conn:
         # In milliseconds, as pg_settings keeps them (SHOW rounds to units).
@@ -528,10 +544,17 @@ class TestTheWaits:
         self, client: AsyncClient, bounded: Callable[..., Awaitable[None]],
     ) -> None:
         """The API forgets a person while an attempt holds their job longer
-        than the API's own limits: the answer is the one it was."""
-        await bounded(ProcessRole.API, statement=0.3, lock=0.2, hold=1.0)
+        than the API's own limits: the answer is the one it was.
+
+        THE MARGINS (TEST-3; the rule and the method:
+        tests/test_recipient_and_first_attempt.py THE MARGINS). The wait,
+        ~1.2 s, is 2.4 times the API's own limits (0.5) and half the
+        lifted lock limit (hold 2.0 + margin 0.4); the idle limit is the
+        API's own (own_idle)."""
+        await bounded(ProcessRole.API, statement=0.3, lock=0.2,
+                      idle=own_idle(ProcessRole.API), hold=2.0)
         job_id, recipient = await _resolved_job()
-        holding = asyncio.ensure_future(_attempt_holding(job_id, 0.8))
+        holding = asyncio.ensure_future(_attempt_holding(job_id, 1.3))
         await asyncio.sleep(0.1)
         started = time.monotonic()
         resp = await client.request(

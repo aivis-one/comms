@@ -26,12 +26,52 @@
 # made small (tests/test_db_limits.py `bounded`): the same code, the
 # seconds of a test.
 #
+# THE MARGINS (TEST-3, the rule of TEST-2: tests/test_sanitizer_hardening.py
+# _assert_linear). Every window here holds at twice at least, both ways:
+# a runner twice as slow does not turn a test red, and a broken property
+# does not turn green on one twice as fast. A slower runner stretches the
+# client's own time -- a request on its way to its lock, an attempt's
+# commit after its sleep -- never a sleep or a limit the server keeps;
+# so a window is held twice over in the client's time (the budget over
+# what the client took) AND on paper (the ratio of the server's times).
+# Measured 26 November 2026 at primer@83f9d1c, Postgres 16, the worst
+# of three runs and of a run on a core shared with a busy loop (a pure
+# Python loop 1.86-1.98 times slower):
+#
+#   test, window                    client: budget/took   paper
+#   snapshot API, took < 0.5        0.5 / 0.095   = 5.3   attempt 1.0 / 0.5 = 2.0
+#   snapshot consumer, before the   1.5 / 0.022   = 68    --
+#     attempt's commit
+#   tombstone API, took > 0.5       0.7 / 0.077   = 9.1   wait 1.2 / 0.5 = 2.4
+#   tombstone API, wait < its lock  1.2 / 0.077   = 15    lock 2.4 / wait 1.2 = 2.0
+#   tombstone consumer, the same    1.1 / 0.087   = 12    lock 1.9 / wait 0.8 = 2.4
+#   past the hold API, took < 2.0   1.5 / 0.037   = 40    attempt 2.0 / 0.5 = 4.0
+#   past the hold API, took > 0.4   0.2 / 0.037   = 5.4   (a 55P03 at its own
+#     (the own lock not mistaken)                          lock, 0.2, to be hidden)
+#   past the hold consumer, held    1.5 / 0.038   = 39    attempt 2.0 / 0.5 = 4.0
+#
+# The idle limit is not what these tests hold: each passes its role's
+# own (tests/test_db_limits.py own_idle, 10 s; the transactions' gaps
+# between two statements measured 8.6 ms at most). The fixture's 0.4 s
+# ended the tombstone's transaction when a stalled runner sat between
+# two of its statements (CI #391: 503, 08003; reproduced by a stall of
+# 0.5 s there, which passes now).
+#
 # MUTATIONS these tests were written against (each turns one red):
 #   W1 the snapshot FOR UPDATE again -> TestTheSnapshot (55P03)
 #   W2 wait_for_attempts off the tombstone -> TestTheTombstone (55P03)
 #   W3 (unkillable, not built: the wait before the SAVEPOINT or inside it
 #      behaves the same -- SET LOCAL is rolled back with the SAVEPOINT and
 #      the second run waits again)
+#   W4 (TEST-3) the tombstone's row FOR NO KEY UPDATE, no wait for the
+#      attempt -> TestTheTombstone
+#   W5 (TEST-3) no withdrawal in withdraw_recipient -> TestTheTombstone
+#      test_the_api_waits_and_withdraws_what_the_attempt_wrote,
+#      test_the_consumer_waits_and_forgets
+#   W6 (TEST-3) the wait for an attempt unbounded (statement_timeout and
+#      lock_timeout 0 in wait_for_attempts) -> TestTheTombstone
+#      test_past_the_hold_the_api_answers_as_it_did,
+#      test_past_the_hold_the_consumer_holds_the_event
 # =============================================================================
 
 import asyncio
@@ -56,7 +96,10 @@ from app.engine.constants import DeliveryStatus
 from app.engine.models import Notification, NotificationDelivery
 from app.transport import consumer as consumer_module
 from app.transport.consumer import StreamConsumer
-from tests.test_db_limits import bounded  # noqa: F401 -- the fixture
+from tests.test_db_limits import (
+    bounded,  # noqa: F401 -- the fixture
+    own_idle,
+)
 from tests.test_transport_consumer import _run_until, _user_upserted_data, _xadd
 from tests.test_worker_keeps_its_work import _job
 
@@ -160,7 +203,8 @@ class TestTheSnapshot:
         self, client: AsyncClient, bounded: Callable[..., Awaitable[None]],  # noqa: F811
         attempt: Callable[..., Awaitable[tuple[UUID, UUID, Any]]],
     ) -> None:
-        await bounded(ProcessRole.API, statement=0.6, lock=0.2, hold=1.0)
+        await bounded(ProcessRole.API, statement=0.6, lock=0.2,
+                      idle=own_idle(ProcessRole.API), hold=1.0)
         _, recipient, task = await attempt(1.0)
         started = time.monotonic()
         resp = await client.put(f"/api/v1/recipients/{recipient}", json=_snapshot(2))
@@ -177,7 +221,8 @@ class TestTheSnapshot:
         self, a_stream: str, bounded: Callable[..., Awaitable[None]],  # noqa: F811
         attempt: Callable[..., Awaitable[tuple[UUID, UUID, Any]]],
     ) -> None:
-        await bounded(ProcessRole.CONSUMER, statement=0.6, lock=0.2, hold=1.5)
+        await bounded(ProcessRole.CONSUMER, statement=0.6, lock=0.2,
+                      idle=own_idle(ProcessRole.CONSUMER), hold=1.5)
         _, recipient, task = await attempt(1.5)
         redis = fakeaioredis.FakeRedis()
         await _xadd(redis, a_stream, "user_upserted", {
@@ -204,8 +249,9 @@ class TestTheTombstone:
         """DELETE while the attempt stands: it waits on the recipient's
         row (seen waiting for a lock), past the API's own limits; the
         attempt commits; the deletion then withdraws its deliveries."""
-        await bounded(ProcessRole.API, statement=0.3, lock=0.2, hold=1.5)
-        job_id, recipient, task = await attempt(0.8)
+        await bounded(ProcessRole.API, statement=0.3, lock=0.2,
+                      idle=own_idle(ProcessRole.API), hold=2.0)
+        job_id, recipient, task = await attempt(1.2)
         deleting = asyncio.ensure_future(client.request(
             "DELETE", f"/api/v1/recipients/{recipient}", json={"version": 2},
         ))
@@ -230,7 +276,8 @@ class TestTheTombstone:
         self, a_stream: str, bounded: Callable[..., Awaitable[None]],  # noqa: F811
         attempt: Callable[..., Awaitable[tuple[UUID, UUID, Any]]],
     ) -> None:
-        await bounded(ProcessRole.CONSUMER, statement=0.3, lock=0.2, hold=1.5)
+        await bounded(ProcessRole.CONSUMER, statement=0.3, lock=0.2,
+                      idle=own_idle(ProcessRole.CONSUMER), hold=1.5)
         job_id, recipient, task = await attempt(0.8)
         redis = fakeaioredis.FakeRedis()
         await _xadd(redis, a_stream, "user_deleted",
@@ -254,7 +301,7 @@ class TestTheTombstone:
     ) -> None:
         """The pair: the wait is the hold and its margin, not unbounded."""
         await bounded(ProcessRole.API, statement=0.3, lock=0.2,
-                      hold=0.3, margin=0.2)
+                      idle=own_idle(ProcessRole.API), hold=0.3, margin=0.2)
         _, recipient, task = await attempt(2.0)
         started = time.monotonic()
         resp = await client.request(
@@ -273,7 +320,8 @@ class TestTheTombstone:
         attempt: Callable[..., Awaitable[tuple[UUID, UUID, Any]]],
     ) -> None:
         await bounded(ProcessRole.CONSUMER, statement=0.3, lock=0.2,
-                      hold=0.3, margin=0.2)
+                      idle=own_idle(ProcessRole.CONSUMER), hold=0.3,
+                      margin=0.2)
         _, recipient, task = await attempt(2.0)
         redis = fakeaioredis.FakeRedis()
         await _xadd(redis, a_stream, "user_deleted",
