@@ -361,7 +361,7 @@ class TestTheThirdWriter:
                     async with factory() as observer:
                         kind = (await observer.execute(text(
                             "SELECT wait_event_type FROM pg_stat_activity "
-                            "WHERE pid = :p"
+                            "WHERE pid = :p AND datname = current_database()"
                         ), {"p": window.pid})).scalar_one_or_none()
                     if kind == "Lock" and window.reads == 1:
                         waited = True
