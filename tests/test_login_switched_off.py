@@ -8,8 +8,11 @@ against v4.0.1 frozen in a fixture:
     (tests/fixtures/routes_v4.0.1.json, taken by _PROBE below from the
     code of the tag ec2ca8d, the same as primer@6bbc1e8's);
   - primer.yaml is v4.0.1's (tests/fixtures/primer_v4.0.1.json: the tag's
-    file parsed -- data, comments do not count) and the option: `login`
-    in `options` and its two keys in `env`, nothing else;
+    file parsed -- data, comments do not count) with two changes, nothing
+    else: the option (v4.2) -- `login` in `options` and its two keys in
+    `env` -- and the seam of the product's storage under the option that
+    reads it (v4.3, S-1, the machine's DM-122) -- PRODUCT_STORAGE_ADDRESS
+    with `when: llm`, the rest of the key as it was;
   - the environment of a v4.0.1 instance plus LOGIN_ENABLED=false and
     the machine's literal in the secret starts, with v4.0.1's routes;
     the secret's value changes nothing that starts (its routes, the
@@ -21,7 +24,9 @@ once, at import. The walk goes through the routers the application
 includes (FastAPI 0.141 keeps them wrapped, `original_router`).
 
 Mutations: a route that is no v4.0.1 route (3.1), a key of `env` without
-`when` (3.2), one more option (3.3) -- each red here. The twin of 3.1 --
+`when` (3.2), one more option (3.3), the seam of the storage without
+`when: llm`, under another option or under an empty one (3.4) -- each red
+here. The twin of 3.1 --
 the same route included only with LOGIN_ENABLED true -- green; since
 L-2 that twin is the code (app/main.py), and with the option on the
 start of the sign-in is in the table (TestTheRoutesWithLoginOn).
@@ -59,6 +64,11 @@ _LOGIN_ENV = {
     "TELEGRAM_LOGIN_CLIENT_SECRET": {"source": "asked", "when": "login"},
 }
 _NEW_SETTINGS = {key.lower() for key in _LOGIN_ENV}
+
+# The one change to a key of v4.0.1's `env` (v4.3.0, S-1, the machine's
+# DM-122): the seam of the product's storage is under the option that
+# reads it, `llm`; the rest of the key is v4.0.1's.
+_STORAGE_UNDER_LLM = {"PRODUCT_STORAGE_ADDRESS": {"when": "llm"}}
 
 # What the machine writes into a key of a switched-off option (the
 # machine v0.1.8, pridem/stacks/options.py off() and LITERAL).
@@ -211,14 +221,27 @@ class TestTheStart:
 
 
 class TestThePrimerYaml:
-    def test_it_is_v401s_and_the_option(self) -> None:
-        """Data against data: the option and its two keys, nothing else
-        -- no other key, no other option, `provides`, `requires`,
-        `accepts`, the stack and the report as they were."""
+    def test_it_is_v401s_the_option_and_the_seam_under_llm(self) -> None:
+        """Data against data, two changes and nothing else: the option
+        and its two keys (v4.2), and the seam of the product's storage
+        under `when: llm` (v4.3, S-1, the machine's DM-122) -- no other
+        key, no other option, no other change to the seam, `provides`,
+        `requires`, `accepts`, the stack and the report as they were. Was
+        test_it_is_v401s_and_the_option, with the first change alone,
+        until S-1 put the seam under its option. The pairs: each change
+        is one -- the login keys are new, and the seam is v4.0.1's, under
+        no option, while `llm` is an option of v4.0.1."""
         assert _PRIMER_V401["options"] and _PRIMER_V401["env"]  # the pair
         assert "login" not in _PRIMER_V401["options"]
         assert set(_LOGIN_ENV).isdisjoint(_PRIMER_V401["env"])
+        assert set(_STORAGE_UNDER_LLM) <= set(_PRIMER_V401["env"])
+        assert all(
+            "when" not in _PRIMER_V401["env"][key] for key in _STORAGE_UNDER_LLM
+        )
+        assert "llm" in _PRIMER_V401["options"]
         expected = copy.deepcopy(_PRIMER_V401)
         expected["options"] = [*expected["options"], "login"]
         expected["env"] = {**expected["env"], **_LOGIN_ENV}
+        for key, change in _STORAGE_UNDER_LLM.items():
+            expected["env"][key] = {**expected["env"][key], **change}
         assert expected == _PRIMER
